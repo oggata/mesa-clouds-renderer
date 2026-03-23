@@ -27,8 +27,8 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 854;
-const HEIGHT = parseInt(process.env.HEIGHT) || 480;
+const WIDTH  = parseInt(process.env.WIDTH)  || 640;
+const HEIGHT = parseInt(process.env.HEIGHT) || 640;
 const FPS    = parseInt(process.env.FPS)    || 20;
 const JPEG_Q = parseInt(process.env.JPEG_Q) || 60;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
@@ -350,10 +350,49 @@ function handleCommand(msg){
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
-const mainCam = new THREE.PerspectiveCamera(52, WIDTH/HEIGHT, 0.1, 1200);
-mainCam.position.set(W*.5, W*.5, W*1.1);   // 真上俯瞰
-mainCam.up.set(0,1,0);
-mainCam.lookAt(W*.5, W*.5, 0);
+const mainCam = new THREE.PerspectiveCamera(60, WIDTH/HEIGHT, 0.1, 1200);
+mainCam.up.set(0,0,1);
+
+// ── 追跡カメラ ────────────────────────────────────────────────
+// 0 = 俯瞰, 1〜5 = ペルソナA〜E 追跡
+const CAM_OVERVIEW_INTERVAL = 5000;  // ms
+let camTargetIdx  = 0;   // 0:俯瞰, 1-5:各ペルソナ
+let camSwitchTimer = Date.now();
+
+function updateTrackingCamera(cam) {
+  const now = Date.now();
+  if (now - camSwitchTimer > CAM_OVERVIEW_INTERVAL) {
+    camTargetIdx = (camTargetIdx + 1) % (agents.length + 1);
+    camSwitchTimer = now;
+    const name = camTargetIdx === 0 ? '俯瞰' : agents[camTargetIdx-1]?.def.name;
+    console.log(`[Cam] → ${name}`);
+  }
+
+  if (camTargetIdx === 0 || agents.length === 0) {
+    // 俯瞰モード: フィールド全体を真上から
+    cam.position.x += (W*.5  - cam.position.x) * 0.05;
+    cam.position.y += (W*.5  - cam.position.y) * 0.05;
+    cam.position.z += (W*1.1 - cam.position.z) * 0.05;
+    cam.up.set(0, 1, 0);
+    cam.lookAt(cam.position.x, cam.position.y + 1, 0);
+  } else {
+    // 追跡モード: エージェントの真上から垂直に見下ろす (回転なし)
+    const a = agents[camTargetIdx - 1];
+    if (!a) return;
+
+    const tx = a.y * CELL + CELL * .5;
+    const ty = a.x * CELL + CELL * .5;
+    const followH = CELL * 12;  // 真上の高さ
+
+    // XY だけエージェントを追う、Z(高さ)は固定、向きは常に北固定
+    cam.position.x += (tx - cam.position.x) * 0.08;
+    cam.position.y += (ty - cam.position.y) * 0.08;
+    cam.position.z += (followH - cam.position.z) * 0.08;
+
+    cam.up.set(0, 1, 0);  // 常に固定方向、回転しない
+    cam.lookAt(cam.position.x, cam.position.y + 1, 0);
+  }
+}
 
 scene = buildScene(MAP);
 PERSONA_DEFS.forEach(p=>{
@@ -366,7 +405,8 @@ const clients = new Set();
 // stats ブロードキャスト (2秒ごと)
 setInterval(()=>{
   if(clients.size===0)return;
-  const msg=JSON.stringify({type:'stats',agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
+  const camName = camTargetIdx === 0 ? '俯瞰' : (agents[camTargetIdx-1]?.def.name || '-');
+  const msg=JSON.stringify({type:'stats', camName, agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
   for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}
 },2000);
 
@@ -400,6 +440,7 @@ setInterval(async()=>{
     m.rotation.z+=dr*Math.min(1,dt*14);
   });
 
+  updateTrackingCamera(mainCam);
   renderer.render(scene,mainCam);
   frameCount++;
 

@@ -38,6 +38,13 @@ button:hover{border-color:var(--accent);color:var(--accent);}button.on{border-co
   padding:5px 10px;display:flex;align-items:center;gap:6px;}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--warn);}
 .dot.ok{background:var(--accent);box-shadow:0 0 8px var(--accent);}
+#cam-badge{
+  position:fixed;bottom:50px;left:50%;transform:translateX(-50%);z-index:60;
+  font-family:var(--mono);font-size:10px;color:var(--accent);
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:4px;padding:5px 16px;letter-spacing:.1em;
+  transition:opacity .3s;
+}
 #dbg{position:fixed;bottom:50px;left:10px;z-index:60;display:none;
   font-family:monospace;font-size:9px;color:#4a7a6a;background:rgba(4,8,14,0.9);
   padding:6px 10px;border-radius:3px;border:1px solid var(--border);max-width:420px;line-height:1.8;}
@@ -68,6 +75,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;
   <button id="b-newmap">🎲 New Map</button>
 </div>
 
+<div id="cam-badge">📷 俯瞰</div>
 <div id="dbg"></div>
 
 <script>
@@ -114,8 +122,8 @@ const canvas=document.getElementById('canvas');
 const ctx2d=canvas.getContext('2d');
 
 // サーバーの解像度比率 (server.js の WIDTH/HEIGHT と合わせる)
-const STREAM_W = 854, STREAM_H = 480;
-const ASPECT = STREAM_W / STREAM_H;
+const STREAM_W = 640, STREAM_H = 640;
+const ASPECT = STREAM_W / STREAM_H;  // 1.0 = 正方形
 
 function resizeCanvas(){
   canvas.width  = window.innerWidth;
@@ -203,6 +211,11 @@ function connect(){
       try{
         const msg=JSON.parse(e.data);
         if(msg.type==='stats'){
+          // カメラ名更新
+          if(msg.camName){
+            const badge = document.getElementById('cam-badge');
+            badge.textContent = msg.camName === '俯瞰' ? '📷 俯瞰' : '🎯 ' + msg.camName;
+          }
           msg.agents.forEach(a=>{
             const el=id=>document.getElementById(id);
             if(el('trips-'+a.id))el('trips-'+a.id).textContent=a.trips;
