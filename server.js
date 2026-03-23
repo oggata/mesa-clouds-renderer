@@ -1,50 +1,45 @@
 /**
  * MESA Persona City Sim — Cloud Rendering Server
- * Three.js (headless-gl r132) + ONNX (onnxruntime-node) + WebRTC
+ * WebSocket + JPEG フレームストリーム方式
+ * headless-gl + Three.js r132 + ws
  *
- * Install:
- *   npm install three@0.132.2 gl@9.0.0-rc.9 ws @roamhq/wrtc onnxruntime-node
- *
- * ONNX files (optional):
- *   ./data/persona_A.onnx 〜 persona_E.onnx
- *
- * Run:
- *   node server.js
+ * ローカル: node server.js
+ * Render:   xvfb-run -s "-screen 0 1x1x24" node server.js  (or Xvfb :99 ...)
  */
 
 'use strict';
 
-const gl   = require('gl');
+const gl    = require('gl');
 const THREE = require('three');
-const { RTCPeerConnection, RTCSessionDescription, nonstandard } = require('@roamhq/wrtc');
-const { RTCVideoSource, rgbaToI420 } = nonstandard;
 const WebSocket = require('ws');
 const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
-// onnxruntime-node はオプション (なくても動く)
+// JPEG エンコードに sharp を使う（なければ簡易PPM→JPEG変換）
+let sharp = null;
+try { sharp = require('sharp'); console.log('[Sharp] loaded'); }
+catch(e) { console.warn('[Sharp] not found — install sharp for better performance'); }
+
+// onnxruntime-node はオプション
 let ort = null;
-try { ort = require('onnxruntime-node'); console.log('[ONNX] onnxruntime-node loaded'); }
-catch(e) { console.warn('[ONNX] onnxruntime-node not found — random mode only'); }
+try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
+catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const WIDTH  = 1280;
 const HEIGHT = 720;
-const FPS    = 30;
+const FPS    = 24;
+const JPEG_Q = 75;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
-// ─── Sim constants (index.htmlと同じ値) ──────────────────────────────────────
+// ─── Sim constants ────────────────────────────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=120;
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
 const MOVE=0.25, ROT=Math.PI/9;
-const RAY_DEG=[-60,-30,0,30,60];
-const RAY_RAD=RAY_DEG.map(d=>d*Math.PI/180);
 const RAY_MAX=6.0, RAY_STEP=0.15;
 const W=GRID*CELL;
-
-// FP画像 (ONNX観測用)
 const IMG_W=64, IMG_H=64, IMG_CH=3;
 const FP_FOV=Math.PI/3, FP_RAY_MAX=8.0, FP_RAY_STEP=0.1;
 const FP_CELL_RGB=[[45,100,45],[80,80,80],[196,32,32],[35,104,40]];
@@ -58,15 +53,14 @@ const PERSONA_DEFS = [
   { id:'E', name:'観光客サラ',     color:0xff7700, hex:'#ff7700', desc:'建物を巡って観光' },
 ];
 
-// ─── マップ生成 (index.htmlと同じ) ───────────────────────────────────────────
+// ─── マップ生成 ───────────────────────────────────────────────────────────────
 function makeMap(size, seed){
   let s=seed>>>0;
   const rng=()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff};
   const ri=n=>Math.floor(rng()*n);
   const pick=a=>a[ri(a.length)];
   const g=Array.from({length:size},()=>new Array(size).fill(OTHER));
-  const step=4;
-  const rows=[],cols=[];
+  const step=4, rows=[], cols=[];
   for(let i=0;i<size;i+=step){rows.push(i);cols.push(i);}
   rows.forEach(r=>{for(let c=0;c<size;c++)g[r][c]=ROAD;});
   cols.forEach(c=>{for(let r=0;r<size;r++)g[r][c]=ROAD;});
@@ -86,352 +80,215 @@ function makeMap(size, seed){
   }
   rows.forEach(r=>{for(let c=0;c<size;c++)g[r][c]=ROAD;});
   cols.forEach(c=>{for(let r=0;r<size;r++)g[r][c]=ROAD;});
-  const isIntersection=(r,c)=>rows.includes(r)&&cols.includes(c);
-  const candidates=[];
+  const isX=(r,c)=>rows.includes(r)&&cols.includes(c);
+  const cands=[];
   for(let r=0;r<size;r++)for(let c=0;c<size;c++)
-    if(g[r][c]===ROAD&&!isIntersection(r,c))candidates.push([r,c]);
-  for(let i=candidates.length-1;i>0;i--){
-    const j=ri(i+1);[candidates[i],candidates[j]]=[candidates[j],candidates[i]];
-  }
-  function roadConnected(grid){
+    if(g[r][c]===ROAD&&!isX(r,c))cands.push([r,c]);
+  for(let i=cands.length-1;i>0;i--){const j=ri(i+1);[cands[i],cands[j]]=[cands[j],cands[i]];}
+  function roadOK(grid){
     let sr=-1,sc=-1;
-    outer:for(let r=0;r<size;r++)for(let c=0;c<size;c++)
-      if(grid[r][c]===ROAD){sr=r;sc=c;break outer;}
+    outer:for(let r=0;r<size;r++)for(let c=0;c<size;c++)if(grid[r][c]===ROAD){sr=r;sc=c;break outer;}
     if(sr<0)return true;
-    const visited=new Set(),queue=[[sr,sc]];
-    visited.add(sr*size+sc);
-    const dirs=[[-1,0],[1,0],[0,-1],[0,1]];
-    while(queue.length){
-      const [r,c]=queue.shift();
-      for(const [dr,dc] of dirs){
-        const nr=r+dr,nc=c+dc;
-        if(nr<0||nr>=size||nc<0||nc>=size)continue;
-        const key=nr*size+nc;
-        if(!visited.has(key)&&grid[nr][nc]===ROAD){visited.add(key);queue.push([nr,nc]);}
-      }
-    }
-    for(let r=0;r<size;r++)for(let c=0;c<size;c++)
-      if(grid[r][c]===ROAD&&!visited.has(r*size+c))return false;
+    const vis=new Set(),q=[[sr,sc]];vis.add(sr*size+sc);
+    const D=[[-1,0],[1,0],[0,-1],[0,1]];
+    while(q.length){const[r,c]=q.shift();for(const[dr,dc]of D){const nr=r+dr,nc=c+dc;if(nr<0||nr>=size||nc<0||nc>=size)continue;const k=nr*size+nc;if(!vis.has(k)&&grid[nr][nc]===ROAD){vis.add(k);q.push([nr,nc]);}}}
+    for(let r=0;r<size;r++)for(let c=0;c<size;c++)if(grid[r][c]===ROAD&&!vis.has(r*size+c))return false;
     return true;
   }
-  const removeRatio=0.30+rng()*0.25;
-  const maxRemove=Math.floor(candidates.length*removeRatio);
-  let removed=0;
-  for(const [r,c] of candidates){
-    if(removed>=maxRemove)break;
-    g[r][c]=OTHER;
-    if(roadConnected(g)){g[r][c]=rng()<0.4?TREE:OTHER;removed++;}
-    else{g[r][c]=ROAD;}
-  }
+  const maxRm=Math.floor(cands.length*(0.30+rng()*0.25));let rm=0;
+  for(const[r,c]of cands){if(rm>=maxRm)break;g[r][c]=OTHER;if(roadOK(g)){g[r][c]=rng()<0.4?TREE:OTHER;rm++;}else g[r][c]=ROAD;}
   return g;
 }
 
-// ─── レイキャスト ─────────────────────────────────────────────────────────────
-function raycast(map,x,y,th){
-  return RAY_RAD.map(da=>{
-    const angle=th+da,dx=Math.cos(angle),dy=Math.sin(angle);
-    for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
-      const nx=x+dx*d,ny=y+dy*d;
-      const r=Math.floor(nx),c=Math.floor(ny);
-      if(r<0||r>=GRID||c<0||c>=GRID)return{type:OTHER,dist:d,norm:d/RAY_MAX};
-      const ct=map[r][c];
-      if(ct===BUILDING||ct===TREE)return{type:ct,dist:d,norm:d/RAY_MAX};
-    }
-    return{type:ROAD,dist:RAY_MAX,norm:1.0};
-  });
-}
-
-// ─── FP画像生成 (ONNX観測) ───────────────────────────────────────────────────
+// ─── FP画像 (ONNX観測) ───────────────────────────────────────────────────────
 function renderFPImage(map,agent){
   const buf=new Float32Array(IMG_CH*IMG_H*IMG_W);
   for(let xi=0;xi<IMG_W;xi++){
-    const rayAngle=agent.th+FP_FOV*(xi/(IMG_W-1)-0.5);
-    const rdx=Math.cos(rayAngle),rdy=Math.sin(rayAngle);
-    let hitType=-1,hitDist=FP_RAY_MAX;
+    const ra=agent.th+FP_FOV*(xi/(IMG_W-1)-0.5);
+    const rdx=Math.cos(ra),rdy=Math.sin(ra);
+    let ht=-1,hd=FP_RAY_MAX;
     for(let d=FP_RAY_STEP;d<FP_RAY_MAX;d+=FP_RAY_STEP){
       const nx=agent.x+rdx*d,ny=agent.y+rdy*d;
       const r=Math.floor(nx),c=Math.floor(ny);
-      if(r<0||r>=GRID||c<0||c>=GRID){hitType=OTHER;hitDist=d;break;}
-      const ct=map[r][c];
-      if(ct!==ROAD){hitType=ct;hitDist=d;break;}
+      if(r<0||r>=GRID||c<0||c>=GRID){ht=OTHER;hd=d;break;}
+      const ct=map[r][c];if(ct!==ROAD){ht=ct;hd=d;break;}
     }
-    const colH=hitType>=0?Math.min(IMG_H*1.5/Math.max(hitDist,0.1),IMG_H):0;
+    const colH=ht>=0?Math.min(IMG_H*1.5/Math.max(hd,0.1),IMG_H):0;
     const y0=Math.floor((IMG_H-colH)*0.5),y1=Math.floor(y0+colH);
-    const bright=hitType>=0?Math.max(0.15,1.0-hitDist/FP_RAY_MAX):0;
-    const rgb=hitType>=0?FP_CELL_RGB[hitType]:[0,0,0];
+    const br=ht>=0?Math.max(0.15,1.0-hd/FP_RAY_MAX):0;
+    const rgb=ht>=0?FP_CELL_RGB[ht]:[0,0,0];
     for(let yi=0;yi<IMG_H;yi++){
       let rv,gv,bv;
-      if(yi>=y0&&yi<y1){rv=rgb[0]/255*bright;gv=rgb[1]/255*bright;bv=rgb[2]/255*bright;}
+      if(yi>=y0&&yi<y1){rv=rgb[0]/255*br;gv=rgb[1]/255*br;bv=rgb[2]/255*br;}
       else if(yi<IMG_H*0.5){rv=FP_SKY_RGB[0]/255;gv=FP_SKY_RGB[1]/255;bv=FP_SKY_RGB[2]/255;}
       else{rv=FP_FLOOR_RGB[0]/255;gv=FP_FLOOR_RGB[1]/255;bv=FP_FLOOR_RGB[2]/255;}
-      const pidx=yi*IMG_W+xi;
-      buf[0*IMG_H*IMG_W+pidx]=rv;
-      buf[1*IMG_H*IMG_W+pidx]=gv;
-      buf[2*IMG_H*IMG_W+pidx]=bv;
+      const pi=yi*IMG_W+xi;buf[0*IMG_H*IMG_W+pi]=rv;buf[1*IMG_H*IMG_W+pi]=gv;buf[2*IMG_H*IMG_W+pi]=bv;
     }
   }
   return buf;
 }
 
-// ─── ONNX セッション読み込み ──────────────────────────────────────────────────
-const ortSessions = {};  // id → ort.InferenceSession
-const obsDims     = {};  // id → number
-
+// ─── ONNX ────────────────────────────────────────────────────────────────────
+const ortSessions={}, obsDims={};
 async function loadOnnxSessions(){
-  if(!ort){ console.log('[ONNX] skipped (not installed)'); return; }
+  if(!ort)return;
   for(const p of PERSONA_DEFS){
-    const onnxPath = path.join(__dirname, 'data', `persona_${p.id}.onnx`);
-    const metaPath = path.join(__dirname, 'data', `persona_${p.id}_meta.json`);
-    // meta
-    if(fs.existsSync(metaPath)){
+    const op=path.join(__dirname,'data',`persona_${p.id}.onnx`);
+    const mp=path.join(__dirname,'data',`persona_${p.id}_meta.json`);
+    if(fs.existsSync(mp)){try{const m=JSON.parse(fs.readFileSync(mp,'utf8'));if(m.input_size)obsDims[p.id]=m.input_size;}catch(e){}}
+    if(fs.existsSync(op)){
       try{
-        const meta = JSON.parse(fs.readFileSync(metaPath,'utf8'));
-        if(meta.input_size) obsDims[p.id] = meta.input_size;
-        if(meta.persona_name){
-          const idx=PERSONA_DEFS.findIndex(x=>x.id===p.id);
-          if(idx>=0) PERSONA_DEFS[idx].name=meta.persona_name;
-        }
-        console.log(`[ONNX] meta ${p.id}: input_size=${obsDims[p.id]}`);
-      }catch(e){ console.warn(`[ONNX] meta ${p.id} parse error:`,e.message); }
-    }
-    // onnx
-    if(fs.existsSync(onnxPath)){
-      try{
-        ortSessions[p.id] = await ort.InferenceSession.create(onnxPath,{
-          executionProviders:['cpu'],
-          graphOptimizationLevel:'all',
-        });
+        ortSessions[p.id]=await ort.InferenceSession.create(op,{executionProviders:['cpu']});
         const dim=obsDims[p.id]||(IMG_CH*IMG_H*IMG_W);
-        const inputName=ortSessions[p.id].inputNames[0];
-        const t=new ort.Tensor('float32',new Float32Array(dim),[1,dim]);
-        await ortSessions[p.id].run({[inputName]:t});
-        console.log(`[ONNX] persona_${p.id} loaded & tested OK`);
-      }catch(e){
-        console.warn(`[ONNX] persona_${p.id} failed:`,e.message);
-        ortSessions[p.id]=null;
-      }
-    }else{
-      console.log(`[ONNX] persona_${p.id}.onnx not found → random mode`);
+        const nm=ortSessions[p.id].inputNames[0];
+        await ortSessions[p.id].run({[nm]:new ort.Tensor('float32',new Float32Array(dim),[1,dim])});
+        console.log(`[ONNX] persona_${p.id} OK`);
+      }catch(e){console.warn(`[ONNX] persona_${p.id}:`,e.message);ortSessions[p.id]=null;}
     }
   }
 }
 
-// ─── 行動選択 ─────────────────────────────────────────────────────────────────
-async function selectAction(map, agent){
-  const session = ortSessions[agent.def.id];
-  if(session){
+async function selectAction(map,agent){
+  const sess=ortSessions[agent.def.id];
+  if(sess){
     try{
       const obs=renderFPImage(map,agent);
       const dim=obsDims[agent.def.id]||(IMG_CH*IMG_H*IMG_W);
-      const inputName=session.inputNames[0];
-      const outputName=session.outputNames[0];
-      const t=new ort.Tensor('float32',obs,[1,dim]);
-      const out=await session.run({[inputName]:t});
-      const lg=Array.from(out[outputName].data);
-      const mx=Math.max(...lg);
-      const ex=lg.map(v=>Math.exp(v-mx));
-      const sm=ex.reduce((a,b)=>a+b,0);
-      const pr=ex.map(v=>v/sm);
-      let rv=Math.random();
-      for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}
-      return 0;
+      const nm=sess.inputNames[0],on=sess.outputNames[0];
+      const out=await sess.run({[nm]:new ort.Tensor('float32',obs,[1,dim])});
+      const lg=Array.from(out[on].data);
+      const mx=Math.max(...lg),ex=lg.map(v=>Math.exp(v-mx)),sm=ex.reduce((a,b)=>a+b,0),pr=ex.map(v=>v/sm);
+      let rv=Math.random();for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}return 0;
     }catch(e){return Math.floor(Math.random()*3);}
   }
-  // ランダム (前進バイアス)
-  const rays=raycast(map,agent.x,agent.y,agent.th);
+  const rays=[0,1,2,3,4].map(i=>{
+    const angle=agent.th+(i-2)*Math.PI/3,dx=Math.cos(angle),dy=Math.sin(angle);
+    for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
+      const r=Math.floor(agent.x+dx*d),c=Math.floor(agent.y+dy*d);
+      if(r<0||r>=GRID||c<0||c>=GRID)return{type:OTHER,dist:d};
+      const ct=map[r][c];if(ct===BUILDING||ct===TREE)return{type:ct,dist:d};
+    }
+    return{type:ROAD,dist:RAY_MAX};
+  });
   return (rays[2].type===ROAD&&Math.random()<0.55)?0:(Math.random()<0.5?1:2);
 }
 
-// ─── Headless GL + Three.js ───────────────────────────────────────────────────
-function createHeadlessRenderer(){
-  const glCtx = gl(WIDTH, HEIGHT, { preserveDrawingBuffer: true });
-  const vaoExt = glCtx.getExtension('OES_vertex_array_object');
+// ─── headless-gl + Three.js ───────────────────────────────────────────────────
+function createRenderer(){
+  const glCtx=gl(WIDTH,HEIGHT,{preserveDrawingBuffer:true});
+  const vaoExt=glCtx.getExtension('OES_vertex_array_object');
   if(vaoExt){
-    glCtx.createVertexArray = ()=>vaoExt.createVertexArrayOES();
-    glCtx.bindVertexArray   = v=>vaoExt.bindVertexArrayOES(v);
-    glCtx.deleteVertexArray = v=>vaoExt.deleteVertexArrayOES(v);
-    glCtx.isVertexArray     = v=>vaoExt.isVertexArrayOES(v);
+    glCtx.createVertexArray=()=>vaoExt.createVertexArrayOES();
+    glCtx.bindVertexArray=v=>vaoExt.bindVertexArrayOES(v);
+    glCtx.deleteVertexArray=v=>vaoExt.deleteVertexArrayOES(v);
+    glCtx.isVertexArray=v=>vaoExt.isVertexArrayOES(v);
     console.log('[GL] VAO patched');
-  } else {
-    glCtx.createVertexArray = ()=>({_stub:true});
-    glCtx.bindVertexArray   = ()=>{};
-    glCtx.deleteVertexArray = ()=>{};
-    glCtx.isVertexArray     = ()=>false;
+  }else{
+    glCtx.createVertexArray=()=>({_stub:true});
+    glCtx.bindVertexArray=()=>{};glCtx.deleteVertexArray=()=>{};glCtx.isVertexArray=()=>false;
   }
-  const canvasMock = {
-    width:WIDTH, height:HEIGHT, style:{},
-    addEventListener:()=>{}, removeEventListener:()=>{}, setAttribute:()=>{},
-    getContext:()=>glCtx,
-  };
-  const renderer = new THREE.WebGLRenderer({ canvas:canvasMock, context:glCtx, antialias:false });
-  renderer.setSize(WIDTH, HEIGHT, false);
-  renderer.setPixelRatio(1);
-  return { renderer, glCtx };
+  const canvasMock={width:WIDTH,height:HEIGHT,style:{},addEventListener:()=>{},removeEventListener:()=>{},setAttribute:()=>{},getContext:()=>glCtx};
+  const renderer=new THREE.WebGLRenderer({canvas:canvasMock,context:glCtx,antialias:false});
+  renderer.setSize(WIDTH,HEIGHT,false);renderer.setPixelRatio(1);
+  return{renderer,glCtx};
 }
 
-// ─── シーン構築 ───────────────────────────────────────────────────────────────
 function buildScene(map){
-  const S = new THREE.Scene();
-  S.background = new THREE.Color(0x020406);
-
-  // ライト (MeshBasicMaterialはライティング不要だが、ambient入れておく)
-  S.add(new THREE.AmbientLight(0xffffff, 1.0));
-
-  // 地面
-  const gnd = new THREE.Mesh(
-    new THREE.PlaneGeometry(W, W),
-    new THREE.MeshBasicMaterial({ color: 0x060a0f })
-  );
-  gnd.position.set(W/2, W/2, 0);
-  S.add(gnd);
-
-  // タイル
-  for(let r=0;r<GRID;r++){
-    for(let c=0;c<GRID;c++){
-      const t=map[r][c];
-      const cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
-      if(t===BUILDING){
-        const h=(0.9+((r*GRID+c)%7)*.3)*CELL;
-        const typeColors=[0xe8a020,0xe03030,0x20a020,0x8B5E3C,0x4060a0,0xa06040,0x20a8e0,0xe0e0f0];
-        const col=typeColors[(r*GRID+c)%typeColors.length];
-        const m=new THREE.Mesh(
-          new THREE.BoxGeometry(CELL*.8,CELL*.8,h),
-          new THREE.MeshBasicMaterial({color:col})
-        );
-        m.position.set(cx,cy,h/2); S.add(m);
-        // 屋上 (白)
-        const roof=new THREE.Mesh(
-          new THREE.BoxGeometry(CELL*.82,CELL*.82,0.06),
-          new THREE.MeshBasicMaterial({color:0xaaaaaa})
-        );
-        roof.position.set(cx,cy,h); S.add(roof);
-      } else if(t===TREE){
-        const tr=new THREE.Mesh(
-          new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),
-          new THREE.MeshBasicMaterial({color:0x4a3020})
-        );
-        tr.position.set(cx,cy,CELL*.2); S.add(tr);
-        const cn=new THREE.Mesh(
-          new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),
-          new THREE.MeshBasicMaterial({color:0x236826})
-        );
-        cn.position.set(cx,cy,CELL*.58); S.add(cn);
-      } else if(t===ROAD){
-        const m=new THREE.Mesh(
-          new THREE.PlaneGeometry(CELL*.97,CELL*.97),
-          new THREE.MeshBasicMaterial({color:0x555555})
-        );
-        m.position.set(cx,cy,.008); S.add(m);
-      } else {
-        const m=new THREE.Mesh(
-          new THREE.PlaneGeometry(CELL*.97,CELL*.97),
-          new THREE.MeshBasicMaterial({color:0x1a3020})
-        );
-        m.position.set(cx,cy,.005); S.add(m);
-      }
+  const S=new THREE.Scene();S.background=new THREE.Color(0x020406);
+  S.add(new THREE.AmbientLight(0xffffff,1.0));
+  const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshBasicMaterial({color:0x060a0f}));
+  gnd.position.set(W/2,W/2,0);S.add(gnd);
+  const typeColors=[0xe8a020,0xe03030,0x20a020,0x8B5E3C,0x4060a0,0xa06040,0x20a8e0,0xe0e0f0];
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    const t=map[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
+    if(t===BUILDING){
+      const h=(0.9+((r*GRID+c)%7)*.3)*CELL,col=typeColors[(r*GRID+c)%typeColors.length];
+      const m=new THREE.Mesh(new THREE.BoxGeometry(CELL*.8,CELL*.8,h),new THREE.MeshBasicMaterial({color:col}));
+      m.position.set(cx,cy,h/2);S.add(m);
+      const roof=new THREE.Mesh(new THREE.BoxGeometry(CELL*.82,CELL*.82,0.06),new THREE.MeshBasicMaterial({color:0xaaaaaa}));
+      roof.position.set(cx,cy,h);S.add(roof);
+    }else if(t===TREE){
+      const tr=new THREE.Mesh(new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),new THREE.MeshBasicMaterial({color:0x4a3020}));
+      tr.position.set(cx,cy,CELL*.2);S.add(tr);
+      const cn=new THREE.Mesh(new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),new THREE.MeshBasicMaterial({color:0x236826}));
+      cn.position.set(cx,cy,CELL*.58);S.add(cn);
+    }else if(t===ROAD){
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.97,CELL*.97),new THREE.MeshBasicMaterial({color:0x555555}));
+      m.position.set(cx,cy,.008);S.add(m);
+    }else{
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.97,CELL*.97),new THREE.MeshBasicMaterial({color:0x1a3020}));
+      m.position.set(cx,cy,.005);S.add(m);
     }
   }
   return S;
 }
 
-// ─── エージェントメッシュ ─────────────────────────────────────────────────────
-function createAgentMesh(S, color){
-  const body=new THREE.Mesh(
-    new THREE.BoxGeometry(CELL*.3,CELL*.3,CELL*.52),
-    new THREE.MeshBasicMaterial({color})
-  );
-  const head=new THREE.Mesh(
-    new THREE.BoxGeometry(CELL*.22,CELL*.22,CELL*.22),
-    new THREE.MeshBasicMaterial({color:0xffd9aa})
-  );
-  head.position.set(0,0,CELL*.4);
-  body.add(head);
-  const nose=new THREE.Mesh(
-    new THREE.BoxGeometry(CELL*.08,CELL*.08,CELL*.12),
-    new THREE.MeshBasicMaterial({color:0xffffff})
-  );
-  nose.position.set(0,CELL*.18,CELL*.12);
-  body.add(nose);
-  S.add(body);
-  return body;
+function createAgentMesh(S,color){
+  const body=new THREE.Mesh(new THREE.BoxGeometry(CELL*.3,CELL*.3,CELL*.52),new THREE.MeshBasicMaterial({color}));
+  const head=new THREE.Mesh(new THREE.BoxGeometry(CELL*.22,CELL*.22,CELL*.22),new THREE.MeshBasicMaterial({color:0xffd9aa}));
+  head.position.set(0,0,CELL*.4);body.add(head);
+  const nose=new THREE.Mesh(new THREE.BoxGeometry(CELL*.08,CELL*.08,CELL*.12),new THREE.MeshBasicMaterial({color:0xffffff}));
+  nose.position.set(0,CELL*.18,CELL*.12);body.add(nose);
+  S.add(body);return body;
 }
 
-// ─── トレイルメッシュ ─────────────────────────────────────────────────────────
-function addTrail(S, agent, trailMats){
-  const m=new THREE.Mesh(
-    new THREE.PlaneGeometry(CELL*.2,CELL*.2),
-    trailMats[agent.def.id]
-  );
-  m.position.set(agent.y*CELL+CELL*.5, agent.x*CELL+CELL*.5, .04);
-  S.add(m);
-  agent.trail.push(m);
-  if(agent.trail.length>50){ S.remove(agent.trail.shift()); }
-}
-
-// ─── カメラ ───────────────────────────────────────────────────────────────────
-function updateCamera(cam, camAngle){
-  cam.position.set(W*.5, -W*.15, W*1.25);
-  cam.up.set(0,1,0);
-  cam.lookAt(W*.5, W*.5, 0);
+// ─── RGBA → JPEG (sharp or 簡易実装) ─────────────────────────────────────────
+async function rgbaToJpeg(rgba, width, height){
+  if(sharp){
+    return await sharp(Buffer.from(rgba),{raw:{width,height,channels:4}})
+      .jpeg({quality:JPEG_Q}).toBuffer();
+  }
+  // sharp がない場合: node-canvas の代替として簡易RGBバッファ返し（非JPEG）
+  // → npm install sharp を強く推奨
+  const rgb=Buffer.alloc(width*height*3);
+  for(let i=0;i<width*height;i++){rgb[i*3]=rgba[i*4];rgb[i*3+1]=rgba[i*4+1];rgb[i*3+2]=rgba[i*4+2];}
+  return rgb; // fallback: raw RGB (ブラウザ側で表示できないが最低限動く)
 }
 
 // ─── Pixel readout ────────────────────────────────────────────────────────────
 function readPixels(glCtx){
-  const pixels=new Uint8ClampedArray(WIDTH*HEIGHT*4);
-  glCtx.readPixels(0,0,WIDTH,HEIGHT,glCtx.RGBA,glCtx.UNSIGNED_BYTE,pixels);
-  const flipped=new Uint8ClampedArray(WIDTH*HEIGHT*4);
-  const row=WIDTH*4;
-  for(let y=0;y<HEIGHT;y++)
-    flipped.set(pixels.subarray((HEIGHT-1-y)*row,(HEIGHT-y)*row),y*row);
-  return flipped;
+  const px=new Uint8ClampedArray(WIDTH*HEIGHT*4);
+  glCtx.readPixels(0,0,WIDTH,HEIGHT,glCtx.RGBA,glCtx.UNSIGNED_BYTE,px);
+  const fl=new Uint8ClampedArray(WIDTH*HEIGHT*4),row=WIDTH*4;
+  for(let y=0;y<HEIGHT;y++)fl.set(px.subarray((HEIGHT-1-y)*row,(HEIGHT-y)*row),y*row);
+  return fl;
 }
 
 // ─── Simulation state ─────────────────────────────────────────────────────────
-let MAP = makeMap(GRID, 42);
-let BUILDINGS = [];
-function rebuildBuildings(map){ BUILDINGS.length=0; for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)if(map[r][c]===BUILDING)BUILDINGS.push([r,c]); }
+let MAP=makeMap(GRID,42), BUILDINGS=[];
+function rebuildBuildings(map){BUILDINGS.length=0;for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)if(map[r][c]===BUILDING)BUILDINGS.push([r,c]);}
 rebuildBuildings(MAP);
+function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
 
-function randB(ex){
-  for(let i=0;i<500;i++){
-    const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];
-    if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];
-  }
-  return[...BUILDINGS[0]];
-}
-
-let agents=[], agentMeshes=[];
+let agents=[], agentMeshes=[], trailMats={};
+let scene=null;
+let paused=false, speedMul=1;
 
 function initAgents(S){
-  agents.forEach(a=>{
-    if(a.mesh)S.remove(a.mesh);
-    a.trail.forEach(m=>S.remove(m));
-  });
-  agents=[]; agentMeshes=[];
+  agents.forEach(a=>{if(a.mesh)S.remove(a.mesh);a.trail.forEach(m=>S.remove(m));});
+  agents=[];agentMeshes=[];
   PERSONA_DEFS.forEach(def=>{
-    const b=randB(null), g=randB(b);
-    agents.push({
-      x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,
-      gx:g[0]+0.5,gy:g[1]+0.5,
-      trips:0,viols:0,steps:0,stall:0,
-      def,trail:[],active:true,
-      visited:new Set(),explored:0,
-    });
-    agentMeshes.push(createAgentMesh(S, def.color));
+    const b=randB(null),g=randB(b);
+    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0});
+    agentMeshes.push(createAgentMesh(S,def.color));
   });
   console.log(`[Sim] ${agents.length} agents initialized`);
 }
 
-let paused=false, speedMul=1;
+function addTrail(S,agent){
+  const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.2,CELL*.2),trailMats[agent.def.id]);
+  m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
+  S.add(m);agent.trail.push(m);
+  if(agent.trail.length>50){S.remove(agent.trail.shift());}
+}
 
-async function stepAll(S, trailMats){
+async function stepAll(){
   if(paused)return;
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
-    const prevX=a.x,prevY=a.y;
+    const px=a.x,py=a.y;
     const action=await selectAction(MAP,a);
-    if(action===1)a.th-=ROT;
-    else if(action===2)a.th+=ROT;
+    if(action===1)a.th-=ROT;else if(action===2)a.th+=ROT;
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
       const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*MOVE));
@@ -440,140 +297,100 @@ async function stepAll(S, trailMats){
       const c=Math.max(0,Math.min(GRID-1,Math.floor(ny)));
       if(PASSABLE.has(MAP[r][c])){
         a.x=nx;a.y=ny;
-        const key=`${r},${c}`;
-        if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
-        addTrail(S,a,trailMats);
-      }else{a.viols++;}
+        const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
+        addTrail(scene,a);
+      }else a.viols++;
     }
     a.steps++;
-    const moved=(Math.abs(a.x-prevX)+Math.abs(a.y-prevY))>0.05;
+    const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>0.05;
     a.stall=moved?0:Math.min(a.stall+1,10);
     const dist=Math.sqrt((a.x-a.gx)**2+(a.y-a.gy)**2);
-    if(dist<0.8){
-      a.trips++;
-      const g=randB([Math.floor(a.x),Math.floor(a.y)]);
-      a.gx=g[0]+0.5;a.gy=g[1]+0.5;
-    }
+    if(dist<0.8){a.trips++;const g=randB([Math.floor(a.x),Math.floor(a.y)]);a.gx=g[0]+0.5;a.gy=g[1]+0.5;}
   }
 }
 
-// ─── Main rendering + sim loop ────────────────────────────────────────────────
-const { renderer, glCtx } = createHeadlessRenderer();
-
-const mainCam = new THREE.PerspectiveCamera(52, WIDTH/HEIGHT, 0.1, 1200);
-updateCamera(mainCam, 0);
-
-let scene = buildScene(MAP);
-
-const trailMats={};
-PERSONA_DEFS.forEach(p=>{
-  trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
-});
-
-initAgents(scene);
-
-// WebRTC video sources (全クライアント共有)
-const videoSources = new Set();
-const i420Data = new Uint8Array(WIDTH * HEIGHT * 3 / 2);
-
-let lastRenderTime = 0;
-let frameCount = 0;
-
-// sim loop (TICK ms ごと)
-setInterval(async()=>{
-  for(let s=0;s<speedMul;s++) await stepAll(scene, trailMats);
-}, TICK);
-
-// render loop (1000/FPS ms ごと)
-setInterval(()=>{
-  // エージェントメッシュ更新
-  const dt = 1/FPS;
-  agents.forEach((a,i)=>{
-    const tx=a.y*CELL+CELL*.5, ty=a.x*CELL+CELL*.5;
-    const m=agentMeshes[i];
-    m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
-    m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
-    m.position.z=CELL*.26;
-    const tar=-a.th+Math.PI*.5;
-    let dr=tar-m.rotation.z;
-    while(dr>Math.PI)dr-=Math.PI*2;
-    while(dr<-Math.PI)dr+=Math.PI*2;
-    m.rotation.z+=dr*Math.min(1,dt*14);
-  });
-
-  renderer.render(scene, mainCam);
-  frameCount++;
-
-  if(videoSources.size===0)return;  // クライアントなしなら変換省略
-
-  const rgba = readPixels(glCtx);
-  rgbaToI420(
-    {width:WIDTH, height:HEIGHT, data:rgba},
-    {width:WIDTH, height:HEIGHT, data:i420Data}
-  );
-  const frame = {width:WIDTH, height:HEIGHT, data:i420Data};
-  for(const src of videoSources){
-    try{ src.onFrame(frame); }catch(e){}
-  }
-
-  if(frameCount % (FPS*10) === 0){
-    const a=agents[0];
-    console.log(`[Sim] frame=${frameCount} clients=${videoSources.size} agent0=(${a.x.toFixed(1)},${a.y.toFixed(1)}) trips=${a.trips}`);
-  }
-}, 1000/FPS);
-
-// ─── WebSocket control messages ───────────────────────────────────────────────
-// クライアントからの操作コマンドを受け付ける
 function handleCommand(msg){
   switch(msg.cmd){
-    case 'pause':  paused=!paused; break;
-    case 'reset':  initAgents(scene); break;
-    case 'speed':  speedMul=[1,2,4][(([1,2,4].indexOf(speedMul)+1)%3)]; break;
+    case 'pause': paused=!paused; break;
+    case 'reset': initAgents(scene); break;
+    case 'speed': speedMul=[1,2,4][(([1,2,4].indexOf(speedMul)+1)%3)]; break;
     case 'newmap':
-      MAP=makeMap(GRID, Math.floor(Math.random()*100000));
+      MAP=makeMap(GRID,Math.floor(Math.random()*100000));
       rebuildBuildings(MAP);
-      // シーン再構築
-      scene = buildScene(MAP);
-      const trailMatsNew={};
-      PERSONA_DEFS.forEach(p=>{
-        trailMatsNew[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
-      });
-      Object.assign(trailMats, trailMatsNew);
+      scene=buildScene(MAP);
+      PERSONA_DEFS.forEach(p=>{trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});});
       initAgents(scene);
       break;
   }
 }
 
-// ─── Per-client WebRTC session ────────────────────────────────────────────────
-class ClientSession {
-  constructor(ws){
-    this.ws=ws;
-    this.pc=null;
-    this.videoSource=new RTCVideoSource();
-    videoSources.add(this.videoSource);
-    console.log(`[Session] client joined  total=${videoSources.size}`);
-  }
-  async start(offer){
-    this.pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-    const track=this.videoSource.createTrack();
-    this.pc.addTrack(track);
-    this.pc.onicecandidate=({candidate})=>{ if(candidate) this.send({type:'candidate',candidate}); };
-    this.pc.onconnectionstatechange=()=>console.log('[RTC]',this.pc.connectionState);
-    await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer=await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-    this.send({type:'answer',sdp:answer.sdp});
-  }
-  addIceCandidate(c){ if(this.pc) this.pc.addIceCandidate(c).catch(console.error); }
-  send(msg){ if(this.ws.readyState===WebSocket.OPEN) this.ws.send(JSON.stringify(msg)); }
-  destroy(){
-    videoSources.delete(this.videoSource);
-    if(this.pc)this.pc.close();
-    console.log(`[Session] client left  total=${videoSources.size}`);
-  }
-}
+// ─── Main ─────────────────────────────────────────────────────────────────────
+const {renderer, glCtx} = createRenderer();
+const mainCam = new THREE.PerspectiveCamera(52, WIDTH/HEIGHT, 0.1, 1200);
+mainCam.position.set(W*.5, -W*.15, W*1.25);
+mainCam.up.set(0,1,0);
+mainCam.lookAt(W*.5, W*.5, 0);
 
-// ─── HTTP + WS ────────────────────────────────────────────────────────────────
+scene = buildScene(MAP);
+PERSONA_DEFS.forEach(p=>{
+  trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
+});
+
+// WebSocket クライアント管理
+const clients = new Set();
+
+// stats ブロードキャスト (2秒ごと)
+setInterval(()=>{
+  if(clients.size===0)return;
+  const msg=JSON.stringify({type:'stats',agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
+  for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}
+},2000);
+
+// sim loop
+setInterval(async()=>{for(let s=0;s<speedMul;s++)await stepAll();},TICK);
+
+// render + JPEG 配信ループ
+let frameCount=0, encoding=false;
+setInterval(async()=>{
+  if(encoding)return; // 前フレームのエンコードが終わってなければスキップ
+  encoding=true;
+
+  // エージェントメッシュ更新
+  const dt=1/FPS;
+  agents.forEach((a,i)=>{
+    const tx=a.y*CELL+CELL*.5,ty=a.x*CELL+CELL*.5,m=agentMeshes[i];
+    m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
+    m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
+    m.position.z=CELL*.26;
+    const tar=-a.th+Math.PI*.5;
+    let dr=tar-m.rotation.z;
+    while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
+    m.rotation.z+=dr*Math.min(1,dt*14);
+  });
+
+  renderer.render(scene,mainCam);
+  frameCount++;
+
+  // クライアントがいなければピクセル読み出しをスキップ
+  if(clients.size===0){encoding=false;return;}
+
+  try{
+    const rgba=readPixels(glCtx);
+    const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
+
+    // 全クライアントにバイナリ送信
+    for(const ws of clients){
+      if(ws.readyState===WebSocket.OPEN){
+        ws.send(jpeg,(err)=>{if(err)clients.delete(ws);});
+      }
+    }
+    if(frameCount%(FPS*10)===0)console.log(`[Render] frame=${frameCount} clients=${clients.size}`);
+  }catch(e){console.error('[Render]',e.message);}
+
+  encoding=false;
+},1000/FPS);
+
+// ─── HTTP + WebSocket ─────────────────────────────────────────────────────────
 const httpServer=http.createServer((req,res)=>{
   if(req.url==='/'||req.url==='/index.html'){
     res.writeHead(200,{'Content-Type':'text/html'});
@@ -582,26 +399,26 @@ const httpServer=http.createServer((req,res)=>{
 });
 
 const wss=new WebSocket.Server({server:httpServer});
-const clientSessions=new Map();
 
 wss.on('connection',ws=>{
-  const s=new ClientSession(ws);
-  clientSessions.set(ws,s);
-  ws.on('message',async data=>{
-    const msg=JSON.parse(data);
-    if(msg.type==='offer')     await s.start(msg);
-    if(msg.type==='candidate') s.addIceCandidate(msg.candidate);
-    if(msg.type==='command')   handleCommand(msg);
+  clients.add(ws);
+  console.log(`[WS] client joined total=${clients.size}`);
+
+  ws.on('message',data=>{
+    try{
+      const msg=JSON.parse(data);
+      if(msg.type==='command') handleCommand(msg);
+    }catch(e){}
   });
-  ws.on('close',()=>{ s.destroy(); clientSessions.delete(ws); });
-  ws.on('error',console.error);
+
+  ws.on('close',()=>{clients.delete(ws);console.log(`[WS] client left total=${clients.size}`);});
+  ws.on('error',()=>clients.delete(ws));
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 (async()=>{
   await loadOnnxSessions();
+  initAgents(scene);
   httpServer.listen(PORT,()=>{
-    console.log(`\n🚀 MESA City Sim → http://localhost:${PORT}`);
-    console.log(`   ONNX sessions: ${Object.keys(ortSessions).filter(k=>ortSessions[k]).join(', ')||'none (random mode)'}\n`);
+    console.log(`\n🚀 MESA City Sim → http://localhost:${PORT}\n`);
   });
 })();

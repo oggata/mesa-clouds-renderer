@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MESA Persona City Sim — Cloud</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#030507;--panel:rgba(4,8,14,0.92);--border:rgba(0,210,160,0.15);
+  --accent:#00d2a0;--warn:#ff4858;
+  --mono:'Orbitron',monospace;
+  --text:#a8c8c0;--dim:#2a4a44;
+}
+html,body{width:100%;height:100%;background:var(--bg);color:var(--text);overflow:hidden}
+
+#videoWrap{position:fixed;inset:0;background:#000;}
+video{width:100%;height:100%;object-fit:contain;display:block;}
+
+#overlay{
+  position:fixed;inset:0;background:rgba(3,5,7,.96);
+  display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:16px;z-index:200;
+}
+#overlay h1{font-family:var(--mono);font-size:18px;font-weight:900;
+  color:var(--accent);letter-spacing:.2em;}
+.spinner{width:40px;height:40px;border:2px solid #1a2040;
+  border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
+#overMsg{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.1em;}
+
+#persona-bar{
+  position:fixed;top:12px;left:50%;transform:translateX(-50%);
+  display:flex;gap:8px;z-index:50;
+}
+.p-card{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:6px;padding:8px 12px;width:148px;
+  backdrop-filter:blur(12px);
+}
+.p-name{font-family:var(--mono);font-size:9px;font-weight:700;
+  letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.p-desc{font-size:9px;color:var(--dim);line-height:1.6;margin-bottom:5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.p-stats{display:flex;gap:4px;font-family:var(--mono);font-size:9px;}
+.p-stat{display:flex;flex-direction:column;align-items:center;gap:1px;flex:1;}
+.p-stat-val{color:var(--accent);font-size:11px;display:block;text-align:center;}
+.p-stat-lbl{color:var(--dim);font-size:7px;}
+
+/* コントロール — admin=1 のときだけ表示 */
+#ctrl{
+  position:fixed;bottom:14px;left:50%;transform:translateX(-50%);
+  display:none;  /* JS で admin=1 なら flex に切り替え */
+  gap:6px;z-index:50;
+}
+button{
+  background:var(--panel);border:1px solid var(--border);
+  color:var(--text);border-radius:4px;padding:6px 12px;
+  font-family:var(--mono);font-size:9px;cursor:pointer;
+  transition:.12s;letter-spacing:.06em;backdrop-filter:blur(8px);
+}
+button:hover{border-color:var(--accent);color:var(--accent);}
+button.on{border-color:var(--accent);color:var(--accent);}
+
+#status-badge{
+  position:fixed;top:12px;right:14px;z-index:60;
+  font-family:var(--mono);font-size:9px;color:var(--dim);
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:4px;padding:5px 10px;display:flex;align-items:center;gap:6px;
+}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--warn);}
+.dot.ok{background:var(--accent);box-shadow:0 0 8px var(--accent);}
+
+/* デバッグログ — debug=1 のときだけ表示 */
+#dbg{
+  position:fixed;bottom:50px;left:10px;z-index:60;
+  display:none;  /* JS で debug=1 なら block に切り替え */
+  font-family:monospace;font-size:9px;color:#4a7a6a;
+  background:rgba(4,8,14,0.9);padding:6px 10px;border-radius:3px;
+  border:1px solid var(--border);max-width:420px;line-height:1.8;
+}
+#dbg .line{display:flex;gap:8px;}
+#dbg .ts{color:#2a4a44;flex-shrink:0;}
+
+body::after{content:'';position:fixed;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,
+    rgba(0,0,0,.02) 2px,rgba(0,0,0,.02) 4px);z-index:300;}
+</style>
+</head>
+<body>
+
+<div id="videoWrap">
+  <video id="video" autoplay playsinline muted></video>
+</div>
+
+<div id="overlay">
+  <h1>MESA PERSONA CITY</h1>
+  <div class="spinner"></div>
+  <div id="overMsg">CONNECTING TO SERVER...</div>
+</div>
+
+<div id="status-badge">
+  <div class="dot" id="connDot"></div>
+  <span id="connText">OFFLINE</span>
+</div>
+
+<div id="persona-bar"></div>
+
+<!-- admin=1 のときだけ表示されるコントロール -->
+<div id="ctrl">
+  <button id="b-pause" class="on">Pause</button>
+  <button id="b-reset">Reset</button>
+  <button id="b-speed">×1</button>
+  <button id="b-newmap">🎲 New Map</button>
+</div>
+
+<!-- debug=1 のときだけ表示されるログ -->
+<div id="dbg"></div>
+
+<script>
+// ── URL パラメータ判定 ──────────────────────────────────────────────────────
+const params  = new URLSearchParams(location.search);
+const IS_DEBUG = params.get('debug') === '1';
+const IS_ADMIN = params.get('admin') === '1';
+
+if (IS_DEBUG) document.getElementById('dbg').style.display  = 'block';
+if (IS_ADMIN) document.getElementById('ctrl').style.display = 'flex';
+
+// ── デバッグログ ────────────────────────────────────────────────────────────
+const MAX_LOG = 12;
+function dbg(msg) {
+  if (!IS_DEBUG) return;
+  const el  = document.getElementById('dbg');
+  const ts  = new Date().toISOString().slice(11, 23);
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.innerHTML = `<span class="ts">${ts}</span><span>${msg}</span>`;
+  el.appendChild(line);
+  while (el.children.length > MAX_LOG) el.removeChild(el.firstChild);
+}
+
+// ── ペルソナ定義 ────────────────────────────────────────────────────────────
+const PERSONA_DEFS = [
+  { id:'A', name:'探索者タロウ',   hex:'#ff3355', desc:'新しい場所を積極的に探索' },
+  { id:'B', name:'インドア花子',   hex:'#00ccff', desc:'最短経路で目的地へ' },
+  { id:'C', name:'社交家ケンジ',   hex:'#33ff88', desc:'他者の近くに集まる' },
+  { id:'D', name:'ビジネスマン誠', hex:'#ffee00', desc:'効率重視で直進' },
+  { id:'E', name:'観光客サラ',     hex:'#ff7700', desc:'建物を巡って観光' },
+];
+
+// ペルソナカード構築
+const bar = document.getElementById('persona-bar');
+PERSONA_DEFS.forEach(p => {
+  const card = document.createElement('div');
+  card.className = 'p-card';
+  card.style.borderColor = p.hex + '44';
+  card.innerHTML = `
+    <div class="p-name" style="color:${p.hex}">[${p.id}] ${p.name}</div>
+    <div class="p-desc">${p.desc}</div>
+    <div class="p-stats">
+      <div class="p-stat"><span class="p-stat-val" id="trips-${p.id}">0</span><span class="p-stat-lbl">Trips</span></div>
+      <div class="p-stat"><span class="p-stat-val" id="viols-${p.id}">0</span><span class="p-stat-lbl">Viols</span></div>
+      <div class="p-stat"><span class="p-stat-val" id="cells-${p.id}">0</span><span class="p-stat-lbl">Cells</span></div>
+    </div>
+  `;
+  bar.appendChild(card);
+});
+
+// ── ステータス ──────────────────────────────────────────────────────────────
+const setStatus = (text, ok=false) => {
+  document.getElementById('connText').textContent = text;
+  document.getElementById('connDot').className = 'dot' + (ok ? ' ok' : '');
+};
+const hideOverlay = () => { document.getElementById('overlay').style.display = 'none'; };
+const showOverlay = msg => {
+  document.getElementById('overlay').style.display = 'flex';
+  document.getElementById('overMsg').textContent = msg;
+};
+
+// ── WebRTC ──────────────────────────────────────────────────────────────────
+let ws = null, pc = null;
+const video = document.getElementById('video');
+
+async function connect() {
+  setStatus('CONNECTING...');
+  showOverlay('CONNECTING TO SERVER...');
+
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(wsProto + '//' + location.host);
+
+  ws.onopen = async () => {
+    dbg('WS open');
+    setStatus('SIGNALING...');
+    showOverlay('SIGNALING...');
+
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.ontrack = e => {
+      dbg('ontrack kind=' + e.track.kind);
+      const stream = (e.streams && e.streams.length > 0)
+        ? e.streams[0]
+        : new MediaStream([e.track]);
+
+      video.srcObject = stream;
+      dbg('srcObject set readyState=' + video.readyState);
+      showOverlay('LOADING STREAM...');
+
+      const doPlay = () => {
+        dbg('doPlay paused=' + video.paused + ' readyState=' + video.readyState);
+        if (!video.paused) { hideOverlay(); setStatus('STREAMING', true); return; }
+        video.play()
+          .then(() => {
+            dbg('play() ✓');
+            hideOverlay();
+            setStatus('STREAMING', true);
+          })
+          .catch(err => {
+            dbg('play() blocked: ' + err.message);
+            showOverlay('▶ クリックして開始');
+            document.getElementById('overlay').style.cursor = 'pointer';
+            document.getElementById('overlay').onclick = () => {
+              video.play().then(() => { hideOverlay(); setStatus('STREAMING', true); });
+            };
+          });
+      };
+
+      if (video.readyState >= 2) { doPlay(); }
+      else {
+        video.addEventListener('loadeddata', doPlay, { once: true });
+        video.addEventListener('canplay',    doPlay, { once: true });
+        setTimeout(doPlay, 2000);
+      }
+    };
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) ws.send(JSON.stringify({ type: 'candidate', candidate }));
+    };
+    pc.oniceconnectionstatechange = () => dbg('ICE: ' + pc.iceConnectionState);
+    pc.onconnectionstatechange    = () => {
+      dbg('Conn: ' + pc.connectionState);
+      if (pc.connectionState === 'failed') setStatus('FAILED');
+    };
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    dbg('offer sent');
+    ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+  };
+
+  ws.onmessage = async ({ data }) => {
+    const msg = JSON.parse(data);
+    if (msg.type === 'answer') {
+      dbg('answer received');
+      await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      dbg('remoteDesc set');
+    } else if (msg.type === 'candidate') {
+      await pc.addIceCandidate(msg.candidate);
+    } else if (msg.type === 'stats') {
+      msg.agents.forEach(a => {
+        const el = id => document.getElementById(id);
+        if (el('trips-'+a.id)) el('trips-'+a.id).textContent = a.trips;
+        if (el('viols-'+a.id)) el('viols-'+a.id).textContent = a.viols;
+        if (el('cells-'+a.id)) el('cells-'+a.id).textContent = a.explored;
+      });
+    }
+  };
+
+  ws.onerror = () => { dbg('WS error'); setStatus('ERROR'); };
+  ws.onclose = () => {
+    dbg('WS closed');
+    setStatus('OFFLINE');
+    showOverlay('DISCONNECTED — 3秒後に再接続...');
+    setTimeout(() => location.reload(), 3000);
+  };
+}
+
+// ── 管理コントロール (admin=1 のみ送信される) ───────────────────────────────
+function cmd(c) {
+  if (!IS_ADMIN) return;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'command', cmd: c }));
+}
+
+document.getElementById('b-pause').addEventListener('click', function() {
+  cmd('pause');
+  this.classList.toggle('on');
+  this.textContent = this.classList.contains('on') ? 'Pause' : 'Resume';
+});
+document.getElementById('b-reset').addEventListener('click',  () => cmd('reset'));
+document.getElementById('b-speed').addEventListener('click', function() {
+  cmd('speed');
+  const labels = ['×1','×2','×4'];
+  this.textContent = labels[(labels.indexOf(this.textContent)+1) % 3];
+});
+document.getElementById('b-newmap').addEventListener('click', () => cmd('newmap'));
+
+// 自動接続
+connect();
+</script>
+</body>
+</html>

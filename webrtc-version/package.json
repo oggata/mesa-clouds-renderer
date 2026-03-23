@@ -1,7 +1,7 @@
 {
   "name": "mesa-cloud-renderer",
-  "version": "3.0.0",
-  "description": "MESA Persona City Sim — WebSocket+JPEG cloud rendering",
+  "version": "2.0.0",
+  "description": "MESA Persona City Sim — server-side Three.js + WebRTC cloud rendering",
   "main": "server.js",
   "scripts": {
     "start": "xvfb-run -s \"-screen 0 1x1x24\" node server.js",
@@ -11,8 +11,10 @@
     "three": "0.132.2",
     "gl": "9.0.0-rc.9",
     "ws": "^8.20.0",
-    "sharp": "^0.33.0",
+    "@roamhq/wrtc": "^0.10.0",
     "onnxruntime-node": "^1.17.0"
   },
-  "engines": { "node": ">=18.0.0" }
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
