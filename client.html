@@ -187,7 +187,8 @@ async function connect() {
   setStatus('CONNECTING...');
   showOverlay('CONNECTING TO SERVER...');
 
-  ws = new WebSocket('ws://' + location.host);
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(wsProto + '//' + location.host);
 
   ws.onopen = async () => {
     dbg('WS open');
