@@ -351,8 +351,8 @@ function handleCommand(msg){
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
 const mainCam = new THREE.PerspectiveCamera(52, WIDTH/HEIGHT, 0.1, 1200);
-mainCam.position.set(W*.5, -W*.15, W*1.25);
-mainCam.up.set(0,1,0);
+mainCam.position.set(W*.5, W*.15, W*0.65);   // 真上俯瞰
+//mainCam.up.set(0,0.05,0);
 mainCam.lookAt(W*.5, W*.5, 0);
 
 scene = buildScene(MAP);
