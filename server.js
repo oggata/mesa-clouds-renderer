@@ -364,8 +364,6 @@ function updateTrackingCamera(cam) {
   if (now - camSwitchTimer > CAM_OVERVIEW_INTERVAL) {
     camTargetIdx = (camTargetIdx + 1) % (agents.length + 1);
     camSwitchTimer = now;
-    const name = camTargetIdx === 0 ? 'overview' : agents[camTargetIdx-1]?.def.name;
-    console.log(`[Cam] → ${name}`);
   }
 
   cam.up.set(0, 1, 0);
