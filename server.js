@@ -27,10 +27,10 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 320;
-const HEIGHT = parseInt(process.env.HEIGHT) || 320;
+const WIDTH  = parseInt(process.env.WIDTH)  || 240;
+const HEIGHT = parseInt(process.env.HEIGHT) || 240;
 const FPS    = parseInt(process.env.FPS)    || 15;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 40;   // JPEG品質 (0-100)
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 80;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
@@ -375,13 +375,15 @@ function updateTrackingCamera(cam) {
     cam.position.set(W*.5, W*.5, W*1.1);
     cam.lookAt(W*.5, W*.5 + 1, 0);
   } else {
-    // 追跡: エージェントの真上に瞬時ワープ、カメラは回転しない
+    // 追跡: 斜め後方上から見下ろす (回転なし・瞬時切り替え)
     const a = agents[camTargetIdx - 1];
     if (!a) return;
     const tx = a.y * CELL + CELL * .5;
     const ty = a.x * CELL + CELL * .5;
-    cam.position.set(tx, ty, CELL * 12);
-    cam.lookAt(tx, ty + 1, 0);
+    const backDist = CELL * 5;   // 後方への距離
+    const height   = CELL * 7;   // 高さ
+    cam.position.set(tx, ty - backDist, height);
+    cam.lookAt(tx, ty + CELL * 1.5, 0);
   }
 }
 
