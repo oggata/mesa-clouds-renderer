@@ -27,10 +27,10 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 640;
-const HEIGHT = parseInt(process.env.HEIGHT) || 640;
-const FPS    = parseInt(process.env.FPS)    || 20;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 60;   // JPEG品質 (0-100)
+const WIDTH  = parseInt(process.env.WIDTH)  || 320;
+const HEIGHT = parseInt(process.env.HEIGHT) || 320;
+const FPS    = parseInt(process.env.FPS)    || 15;
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 40;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
@@ -368,29 +368,20 @@ function updateTrackingCamera(cam) {
     console.log(`[Cam] → ${name}`);
   }
 
+  cam.up.set(0, 1, 0);
+
   if (camTargetIdx === 0 || agents.length === 0) {
-    // 俯瞰モード: フィールド全体を真上から
-    cam.position.x += (W*.5  - cam.position.x) * 0.05;
-    cam.position.y += (W*.5  - cam.position.y) * 0.05;
-    cam.position.z += (W*1.1 - cam.position.z) * 0.05;
-    cam.up.set(0, 1, 0);
-    cam.lookAt(cam.position.x, cam.position.y + 1, 0);
+    // 俯瞰: フィールド全体を真上から瞬時に
+    cam.position.set(W*.5, W*.5, W*1.1);
+    cam.lookAt(W*.5, W*.5 + 1, 0);
   } else {
-    // 追跡モード: エージェントの真上から垂直に見下ろす (回転なし)
+    // 追跡: エージェントの真上に瞬時ワープ、カメラは回転しない
     const a = agents[camTargetIdx - 1];
     if (!a) return;
-
     const tx = a.y * CELL + CELL * .5;
     const ty = a.x * CELL + CELL * .5;
-    const followH = CELL * 12;  // 真上の高さ
-
-    // XY だけエージェントを追う、Z(高さ)は固定、向きは常に北固定
-    cam.position.x += (tx - cam.position.x) * 0.08;
-    cam.position.y += (ty - cam.position.y) * 0.08;
-    cam.position.z += (followH - cam.position.z) * 0.08;
-
-    cam.up.set(0, 1, 0);  // 常に固定方向、回転しない
-    cam.lookAt(cam.position.x, cam.position.y + 1, 0);
+    cam.position.set(tx, ty, CELL * 12);
+    cam.lookAt(tx, ty + 1, 0);
   }
 }
 
