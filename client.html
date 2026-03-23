@@ -21,14 +21,14 @@ canvas{width:100%;height:100%;display:block;}
 .spinner{width:40px;height:40px;border:2px solid #1a2040;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg)}}
 #overMsg{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:.1em;}
-#persona-bar{position:fixed;top:12px;left:50%;transform:translateX(-50%);display:flex;gap:8px;z-index:50;}
-.p-card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px 12px;width:148px;backdrop-filter:blur(12px);}
-.p-name{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.p-desc{font-size:9px;color:var(--dim);line-height:1.6;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.p-stats{display:flex;gap:4px;font-family:var(--mono);font-size:9px;}
-.p-stat{display:flex;flex-direction:column;align-items:center;gap:1px;flex:1;}
-.p-stat-val{color:var(--accent);font-size:11px;display:block;text-align:center;}
-.p-stat-lbl{color:var(--dim);font-size:7px;}
+
+
+
+
+
+
+
+
 #ctrl{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);display:none;gap:6px;z-index:50;}
 button{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:4px;
   padding:6px 12px;font-family:var(--mono);font-size:9px;cursor:pointer;transition:.12s;letter-spacing:.06em;backdrop-filter:blur(8px);}
@@ -45,6 +45,32 @@ button:hover{border-color:var(--accent);color:var(--accent);}button.on{border-co
   border-radius:4px;padding:5px 16px;letter-spacing:.1em;
   transition:opacity .3s;
 }
+/* 思考ウィンドウ */
+#thought-box{
+  position:fixed;bottom:50px;left:50%;transform:translateX(-50%);
+  z-index:60;width:min(420px, 90vw);
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;padding:12px 16px;
+  backdrop-filter:blur(12px);
+  display:none;  /* 俯瞰中は非表示 */
+}
+#thought-persona{
+  font-family:var(--mono);font-size:9px;font-weight:700;
+  letter-spacing:.12em;text-transform:uppercase;
+  margin-bottom:8px;
+}
+#thought-text{
+  font-size:11px;line-height:1.8;color:var(--text);
+  min-height:2em;
+  white-space:pre-wrap;
+}
+.thought-cursor{
+  display:inline-block;width:2px;height:1em;
+  background:var(--accent);vertical-align:middle;
+  animation:blink .8s step-end infinite;
+}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+
 #dbg{position:fixed;bottom:50px;left:10px;z-index:60;display:none;
   font-family:monospace;font-size:9px;color:#4a7a6a;background:rgba(4,8,14,0.9);
   padding:6px 10px;border-radius:3px;border:1px solid var(--border);max-width:420px;line-height:1.8;}
@@ -66,7 +92,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;
   <span id="connText">OFFLINE</span>
 </div>
 
-<div id="persona-bar"></div>
+
 
 <div id="ctrl">
   <button id="b-pause" class="on">Pause</button>
@@ -75,7 +101,11 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;
   <button id="b-newmap">🎲 New Map</button>
 </div>
 
-<div id="cam-badge">📷 俯瞰</div>
+<div id="cam-badge">📷 Overview</div>
+<div id="thought-box">
+  <div id="thought-persona"></div>
+  <div id="thought-text"><span class="thought-cursor"></span></div>
+</div>
 <div id="dbg"></div>
 
 <script>
@@ -97,25 +127,13 @@ function dbg(msg){
 
 // ── personas ──
 const PERSONA_DEFS=[
-  {id:'A',name:'探索者タロウ',  hex:'#ff3355',desc:'新しい場所を積極的に探索'},
-  {id:'B',name:'インドア花子',  hex:'#00ccff',desc:'最短経路で目的地へ'},
-  {id:'C',name:'社交家ケンジ',  hex:'#33ff88',desc:'他者の近くに集まる'},
-  {id:'D',name:'ビジネスマン誠',hex:'#ffee00',desc:'効率重視で直進'},
-  {id:'E',name:'観光客サラ',    hex:'#ff7700',desc:'建物を巡って観光'},
+  {id:'A',name:'Explorer Rex',  hex:'#ff3355',desc:'Actively explores new areas'},
+  {id:'B',name:'Homebody Lily',  hex:'#00ccff',desc:'Takes the shortest route'},
+  {id:'C',name:'Social Marco',   hex:'#33ff88',desc:'Gathers near others'},
+  {id:'D',name:'Businessman Cole',hex:'#ffee00',desc:'Moves straight, efficiency first'},
+  {id:'E',name:'Tourist Elena',   hex:'#ff7700',desc:'Wanders around buildings'},
 ];
-const bar=document.getElementById('persona-bar');
-PERSONA_DEFS.forEach(p=>{
-  const card=document.createElement('div');
-  card.className='p-card';card.style.borderColor=p.hex+'44';
-  card.innerHTML=`<div class="p-name" style="color:${p.hex}">[${p.id}] ${p.name}</div>
-    <div class="p-desc">${p.desc}</div>
-    <div class="p-stats">
-      <div class="p-stat"><span class="p-stat-val" id="trips-${p.id}">0</span><span class="p-stat-lbl">Trips</span></div>
-      <div class="p-stat"><span class="p-stat-val" id="viols-${p.id}">0</span><span class="p-stat-lbl">Viols</span></div>
-      <div class="p-stat"><span class="p-stat-val" id="cells-${p.id}">0</span><span class="p-stat-lbl">Cells</span></div>
-    </div>`;
-  bar.appendChild(card);
-});
+
 
 // ── canvas 描画 ──
 const canvas=document.getElementById('canvas');
@@ -214,14 +232,15 @@ function connect(){
           // カメラ名更新
           if(msg.camName){
             const badge = document.getElementById('cam-badge');
-            badge.textContent = msg.camName === '俯瞰' ? '📷 俯瞰' : '🎯 ' + msg.camName;
+            const isOverview = msg.camName === '俯瞰';
+            badge.textContent = isOverview ? '📷 Overview' : '🎯 ' + msg.camName;
+            // カメラ切り替わり検知 → 思考ウィンドウ更新
+            if(msg.camName !== badge._last) {
+              badge._last = msg.camName;
+              showThought(msg.camName);
+            }
           }
-          msg.agents.forEach(a=>{
-            const el=id=>document.getElementById(id);
-            if(el('trips-'+a.id))el('trips-'+a.id).textContent=a.trips;
-            if(el('viols-'+a.id))el('viols-'+a.id).textContent=a.viols;
-            if(el('cells-'+a.id))el('cells-'+a.id).textContent=a.explored;
-          });
+
         }
       }catch(e){}
     }
@@ -234,6 +253,54 @@ function connect(){
     showOverlay('RECONNECTING...');
     setTimeout(connect,3000);
   };
+}
+
+// ── 思考ウィンドウ ──────────────────────────────────────────────────────────
+const PERSONA_THOUGHTS = {
+  "overview": null,
+  "Explorer Rex":   "Found a new area... heading somewhere unexplored......",
+  "Homebody Lily":   "Calculating shortest path... almost there......",
+  "Social Marco":    "Someone must be nearby... let me get a little closer......",
+  "Businessman Cole": "No time to waste... selecting the most efficient route......",
+  "Tourist Elena":    "That building looks interesting... where should I explore next......",
+};
+
+let thoughtTimer = null;
+let thoughtFullText = '';
+let thoughtCharIdx  = 0;
+
+function showThought(personaName) {
+  const box  = document.getElementById('thought-box');
+  const nameEl = document.getElementById('thought-persona');
+  const textEl = document.getElementById('thought-text');
+
+  if (!personaName || personaName === 'overview' || !PERSONA_THOUGHTS[personaName]) {
+    box.style.display = 'none';
+    if (thoughtTimer) clearInterval(thoughtTimer);
+    return;
+  }
+
+  // ペルソナ名と色を設定
+  const persona = PERSONA_DEFS.find(p => p.name === personaName);
+  const color   = persona ? persona.hex : 'var(--accent)';
+  nameEl.textContent  = '💭 ' + personaName;
+  nameEl.style.color  = color;
+
+  // タイプライター開始
+  if (thoughtTimer) clearInterval(thoughtTimer);
+  thoughtFullText = PERSONA_THOUGHTS[personaName];
+  thoughtCharIdx  = 0;
+  textEl.innerHTML = '<span class="thought-cursor"></span>';
+  box.style.display = 'block';
+
+  thoughtTimer = setInterval(() => {
+    if (thoughtCharIdx >= thoughtFullText.length) {
+      clearInterval(thoughtTimer);
+      return;
+    }
+    const shown = thoughtFullText.slice(0, ++thoughtCharIdx);
+    textEl.innerHTML = shown + '<span class="thought-cursor"></span>';
+  }, 40);
 }
 
 // ── admin controls ──

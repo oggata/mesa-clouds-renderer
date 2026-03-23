@@ -47,11 +47,11 @@ const FP_CELL_RGB=[[45,100,45],[80,80,80],[196,32,32],[35,104,40]];
 const FP_SKY_RGB=[6,12,20], FP_FLOOR_RGB=[26,40,32];
 
 const PERSONA_DEFS = [
-  { id:'A', name:'探索者タロウ',   color:0xff3355, hex:'#ff3355', desc:'新しい場所を積極的に探索' },
-  { id:'B', name:'インドア花子',   color:0x00ccff, hex:'#00ccff', desc:'最短経路で目的地へ' },
-  { id:'C', name:'社交家ケンジ',   color:0x33ff88, hex:'#33ff88', desc:'他者の近くに集まる' },
-  { id:'D', name:'ビジネスマン誠', color:0xffee00, hex:'#ffee00', desc:'効率重視で直進' },
-  { id:'E', name:'観光客サラ',     color:0xff7700, hex:'#ff7700', desc:'建物を巡って観光' },
+  { id:'A', name:'Explorer Rex',  color:0xff3355, hex:'#ff3355', desc:'Actively explores new areas' },
+  { id:'B', name:'Homebody Lily',  color:0x00ccff, hex:'#00ccff', desc:'Takes the shortest route' },
+  { id:'C', name:'Social Marco',   color:0x33ff88, hex:'#33ff88', desc:'Gathers near others' },
+  { id:'D', name:'Businessman Cole',color:0xffee00, hex:'#ffee00', desc:'Moves straight, efficiency first' },
+  { id:'E', name:'Tourist Elena',   color:0xff7700, hex:'#ff7700', desc:'Wanders around buildings' },
 ];
 
 // ─── マップ生成 ───────────────────────────────────────────────────────────────
@@ -364,7 +364,7 @@ function updateTrackingCamera(cam) {
   if (now - camSwitchTimer > CAM_OVERVIEW_INTERVAL) {
     camTargetIdx = (camTargetIdx + 1) % (agents.length + 1);
     camSwitchTimer = now;
-    const name = camTargetIdx === 0 ? '俯瞰' : agents[camTargetIdx-1]?.def.name;
+    const name = camTargetIdx === 0 ? 'overview' : agents[camTargetIdx-1]?.def.name;
     console.log(`[Cam] → ${name}`);
   }
 
@@ -398,7 +398,7 @@ const clients = new Set();
 // stats ブロードキャスト (2秒ごと)
 setInterval(()=>{
   if(clients.size===0)return;
-  const camName = camTargetIdx === 0 ? '俯瞰' : (agents[camTargetIdx-1]?.def.name || '-');
+  const camName = camTargetIdx === 0 ? 'overview' : (agents[camTargetIdx-1]?.def.name || '-');
   const msg=JSON.stringify({type:'stats', camName, agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
   for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}
 },2000);
