@@ -14,7 +14,7 @@
 }
 html,body{width:100%;height:100%;background:var(--bg);color:var(--text);overflow:hidden}
 #wrap{position:fixed;inset:0;background:#000;}
-canvas{width:100%;height:100%;display:block;object-fit:contain;}
+canvas{width:100%;height:100%;display:block;}
 #overlay{position:fixed;inset:0;background:rgba(3,5,7,.96);
   display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;z-index:200;}
 #overlay h1{font-family:var(--mono);font-size:18px;font-weight:900;color:var(--accent);letter-spacing:.2em;}
@@ -113,22 +113,44 @@ PERSONA_DEFS.forEach(p=>{
 const canvas=document.getElementById('canvas');
 const ctx2d=canvas.getContext('2d');
 
+// サーバーの解像度比率 (server.js の WIDTH/HEIGHT と合わせる)
+const STREAM_W = 854, STREAM_H = 480;
+const ASPECT = STREAM_W / STREAM_H;
+
 function resizeCanvas(){
-  canvas.width=window.innerWidth;
-  canvas.height=window.innerHeight;
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
 }
 resizeCanvas();
-window.addEventListener('resize',resizeCanvas);
+window.addEventListener('resize', resizeCanvas);
 
-// JPEG blob → canvas に描画
+// アスペクト比を維持してletterbox描画
 function drawFrame(blob){
-  const url=URL.createObjectURL(blob);
-  const img=new Image();
-  img.onload=()=>{
-    ctx2d.drawImage(img,0,0,canvas.width,canvas.height);
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => {
+    const cw = canvas.width, ch = canvas.height;
+
+    // letterbox: 画面に収まる最大サイズを計算
+    let dw, dh;
+    if (cw / ch > ASPECT) {
+      // 画面が横長 → 高さ基準
+      dh = ch;
+      dw = ch * ASPECT;
+    } else {
+      // 画面が縦長 → 幅基準
+      dw = cw;
+      dh = cw / ASPECT;
+    }
+    const dx = (cw - dw) / 2;
+    const dy = (ch - dh) / 2;
+
+    ctx2d.fillStyle = '#000';
+    ctx2d.fillRect(0, 0, cw, ch);              // 黒背景
+    ctx2d.drawImage(img, dx, dy, dw, dh);      // 中央にletterbox描画
     URL.revokeObjectURL(url);
   };
-  img.src=url;
+  img.src = url;
 }
 
 // ── WebSocket ──
