@@ -35,7 +35,7 @@ const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
-const INFER_EVERY=3;  // N ステップに1回だけ推論 (中間はキャッシュ)
+const INFER_EVERY=parseInt(process.env.INFER_EVERY)||10;  // N ステップに1回だけ推論 (中間はキャッシュ)
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
 const MOVE=0.25, ROT=Math.PI/9;
