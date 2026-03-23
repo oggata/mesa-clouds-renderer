@@ -34,7 +34,8 @@ const JPEG_Q = parseInt(process.env.JPEG_Q) || 60;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
-const GRID=30, CELL=2.0, TICK=120;
+const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
+const INFER_EVERY=3;  // N ステップに1回だけ推論 (中間はキャッシュ)
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
 const MOVE=0.25, ROT=Math.PI/9;
@@ -148,7 +149,10 @@ async function loadOnnxSessions(){
   }
 }
 
-async function selectAction(map,agent){
+// 推論結果キャッシュ (エージェントごと)
+const actionCache = {};  // agent.def.id → {action, ttl}
+
+async function inferAction(map, agent){
   const sess=ortSessions[agent.def.id];
   if(sess){
     try{
@@ -161,6 +165,7 @@ async function selectAction(map,agent){
       let rv=Math.random();for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}return 0;
     }catch(e){return Math.floor(Math.random()*3);}
   }
+  // ランダム (前進バイアス)
   const rays=[0,1,2,3,4].map(i=>{
     const angle=agent.th+(i-2)*Math.PI/3,dx=Math.cos(angle),dy=Math.sin(angle);
     for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
@@ -171,6 +176,22 @@ async function selectAction(map,agent){
     return{type:ROAD,dist:RAY_MAX};
   });
   return (rays[2].type===ROAD&&Math.random()<0.55)?0:(Math.random()<0.5?1:2);
+}
+
+// キャッシュ付き行動選択 + バッチ並列推論
+let stepCount = 0;
+async function prefetchAllActions(map, agents){
+  // INFER_EVERY ステップに1回だけ全エージェントを並列推論
+  if(stepCount % INFER_EVERY !== 0) return;
+  await Promise.all(agents.map(async a=>{
+    const action = await inferAction(map, a);
+    actionCache[a.def.id] = action;
+  }));
+}
+
+function selectAction(agent){
+  // キャッシュから取得 (なければランダム)
+  return actionCache[agent.def.id] ?? Math.floor(Math.random()*3);
 }
 
 // ─── headless-gl + Three.js ───────────────────────────────────────────────────
@@ -284,10 +305,13 @@ function addTrail(S,agent){
 
 async function stepAll(){
   if(paused)return;
+  stepCount++;
+  // 全エージェントの推論を並列で先に実行
+  await prefetchAllActions(MAP, agents);
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
     const px=a.x,py=a.y;
-    const action=await selectAction(MAP,a);
+    const action=selectAction(a);  // キャッシュから取得 (同期)
     if(action===1)a.th-=ROT;else if(action===2)a.th+=ROT;
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
@@ -347,7 +371,15 @@ setInterval(()=>{
 },2000);
 
 // sim loop
-setInterval(async()=>{for(let s=0;s<speedMul;s++)await stepAll();},TICK);
+// sim と render を完全分離: sim は自分のペースで回す
+let simRunning = false;
+async function simLoop(){
+  if(simRunning) return;
+  simRunning = true;
+  for(let s=0;s<speedMul;s++) await stepAll();
+  simRunning = false;
+}
+setInterval(simLoop, TICK);
 
 // render + JPEG 配信ループ
 let frameCount=0, encoding=false;
