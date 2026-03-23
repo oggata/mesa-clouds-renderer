@@ -27,10 +27,10 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = 1280;
-const HEIGHT = 720;
-const FPS    = 24;
-const JPEG_Q = 75;   // JPEG品質 (0-100)
+const WIDTH  = parseInt(process.env.WIDTH)  || 854;
+const HEIGHT = parseInt(process.env.HEIGHT) || 480;
+const FPS    = parseInt(process.env.FPS)    || 20;
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 60;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
