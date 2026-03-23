@@ -30,7 +30,7 @@ catch(e) { console.warn('[ONNX] not found — random mode'); }
 const WIDTH  = parseInt(process.env.WIDTH)  || 120;
 const HEIGHT = parseInt(process.env.HEIGHT) || 120;
 const FPS    = parseInt(process.env.FPS)    || 12;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 100;   // JPEG品質 (0-100)
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 95;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
@@ -370,7 +370,7 @@ function updateTrackingCamera(cam) {
 
   if (camTargetIdx === 0 || agents.length === 0) {
     // 俯瞰: フィールド全体を真上から瞬時に
-    cam.position.set(W*.5, W*.5, W*1.1);
+    cam.position.set(W*.5, W*.5, W*0.75);
     cam.lookAt(W*.5, W*.5 + 1, 0);
   } else {
     // 追跡: 斜め後方上から見下ろす (回転なし・瞬時切り替え)
