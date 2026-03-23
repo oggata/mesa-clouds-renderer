@@ -32,7 +32,7 @@ catch(e) { console.warn('[ONNX] onnxruntime-node not found — random mode only'
 const WIDTH  = 1280;
 const HEIGHT = 720;
 const FPS    = 30;
-const PORT   = 8080;
+const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants (index.htmlと同じ値) ──────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=120;

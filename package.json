@@ -4,7 +4,8 @@
   "description": "MESA Persona City Sim — server-side Three.js + WebRTC cloud rendering",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "xvfb-run -s \"-screen 0 1x1x24\" node server.js",
+    "start:local": "node server.js"
   },
   "dependencies": {
     "three": "0.132.2",
@@ -13,5 +14,7 @@
     "@roamhq/wrtc": "^0.10.0",
     "onnxruntime-node": "^1.17.0"
   },
-  "engines": { "node": ">=18.0.0" }
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
