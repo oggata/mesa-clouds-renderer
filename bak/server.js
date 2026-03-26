@@ -5,11 +5,6 @@
  *
  * ローカル: node server.js
  * Render:   xvfb-run -s "-screen 0 1x1x24" node server.js  (or Xvfb :99 ...)
- *
- * [Fix] レースコンディション修正:
- *   simLoop / renderLoop / statsLoop の setInterval を
- *   async 初期化 (ONNX + テクスチャ + scene 構築) 完了後に開始するよう変更。
- *   これにより scene = null の状態で renderer.render() が呼ばれるクラッシュを根絶。
  */
 
 'use strict';
@@ -21,7 +16,7 @@ const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
-// JPEG エンコードに sharp を使う（なければ簡易RGB返し）
+// JPEG エンコードに sharp を使う（なければ簡易PPM→JPEG変換）
 let sharp = null;
 try { sharp = require('sharp'); console.log('[Sharp] loaded'); }
 catch(e) { console.warn('[Sharp] not found — install sharp for better performance'); }
@@ -40,7 +35,7 @@ const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
-const INFER_EVERY=parseInt(process.env.INFER_EVERY)||10;
+const INFER_EVERY=parseInt(process.env.INFER_EVERY)||10;  // N ステップに1回だけ推論 (中間はキャッシュ)
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
 const MOVE=0.25, ROT=Math.PI/9;
@@ -52,9 +47,9 @@ const FP_CELL_RGB=[[45,100,45],[80,80,80],[196,32,32],[35,104,40]];
 const FP_SKY_RGB=[6,12,20], FP_FLOOR_RGB=[26,40,32];
 
 const PERSONA_DEFS = [
-  { id:'A', name:'Explorer Rex',    color:0xff3355, hex:'#ff3355', desc:'Actively explores new areas' },
-  { id:'B', name:'Homebody Lily',   color:0x00ccff, hex:'#00ccff', desc:'Takes the shortest route' },
-  { id:'C', name:'Social Marco',    color:0x33ff88, hex:'#33ff88', desc:'Gathers near others' },
+  { id:'A', name:'Explorer Rex',  color:0xff3355, hex:'#ff3355', desc:'Actively explores new areas' },
+  { id:'B', name:'Homebody Lily',  color:0x00ccff, hex:'#00ccff', desc:'Takes the shortest route' },
+  { id:'C', name:'Social Marco',   color:0x33ff88, hex:'#33ff88', desc:'Gathers near others' },
   { id:'D', name:'Businessman Cole',color:0xffee00, hex:'#ffee00', desc:'Moves straight, efficiency first' },
   { id:'E', name:'Tourist Elena',   color:0xff7700, hex:'#ff7700', desc:'Wanders around buildings' },
 ];
@@ -155,7 +150,7 @@ async function loadOnnxSessions(){
 }
 
 // 推論結果キャッシュ (エージェントごと)
-const actionCache = {};
+const actionCache = {};  // agent.def.id → {action, ttl}
 
 async function inferAction(map, agent){
   const sess=ortSessions[agent.def.id];
@@ -183,8 +178,10 @@ async function inferAction(map, agent){
   return (rays[2].type===ROAD&&Math.random()<0.55)?0:(Math.random()<0.5?1:2);
 }
 
+// キャッシュ付き行動選択 + バッチ並列推論
 let stepCount = 0;
 async function prefetchAllActions(map, agents){
+  // INFER_EVERY ステップに1回だけ全エージェントを並列推論
   if(stepCount % INFER_EVERY !== 0) return;
   await Promise.all(agents.map(async a=>{
     const action = await inferAction(map, a);
@@ -193,75 +190,8 @@ async function prefetchAllActions(map, agents){
 }
 
 function selectAction(agent){
+  // キャッシュから取得 (なければランダム)
   return actionCache[agent.def.id] ?? Math.floor(Math.random()*3);
-}
-
-// ─── 建物タイプ定義 ────────────────────────────────────────────────────────────
-const BLDG_TYPES = [
-  { label: '🥩 牛丼屋',    name: 'gyudon',   textureFile: './textures/50x80/gyudon.png', fallbackColor: 0xe8a020, height: 1.6 },
-  { label: '🍜 ラーメン屋', name: 'ramen',    textureFile: './textures/50x80/ramen.png',   fallbackColor: 0xe03030, height: 1.6 },
-  { label: '🍱 弁当屋',    name: 'bento',    textureFile: './textures/50x50/bento.png',  fallbackColor: 0x20a020, height: 1.0 },
-  { label: '☕ カフェ',    name: 'cafe',     textureFile: './textures/50x80/cafe.png',  fallbackColor: 0x8B5E3C, height: 1.6 },
-  { label: '🏢 オフィス',  name: 'office',   textureFile: './textures/50x120/office.png',  fallbackColor: 0x4060a0, height: 2.4 },
-  { label: '🏠 住宅',      name: 'house',    textureFile: './textures/50x80/house.png',  fallbackColor: 0xa06040, height: 1.6 },
-  { label: '🏪 コンビニ',  name: 'conbini',  textureFile: './textures/50x50/conbini.png',   fallbackColor: 0x20a8e0, height: 1.0 },
-  { label: '🏥 病院',      name: 'hospital', textureFile: './textures/50x80/hospital.png',  fallbackColor: 0xe0e0f0, height: 1.6 },
-];
-
-let BUILDING_TYPES = {};
-const texCache = {};
-
-async function loadTextureFile(filePath) {
-  if (!filePath || texCache.hasOwnProperty(filePath)) return;
-  const fullPath = path.join(__dirname, filePath);
-  if (!sharp || !fs.existsSync(fullPath)) { texCache[filePath] = null; return; }
-  try {
-    const { data, info } = await sharp(fullPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-    const tex = new THREE.DataTexture(new Uint8Array(data), info.width, info.height, THREE.RGBAFormat);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.flipY = true;
-    tex.needsUpdate = true;
-    texCache[filePath] = tex;
-    console.log(`[Tex] loaded ${filePath} (${info.width}x${info.height})`);
-  } catch(e) {
-    console.warn(`[Tex] failed ${filePath}:`, e.message);
-    texCache[filePath] = null;
-  }
-}
-
-async function preloadTextures() {
-  await Promise.all(BLDG_TYPES.map(bt => loadTextureFile(bt.textureFile)));
-}
-
-// BoxGeometry 面インデックス:
-//   0: +X, 1: -X → UV横がZ軸方向なので90°補正
-//   2: +Y, 3: -Y → 正常
-//   4: +Z 上面(屋上), 5: -Z 底面
-function getBuildingMaterial(typeIdx) {
-  const bt = BLDG_TYPES[typeIdx % BLDG_TYPES.length];
-  const sideTex = texCache[bt.textureFile];
-
-  function makeMat(flipU = false, flipV = false, rotateDeg = 0) {
-    if (!sideTex) return new THREE.MeshBasicMaterial({ color: bt.fallbackColor });
-    const t = sideTex.clone();
-    t.needsUpdate = true;
-    if (rotateDeg !== 0) {
-      t.rotation = rotateDeg * (Math.PI / 180);
-      t.center.set(0.5, 0.5);
-    }
-    t.repeat.set(flipU ? -1 : 1, flipV ? -1 : 1);
-    t.offset.set(flipU ?  1 : 0, flipV ?  1 : 0);
-    return new THREE.MeshBasicMaterial({ map: t });
-  }
-
-  return [
-    makeMat(false, false,  90), // 0: +X 右側面
-    makeMat(false, false,   -90), // 1: -X 左側面
-    makeMat(false, false,   0), // 2: +Y 正面
-    makeMat(true,  false,   0), // 3: -Y 背面
-    new THREE.MeshBasicMaterial({ color: 0x888888 }), // 4: 屋上
-    new THREE.MeshBasicMaterial({ color: 0x444444 }), // 5: 底面
-  ];
 }
 
 // ─── headless-gl + Three.js ───────────────────────────────────────────────────
@@ -285,25 +215,19 @@ function createRenderer(){
 }
 
 function buildScene(map){
-  BUILDING_TYPES = {};
-  const rng=(()=>{let s=42;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
-  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
-    if(map[r][c]===BUILDING) BUILDING_TYPES[r+'_'+c]=Math.floor(rng()*BLDG_TYPES.length);
-  }
-
   const S=new THREE.Scene();S.background=new THREE.Color(0x020406);
   S.add(new THREE.AmbientLight(0xffffff,1.0));
   const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshBasicMaterial({color:0x060a0f}));
   gnd.position.set(W/2,W/2,0);S.add(gnd);
+  const typeColors=[0xe8a020,0xe03030,0x20a020,0x8B5E3C,0x4060a0,0xa06040,0x20a8e0,0xe0e0f0];
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     const t=map[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
     if(t===BUILDING){
-      const typeIdx=BUILDING_TYPES[r+'_'+c]||0;
-      const bt=BLDG_TYPES[typeIdx%BLDG_TYPES.length];
-      const h=bt.height*CELL;
-      const mat=getBuildingMaterial(typeIdx);
-      const m=new THREE.Mesh(new THREE.BoxGeometry(CELL*.8,CELL*.8,h),mat);
+      const h=(0.9+((r*GRID+c)%7)*.3)*CELL,col=typeColors[(r*GRID+c)%typeColors.length];
+      const m=new THREE.Mesh(new THREE.BoxGeometry(CELL*.8,CELL*.8,h),new THREE.MeshBasicMaterial({color:col}));
       m.position.set(cx,cy,h/2);S.add(m);
+      const roof=new THREE.Mesh(new THREE.BoxGeometry(CELL*.82,CELL*.82,0.06),new THREE.MeshBasicMaterial({color:0xaaaaaa}));
+      roof.position.set(cx,cy,h);S.add(roof);
     }else if(t===TREE){
       const tr=new THREE.Mesh(new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),new THREE.MeshBasicMaterial({color:0x4a3020}));
       tr.position.set(cx,cy,CELL*.2);S.add(tr);
@@ -329,15 +253,17 @@ function createAgentMesh(S,color){
   S.add(body);return body;
 }
 
-// ─── RGBA → JPEG ─────────────────────────────────────────────────────────────
+// ─── RGBA → JPEG (sharp or 簡易実装) ─────────────────────────────────────────
 async function rgbaToJpeg(rgba, width, height){
   if(sharp){
     return await sharp(Buffer.from(rgba),{raw:{width,height,channels:4}})
       .jpeg({quality:JPEG_Q}).toBuffer();
   }
+  // sharp がない場合: node-canvas の代替として簡易RGBバッファ返し（非JPEG）
+  // → npm install sharp を強く推奨
   const rgb=Buffer.alloc(width*height*3);
   for(let i=0;i<width*height;i++){rgb[i*3]=rgba[i*4];rgb[i*3+1]=rgba[i*4+1];rgb[i*3+2]=rgba[i*4+2];}
-  return rgb;
+  return rgb; // fallback: raw RGB (ブラウザ側で表示できないが最低限動く)
 }
 
 // ─── Pixel readout ────────────────────────────────────────────────────────────
@@ -356,7 +282,7 @@ rebuildBuildings(MAP);
 function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
 
 let agents=[], agentMeshes=[], trailMats={};
-let scene=null;   // ★ async init 完了まで null のまま
+let scene=null;
 let paused=false, speedMul=1;
 
 function initAgents(S){
@@ -378,13 +304,14 @@ function addTrail(S,agent){
 }
 
 async function stepAll(){
-  if(paused || !scene) return;   // ★ scene null ガード
+  if(paused)return;
   stepCount++;
+  // 全エージェントの推論を並列で先に実行
   await prefetchAllActions(MAP, agents);
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
     const px=a.x,py=a.y;
-    const action=selectAction(a);
+    const action=selectAction(a);  // キャッシュから取得 (同期)
     if(action===1)a.th-=ROT;else if(action===2)a.th+=ROT;
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
@@ -409,14 +336,14 @@ async function stepAll(){
 function handleCommand(msg){
   switch(msg.cmd){
     case 'pause': paused=!paused; break;
-    case 'reset': if(scene) initAgents(scene); break;
+    case 'reset': initAgents(scene); break;
     case 'speed': speedMul=[1,2,4][(([1,2,4].indexOf(speedMul)+1)%3)]; break;
     case 'newmap':
       MAP=makeMap(GRID,Math.floor(Math.random()*100000));
       rebuildBuildings(MAP);
       scene=buildScene(MAP);
       PERSONA_DEFS.forEach(p=>{trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});});
-      if(scene) initAgents(scene);
+      initAgents(scene);
       break;
   }
 }
@@ -427,8 +354,9 @@ const mainCam = new THREE.PerspectiveCamera(60, WIDTH/HEIGHT, 0.1, 1200);
 mainCam.up.set(0,0,1);
 
 // ── 追跡カメラ ────────────────────────────────────────────────
-const CAM_OVERVIEW_INTERVAL = 5000;
-let camTargetIdx  = 0;
+// 0 = 俯瞰, 1〜5 = ペルソナA〜E 追跡
+const CAM_OVERVIEW_INTERVAL = 5000;  // ms
+let camTargetIdx  = 0;   // 0:俯瞰, 1-5:各ペルソナ
 let camSwitchTimer = Date.now();
 
 function updateTrackingCamera(cam) {
@@ -437,49 +365,44 @@ function updateTrackingCamera(cam) {
     camTargetIdx = (camTargetIdx + 1) % (agents.length + 1);
     camSwitchTimer = now;
   }
+
   cam.up.set(0, 1, 0);
+
   if (camTargetIdx === 0 || agents.length === 0) {
+    // 俯瞰: フィールド全体を真上から瞬時に
     cam.position.set(W*.5, W*.5, W*0.75);
     cam.lookAt(W*.5, W*.5 + 1, 0);
   } else {
+    // 追跡: 斜め後方上から見下ろす (回転なし・瞬時切り替え)
     const a = agents[camTargetIdx - 1];
     if (!a) return;
     const tx = a.y * CELL + CELL * .5;
     const ty = a.x * CELL + CELL * .5;
-    cam.position.set(tx, ty - CELL*5, CELL*7);
+    const backDist = CELL * 5;   // 後方への距離
+    const height   = CELL * 7;   // 高さ
+    cam.position.set(tx, ty - backDist, height);
     cam.lookAt(tx, ty + CELL * 1.5, 0);
   }
 }
 
-// ─── WebSocket クライアント管理 ────────────────────────────────────────────────
+scene = buildScene(MAP);
+PERSONA_DEFS.forEach(p=>{
+  trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
+});
+
+// WebSocket クライアント管理
 const clients = new Set();
 
-// ─── HTTP + WebSocket サーバー ─────────────────────────────────────────────────
-const httpServer=http.createServer((req,res)=>{
-  if(req.url==='/'||req.url==='/index.html'){
-    res.writeHead(200,{'Content-Type':'text/html'});
-    res.end(fs.readFileSync(path.join(__dirname,'client.html')));
-  }else{res.writeHead(404);res.end();}
-});
+// stats ブロードキャスト (2秒ごと)
+setInterval(()=>{
+  if(clients.size===0)return;
+  const camName = camTargetIdx === 0 ? 'overview' : (agents[camTargetIdx-1]?.def.name || '-');
+  const msg=JSON.stringify({type:'stats', camName, agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
+  for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}
+},2000);
 
-const wss=new WebSocket.Server({server:httpServer});
-
-wss.on('connection',ws=>{
-  clients.add(ws);
-  console.log(`[WS] client joined total=${clients.size}`);
-  ws.on('message',data=>{
-    try{
-      const msg=JSON.parse(data);
-      if(msg.type==='command') handleCommand(msg);
-    }catch(e){}
-  });
-  ws.on('close',()=>{clients.delete(ws);console.log(`[WS] client left total=${clients.size}`);});
-  ws.on('error',()=>clients.delete(ws));
-});
-
-// ─── ループ関数定義 (startLoops() から呼ばれる) ───────────────────────────────
-
-// sim ループ
+// sim loop
+// sim と render を完全分離: sim は自分のペースで回す
 let simRunning = false;
 async function simLoop(){
   if(simRunning) return;
@@ -487,12 +410,12 @@ async function simLoop(){
   for(let s=0;s<speedMul;s++) await stepAll();
   simRunning = false;
 }
+setInterval(simLoop, TICK);
 
 // render + JPEG 配信ループ
 let frameCount=0, encoding=false;
-async function renderLoop(){
-  if(!scene) return;          // ★ scene null ガード (二重保険)
-  if(encoding) return;
+setInterval(async()=>{
+  if(encoding)return; // 前フレームのエンコードが終わってなければスキップ
   encoding=true;
 
   // エージェントメッシュ更新
@@ -509,14 +432,17 @@ async function renderLoop(){
   });
 
   updateTrackingCamera(mainCam);
-  renderer.render(scene, mainCam);
+  renderer.render(scene,mainCam);
   frameCount++;
 
+  // クライアントがいなければピクセル読み出しをスキップ
   if(clients.size===0){encoding=false;return;}
 
   try{
     const rgba=readPixels(glCtx);
     const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
+
+    // 全クライアントにバイナリ送信
     for(const ws of clients){
       if(ws.readyState===WebSocket.OPEN){
         ws.send(jpeg,(err)=>{if(err)clients.delete(ws);});
@@ -526,50 +452,37 @@ async function renderLoop(){
   }catch(e){console.error('[Render]',e.message);}
 
   encoding=false;
-}
+},1000/FPS);
 
-// stats ブロードキャスト
-function statsLoop(){
-  if(clients.size===0) return;
-  const camName = camTargetIdx === 0 ? 'overview' : (agents[camTargetIdx-1]?.def.name || '-');
-  const msg=JSON.stringify({type:'stats', camName, agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
-  for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}
-}
+// ─── HTTP + WebSocket ─────────────────────────────────────────────────────────
+const httpServer=http.createServer((req,res)=>{
+  if(req.url==='/'||req.url==='/index.html'){
+    res.writeHead(200,{'Content-Type':'text/html'});
+    res.end(fs.readFileSync(path.join(__dirname,'client.html')));
+  }else{res.writeHead(404);res.end();}
+});
 
-/**
- * ★ 修正のポイント:
- *   全ての setInterval をここでまとめて開始する。
- *   この関数は async init (ONNX + テクスチャ + scene 構築) が
- *   完全に完了した後にのみ呼ばれるため、scene が null になることはない。
- */
-function startLoops(){
-  setInterval(simLoop,    TICK);
-  setInterval(renderLoop, 1000/FPS);
-  setInterval(statsLoop,  2000);
-  console.log('[Loops] sim / render / stats loops started');
-}
+const wss=new WebSocket.Server({server:httpServer});
 
-// ─── エントリポイント ──────────────────────────────────────────────────────────
-(async()=>{
-  console.log('[Init] loading ONNX sessions...');
-  await loadOnnxSessions();
+wss.on('connection',ws=>{
+  clients.add(ws);
+  console.log(`[WS] client joined total=${clients.size}`);
 
-  console.log('[Init] preloading textures...');
-  await preloadTextures();
-
-  console.log('[Init] building scene...');
-  scene = buildScene(MAP);
-
-  PERSONA_DEFS.forEach(p=>{
-    trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
+  ws.on('message',data=>{
+    try{
+      const msg=JSON.parse(data);
+      if(msg.type==='command') handleCommand(msg);
+    }catch(e){}
   });
 
-  initAgents(scene);
+  ws.on('close',()=>{clients.delete(ws);console.log(`[WS] client left total=${clients.size}`);});
+  ws.on('error',()=>clients.delete(ws));
+});
 
-  httpServer.listen(PORT, ()=>{
+(async()=>{
+  await loadOnnxSessions();
+  initAgents(scene);
+  httpServer.listen(PORT,()=>{
     console.log(`\n🚀 MESA City Sim → http://localhost:${PORT}\n`);
   });
-
-  // ★ scene の構築が完全に終わってからループを開始する
-  startLoops();
 })();
