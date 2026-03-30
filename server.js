@@ -32,10 +32,10 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 120;
-const HEIGHT = parseInt(process.env.HEIGHT) || 120;
+const WIDTH  = parseInt(process.env.WIDTH)  || 100;
+const HEIGHT = parseInt(process.env.HEIGHT) || 100;
 const FPS    = parseInt(process.env.FPS)    || 12;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 95;   // JPEG品質 (0-100)
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 70;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
@@ -216,13 +216,16 @@ async function loadTextureFile(filePath) {
   const fullPath = path.join(__dirname, filePath);
   if (!sharp || !fs.existsSync(fullPath)) { texCache[filePath] = null; return; }
   try {
-    const { data, info } = await sharp(fullPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const { data, info } = await sharp(fullPath)
+      .resize(512, 512)   // ← 2のべき乗サイズに強制リサイズ
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
     const tex = new THREE.DataTexture(new Uint8Array(data), info.width, info.height, THREE.RGBAFormat);
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
     tex.flipY = true;
     tex.needsUpdate = true;
     texCache[filePath] = tex;
-    console.log(`[Tex] loaded ${filePath} (${info.width}x${info.height})`);
   } catch(e) {
     console.warn(`[Tex] failed ${filePath}:`, e.message);
     texCache[filePath] = null;
