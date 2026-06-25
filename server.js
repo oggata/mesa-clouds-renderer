@@ -211,6 +211,12 @@ const BLDG_TYPES = [
 let BUILDING_TYPES = {};
 const texCache = {};
 
+// 建物 material は「建物タイプ × 面」単位で共有する。
+// 以前は建物ごとにテクスチャを clone していたため、同じタイプの建物が
+// 大量にあるとテクスチャ/マテリアルが建物数ぶん重複し GPU メモリを圧迫していた。
+// buildScene ごとに作り直し、disposeScene で破棄する。
+let buildingMatCache = {};
+
 async function loadTextureFile(filePath) {
   if (!filePath || texCache.hasOwnProperty(filePath)) return;
   const fullPath = path.join(__dirname, filePath);
@@ -241,7 +247,10 @@ async function preloadTextures() {
 //   2: +Y, 3: -Y → 正常
 //   4: +Z 上面(屋上), 5: -Z 底面
 function getBuildingMaterial(typeIdx) {
-  const bt = BLDG_TYPES[typeIdx % BLDG_TYPES.length];
+  const cacheKey = typeIdx % BLDG_TYPES.length;
+  if (buildingMatCache[cacheKey]) return buildingMatCache[cacheKey];
+
+  const bt = BLDG_TYPES[cacheKey];
   const sideTex = texCache[bt.textureFile];
 
   function makeMat(flipU = false, flipV = false, rotateDeg = 0) {
@@ -257,7 +266,7 @@ function getBuildingMaterial(typeIdx) {
     return new THREE.MeshBasicMaterial({ map: t });
   }
 
-  return [
+  const mats = [
     makeMat(false, false,  90), // 0: +X 右側面
     makeMat(false, false,   -90), // 1: -X 左側面
     makeMat(false, false,   0), // 2: +Y 正面
@@ -265,6 +274,8 @@ function getBuildingMaterial(typeIdx) {
     new THREE.MeshBasicMaterial({ color: 0x888888 }), // 4: 屋上
     new THREE.MeshBasicMaterial({ color: 0x444444 }), // 5: 底面
   ];
+  buildingMatCache[cacheKey] = mats;
+  return mats;
 }
 
 // ─── headless-gl + Three.js ───────────────────────────────────────────────────
@@ -287,7 +298,29 @@ function createRenderer(){
   return{renderer,glCtx};
 }
 
+// シーン全体の GPU リソースを解放する。
+// newmap などで scene を作り直す際、古い scene を渡して呼ぶ。
+// geometry / material / texture は GC 対象外なので明示的に dispose しないと
+// headless-gl のメモリにリークし続け、最終的にサーバーが落ちる。
+function disposeScene(S){
+  if(!S) return;
+  const geos = new Set(), mats = new Set();
+  S.traverse(obj=>{
+    if(obj.geometry) geos.add(obj.geometry);
+    if(obj.material){
+      if(Array.isArray(obj.material)) obj.material.forEach(m=>mats.add(m));
+      else mats.add(obj.material);
+    }
+  });
+  geos.forEach(g=>{ if(g!==TRAIL_GEO) g.dispose(); });
+  mats.forEach(m=>{
+    if(m.map) m.map.dispose();
+    m.dispose();
+  });
+}
+
 function buildScene(map){
+  buildingMatCache = {};
   BUILDING_TYPES = {};
   const rng=(()=>{let s=42;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
@@ -344,12 +377,15 @@ async function rgbaToJpeg(rgba, width, height){
 }
 
 // ─── Pixel readout ────────────────────────────────────────────────────────────
+// バッファは毎フレーム使い回す (renderLoop は encoding ガードで直列実行されるため安全)。
+// 以前は毎フレーム 2 本の TypedArray を確保しており GC 圧の原因になっていた。
+const _pxBuf=new Uint8ClampedArray(WIDTH*HEIGHT*4);
+const _flBuf=new Uint8ClampedArray(WIDTH*HEIGHT*4);
 function readPixels(glCtx){
-  const px=new Uint8ClampedArray(WIDTH*HEIGHT*4);
-  glCtx.readPixels(0,0,WIDTH,HEIGHT,glCtx.RGBA,glCtx.UNSIGNED_BYTE,px);
-  const fl=new Uint8ClampedArray(WIDTH*HEIGHT*4),row=WIDTH*4;
-  for(let y=0;y<HEIGHT;y++)fl.set(px.subarray((HEIGHT-1-y)*row,(HEIGHT-y)*row),y*row);
-  return fl;
+  glCtx.readPixels(0,0,WIDTH,HEIGHT,glCtx.RGBA,glCtx.UNSIGNED_BYTE,_pxBuf);
+  const row=WIDTH*4;
+  for(let y=0;y<HEIGHT;y++)_flBuf.set(_pxBuf.subarray((HEIGHT-1-y)*row,(HEIGHT-y)*row),y*row);
+  return _flBuf;
 }
 
 // ─── Simulation state ─────────────────────────────────────────────────────────
@@ -362,8 +398,21 @@ let agents=[], agentMeshes=[], trailMats={};
 let scene=null;   // ★ async init 完了まで null のまま
 let paused=false, speedMul=1;
 
+function disposeMesh(m){
+  if(!m) return;
+  m.traverse(o=>{
+    if(o.geometry && o.geometry!==TRAIL_GEO) o.geometry.dispose();
+    if(o.material){
+      const arr=Array.isArray(o.material)?o.material:[o.material];
+      arr.forEach(mat=>{ if(mat.map) mat.map.dispose(); mat.dispose(); });
+    }
+  });
+}
+
 function initAgents(S){
-  agents.forEach(a=>{if(a.mesh)S.remove(a.mesh);a.trail.forEach(m=>S.remove(m));});
+  // 既存エージェント/トレイルのメッシュを scene から外し GPU リソースを解放
+  agentMeshes.forEach(m=>{S.remove(m);disposeMesh(m);});
+  agents.forEach(a=>{a.trail.forEach(m=>S.remove(m));});  // trail geo/mat は共有なので dispose しない
   agents=[];agentMeshes=[];
   PERSONA_DEFS.forEach(def=>{
     const b=randB(null),g=randB(b);
@@ -373,11 +422,20 @@ function initAgents(S){
   console.log(`[Sim] ${agents.length} agents initialized`);
 }
 
+// トレイルは毎ステップ生成されるため、geometry を全トレイルで共有する。
+// 以前は毎回 new PlaneGeometry していて、50個超で remove するだけ (dispose なし)
+// だったため GPU バッファがリークし続けていた。共有 geometry なら 1個で済み、
+// disposeScene では破棄しない (TRAIL_GEO で除外)。
+const TRAIL_GEO = new THREE.PlaneGeometry(CELL*.2, CELL*.2);
+
 function addTrail(S,agent){
-  const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.2,CELL*.2),trailMats[agent.def.id]);
+  const m=new THREE.Mesh(TRAIL_GEO,trailMats[agent.def.id]);
   m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
   S.add(m);agent.trail.push(m);
-  if(agent.trail.length>50){S.remove(agent.trail.shift());}
+  if(agent.trail.length>50){
+    const old=agent.trail.shift();
+    S.remove(old);   // geometry は共有・material はパーソナ共有なので dispose 不要
+  }
 }
 
 async function stepAll(){
@@ -414,15 +472,28 @@ function handleCommand(msg){
     case 'pause': paused=!paused; break;
     case 'reset': if(scene) initAgents(scene); break;
     case 'speed': speedMul=[1,2,4][(([1,2,4].indexOf(speedMul)+1)%3)]; break;
-    case 'newmap':
+    case 'newmap': {
+      const oldScene=scene;
       MAP=makeMap(GRID,Math.floor(Math.random()*100000));
       rebuildBuildings(MAP);
       scene=buildScene(MAP);
+      // 古いシーン (建物/道路/エージェント/トレイル) の GPU リソースを解放
+      disposeScene(oldScene);
       PERSONA_DEFS.forEach(p=>{trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});});
       if(scene) initAgents(scene);
       break;
+    }
   }
 }
+
+// プロセスを巻き込んで落とさないよう、未処理の例外/Promise reject はログだけ残す。
+// (ループは個別に try/catch 済み。これは最後のセーフティネット)
+process.on('unhandledRejection', (reason)=>{
+  console.error('[unhandledRejection]', reason && reason.message ? reason.message : reason);
+});
+process.on('uncaughtException', (err)=>{
+  console.error('[uncaughtException]', err && err.message ? err.message : err);
+});
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
@@ -487,8 +558,13 @@ let simRunning = false;
 async function simLoop(){
   if(simRunning) return;
   simRunning = true;
-  for(let s=0;s<speedMul;s++) await stepAll();
-  simRunning = false;
+  try{
+    for(let s=0;s<speedMul;s++) await stepAll();
+  }catch(e){
+    console.error('[Sim]',e.message);
+  }finally{
+    simRunning = false;   // 例外が出てもフラグを必ず戻す (デッドロック防止)
+  }
 }
 
 // render + JPEG 配信ループ
@@ -498,26 +574,27 @@ async function renderLoop(){
   if(encoding) return;
   encoding=true;
 
-  // エージェントメッシュ更新
-  const dt=1/FPS;
-  agents.forEach((a,i)=>{
-    const tx=a.y*CELL+CELL*.5,ty=a.x*CELL+CELL*.5,m=agentMeshes[i];
-    m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
-    m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
-    m.position.z=CELL*.26;
-    const tar=-a.th+Math.PI*.5;
-    let dr=tar-m.rotation.z;
-    while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
-    m.rotation.z+=dr*Math.min(1,dt*14);
-  });
-
-  updateTrackingCamera(mainCam);
-  renderer.render(scene, mainCam);
-  frameCount++;
-
-  if(clients.size===0){encoding=false;return;}
-
   try{
+    // エージェントメッシュ更新
+    const dt=1/FPS;
+    agents.forEach((a,i)=>{
+      const tx=a.y*CELL+CELL*.5,ty=a.x*CELL+CELL*.5,m=agentMeshes[i];
+      if(!m) return;
+      m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
+      m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
+      m.position.z=CELL*.26;
+      const tar=-a.th+Math.PI*.5;
+      let dr=tar-m.rotation.z;
+      while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
+      m.rotation.z+=dr*Math.min(1,dt*14);
+    });
+
+    updateTrackingCamera(mainCam);
+    renderer.render(scene, mainCam);
+    frameCount++;
+
+    if(clients.size===0) return;
+
     const rgba=readPixels(glCtx);
     const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
     for(const ws of clients){
@@ -526,9 +603,11 @@ async function renderLoop(){
       }
     }
     if(frameCount%(FPS*10)===0)console.log(`[Render] frame=${frameCount} clients=${clients.size}`);
-  }catch(e){console.error('[Render]',e.message);}
-
-  encoding=false;
+  }catch(e){
+    console.error('[Render]',e.message);
+  }finally{
+    encoding=false;   // 例外時もフラグを必ず戻す (描画停止防止)
+  }
 }
 
 // stats ブロードキャスト
