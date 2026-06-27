@@ -32,10 +32,10 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 200;
-const HEIGHT = parseInt(process.env.HEIGHT) || 200;
+const WIDTH  = parseInt(process.env.WIDTH)  || 140;
+const HEIGHT = parseInt(process.env.HEIGHT) || 140;
 const FPS    = parseInt(process.env.FPS)    || 12;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 70;   // JPEG品質 (0-100)
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 90;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
