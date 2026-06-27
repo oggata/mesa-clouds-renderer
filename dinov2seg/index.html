@@ -1,0 +1,1499 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MESA Persona City Sim</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Noto+Sans+JP:wght@300;400&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#030507;--panel:rgba(4,8,14,0.92);--border:rgba(0,210,160,0.15);
+  --accent:#00d2a0;--warn:#ff4858;--gold:#ffcc44;
+  --mono:'Orbitron',monospace;--body:'Noto Sans JP',sans-serif;
+  --text:#a8c8c0;--dim:#2a4a44;
+}
+html,body{width:100%;height:100%;background:var(--bg);color:var(--text);
+  font-family:var(--body);overflow:hidden}
+#c3d{position:fixed;inset:0}
+#c3d canvas{display:block;width:100%!important;height:100%!important}
+
+/* ── ペルソナカード ── */
+#persona-bar{
+  position:fixed;top:12px;left:50%;transform:translateX(-50%);
+  display:flex;gap:8px;z-index:50;pointer-events:auto;
+}
+.p-card{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:6px;padding:8px 12px;
+  width:148px;min-width:148px;max-width:148px;  /* 固定幅 */
+  box-sizing:border-box;overflow:hidden;
+  backdrop-filter:blur(12px);cursor:pointer;transition:.15s;
+}
+.p-card:hover{border-color:var(--accent);}
+.p-card.active{box-shadow:0 0 12px rgba(0,210,160,.3);}
+.p-card.inactive{opacity:0.4;}
+.p-name{font-family:var(--mono);font-size:9px;font-weight:700;
+  letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.p-desc{font-size:9px;color:var(--dim);line-height:1.6;margin-bottom:5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.p-stats{display:flex;gap:4px;font-family:var(--mono);font-size:9px;}
+.p-stat{display:flex;flex-direction:column;align-items:center;gap:1px;
+  flex:1;min-width:0;}
+.p-stat-val{color:var(--accent);font-size:11px;
+  min-width:2.5em;text-align:center;  /* 数字が増えても幅変化なし */
+  display:block;}
+.p-stat-lbl{color:var(--dim);font-size:7px;}
+.p-dot{width:8px;height:8px;border-radius:50%;margin-bottom:3px;flex-shrink:0;}
+
+/* ── コントロール ── */
+#ctrl{
+  position:fixed;bottom:14px;left:50%;transform:translateX(-50%);
+  display:flex;gap:6px;z-index:50;
+}
+button{
+  background:var(--panel);border:1px solid var(--border);
+  color:var(--text);border-radius:4px;padding:6px 12px;
+  font-family:var(--mono);font-size:9px;cursor:pointer;
+  transition:.12s;letter-spacing:.06em;backdrop-filter:blur(8px);
+}
+button:hover{border-color:var(--accent);color:var(--accent);}
+button.on{border-color:var(--accent);color:var(--accent);
+  box-shadow:0 0 8px rgba(0,210,160,.25);}
+
+/* ── FP PiP ── */
+#fp-wrap{
+  position:fixed;bottom:60px;right:14px;z-index:50;
+}
+#fp-label{font-family:var(--mono);font-size:9px;color:var(--accent);
+  margin-bottom:4px;text-align:right;}
+#fp-canvas{width:240px;height:150px;border:1px solid var(--border);
+  border-radius:4px;background:#000;}
+
+/* ── ロード画面 ── */
+#overlay{
+  position:fixed;inset:0;background:rgba(3,5,7,.96);
+  display:flex;align-items:center;justify-content:center;
+  flex-direction:column;gap:16px;z-index:200;
+}
+#overlay h1{font-family:var(--mono);font-size:18px;font-weight:900;
+  color:var(--accent);letter-spacing:.2em;text-transform:uppercase;}
+#overlay p{font-size:11px;color:var(--dim);text-align:center;
+  line-height:2;max-width:400px;}
+.load-section{background:rgba(0,0,0,.4);border:1px solid var(--border);
+  border-radius:6px;padding:16px 20px;min-width:380px;}
+.load-section h3{font-family:var(--mono);font-size:10px;color:var(--accent);
+  margin-bottom:10px;letter-spacing:.1em;}
+.persona-load-row{display:flex;align-items:center;gap:10px;
+  margin-bottom:8px;font-size:10px;}
+.persona-load-row .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.persona-load-row label{cursor:pointer;color:var(--text);}
+.persona-load-row .status{font-family:var(--mono);font-size:9px;
+  color:var(--dim);margin-left:auto;}
+.load-btn{background:transparent;border:1px solid var(--accent);
+  color:var(--accent);padding:8px 20px;border-radius:4px;
+  font-family:var(--mono);font-size:10px;cursor:pointer;transition:.15s;}
+.load-btn:hover{background:rgba(0,210,160,.1);}
+.skip-btn{background:transparent;border:1px solid var(--dim);
+  color:var(--dim);padding:6px 16px;border-radius:4px;
+  font-family:var(--mono);font-size:9px;cursor:pointer;}
+
+/* scanline */
+body::after{content:'';position:fixed;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,
+    rgba(0,0,0,.02) 2px,rgba(0,0,0,.02) 4px);z-index:300;}
+</style>
+</head>
+<body>
+
+<!-- ロード画面 -->
+<div id="overlay">
+  <h1>MESA PERSONA CITY</h1>
+  <p>ペルソナ別に学習されたONNXポリシーを読み込みます。<br>
+  Step2で生成した persona_X.onnx ファイルを選択してください。</p>
+
+  <div class="load-section">
+    <h3>PERSONA ONNX FILES</h3>
+    <div id="persona-load-list"></div>
+  </div>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;">
+    <button class="load-btn" id="start-btn">Start Simulation</button>
+    <button class="load-btn" id="default-btn" style="background:rgba(0,210,160,0.12);border-color:#00d2a0;">▶ Start Default ONNX</button>
+    <button class="skip-btn" id="skip-btn">Skip (Random Mode)</button>
+  </div>
+  <p style="font-size:9px;color:var(--dim);margin-top:4px;">
+    Default ONNX: <code style="color:#00d2a0;">./data/persona_A.onnx</code> 〜 <code style="color:#00d2a0;">./data/persona_E.onnx</code>
+  </p>
+</div>
+
+<div id="c3d"></div>
+
+<!-- ペルソナカード -->
+<div id="persona-bar"></div>
+
+<!-- コントロール -->
+<div id="dino-status" style="
+  position:fixed;top:auto;bottom:50px;right:14px;
+  font-family:monospace;font-size:9px;color:#4a5a6a;
+  background:rgba(4,8,14,0.85);padding:4px 8px;border-radius:3px;
+  border:1px solid rgba(0,210,160,0.15);z-index:60;">
+  DINOv2 Loading...
+</div>
+<div id="ctrl">
+  <button id="b-pause">Pause</button>
+  <button id="b-reset">Reset</button>
+  <button id="b-speed">×1</button>
+  <button id="b-cam" class="on">俯瞰</button>
+  <button id="b-trail" class="on">Trail</button>
+  <button id="b-fp">FP View</button>
+  <button id="b-newmap">🎲 New Map</button>
+</div>
+
+<!-- 一人称ビュー -->
+<div id="fp-wrap" style="display:none">
+  <div id="fp-label">FOLLOWING: <span id="fp-name">-</span></div>
+  <canvas id="fp-canvas"></canvas>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<script type="module">
+// Transformers.js (DINOv2 ブラウザ推論)
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/dist/transformers.min.js';
+env.allowLocalModels = false;
+// DINOv2 特徴抽出パイプラインをグローバルに公開
+window.dinoReady = false;
+window.dinoExtractor = null;
+(async () => {
+  try {
+    console.log('[DINOv2] Loading model...');
+    window.dinoExtractor = await pipeline(
+      'image-feature-extraction',
+      'Xenova/dinov2-small-imagenet1k-1-layer',
+      { device: 'webgl' }  // webgl が使えない場合は 'cpu' に
+    );
+    window.dinoReady = true;
+    console.log('[DINOv2] Ready!');
+    document.getElementById('dino-status').textContent = '✓ DINOv2 Ready';
+    document.getElementById('dino-status').style.color = '#00d2a0';
+  } catch(e) {
+    console.warn('[DINOv2] Load failed, falling back to CNN obs:', e.message);
+    document.getElementById('dino-status').textContent = '⚠ DINOv2 unavailable (CNN fallback)';
+    document.getElementById('dino-status').style.color = '#ffcc44';
+  }
+})();
+</script>
+<script>
+// ============================================================
+// ペルソナ定義 (ONNX未読み込み時のデフォルト)
+// ============================================================
+const PERSONA_DEFS = [
+  { id:'A', name:'探索者タロウ',   color:0xff3355, hex:'#ff3355',
+    desc:'新しい場所を積極的に探索' },
+  { id:'B', name:'インドア花子',   color:0x00ccff, hex:'#00ccff',
+    desc:'最短経路で目的地へ' },
+  { id:'C', name:'社交家ケンジ',   color:0x33ff88, hex:'#33ff88',
+    desc:'他者の近くに集まる' },
+  { id:'D', name:'ビジネスマン誠', color:0xffee00, hex:'#ffee00',
+    desc:'効率重視で直進' },
+  { id:'E', name:'観光客サラ',     color:0xff7700, hex:'#ff7700',
+    desc:'建物を巡って観光' },
+];
+
+// ============================================================
+// 定数
+// ============================================================
+const GRID=30,CELL=2.0,TICK=80;
+const OTHER=0,ROAD=1,BUILDING=2,TREE=3;
+const PASSABLE=new Set([ROAD,BUILDING]);
+const MOVE=0.25, ROT=Math.PI/9;
+const RAY_DEG=[-60,-30,0,30,60];
+const RAY_RAD=RAY_DEG.map(d=>d*Math.PI/180);
+const RAY_MAX=6.0, RAY_STEP=0.15;
+let OBS_DIM=18;
+const W=GRID*CELL;
+
+// ── FP画像CNN設定 (Pythonの学習設定と一致させる) ──
+const IMG_W  = 64;     // 画像幅
+const IMG_H  = 64;     // 画像高さ
+const IMG_CH = 3;      // RGB
+const FP_FOV = Math.PI / 3;  // 水平視野角 60度
+const FP_RAY_MAX = 8.0;
+const FP_RAY_STEP = 0.1;
+
+// セルタイプ別RGB (Pythonと同じ値)
+const FP_CELL_RGB = [
+  [ 45, 100,  45],  // OTHER → 草地 (緑)
+  [ 80,  80,  80],  // ROAD  → アスファルト (ダークグレー)
+  [196,  32,  32],  // BUILDING
+  [ 35, 104,  40],  // TREE
+];
+const FP_SKY_RGB   = [  6, 12, 20];
+const FP_FLOOR_RGB = [ 26, 40, 32];
+
+// ============================================================
+// ロード画面セットアップ
+// ============================================================
+const sessions = {};  // persona_id → ort.InferenceSession
+let segSession   = null;   // seg_head.onnx セッション
+let segMeta      = null;   // seg_head_meta.json
+let SEG_OPEN_ID  = 2;      // open クラスのID (道路方向=通行可)
+let USE_SEG_PASS = false;  // セグメンテーション移動判定を使うか
+const metaData = {};  // persona_id → meta JSON
+const obsDims  = {};  // persona_id → input_size
+
+function showError(msg) {
+  let el = document.getElementById('error-log');
+  if(!el){ el=document.createElement('div'); el.id='error-log';
+    Object.assign(el.style,{position:'fixed',bottom:'50px',left:'50%',
+    transform:'translateX(-50%)',background:'rgba(255,72,88,.9)',
+    color:'#fff',padding:'8px 16px',borderRadius:'4px',
+    fontFamily:'monospace',fontSize:'11px',zIndex:'999',maxWidth:'80vw',
+    wordBreak:'break-all'}); document.body.appendChild(el); }
+  el.textContent = msg; el.style.display='block';
+  setTimeout(()=>{ el.style.display='none'; }, 8000);
+  console.error(msg);
+}
+
+const loadList = document.getElementById('persona-load-list');
+PERSONA_DEFS.forEach(p => {
+  const row = document.createElement('div');
+  row.className = 'persona-load-row';
+  row.innerHTML = `
+    <div class="dot" style="background:${p.hex}"></div>
+    <label>[${p.id}] ${p.name}</label>
+    <input type="file" id="file-${p.id}" accept=".onnx,.json" multiple
+           style="display:none">
+    <button class="load-btn" style="padding:4px 10px;font-size:9px"
+            onclick="document.getElementById('file-${p.id}').click()">
+      Select</button>
+    <span class="status" id="status-${p.id}">未読み込み</span>
+  `;
+  loadList.appendChild(row);
+
+  document.addEventListener('change', async e => {
+    if(e.target.id !== `file-${p.id}`) return;
+    const files = Array.from(e.target.files);
+    const onnxFile = files.find(f=>f.name.endsWith('.onnx'));
+    const metaFile = files.find(f=>f.name.endsWith('.json'));
+    const st = document.getElementById(`status-${p.id}`);
+
+    // JSON を先に読んで OBS_DIM を確定
+    if(metaFile) {
+      try {
+        const txt = await metaFile.text();
+        metaData[p.id] = JSON.parse(txt);
+        const dim = metaData[p.id].input_size;
+        if(dim) obsDims[p.id] = dim;
+        const idx = PERSONA_DEFS.findIndex(x=>x.id===p.id);
+        if(idx>=0 && metaData[p.id].persona_name)
+          PERSONA_DEFS[idx].name = metaData[p.id].persona_name;
+        if(idx>=0 && metaData[p.id].description)
+          PERSONA_DEFS[idx].desc = metaData[p.id].description;
+        st.textContent = metaOnly ? '✓ META読込' : '読込中...';
+        st.style.color = '#ffcc44';
+      } catch(err) {
+        showError(`[${p.id}] JSON読み込みエラー: ${err.message}`);
+        st.textContent = '❌ JSON失敗'; st.style.color='#ff4858'; return;
+      }
+    }
+
+    const metaOnly = !onnxFile;
+
+    if(onnxFile) {
+      try {
+        st.textContent = '読込中...'; st.style.color = '#ffcc44';
+        const buf = await onnxFile.arrayBuffer();
+        // wasmバックエンドを明示指定
+        sessions[p.id] = await ort.InferenceSession.create(buf, {
+          executionProviders: ['wasm'],
+          graphOptimizationLevel: 'all',
+        });
+        // 動作テスト
+        const dim = obsDims[p.id] || 18;
+        const inputName = sessions[p.id].inputNames[0];
+        const testT = new ort.Tensor('float32', new Float32Array(dim), [1, dim]);
+        const testOut = await sessions[p.id].run({ [inputName]: testT });
+        const logits = Array.from(testOut[sessions[p.id].outputNames[0]].data);
+        console.log(`[${p.id}] OK input="${inputName}" logits=${logits.map(v=>v.toFixed(2))}`);
+        st.textContent = '✓ ONNX+推論OK'; st.style.color = '#00d2a0';
+      } catch(err) {
+        showError(`[${p.id}] ONNXエラー: ${err.message}`);
+        st.textContent = '❌ ONNX失敗'; st.style.color='#ff4858';
+        sessions[p.id] = null;
+      }
+    } else if(metaFile) {
+      st.textContent = '✓ META読込'; st.style.color = '#ffcc44';
+    }
+  });
+});
+
+document.getElementById('start-btn').addEventListener('click', () => {
+  document.getElementById('overlay').style.display='none';
+  // metaから OBS_DIM を確定
+  for(const pid of Object.keys(obsDims)){ OBS_DIM = obsDims[pid]; break; }
+  console.log('OBS_DIM =', OBS_DIM);
+  initAll();
+});
+document.getElementById('skip-btn').addEventListener('click', ()=>{
+  document.getElementById('overlay').style.display='none';
+  initAll();
+});
+
+// ── Default ONNX: ./data/ から自動ロード ──
+document.getElementById('default-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('default-btn');
+  btn.textContent = '読み込み中...';
+  btn.disabled = true;
+
+  const statusEl = document.createElement('p');
+  statusEl.style.cssText = 'font-size:10px;color:#ffcc44;margin-top:6px;font-family:monospace;';
+  btn.parentElement.after(statusEl);
+
+  let anyLoaded = false;
+
+  for(const p of PERSONA_DEFS){
+    const onnxUrl = `./data/persona_${p.id}.onnx`;
+    const metaUrl = `./data/persona_${p.id}_meta.json`;
+    const st = document.getElementById(`status-${p.id}`);
+    statusEl.textContent = `Loading persona_${p.id}.onnx ...`;
+
+    // meta を先に読む
+    try{
+      const metaRes = await fetch(metaUrl);
+      if(metaRes.ok){
+        metaData[p.id] = await metaRes.json();
+        const dim = metaData[p.id].input_size;
+        if(dim) obsDims[p.id] = dim;
+        const idx = PERSONA_DEFS.findIndex(x=>x.id===p.id);
+        if(idx>=0 && metaData[p.id].persona_name)
+          PERSONA_DEFS[idx].name = metaData[p.id].persona_name;
+        if(idx>=0 && metaData[p.id].description)
+          PERSONA_DEFS[idx].desc = metaData[p.id].description;
+      }
+    } catch(e){ /* meta は任意 */ }
+
+    // ONNX を読む
+    try{
+      const onnxRes = await fetch(onnxUrl);
+      if(!onnxRes.ok) throw new Error(`HTTP ${onnxRes.status}`);
+      const buf = await onnxRes.arrayBuffer();
+      sessions[p.id] = await ort.InferenceSession.create(buf, {
+        executionProviders: ['wasm'],
+        graphOptimizationLevel: 'all',
+      });
+      // 推論テスト
+      const dim = obsDims[p.id] || 18;
+      const inputName = sessions[p.id].inputNames[0];
+      const testT = new ort.Tensor('float32', new Float32Array(dim), [1, dim]);
+      await sessions[p.id].run({ [inputName]: testT });
+
+      st.textContent = '✓ ONNX読込';
+      st.style.color = '#00d2a0';
+      anyLoaded = true;
+      console.log(`[${p.id}] Default ONNX loaded: ${onnxUrl}`);
+    } catch(e){
+      st.textContent = `⚠ ${e.message.slice(0,20)}`;
+      st.style.color = '#ffcc44';
+      console.warn(`[${p.id}] ${onnxUrl}: ${e.message}`);
+    }
+  }
+
+  statusEl.remove();
+  for(const pid of Object.keys(obsDims)){ OBS_DIM = obsDims[pid]; break; }
+  document.getElementById('overlay').style.display = 'none';
+
+  if(anyLoaded){
+    console.log('Default ONNX mode started. OBS_DIM =', OBS_DIM);
+  } else {
+    console.warn('No ONNX loaded from ./data/ — running in random mode.');
+  }
+  initAll();
+});
+
+// ============================================================
+// マップ生成
+// ============================================================
+// 有機的グリッドマップ生成
+//   ① 格子道路を敷く
+//   ② 道路の一部をランダム削除 (接続性をBFSで保証)
+//   ③ 削除した道路セグメントにTREE/OTHERを配置
+//   ④ ブロック内に建物・木を配置
+// ============================================================
+function makeMap(size, seed){
+  let s=seed>>>0;
+  const rng=()=>{s=(s*1664525+1013904223)>>>0; return s/0xffffffff};
+  const ri=n=>Math.floor(rng()*n);
+  const pick=a=>a[ri(a.length)];
+
+  const g=Array.from({length:size},()=>new Array(size).fill(OTHER));
+  const step=4;
+  const rows=[], cols=[];
+  for(let i=0;i<size;i+=step){rows.push(i); cols.push(i);}
+
+  // ① 格子道路を全部敷く
+  rows.forEach(r=>{for(let c=0;c<size;c++) g[r][c]=ROAD;});
+  cols.forEach(c=>{for(let r=0;r<size;r++) g[r][c]=ROAD;});
+
+  // ② ブロック内に建物・木を配置
+  for(let ri2=0;ri2<rows.length-1;ri2++){
+    for(let ci=0;ci<cols.length-1;ci++){
+      const r0=rows[ri2]+1, r1=rows[ri2+1];
+      const c0=cols[ci]+1,  c1=cols[ci+1];
+      const cells=[];
+      for(let r=r0;r<r1;r++) for(let c=c0;c<c1;c++) cells.push([r,c]);
+      if(!cells.length) continue;
+      const b=pick(cells); g[b[0]][b[1]]=BUILDING;
+      cells.forEach(([r,c])=>{
+        if(r===b[0]&&c===b[1]) return;
+        const v=rng();
+        if(v<.25) g[r][c]=TREE; else if(v<.45) g[r][c]=BUILDING;
+      });
+    }
+  }
+  // 道路を最終確定
+  rows.forEach(r=>{for(let c=0;c<size;c++) g[r][c]=ROAD;});
+  cols.forEach(c=>{for(let r=0;r<size;r++) g[r][c]=ROAD;});
+
+  // ③ 道路区間の削除候補を作る
+  //    交差点(行・列の交点)は絶対に削除しない
+  //    交差点間の「区間セル」のみ候補にする
+  const isIntersection=(r,c)=>rows.includes(r)&&cols.includes(c);
+
+  // 削除候補: 道路の区間セル (交差点でないROADセル)
+  const candidates=[];
+  for(let r=0;r<size;r++){
+    for(let c=0;c<size;c++){
+      if(g[r][c]===ROAD && !isIntersection(r,c)){
+        candidates.push([r,c]);
+      }
+    }
+  }
+
+  // シャッフル (rngベース)
+  for(let i=candidates.length-1;i>0;i--){
+    const j=ri(i+1);
+    [candidates[i],candidates[j]]=[candidates[j],candidates[i]];
+  }
+
+  // 道路が全て連結しているか確認 (建物BFSではなく道路BFS)
+  // 道路ネットワークが1つに繋がっていれば全建物に到達可能
+  function roadConnected(grid){
+    // 道路セルの1つを起点にする
+    let sr=-1, sc=-1;
+    outer: for(let r=0;r<size;r++) for(let c=0;c<size;c++)
+      if(grid[r][c]===ROAD){ sr=r; sc=c; break outer; }
+    if(sr<0) return true;
+
+    // BFSで道路を全探索
+    const visited=new Set();
+    const queue=[[sr,sc]];
+    visited.add(sr*size+sc);
+    const dirs=[[-1,0],[1,0],[0,-1],[0,1]];
+    while(queue.length){
+      const [r,c]=queue.shift();
+      for(const [dr,dc] of dirs){
+        const nr=r+dr, nc=c+dc;
+        if(nr<0||nr>=size||nc<0||nc>=size) continue;
+        const key=nr*size+nc;
+        if(!visited.has(key) && grid[nr][nc]===ROAD){
+          visited.add(key); queue.push([nr,nc]);
+        }
+      }
+    }
+    // 全道路セルが1つの連結成分に含まれるか
+    for(let r=0;r<size;r++) for(let c=0;c<size;c++)
+      if(grid[r][c]===ROAD && !visited.has(r*size+c)) return false;
+    return true;
+  }
+
+  // ④ 削除の実施 (道路連結性を保ちながら)
+  //    削除率: 30〜55% をランダムに決定
+  const removeRatio = 0.30 + rng()*0.25;
+  const maxRemove = Math.floor(candidates.length * removeRatio);
+  let removed = 0;
+
+  for(const [r,c] of candidates){
+    if(removed >= maxRemove) break;
+
+    // 試しに削除
+    g[r][c] = OTHER;
+
+    // 道路連結チェック (繋がっていれば削除確定)
+    if(roadConnected(g)){
+      g[r][c] = rng()<0.4 ? TREE : OTHER;
+      removed++;
+    } else {
+      // 切断される → 復元
+      g[r][c] = ROAD;
+    }
+  }
+
+  return g;
+}
+
+let MAP=makeMap(GRID,42);
+let BUILDINGS=[];
+let BUILDING_TYPES={};  // {r_c: typeIndex}
+
+// 建物タイプ定義
+// ── 実写テクスチャ 建物タイプ定義 ──
+// テクスチャ画像は ./textures/ フォルダに配置するか
+// 外部URL (Unsplash等) を指定する
+// ローカル配置の場合: python3 -m http.server 8000 が必要
+const BLDG_TYPES = [
+  {
+    label: '🥩 牛丼屋',
+    name:  'gyudon',
+    // 実写テクスチャURL (差し替え可能)
+    // ローカルファイル例: './textures/gyudon.jpg'
+    textureUrl: './textures/3.png',
+    fallbackColor: 0xe8a020,   // テクスチャ読み込み失敗時のフォールバック色
+    height: 1.2,               // 建物の高さ (CELL倍率)
+  },
+  {
+    label: '🍜 ラーメン屋',
+    name:  'ramen',
+    textureUrl: './textures/1.png',
+    fallbackColor: 0xe03030,
+    height: 1.0,
+  },
+  {
+    label: '🍱 弁当屋',
+    name:  'bento',
+    textureUrl: '',
+    fallbackColor: 0x20a020,
+    height: 1.0,
+  },
+  {
+    label: '☕ カフェ',
+    name:  'cafe',
+    textureUrl: '',
+    fallbackColor: 0x8B5E3C,
+    height: 1.2,
+  },
+  {
+    label: '🏢 オフィス',
+    name:  'office',
+    textureUrl: '',
+    fallbackColor: 0x4060a0,
+    height: 3.0,               // オフィスは高層
+  },
+  {
+    label: '🏠 住宅',
+    name:  'house',
+    textureUrl: '',
+    fallbackColor: 0xa06040,
+    height: 1.5,
+  },
+  {
+    label: '🏪 コンビニ',
+    name:  'conbini',
+    textureUrl: './textures/2.png',
+    fallbackColor: 0x20a8e0,
+    height: 1.0,
+  },
+  {
+    label: '🏥 病院',
+    name:  'hospital',
+    textureUrl: '',
+    fallbackColor: 0xe0e0f0,
+    height: 2.0,
+  },
+];
+
+// ── テクスチャローダー ──
+const texLoader    = new THREE.TextureLoader();
+const texCache     = {};   // url → THREE.Texture
+const texLoadingQ  = {};   // url → Promise
+
+function loadTexture(url, fallbackColor) {
+  // キャッシュ済みならそのまま返す
+  if(texCache[url]) return Promise.resolve(texCache[url]);
+  // 読み込み中なら既存のPromiseを返す
+  if(texLoadingQ[url]) return texLoadingQ[url];
+
+  texLoadingQ[url] = new Promise(resolve => {
+    texLoader.load(
+      url,
+      (tex) => {
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(1, 1);
+        texCache[url] = tex;
+        resolve(tex);
+      },
+      undefined,
+      (err) => {
+        // 読み込み失敗 → フォールバック色でソリッドテクスチャを生成
+        console.warn('Texture load failed:', url, err.message);
+        const fb = new THREE.MeshLambertMaterial({ color: fallbackColor });
+        texCache[url] = null;  // null = フォールバック
+        resolve(null);
+      }
+    );
+  });
+  return texLoadingQ[url];
+}
+
+// ── 地面・道路・屋上テクスチャ ──
+const SURFACE_TEXTURES = {
+  // 屋上 (コンクリート・屋根)
+  rooftop: {
+    url: '',
+    repeat: 2,
+    fallback: 0x888888,
+  },
+  // 道路 (アスファルト)
+  road: {
+    url: '',
+    repeat: 1,
+    fallback: 0xb0b4ac,
+  },
+  // OTHER (芝生・草地)
+  grass: {
+    url: '',
+    repeat: 1,
+    fallback: 0x2d6a2d,
+  },
+};
+
+// 全テクスチャを事前ロード (起動時)
+function preloadTextures() {
+  BLDG_TYPES.forEach(bt => {
+    loadTexture(bt.textureUrl, bt.fallbackColor);
+  });
+  Object.values(SURFACE_TEXTURES).forEach(st => {
+    loadTexture(st.url, st.fallback);
+  });
+}
+preloadTextures();
+
+// テクスチャが全部ロードされたらタイルを再描画
+const allUrls = [
+  ...BLDG_TYPES.map(bt => loadTexture(bt.textureUrl, bt.fallbackColor)),
+  ...Object.values(SURFACE_TEXTURES).map(st => loadTexture(st.url, st.fallback)),
+];
+Promise.allSettled(allUrls).then(() => {
+  console.log('[Textures] All loaded, rebuilding tiles...');
+  if(typeof buildTiles === 'function') buildTiles();
+});
+
+// 地面テクスチャからマテリアルを取得
+function getSurfaceMaterial(key) {
+  const st  = SURFACE_TEXTURES[key];
+  const tex = texCache[st.url];
+  if(tex) {
+    const mat = new THREE.MeshLambertMaterial({ map: tex });
+    return mat;
+  }
+  return new THREE.MeshLambertMaterial({ color: st.fallback });
+}
+
+// 建物マテリアルを取得 (6面: 側面=実写, 屋上=コンクリート)
+// BoxGeometry(w, w, h) でZ軸が高さ方向の場合の面順:
+//   index 0: +X (右側面)  UV: u→Z(高さ), v→Y(幅) ← テクスチャが90°回転するため補正が必要
+//   index 1: -X (左側面)  同上
+//   index 2: +Y (前側面)  UV: u→X(幅), v→Z(高さ) ← 向きは正常
+//   index 3: -Y (後側面)  同上
+//   index 4: +Z (上面=屋上) ← Z軸が上の場合の実際の屋上
+//   index 5: -Z (底面)
+function getBuildingMaterial(typeIdx) {
+  const bt      = BLDG_TYPES[typeIdx % BLDG_TYPES.length];
+  const sideTex = texCache[bt.textureUrl];
+  const roofTex = texCache[SURFACE_TEXTURES.rooftop.url];
+
+  // +Y/-Y 面用 (UV向き正常)
+  const sideMat = sideTex
+    ? new THREE.MeshLambertMaterial({ map: sideTex })
+    : new THREE.MeshLambertMaterial({ color: bt.fallbackColor });
+
+  // +X/-X 面用: UVがu→Z, v→Yで90°ずれるためテクスチャを90°回転して補正
+  let sideMatRotated;
+  if (sideTex) {
+    const texRot = sideTex.clone();
+    texRot.needsUpdate = true;
+    texRot.rotation = Math.PI / 2;
+    texRot.center.set(0.5, 0.5);
+    sideMatRotated = new THREE.MeshLambertMaterial({ map: texRot });
+  } else {
+    sideMatRotated = new THREE.MeshLambertMaterial({ color: bt.fallbackColor });
+  }
+
+  const roofMat = roofTex
+    ? new THREE.MeshLambertMaterial({ map: roofTex })
+    : new THREE.MeshLambertMaterial({ color: SURFACE_TEXTURES.rooftop.fallback });
+
+  const bottomMat = new THREE.MeshLambertMaterial({ color: 0x444444 });
+
+  return [
+    sideMatRotated,  // index 0: +X 右側面 (90°回転補正)
+    sideMatRotated,  // index 1: -X 左側面 (90°回転補正)
+    sideMat,         // index 2: +Y 前側面
+    sideMat,         // index 3: -Y 後側面
+    roofMat,         // index 4: +Z 上面 (屋上) ← 実際の屋上
+    bottomMat,       // index 5: -Z 底面
+  ];
+}
+function rebuildBuildings(){
+  BUILDINGS.length=0;
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
+    if(MAP[r][c]===BUILDING)BUILDINGS.push([r,c]);
+}
+rebuildBuildings();
+
+function randB(ex){
+  for(let i=0;i<500;i++){
+    const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];
+    if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];
+  }
+  return[...BUILDINGS[0]];
+}
+
+// ============================================================
+// レイキャスト (DOOM式: 壁ヒットまたは最大距離)
+// ============================================================
+function raycast(x,y,th){
+  return RAY_RAD.map(da=>{
+    const angle=th+da;
+    const dx=Math.cos(angle);
+    const dy=Math.sin(angle);
+    let prevType=MAP[Math.floor(x)][Math.floor(y)];
+    for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
+      const nx=x+dx*d, ny=y+dy*d;
+      const r=Math.floor(nx), c=Math.floor(ny);
+      // マップ外 → 壁としてヒット
+      if(r<0||r>=GRID||c<0||c>=GRID){
+        return{type:OTHER, dist:d, norm:d/RAY_MAX};
+      }
+      const ct=MAP[r][c];
+      // BUILDING または TREE に当たったらヒット
+      if(ct===BUILDING||ct===TREE){
+        return{type:ct, dist:d, norm:d/RAY_MAX};
+      }
+    }
+    // 最大距離まで障害物なし → 遠景として道路色で描画
+    return{type:ROAD, dist:RAY_MAX, norm:1.0};
+  });
+}
+
+// ============================================================
+// Three.js セットアップ
+// ============================================================
+const cont=document.getElementById('c3d');
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio);
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=0.9;
+cont.appendChild(renderer.domElement);
+
+const S=new THREE.Scene();
+S.background=new THREE.Color(0x020406);
+S.fog=new THREE.FogExp2(0x020406,0.0038);
+
+const mainCam=new THREE.PerspectiveCamera(52,1,0.1,1200);
+mainCam.position.set(W*.5,-W*.15,W*1.25);
+mainCam.lookAt(W*.5,W*.5,0);
+
+(()=>{const w=cont.clientWidth,h=cont.clientHeight;
+  renderer.setSize(w,h);mainCam.aspect=w/h;mainCam.updateProjectionMatrix();})();
+window.addEventListener('resize',()=>{
+  const w=cont.clientWidth,h=cont.clientHeight;
+  renderer.setSize(w,h);mainCam.aspect=w/h;mainCam.updateProjectionMatrix();});
+
+S.add(new THREE.AmbientLight(0x0c1a20,2.5));
+const sun=new THREE.DirectionalLight(0xffe8cc,1.6);
+sun.position.set(W*.4,-W*.3,W*.8);sun.castShadow=true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.left=sun.shadow.camera.bottom=-W*.8;
+sun.shadow.camera.right=sun.shadow.camera.top=W*.8;
+sun.shadow.camera.far=1500;S.add(sun);
+
+// タイル
+const MATS={
+  [OTHER]:new THREE.MeshLambertMaterial({color:0x2d6a2d}),   // 芝生 (テクスチャ未ロード時フォールバック)
+  [ROAD]: new THREE.MeshLambertMaterial({color:0x808080}),   // アスファルト (フォールバック)
+  [BUILDING]:new THREE.MeshLambertMaterial({color:0xc42020}),
+  [TREE]: new THREE.MeshLambertMaterial({color:0x236826}),
+};
+const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),
+  new THREE.MeshLambertMaterial({color:0x060a0f}));
+gnd.position.set(W/2,W/2,0);gnd.receiveShadow=true;S.add(gnd);
+
+// タイルを Group で管理 → 丸ごと入れ替え可能
+let tileGroup = new THREE.Group();
+S.add(tileGroup);
+
+function buildTiles(){
+  // 既存タイルを全削除
+  while(tileGroup.children.length){
+    const c=tileGroup.children[0];
+    tileGroup.remove(c);
+    c.geometry && c.geometry.dispose();
+  }
+  // 建物タイプをランダムに割り当て (マップ生成ごと)
+  BUILDING_TYPES = {};
+  const rng = (()=>{ let s=42; return ()=>{ s=(s*1664525+1013904223)>>>0; return s/0xffffffff; }; })();
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(MAP[r][c]===BUILDING){
+      BUILDING_TYPES[r+'_'+c] = Math.floor(rng() * BLDG_TYPES.length);
+    }
+  }
+
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    const t=MAP[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
+    if(t===BUILDING){
+      const typeIdx = BUILDING_TYPES[r+'_'+c] || 0;
+      const bt = BLDG_TYPES[typeIdx % BLDG_TYPES.length];
+      const h = bt.height * CELL;
+      const mat = getBuildingMaterial(typeIdx);
+      const m=new THREE.Mesh(new THREE.BoxGeometry(CELL*.8,CELL*.8,h), mat);
+      m.position.set(cx,cy,h/2);m.castShadow=m.receiveShadow=true;
+      tileGroup.add(m);
+    }else if(t===TREE){
+      const tr=new THREE.Mesh(new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),
+        new THREE.MeshLambertMaterial({color:0x4a3020}));
+      tr.position.set(cx,cy,CELL*.2);tileGroup.add(tr);
+      const cn=new THREE.Mesh(new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),MATS[TREE]);
+      cn.position.set(cx,cy,CELL*.58);cn.castShadow=true;tileGroup.add(cn);
+    }else if(t===ROAD){
+      const mat = getSurfaceMaterial('road');
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.97,CELL*.97),mat);
+      m.position.set(cx,cy,.008);m.receiveShadow=true;tileGroup.add(m);
+    }else{
+      const mat = getSurfaceMaterial('grass');
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.97,CELL*.97),mat);
+      m.position.set(cx,cy,.005);tileGroup.add(m);
+    }
+  }
+}
+buildTiles();
+
+// ============================================================
+// エージェント状態 & メッシュ
+// ============================================================
+let agents=[];       // {x,y,th,gx,gy,trips,viols,steps,def,session,trail[]}
+let agentMeshes=[];
+let showTrail=true;
+let followIdx=0;     // FP視点で追うエージェントのインデックス
+let paused=false,speedMul=1,camMode=0,showFP=false;
+
+function createAgentMesh(color){
+  const body=new THREE.Mesh(
+    new THREE.BoxGeometry(CELL*.3,CELL*.3,CELL*.52),
+    new THREE.MeshLambertMaterial({color}));
+  body.castShadow=true;S.add(body);
+  const head=new THREE.Mesh(
+    new THREE.BoxGeometry(CELL*.22,CELL*.22,CELL*.22),
+    new THREE.MeshLambertMaterial({color:0xffd9aa}));
+  head.position.set(0,0,CELL*.4);body.add(head);
+  const nose=new THREE.Mesh(
+    new THREE.BoxGeometry(CELL*.08,CELL*.08,CELL*.12),
+    new THREE.MeshLambertMaterial({color:0xffffff}));
+  nose.position.set(0,CELL*.18,CELL*.12);body.add(nose);
+  // 名前ラベル (点光源で識別)
+  const pl=new THREE.PointLight(color,1.2,CELL*3);
+  pl.position.set(0,0,CELL*.8);body.add(pl);
+  return body;
+}
+
+function initAll(){
+  // 既存エージェントを削除
+  agents.forEach(a=>{
+    if(a.mesh)S.remove(a.mesh);
+    a.trail.forEach(m=>S.remove(m));
+  });
+  agents=[]; agentMeshes=[];
+
+  // ペルソナカードのUI構築
+  const bar=document.getElementById('persona-bar');
+  bar.innerHTML='';
+
+  PERSONA_DEFS.forEach((def,i)=>{
+    const b=randB(null);
+    const g=randB(b);
+    const session=sessions[def.id]||null;
+
+    const agent={
+      x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,
+      gx:g[0]+0.5,gy:g[1]+0.5,
+      trips:0,viols:0,steps:0,stall:0,
+      def,session,
+      trail:[],active:true,
+      visited:new Set(),
+      explored:0,
+    };
+    agents.push(agent);
+
+    const mesh=createAgentMesh(def.color);
+    mesh.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,CELL*.26);
+    agentMeshes.push(mesh);
+
+    // ペルソナカード
+    const card=document.createElement('div');
+    card.className='p-card active';
+    card.style.borderColor=def.hex+'44';
+    card.innerHTML=`
+      <div class="p-name" style="color:${def.hex}">
+        <span class="p-dot" style="background:${def.hex};display:inline-block;margin-right:5px"></span>
+        [${def.id}] ${def.name}
+      </div>
+      <div class="p-desc">${def.desc}</div>
+      <div class="p-stats">
+        <div class="p-stat"><div class="p-stat-val" id="stat-trips-${def.id}">0</div><div class="p-stat-lbl">Trips</div></div>
+        <div class="p-stat"><div class="p-stat-val" id="stat-viols-${def.id}">0</div><div class="p-stat-lbl">Viols</div></div>
+        <div class="p-stat"><div class="p-stat-val" id="stat-exp-${def.id}">0</div><div class="p-stat-lbl">Cells</div></div>
+        <div class="p-stat"><div class="p-stat-val" style="color:${session?'#00d2a0':'#ff4858'}">${session?'ONNX':'RND'}</div><div class="p-stat-lbl">Mode</div></div>
+      </div>
+    `;
+    card.addEventListener('click',()=>{
+      followIdx=i;
+      document.querySelectorAll('.p-card').forEach((c,j)=>{
+        c.classList.toggle('active',j===i);
+      });
+      document.getElementById('fp-name').textContent=def.name;
+    });
+    bar.appendChild(card);
+  });
+
+  document.getElementById('fp-name').textContent=PERSONA_DEFS[0].name;
+}
+
+// ============================================================
+// 観測生成
+// ============================================================
+function renderFPImage(agent){
+  // ── Pythonの render_fp_batch と同じロジックで FP画像を生成 ──
+  // returns: Float32Array (IMG_CH * IMG_H * IMG_W) = 3*64*64 = 12288
+  const W = IMG_W, H = IMG_H;
+  const buf = new Float32Array(IMG_CH * H * W);
+
+  // レイ角度 (-FOV/2 〜 +FOV/2 を W 等分)
+  for(let xi=0; xi<W; xi++){
+    const rayAngle = agent.th + FP_FOV * (xi / (W-1) - 0.5);
+    const rdx = Math.cos(rayAngle);
+    const rdy = Math.sin(rayAngle);
+
+    let hitType  = -1;
+    let hitDist  = FP_RAY_MAX;
+
+    // レイを飛ばす
+    for(let d=FP_RAY_STEP; d<FP_RAY_MAX; d+=FP_RAY_STEP){
+      const nx = agent.x + rdx * d;
+      const ny = agent.y + rdy * d;
+      const r  = Math.floor(nx), c = Math.floor(ny);
+      if(r<0||r>=GRID||c<0||c>=GRID){
+        hitType=OTHER; hitDist=d; break;
+      }
+      const ct = MAP[r][c];
+      if(ct !== ROAD){
+        hitType=ct; hitDist=d; break;
+      }
+    }
+
+    // 柱の高さ (距離に反比例)
+    const colH = hitType>=0
+      ? Math.min(H * 1.5 / Math.max(hitDist, 0.1), H)
+      : 0;
+    const y0 = Math.floor((H - colH) * 0.5);
+    const y1 = Math.floor(y0 + colH);
+
+    // 距離による明るさ
+    const bright = hitType>=0
+      ? Math.max(0.15, 1.0 - hitDist / FP_RAY_MAX)
+      : 0;
+
+    // 壁の色
+    const rgb = hitType>=0 ? FP_CELL_RGB[hitType] : [0,0,0];
+
+    // 各ピクセル行を塗る
+    for(let yi=0; yi<H; yi++){
+      let r_val, g_val, b_val;
+      if(yi >= y0 && yi < y1){
+        // 壁
+        r_val = rgb[0] / 255 * bright;
+        g_val = rgb[1] / 255 * bright;
+        b_val = rgb[2] / 255 * bright;
+      } else if(yi < H * 0.5){
+        // 空
+        r_val = FP_SKY_RGB[0]   / 255;
+        g_val = FP_SKY_RGB[1]   / 255;
+        b_val = FP_SKY_RGB[2]   / 255;
+      } else {
+        // 地面
+        r_val = FP_FLOOR_RGB[0] / 255;
+        g_val = FP_FLOOR_RGB[1] / 255;
+        b_val = FP_FLOOR_RGB[2] / 255;
+      }
+      // CHW形式で格納 (Pythonのtorch.Tensorと同じ並び)
+      const pixIdx = yi * W + xi;
+      buf[0 * H * W + pixIdx] = r_val;
+      buf[1 * H * W + pixIdx] = g_val;
+      buf[2 * H * W + pixIdx] = b_val;
+    }
+  }
+  return buf;
+}
+
+// ── セグメンテーション通行可能判定 ──
+async function isPassableViaSeg(agent) {
+  if(!USE_SEG_PASS || !segSession || !window.dinoReady) return null;
+  try {
+    // FPV画像を生成
+    const fpBuf  = renderFPImage(agent);
+    const imgData= fpChwToImageData(fpBuf, IMG_W, IMG_H);
+
+    // DINOv2 で Patch tokens を取得
+    const result = await window.dinoExtractor(imgData, {
+      pooling: 'none',   // CLS + Patch tokens 両方取得
+      normalize: true
+    });
+    // Patch tokens: shape (1, N_PATCHES+1, DINO_DIM) → [1:] でCLSを除く
+    const allTokens = result.data;
+    const dinoD     = segMeta.dino_dim   || 384;
+    const nPatches  = segMeta.n_patches  || 256;
+    // CLS tokenを除いたPatch tokens (N_PATCHES × DINO_DIM)
+    const patchFlat = new Float32Array(nPatches * dinoD);
+    for(let p=0; p<nPatches; p++){
+      for(let d=0; d<dinoD; d++){
+        patchFlat[p*dinoD+d] = allTokens[(p+1)*dinoD+d];  // +1 でCLSをスキップ
+      }
+    }
+
+    // seg_head.onnx に渡す: input shape (1, N_PATCHES, DINO_DIM)
+    const segIn   = new ort.Tensor('float32', patchFlat, [1, nPatches, dinoD]);
+    const inName  = segSession.inputNames[0];
+    const outName = segSession.outputNames[0];
+    const segOut  = await segSession.run({ [inName]: segIn });
+    const logits  = segOut[outName].data;  // (1 * N_SEG * H * W)
+
+    // 前方中央ピクセル (H/2, W/2) のクラスを取得
+    const nSeg= segMeta.n_classes || 5;
+    const H   = segMeta.img_h     || 224;
+    const W   = segMeta.img_w     || 224;
+    const cy  = Math.floor(H/2);
+    const cx  = Math.floor(W/2);
+    let maxLogit = -Infinity, predCls = 0;
+    for(let cls=0; cls<nSeg; cls++){
+      const val = logits[cls*H*W + cy*W + cx];
+      if(val > maxLogit){ maxLogit=val; predCls=cls; }
+    }
+
+    return (predCls === SEG_OPEN_ID);  // open → 通行可能
+  } catch(e) {
+    console.warn('[SegPass]', e.message);
+    return null;   // エラー時はフォールバック
+  }
+}
+
+// CHW形式のFloat32Array → ImageData (DINOv2入力用)
+function fpChwToImageData(chw, w, h) {
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  for(let i=0; i<w*h; i++){
+    rgba[i*4+0] = Math.min(255, chw[0*h*w+i] * 255);  // R
+    rgba[i*4+1] = Math.min(255, chw[1*h*w+i] * 255);  // G
+    rgba[i*4+2] = Math.min(255, chw[2*h*w+i] * 255);  // B
+    rgba[i*4+3] = 255;
+  }
+  return new ImageData(rgba, w, h);
+}
+
+function getObs(agent){
+  return renderFPImage(agent);
+}
+
+// ============================================================
+// 行動選択
+// ============================================================
+async function selectAction(agent){
+  if(agent.session){
+    try{
+      let lg;
+
+      if(window.dinoReady && window.dinoExtractor){
+        // ── DINOv2パス ──
+        // FPV画像をImageDataに変換してDINOv2に渡す
+        const fpBuf = renderFPImage(agent);   // Float32Array CHW
+        const imgData = fpChwToImageData(fpBuf, IMG_W, IMG_H);
+
+        // DINOv2で特徴抽出 (CLS token 384次元)
+        const result = await window.dinoExtractor(imgData, { pooling:'cls', normalize:true });
+        const feat = new Float32Array(result.data);  // (384,)
+
+        // FC+Actor ONNX に渡す (入力: 384次元)
+        const dim = obsDims[agent.def.id] || 384;
+        const inputName  = agent.session.inputNames[0];
+        const outputName = agent.session.outputNames[0];
+        const t = new ort.Tensor('float32', feat, [1, dim]);
+        const out = await agent.session.run({[inputName]: t});
+        lg = Array.from(out[outputName].data);
+
+      } else {
+        // ── CNNフォールバックパス ──
+        const obs = getObs(agent);
+        const dim = obsDims[agent.def.id]||(IMG_CH*IMG_H*IMG_W);
+        const inputName  = agent.session.inputNames[0];
+        const outputName = agent.session.outputNames[0];
+        const t = new ort.Tensor('float32', obs, [1, dim]);
+        const out = await agent.session.run({[inputName]: t});
+        lg = Array.from(out[outputName].data);
+      }
+      const mx=Math.max(...lg);
+      const ex=lg.map(v=>Math.exp(v-mx));
+      const sm=ex.reduce((a,b)=>a+b,0);
+      const pr=ex.map(v=>v/sm);
+      let rv=Math.random();
+      for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}
+      return 0;
+    }catch(e){return Math.floor(Math.random()*3);}
+  }
+  // ランダム (前進バイアス付き)
+  const rays=raycast(agent.x,agent.y,agent.th);
+  return (rays[2].type===ROAD&&Math.random()<0.55)?0:(Math.random()<0.5?1:2);
+}
+
+// ============================================================
+// トレイル
+// ============================================================
+const trailMats={};
+PERSONA_DEFS.forEach(p=>{
+  trailMats[p.id]=new THREE.MeshBasicMaterial({
+    color:p.color,transparent:true,opacity:0.28,depthWrite:false});
+});
+
+function addTrail(agent,idx){
+  if(!showTrail)return;
+  const m=new THREE.Mesh(
+    new THREE.PlaneGeometry(CELL*.2,CELL*.2),trailMats[agent.def.id]);
+  m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
+  S.add(m);agent.trail.push(m);
+  if(agent.trail.length>50){S.remove(agent.trail.shift());}
+}
+function clearAllTrails(){
+  agents.forEach(a=>{a.trail.forEach(m=>S.remove(m));a.trail=[];});
+}
+
+// ============================================================
+// シミュレーション 1 ステップ
+// ============================================================
+async function stepAll(){
+  if(paused)return;
+  for(let i=0;i<agents.length;i++){
+    const a=agents[i];
+    if(!a.active)continue;
+    const prevX=a.x, prevY=a.y;
+    const action=await selectAction(a);
+    if(action===1)a.th-=ROT;
+    else if(action===2)a.th+=ROT;
+    a.th=(a.th+Math.PI*2)%(Math.PI*2);
+
+    if(action===0){
+      const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*MOVE));
+      const ny=Math.max(0.01,Math.min(GRID-0.01,a.y+Math.sin(a.th)*MOVE));
+      const r=Math.max(0,Math.min(GRID-1,Math.floor(nx)));
+      const c=Math.max(0,Math.min(GRID-1,Math.floor(ny)));
+
+      // ── 移動判定: セグメンテーション or マップ配列 ──
+      let canMove = false;
+      if(USE_SEG_PASS){
+        const segPass = await isPassableViaSeg(a);
+        if(segPass !== null){
+          canMove = segPass;   // セグメンテーション判定
+        } else {
+          canMove = PASSABLE.has(MAP[r][c]);  // エラー時フォールバック
+        }
+      } else {
+        canMove = PASSABLE.has(MAP[r][c]);   // 従来のマップ配列判定
+      }
+
+      if(canMove){
+        a.x=nx;a.y=ny;
+        const key=`${r},${c}`;
+        if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
+        addTrail(a,i);
+      }else{
+        a.viols++;
+      }
+    }
+
+    a.steps++;
+    // stall カウンタ更新 (観測[17]用)
+    const moved=(Math.abs(a.x-prevX)+Math.abs(a.y-prevY))>0.05;
+    a.stall = moved ? 0 : Math.min(a.stall+1, 10);
+    const dist=Math.sqrt((a.x-a.gx)**2+(a.y-a.gy)**2);
+    if(dist<0.8){
+      a.trips++;
+      const g=randB([Math.floor(a.x),Math.floor(a.y)]);
+      a.gx=g[0]+0.5;a.gy=g[1]+0.5;
+    }
+
+    // カード更新
+    document.getElementById(`stat-trips-${a.def.id}`).textContent=a.trips;
+    document.getElementById(`stat-viols-${a.def.id}`).textContent=a.viols;
+    document.getElementById(`stat-exp-${a.def.id}`).textContent=a.explored;
+  }
+}
+
+// ============================================================
+// FP ビュー描画
+// ============================================================
+const fpCanvas=document.getElementById('fp-canvas');
+const fpCtx=fpCanvas.getContext('2d');
+
+// キャンバスのピクセルサイズを CSS サイズに合わせて初期化・更新
+function resizeFpCanvas(){
+  const rect=fpCanvas.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  const w=Math.max(rect.width,240)*dpr;
+  const h=Math.max(rect.height,150)*dpr;
+  if(fpCanvas.width!==w||fpCanvas.height!==h){
+    fpCanvas.width=w;
+    fpCanvas.height=h;
+  }
+}
+const CT_COLORS={
+  [OTHER]:'#0c1e4a',[ROAD]:'#b0b4ac',[BUILDING]:'#c42020',[TREE]:'#236826'
+};
+
+function drawFP(){
+  if(!showFP) return;
+  const a=agents[followIdx];
+  if(!a) return;
+
+  resizeFpCanvas();
+  const w=fpCanvas.width, h=fpCanvas.height;
+  if(w===0||h===0) return;
+
+  const rays=raycast(a.x, a.y, a.th);
+  const N=rays.length;
+  const cw=w/N;
+
+  // ── 背景: 空 (上半分) ──
+  const sky=fpCtx.createLinearGradient(0,0,0,h*0.5);
+  sky.addColorStop(0,'#080e18'); sky.addColorStop(1,'#121e2c');
+  fpCtx.fillStyle=sky; fpCtx.fillRect(0,0,w,h*0.5);
+
+  // ── 背景: 道路/地面 (下半分) ──
+  const gnd=fpCtx.createLinearGradient(0,h*0.5,0,h);
+  gnd.addColorStop(0,'#1a1e1a'); gnd.addColorStop(1,'#0a0e0a');
+  fpCtx.fillStyle=gnd; fpCtx.fillRect(0,h*0.5,w,h*0.5);
+
+  // ── DOOM式レイキャスト柱 ──
+  for(let i=0;i<N;i++){
+    const ray=rays[i];
+
+    // 道路(最大距離)は柱なし → 空/地面のみ見える
+    if(ray.type===ROAD) continue;
+
+    // 距離に反比例した柱の高さ (近いほど大きい)
+    // dist=0.15 → colH≈h, dist=6.0 → colH≈h*0.04
+    const dist=Math.max(ray.dist, 0.1);
+    const colH=Math.min((h * 1.5) / dist, h);
+    const y0=(h-colH)*0.5;
+    const x0=i*cw;
+
+    // 距離による明るさ (遠いほど暗い)
+    const bright=Math.max(0.15, 1.0 - ray.dist/RAY_MAX);
+
+    // セルタイプ別の基本色
+    let baseHex=CT_COLORS[ray.type]||'#888888';
+    const base=parseInt(baseHex.slice(1),16);
+    const rv=Math.min(255,Math.round(((base>>16)&0xff)*bright));
+    const gv=Math.min(255,Math.round(((base>>8) &0xff)*bright));
+    const bv=Math.min(255,Math.round(( base     &0xff)*bright));
+
+    fpCtx.fillStyle=`rgb(${rv},${gv},${bv})`;
+    fpCtx.fillRect(x0, y0, cw+1, colH);
+
+    // 上端に明るいハイライト (立体感)
+    fpCtx.fillStyle=`rgba(255,255,255,${bright*0.15})`;
+    fpCtx.fillRect(x0, y0, cw+1, Math.max(2, colH*0.04));
+  }
+
+  // ── ミニマップ風の足元セル表示 ──
+  const footR=Math.floor(a.x), footC=Math.floor(a.y);
+  if(footR>=0&&footR<GRID&&footC>=0&&footC<GRID){
+    const ft=MAP[footR][footC];
+    const ftNames={[ROAD]:'ROAD',[BUILDING]:'BLDG',[TREE]:'TREE',[OTHER]:'OUT'};
+    fpCtx.fillStyle='rgba(0,0,0,0.5)';
+    fpCtx.fillRect(4,4,52,16);
+    fpCtx.fillStyle=CT_COLORS[ft]||'#fff';
+    fpCtx.font=`bold ${Math.round(h*0.08)}px monospace`;
+    fpCtx.textAlign='left';
+    fpCtx.fillText(ftNames[ft]||'?', 6, 16);
+  }
+
+  // ── 照準 ──
+  const col=a.def.hex;
+  fpCtx.strokeStyle=col+'dd';
+  fpCtx.lineWidth=Math.max(1.5, w/320);
+  fpCtx.beginPath();
+  fpCtx.moveTo(w*0.5-12,h*0.5); fpCtx.lineTo(w*0.5+12,h*0.5);
+  fpCtx.moveTo(w*0.5,h*0.5-12); fpCtx.lineTo(w*0.5,h*0.5+12);
+  fpCtx.stroke();
+  // 照準中心の点
+  fpCtx.fillStyle=col;
+  fpCtx.beginPath();
+  fpCtx.arc(w*0.5,h*0.5,2,0,Math.PI*2);
+  fpCtx.fill();
+
+  // ── ゴール方向コンパス ──
+  const dx2=a.gx-a.x, dy2=a.gy-a.y;
+  const worldAng=Math.atan2(dy2,dx2);
+  const relAng=worldAng-a.th;
+  const arLen=Math.min(w,h)*0.14;
+  const arX=w*0.5+Math.sin(relAng)*arLen;
+  const arY=h*0.5-Math.cos(relAng)*arLen;
+
+  // 矢印の線
+  fpCtx.strokeStyle=col;
+  fpCtx.lineWidth=2.5;
+  fpCtx.beginPath();
+  fpCtx.moveTo(w*0.5, h*0.5);
+  fpCtx.lineTo(arX, arY);
+  fpCtx.stroke();
+
+  // ゴールラベル (外周に寄せる)
+  const lblX=w*0.5+Math.sin(relAng)*(arLen+10);
+  const lblY=h*0.5-Math.cos(relAng)*(arLen+10);
+  fpCtx.fillStyle=col;
+  fpCtx.font=`bold ${Math.round(h*0.075)}px monospace`;
+  fpCtx.textAlign='center';
+  fpCtx.textBaseline='middle';
+  fpCtx.fillText('▶GOAL', lblX, lblY);
+  fpCtx.textBaseline='alphabetic';
+
+  // ── ペルソナ名 (右上) ──
+  fpCtx.fillStyle='rgba(0,0,0,0.55)';
+  fpCtx.fillRect(w-90,4,86,18);
+  fpCtx.fillStyle=col;
+  fpCtx.font=`${Math.round(h*0.08)}px monospace`;
+  fpCtx.textAlign='right';
+  fpCtx.fillText(a.def.name, w-6, 17);
+}
+
+// ============================================================
+// Three.js ループ
+// ============================================================
+let lastT=0,camAngle=0;
+
+function updateMeshes(dt){
+  agents.forEach((a,i)=>{
+    const tx=a.y*CELL+CELL*.5,ty=a.x*CELL+CELL*.5;
+    const m=agentMeshes[i];
+    m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
+    m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
+    m.position.z=CELL*.26+Math.sin(Date.now()*.003+i*1.3)*.05;
+    const tar=-a.th+Math.PI*.5;
+    let dr=tar-m.rotation.z;
+    while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
+    m.rotation.z+=dr*Math.min(1,dt*14);
+  });
+}
+
+function updateCamera(dt){
+  if(camMode===0){
+    // 俯瞰: 固定位置
+    mainCam.position.set(W*.5, -W*.15, W*1.25);
+    mainCam.up.set(0,1,0);
+    mainCam.lookAt(W*.5, W*.5, 0);
+  } else {
+    // Orbit: 地面を常に下にして水平回転
+    // 仰角(elevation)を固定し、方位角(azimuth)だけ変化させる
+    camAngle += dt * 0.06;
+    const elevation = Math.PI / 6;   // 30度の仰角 (地面が常に下)
+    const radius    = W * 1.0;
+    const cx = W * 0.5;
+    const cy = W * 0.5;
+
+    // 水平面上の位置 + 一定の高さ
+    const px = cx + Math.cos(camAngle) * radius * Math.cos(elevation);
+    const py = cy + Math.sin(camAngle) * radius * Math.cos(elevation);
+    const pz = radius * Math.sin(elevation);
+
+    mainCam.position.set(px, py, pz);
+    // up ベクトルを常に世界のZ軸方向(上)に固定
+    mainCam.up.set(0, 0, 1);
+    mainCam.lookAt(cx, cy, 0);
+  }
+}
+
+function animate(t){
+  requestAnimationFrame(animate);
+  const dt=Math.min((t-lastT)/1000,.1);lastT=t;
+  updateMeshes(dt);updateCamera(dt);
+  drawFP();       // リサイズは drawFP 内の resizeFpCanvas() で実行
+  renderer.render(S,mainCam);
+}
+requestAnimationFrame(animate);
+
+function addLog(msg,cls){
+  const b=document.getElementById('log-box')||document.body;
+  console.log(`[${cls||''}] ${msg}`);
+}
+
+setInterval(async()=>{
+  for(let s=0;s<speedMul;s++) await stepAll();
+},TICK);
+
+// ============================================================
+// コントロール
+// ============================================================
+document.getElementById('b-pause').addEventListener('click',function(){
+  paused=!paused;this.textContent=paused?'Resume':'Pause';
+  this.classList.toggle('on',!paused);
+});
+document.getElementById('b-reset').addEventListener('click',()=>{
+  clearAllTrails();initAll();
+});
+document.getElementById('b-speed').addEventListener('click',function(){
+  const ss=[1,2,4],ll=['×1','×2','×4'];
+  speedMul=ss[(ss.indexOf(speedMul)+1)%3];
+  this.textContent=ll[ss.indexOf(speedMul)];
+});
+document.getElementById('b-cam').addEventListener('click',function(){
+  camMode=(camMode+1)%2;
+  this.textContent=camMode===0?'俯瞰':'Orbit';
+  this.classList.toggle('on',camMode===0);
+});
+document.getElementById('b-trail').addEventListener('click',function(){
+  showTrail=!showTrail;
+  this.textContent=showTrail?'Trail':'No Trail';
+  this.classList.toggle('on',showTrail);
+  if(!showTrail)clearAllTrails();
+});
+
+document.getElementById('b-newmap').addEventListener('click',function(){
+  // ランダムシードで新しいマップを生成
+  const seed = Math.floor(Math.random()*100000);
+
+  // MAPを更新
+  MAP = makeMap(GRID, seed);
+  rebuildBuildings();
+
+  // 3Dタイルを再構築
+  buildTiles();
+
+  // エージェントをリセット (新マップの建物上に配置)
+  clearAllTrails();
+  initAll();
+
+  addLog(`New map (seed:${seed})`, 'hi');
+  console.log(`New map generated. seed=${seed} buildings=${BUILDINGS.length}`);
+});
+document.getElementById('b-fp').addEventListener('click',function(){
+  showFP=!showFP;
+  this.textContent=showFP?'FP ON':'FP View';
+  this.classList.toggle('on',showFP);
+  document.getElementById('fp-wrap').style.display=showFP?'block':'none';
+  if(showFP){
+    // 表示直後にサイズを確定させてから描画
+    requestAnimationFrame(()=>{ resizeFpCanvas(); drawFP(); });
+  }
+});
+</script>
+</body>
+</html>

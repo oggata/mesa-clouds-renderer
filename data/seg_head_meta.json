@@ -1,0 +1,47 @@
+{
+  "classes": [
+    "sky",
+    "ground",
+    "open",
+    "building",
+    "tree"
+  ],
+  "n_classes": 5,
+  "dino_model": "dinov2_vits14",
+  "dino_dim": 384,
+  "n_patches": 256,
+  "patch_size": 14,
+  "img_w": 224,
+  "img_h": 224,
+  "input_name": "patch_tokens",
+  "output_name": "seg_logits",
+  "best_miou": 0.955731716997002,
+  "seg_colors": {
+    "0": [
+      135,
+      206,
+      235
+    ],
+    "1": [
+      26,
+      40,
+      32
+    ],
+    "2": [
+      80,
+      80,
+      80
+    ],
+    "3": [
+      196,
+      32,
+      32
+    ],
+    "4": [
+      35,
+      104,
+      40
+    ]
+  },
+  "open_class_id": 2
+}

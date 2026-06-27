@@ -32,11 +32,14 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 100;
-const HEIGHT = parseInt(process.env.HEIGHT) || 100;
+const WIDTH  = parseInt(process.env.WIDTH)  || 200;
+const HEIGHT = parseInt(process.env.HEIGHT) || 200;
 const FPS    = parseInt(process.env.FPS)    || 12;
 const JPEG_Q = parseInt(process.env.JPEG_Q) || 70;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
+// 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
+// seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
+const SEG_GATE = process.env.SEG_GATE === '1';
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
@@ -135,61 +138,263 @@ function renderFPImage(map,agent){
 }
 
 // ─── ONNX ────────────────────────────────────────────────────────────────────
-const ortSessions={}, obsDims={};
+// 観測方式は persona meta の input_size で決まる:
+//   12288 (= img_w*img_h*img_ch)  → 旧CNN方式: 生FPV画像をそのままヘッドへ (persona E)
+//   384 / 392                     → DINOv2方式: 224画像→DINOv2→CLS(384)[+建物分類8]→ヘッド
+// DINOv2本体 (dinov2_vits14.onnx) と seg_head / building_classifier は
+// 全ペルソナで共有する1セッションとしてロードする (メモリ最小化)。
+const ortSessions={}, obsDims={}, personaMeta={};
+let dinoSession=null, segSession=null, bldgSession=null, segMeta=null;
+let dinoIn='image', dinoClsOut='cls', dinoPatchOut='patch';
+let segIn='patch_tokens', segOut=null, bldgIn='dino_feat', bldgOut=null;
+const inferErrLogged={};        // ペルソナごと: フォールバック警告を1回だけ出す
+const segPassCache={};          // ペルソナごと: seg による前方通行可否 (キャッシュ)
+
+// 共有 ONNX (DINOv2 / seg_head / building_classifier) をロード
+async function loadSharedSessions(){
+  if(!ort) return;
+  const dinoPath=path.join(__dirname,'data','dinov2_vits14.onnx');
+  if(fs.existsSync(dinoPath)){
+    try{
+      dinoSession=await ort.InferenceSession.create(dinoPath,{executionProviders:['cpu']});
+      dinoIn=dinoSession.inputNames[0];
+      // 出力名: cls / patch を名前で拾い、無ければ順番で割り当て
+      const outs=dinoSession.outputNames;
+      dinoClsOut=outs.find(n=>/cls/i.test(n))||outs[0];
+      dinoPatchOut=outs.find(n=>/patch/i.test(n))||outs[1]||outs[0];
+      console.log(`[ONNX] dinov2_vits14 OK  in=${dinoIn} out=${outs.join(',')}`);
+    }catch(e){console.warn('[ONNX] dinov2 load failed:',e.message);dinoSession=null;}
+  }else{
+    console.warn('[ONNX] dinov2_vits14.onnx not found — DINOv2系ペルソナはランダムにフォールバック');
+  }
+  const segPath=path.join(__dirname,'data','seg_head.onnx');
+  const segMetaPath=path.join(__dirname,'data','seg_head_meta.json');
+  if(fs.existsSync(segPath)){
+    try{
+      segSession=await ort.InferenceSession.create(segPath,{executionProviders:['cpu']});
+      segIn=segSession.inputNames[0]; segOut=segSession.outputNames[0];
+      segMeta=fs.existsSync(segMetaPath)?JSON.parse(fs.readFileSync(segMetaPath,'utf8')):{open_class_id:2,n_classes:5};
+      console.log(`[ONNX] seg_head OK  open_class_id=${segMeta.open_class_id}`);
+    }catch(e){console.warn('[ONNX] seg_head load failed:',e.message);segSession=null;}
+  }
+  const bldgPath=path.join(__dirname,'data','building_classifier.onnx');
+  if(fs.existsSync(bldgPath)){
+    try{
+      bldgSession=await ort.InferenceSession.create(bldgPath,{executionProviders:['cpu']});
+      bldgIn=bldgSession.inputNames[0]; bldgOut=bldgSession.outputNames[0];
+      console.log(`[ONNX] building_classifier OK`);
+    }catch(e){console.warn('[ONNX] building_classifier load failed:',e.message);bldgSession=null;}
+  }
+}
+
 async function loadOnnxSessions(){
   if(!ort)return;
+  await loadSharedSessions();
   for(const p of PERSONA_DEFS){
     const op=path.join(__dirname,'data',`persona_${p.id}.onnx`);
     const mp=path.join(__dirname,'data',`persona_${p.id}_meta.json`);
-    if(fs.existsSync(mp)){try{const m=JSON.parse(fs.readFileSync(mp,'utf8'));if(m.input_size)obsDims[p.id]=m.input_size;}catch(e){}}
+    if(fs.existsSync(mp)){
+      try{
+        const m=JSON.parse(fs.readFileSync(mp,'utf8'));
+        if(m.input_size)obsDims[p.id]=m.input_size;
+        const iw=m.img_w||IMG_W, ih=m.img_h||IMG_H, ic=m.img_ch||IMG_CH;
+        const isize=m.input_size||(iw*ih*ic);
+        const div=v=>v/255;
+        personaMeta[p.id]={
+          inputSize: isize,
+          dino: isize!==iw*ih*ic,             // 生画像サイズと違う → DINOv2方式
+          cfg:{
+            w:iw, h:ih,
+            fov:(m.fov_deg||60)*Math.PI/180,
+            rayMax:m.ray_max||FP_RAY_MAX,
+            rayStep:FP_RAY_STEP,
+            cell:(m.cell_rgb||[[12,30,74],[176,180,172],[196,32,32],[35,104,40]]).map(c=>c.map(div)),
+            sky:(m.sky_rgb||FP_SKY_RGB).map(div),
+            floor:(m.floor_rgb||FP_FLOOR_RGB).map(div),
+          },
+        };
+      }catch(e){console.warn(`[Meta] persona_${p.id}:`,e.message);}
+    }
     if(fs.existsSync(op)){
       try{
         ortSessions[p.id]=await ort.InferenceSession.create(op,{executionProviders:['cpu']});
         const dim=obsDims[p.id]||(IMG_CH*IMG_H*IMG_W);
         const nm=ortSessions[p.id].inputNames[0];
         await ortSessions[p.id].run({[nm]:new ort.Tensor('float32',new Float32Array(dim),[1,dim])});
-        console.log(`[ONNX] persona_${p.id} OK`);
+        const mode=personaMeta[p.id]&&personaMeta[p.id].dino?`DINOv2(${dim})`:`CNN(${dim})`;
+        console.log(`[ONNX] persona_${p.id} OK  ${mode}`);
       }catch(e){console.warn(`[ONNX] persona_${p.id}:`,e.message);ortSessions[p.id]=null;}
     }
   }
+}
+
+// ─── 224 FPV レンダリング (学習時 render_fp_batch と一致) ─────────────────────
+// CHW [0,1] の Float32Array を返す。逐次推論前提でサイズ別バッファを再利用する。
+const _renderBufs={};
+function getRenderBuf(w,h){
+  const k=w+'x'+h;
+  if(!_renderBufs[k]) _renderBufs[k]=new Float32Array(3*h*w);
+  return _renderBufs[k];
+}
+// ── レイキャスタ用テクスチャ (学習と同じ 64×64・BLDG_TYPES順) ──
+const RC_TW=64, RC_TH=64;
+let rcTex=[], rcTexReady=false;
+async function loadRaycastTextures(){
+  if(!sharp){ console.warn('[Raycast] sharp 無し → テクスチャ観測不可'); return; }
+  rcTex=new Array(BLDG_TYPES.length).fill(null);
+  await Promise.all(BLDG_TYPES.map(async (bt,i)=>{
+    const fp=path.join(__dirname, bt.textureFile);
+    if(!fs.existsSync(fp)) return;
+    try{
+      const {data}=await sharp(fp).resize(RC_TW,RC_TH,{fit:'fill'}).removeAlpha().raw().toBuffer({resolveWithObject:true});
+      const f=new Float32Array(RC_TW*RC_TH*3);
+      for(let k=0;k<f.length;k++) f[k]=data[k]/255;
+      rcTex[i]=f;
+    }catch(e){ console.warn(`[Raycast] tex ${bt.name}:`,e.message); }
+  }));
+  rcTexReady = rcTex.length>0 && rcTex.every(t=>t);
+  console.log(`[Raycast] textures ${rcTex.filter(t=>t).length}/${BLDG_TYPES.length} loaded  ready=${rcTexReady}`);
+}
+
+// テクスチャ付きDDAレイキャスタ (学習 render_fp_batch と一致)。返り値 CHW [0,1]。
+// 壁=建物セルのみ (BUILDING_TYPES でタイプ決定)。木/空地/道路は通過。
+function renderFPImageCfg(map, agent, cfg){
+  const W=cfg.w, H=cfg.h, HW=H*W;
+  const sky=cfg.sky, fl=cfg.floor, FOV=cfg.fov;
+  const buf=getRenderBuf(W,H);
+  // 背景: 上半分=空 / 下半分=地面
+  for(let yi=0;yi<H;yi++){
+    const col=(yi<H*0.5)?sky:fl;
+    for(let xi=0;xi<W;xi++){ const pi=yi*W+xi; buf[pi]=col[0]; buf[HW+pi]=col[1]; buf[2*HW+pi]=col[2]; }
+  }
+  if(!rcTexReady) return buf;   // テクスチャ未ロード → 背景のみ
+  const dirX=Math.cos(agent.th), dirY=Math.sin(agent.th);
+  const pl=Math.tan(FOV/2), planeX=-dirY*pl, planeY=dirX*pl;
+  for(let x=0;x<W;x++){
+    const cam=2*x/W-1;
+    const rdx=dirX+planeX*cam, rdy=dirY+planeY*cam;
+    let mapX=Math.floor(agent.x), mapY=Math.floor(agent.y);
+    const ddx=rdx===0?1e30:Math.abs(1/rdx), ddy=rdy===0?1e30:Math.abs(1/rdy);
+    let stepX,stepY,sdx,sdy;
+    if(rdx<0){stepX=-1;sdx=(agent.x-mapX)*ddx;}else{stepX=1;sdx=(mapX+1-agent.x)*ddx;}
+    if(rdy<0){stepY=-1;sdy=(agent.y-mapY)*ddy;}else{stepY=1;sdy=(mapY+1-agent.y)*ddy;}
+    let hit=-1, side=0, g=0;
+    while(g++<64){
+      if(sdx<sdy){sdx+=ddx;mapX+=stepX;side=0;}else{sdy+=ddy;mapY+=stepY;side=1;}
+      if(mapX<0||mapX>=GRID||mapY<0||mapY>=GRID) break;
+      if(map[mapX][mapY]===BUILDING){ const ti=BUILDING_TYPES[mapX+'_'+mapY]; hit=(ti==null?0:ti); break; }
+    }
+    if(hit<0) continue;
+    const tex=rcTex[hit % rcTex.length]; if(!tex) continue;
+    const perp=Math.max(1e-4, side===0?(sdx-ddx):(sdy-ddy));
+    const lineH=H/perp;
+    const dsC=Math.min(H-1, Math.max(0, -lineH/2+H/2));
+    const deC=Math.min(H-1, Math.max(0,  lineH/2+H/2));
+    let wallX=side===0?agent.y+perp*rdy:agent.x+perp*rdx; wallX-=Math.floor(wallX);
+    let texXi=Math.floor(wallX*RC_TW);
+    if((side===0&&rdx>0)||(side===1&&rdy<0)) texXi=RC_TW-1-texXi;
+    if(texXi<0)texXi=0; if(texXi>=RC_TW)texXi=RC_TW-1;
+    const br=Math.min(1.0, Math.max(0.35, 1.0-perp/9));
+    for(let yi=Math.ceil(dsC); yi<=deC; yi++){
+      let texYi=Math.floor((yi-dsC)/lineH*RC_TH);
+      if(texYi<0)texYi=0; if(texYi>=RC_TH)texYi=RC_TH-1;
+      const ti=(texYi*RC_TW+texXi)*3, pi=yi*W+x;
+      buf[pi]=tex[ti]*br; buf[HW+pi]=tex[ti+1]*br; buf[2*HW+pi]=tex[ti+2]*br;
+    }
+  }
+  return buf;
+}
+
+function sampleLogits(lg){
+  const mx=Math.max(...lg), ex=lg.map(v=>Math.exp(v-mx));
+  const sm=ex.reduce((a,b)=>a+b,0), pr=ex.map(v=>v/sm);
+  let rv=Math.random();
+  for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}
+  return 0;
+}
+
+// 前進バイアス付きランダム (ONNX未ロード/失敗時のフォールバック)
+function biasedRandom(map, agent){
+  const fwd=(()=>{
+    const dx=Math.cos(agent.th), dy=Math.sin(agent.th);
+    for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
+      const r=Math.floor(agent.x+dx*d), c=Math.floor(agent.y+dy*d);
+      if(r<0||r>=GRID||c<0||c>=GRID) return ROAD;
+      const ct=map[r][c]; if(ct===BUILDING||ct===TREE) return ct;
+    }
+    return ROAD;
+  })();
+  return (fwd===ROAD && Math.random()<0.55) ? 0 : (Math.random()<0.5?1:2);
+}
+
+// seg_head: DINOv2 patch tokens → セグメンテーション → 前方中央が open か
+async function computeSegPassable(patchTensor){
+  const so=await segSession.run({[segIn]:patchTensor});
+  const t=so[segOut], dims=t.dims, data=t.data;        // (1, C, H, W)
+  const C=dims[1], H=dims[2], W=dims[3];
+  const cy=H>>1, cx=W>>1, base=cy*W+cx, plane=H*W;
+  let best=-Infinity, cls=0;
+  for(let k=0;k<C;k++){ const v=data[k*plane+base]; if(v>best){best=v;cls=k;} }
+  return cls===(segMeta?segMeta.open_class_id:2);
 }
 
 // 推論結果キャッシュ (エージェントごと)
 const actionCache = {};
 
 async function inferAction(map, agent){
-  const sess=ortSessions[agent.def.id];
-  if(sess){
-    try{
-      const obs=renderFPImage(map,agent);
-      const dim=obsDims[agent.def.id]||(IMG_CH*IMG_H*IMG_W);
-      const nm=sess.inputNames[0],on=sess.outputNames[0];
-      const out=await sess.run({[nm]:new ort.Tensor('float32',obs,[1,dim])});
-      const lg=Array.from(out[on].data);
-      const mx=Math.max(...lg),ex=lg.map(v=>Math.exp(v-mx)),sm=ex.reduce((a,b)=>a+b,0),pr=ex.map(v=>v/sm);
-      let rv=Math.random();for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}return 0;
-    }catch(e){return Math.floor(Math.random()*3);}
-  }
-  // ランダム (前進バイアス)
-  const rays=[0,1,2,3,4].map(i=>{
-    const angle=agent.th+(i-2)*Math.PI/3,dx=Math.cos(angle),dy=Math.sin(angle);
-    for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
-      const r=Math.floor(agent.x+dx*d),c=Math.floor(agent.y+dy*d);
-      if(r<0||r>=GRID||c<0||c>=GRID)return{type:OTHER,dist:d};
-      const ct=map[r][c];if(ct===BUILDING||ct===TREE)return{type:ct,dist:d};
+  const id=agent.def.id;
+  const sess=ortSessions[id];
+  if(!sess) return biasedRandom(map, agent);
+  const meta=personaMeta[id];
+  try{
+    if(meta && meta.dino){
+      if(!dinoSession) return biasedRandom(map, agent);   // DINOv2未ロード
+      // 224画像 → DINOv2 → CLS(384) + patch(256,384)
+      const img=renderFPImageCfg(map, agent, meta.cfg);
+      const di=await dinoSession.run({[dinoIn]:new ort.Tensor('float32', img, [1,3,meta.cfg.h,meta.cfg.w])});
+      const cls=di[dinoClsOut];
+
+      // ヘッド入力: CLSのみ(384) か CLS+建物分類(392)
+      let inData=cls.data, inDim=cls.data.length;
+      if(meta.inputSize>cls.data.length && bldgSession){
+        const bo=await bldgSession.run({[bldgIn]:new ort.Tensor('float32', cls.data, [1, cls.data.length])});
+        const bl=bo[bldgOut].data;
+        const bmx=Math.max(...bl), bex=Array.from(bl).map(v=>Math.exp(v-bmx));
+        const bsm=bex.reduce((a,b)=>a+b,0), probs=bex.map(v=>v/bsm);
+        inDim=cls.data.length+probs.length;
+        const cat=new Float32Array(inDim);
+        cat.set(cls.data,0); cat.set(probs, cls.data.length);
+        inData=cat;
+      }
+      const ho=await sess.run({[sess.inputNames[0]]:new ort.Tensor('float32', inData, [1, inDim])});
+      const lg=Array.from(ho[sess.outputNames[0]].data);
+
+      // seg による前方通行可否を更新 (使う場合のみ)
+      if(segSession){
+        try{ segPassCache[id]=await computeSegPassable(di[dinoPatchOut]); }
+        catch(e){ segPassCache[id]=true; }
+      }
+      return sampleLogits(lg);
     }
-    return{type:ROAD,dist:RAY_MAX};
-  });
-  return (rays[2].type===ROAD&&Math.random()<0.55)?0:(Math.random()<0.5?1:2);
+
+    // 旧CNN方式 (生FPV画像をそのままヘッドへ)
+    const obs=renderFPImage(map, agent);
+    const dim=(meta&&meta.inputSize)||(IMG_CH*IMG_H*IMG_W);
+    const out=await sess.run({[sess.inputNames[0]]:new ort.Tensor('float32', obs, [1, dim])});
+    return sampleLogits(Array.from(out[sess.outputNames[0]].data));
+  }catch(e){
+    if(!inferErrLogged[id]){ console.warn(`[Infer] persona_${id} → フォールバック:`, e.message); inferErrLogged[id]=true; }
+    return biasedRandom(map, agent);
+  }
 }
 
 let stepCount = 0;
 async function prefetchAllActions(map, agents){
   if(stepCount % INFER_EVERY !== 0) return;
-  await Promise.all(agents.map(async a=>{
-    const action = await inferAction(map, a);
-    actionCache[a.def.id] = action;
-  }));
+  // 逐次実行: DINOv2/seg のピークメモリを抑えつつ描画バッファを再利用できる
+  for(const a of agents){
+    actionCache[a.def.id] = await inferAction(map, a);
+  }
 }
 
 function selectAction(agent){
@@ -319,6 +524,67 @@ function disposeScene(S){
   });
 }
 
+// ─── ジオメトリマージ用ヘルパー ───────────────────────────────────────────────
+// three の CJS ビルドには BufferGeometryUtils が含まれない (examples/jsm は ESM)
+// ため、非インデックス BufferGeometry の position(+uv) を連結する軽量版を自前で持つ。
+
+// フラットな正方形タイル (道路/地面) を2三角形=6頂点ぶん配列に追加する。
+function pushQuad(arr, size, tx, ty, z){
+  const h=size/2, x0=tx-h, x1=tx+h, y0=ty-h, y1=ty+h;
+  arr.push(
+    x0,y0,z,  x1,y0,z,  x1,y1,z,   // +Z を向く CCW 巻き
+    x0,y0,z,  x1,y1,z,  x0,y1,z
+  );
+}
+function quadMesh(posArr, color){
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posArr), 3));
+  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({color}));
+}
+
+// 複数の非インデックス geometry を1つに連結 (position 必須, uv は任意)。
+function mergeGeos(geos, includeUV){
+  let posLen=0, uvLen=0;
+  for(const g of geos){
+    posLen += g.attributes.position.array.length;
+    if(includeUV) uvLen += g.attributes.uv.array.length;
+  }
+  const pos=new Float32Array(posLen);
+  const uv = includeUV ? new Float32Array(uvLen) : null;
+  let po=0, uo=0;
+  for(const g of geos){
+    const pa=g.attributes.position.array; pos.set(pa, po); po+=pa.length;
+    if(includeUV){ const ua=g.attributes.uv.array; uv.set(ua, uo); uo+=ua.length; }
+  }
+  const m=new THREE.BufferGeometry();
+  m.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  if(includeUV) m.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return m;
+}
+
+// BoxGeometry の1面 (groups[i]) を切り出し、(tx,ty,tz) 平行移動した
+// 非インデックス geometry を返す。box の UV をそのまま使うので、
+// material 側のテクスチャ回転/反転 (getBuildingMaterial) の見た目を保持できる。
+function extractFace(boxGeo, group, tx, ty, tz){
+  const idx=boxGeo.index.array;
+  const P=boxGeo.attributes.position.array;
+  const U=boxGeo.attributes.uv.array;
+  const n=group.count;
+  const pos=new Float32Array(n*3), uv=new Float32Array(n*2);
+  for(let k=0;k<n;k++){
+    const vi=idx[group.start+k];
+    pos[k*3]   = P[vi*3]   + tx;
+    pos[k*3+1] = P[vi*3+1] + ty;
+    pos[k*3+2] = P[vi*3+2] + tz;
+    uv[k*2]    = U[vi*2];
+    uv[k*2+1]  = U[vi*2+1];
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return g;
+}
+
 function buildScene(map){
   buildingMatCache = {};
   BUILDING_TYPES = {};
@@ -331,28 +597,57 @@ function buildScene(map){
   S.add(new THREE.AmbientLight(0xffffff,1.0));
   const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshBasicMaterial({color:0x060a0f}));
   gnd.position.set(W/2,W/2,0);S.add(gnd);
+
+  // セルごとに個別メッシュを作らず、種類ごとに集約して最後にマージする。
+  // これでマップ部分のドローコール/ジオメトリ数が ~900 → 数十に減る。
+  const roadPos=[], groundPos=[];
+  const trunkGeos=[], coneGeos=[];
+  const trunkBaseNI=new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4).toNonIndexed();
+  const coneBaseNI =new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45).toNonIndexed();
+  const boxGeoByH={};                 // 高さ別 BoxGeometry (面抽出用・indexed)
+  const bldgFaces={};                 // typeIdx -> [面0..5 ごとの geometry 配列]
+
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     const t=map[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
     if(t===BUILDING){
       const typeIdx=BUILDING_TYPES[r+'_'+c]||0;
       const bt=BLDG_TYPES[typeIdx%BLDG_TYPES.length];
       const h=bt.height*CELL;
-      const mat=getBuildingMaterial(typeIdx);
-      const m=new THREE.Mesh(new THREE.BoxGeometry(CELL*.8,CELL*.8,h),mat);
-      m.position.set(cx,cy,h/2);S.add(m);
+      if(!boxGeoByH[h]) boxGeoByH[h]=new THREE.BoxGeometry(CELL*.8,CELL*.8,h);
+      const bg=boxGeoByH[h];
+      if(!bldgFaces[typeIdx]) bldgFaces[typeIdx]=[[],[],[],[],[],[]];
+      for(const grp of bg.groups){
+        bldgFaces[typeIdx][grp.materialIndex].push(extractFace(bg,grp,cx,cy,h/2));
+      }
     }else if(t===TREE){
-      const tr=new THREE.Mesh(new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),new THREE.MeshBasicMaterial({color:0x4a3020}));
-      tr.position.set(cx,cy,CELL*.2);S.add(tr);
-      const cn=new THREE.Mesh(new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),new THREE.MeshBasicMaterial({color:0x236826}));
-      cn.position.set(cx,cy,CELL*.58);S.add(cn);
+      const g1=trunkBaseNI.clone(); g1.translate(cx,cy,CELL*.2); trunkGeos.push(g1);
+      const g2=coneBaseNI.clone();  g2.translate(cx,cy,CELL*.58); coneGeos.push(g2);
     }else if(t===ROAD){
-      const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.97,CELL*.97),new THREE.MeshBasicMaterial({color:0x555555}));
-      m.position.set(cx,cy,.008);S.add(m);
+      pushQuad(roadPos, CELL*.97, cx, cy, .008);
     }else{
-      const m=new THREE.Mesh(new THREE.PlaneGeometry(CELL*.97,CELL*.97),new THREE.MeshBasicMaterial({color:0x1a3020}));
-      m.position.set(cx,cy,.005);S.add(m);
+      pushQuad(groundPos, CELL*.97, cx, cy, .005);
     }
   }
+
+  // ── マージ済みメッシュを追加 ──
+  if(roadPos.length)   S.add(quadMesh(roadPos,   0x555555));
+  if(groundPos.length) S.add(quadMesh(groundPos, 0x1a3020));
+  if(trunkGeos.length) S.add(new THREE.Mesh(mergeGeos(trunkGeos,false), new THREE.MeshBasicMaterial({color:0x4a3020})));
+  if(coneGeos.length)  S.add(new THREE.Mesh(mergeGeos(coneGeos, false), new THREE.MeshBasicMaterial({color:0x236826})));
+
+  // 建物は (タイプ × 面) 単位でマージ → 1建物6ドローコールが、1タイプ最大6に。
+  for(const typeIdx of Object.keys(bldgFaces)){
+    const mats=getBuildingMaterial(Number(typeIdx));
+    const faces=bldgFaces[typeIdx];
+    for(let i=0;i<6;i++){
+      if(faces[i].length) S.add(new THREE.Mesh(mergeGeos(faces[i],true), mats[i]));
+    }
+  }
+
+  // 一時 geometry (GPU 未アップロード) は GC 任せでよいが、明示的に解放しておく。
+  trunkBaseNI.dispose(); coneBaseNI.dispose();
+  for(const h in boxGeoByH) boxGeoByH[h].dispose();
+
   return S;
 }
 
@@ -453,7 +748,13 @@ async function stepAll(){
       const ny=Math.max(0.01,Math.min(GRID-0.01,a.y+Math.sin(a.th)*MOVE));
       const r=Math.max(0,Math.min(GRID-1,Math.floor(nx)));
       const c=Math.max(0,Math.min(GRID-1,Math.floor(ny)));
-      if(PASSABLE.has(MAP[r][c])){
+      // 通行判定: 既定は実マップ配列(=前方セルが道路/建物か)。確実で、
+      // 学習時(マップ配列で通行判定)とも一致するため「seg誤判定で止まる」を防ぐ。
+      // SEG_GATE=1 かつ seg_head ありのときだけ seg 判定を使う。
+      const meta=personaMeta[a.def.id];
+      const useSeg = SEG_GATE && segSession && meta && meta.dino;
+      const passable = useSeg ? (segPassCache[a.def.id] ?? true) : PASSABLE.has(MAP[r][c]);
+      if(passable){
         a.x=nx;a.y=ny;
         const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
         addTrail(scene,a);
@@ -638,6 +939,7 @@ function startLoops(){
 
   console.log('[Init] preloading textures...');
   await preloadTextures();
+  await loadRaycastTextures();   // エージェント観測(FPV)用の64×64テクスチャ
 
   console.log('[Init] building scene...');
   scene = buildScene(MAP);
