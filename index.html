@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>MESA PERSONA CITY — Standalone</title>
+<style>
+  :root{
+    --bg:#eaf2f7; --panel:rgba(255,255,255,.72); --border:rgba(40,70,90,.25);
+    --text:#243a44; --dim:#5f7a86; --accent:#1f9e8a; --warn:#e0a020;
+    --mono:'SFMono-Regular',Consolas,'Liberation Mono',monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{width:100%;height:100%;background:var(--bg);color:var(--text);overflow:hidden;font-family:var(--mono);}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg);}
+  canvas{display:block;box-shadow:0 8px 40px rgba(40,70,90,.18);border-radius:6px;}
+
+  /* ── loading overlay ── */
+  #overlay{position:fixed;inset:0;background:rgba(234,242,247,.97);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:500;}
+  #overlay h1{font-size:18px;font-weight:900;color:var(--accent);letter-spacing:.2em;}
+  .spinner{width:40px;height:40px;border:3px solid #cfe0e6;border-top-color:var(--accent);
+    border-radius:50%;animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #overMsg{font-size:11px;color:var(--dim);letter-spacing:.05em;max-width:80vw;text-align:center;}
+  #overBar{width:240px;height:6px;background:#d3e1e7;border-radius:3px;overflow:hidden;}
+  #overBarFill{height:100%;width:0;background:var(--accent);transition:width .25s;}
+
+  /* ── badges / controls ── */
+  #status-badge{position:fixed;top:12px;left:12px;display:flex;align-items:center;gap:7px;
+    font-size:10px;color:var(--dim);background:var(--panel);border:1px solid var(--border);
+    border-radius:5px;padding:5px 10px;backdrop-filter:blur(6px);z-index:300;}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--warn);}
+  .dot.ok{background:var(--accent);box-shadow:0 0 8px var(--accent);}
+
+  #cam-badge{position:fixed;top:12px;right:12px;font-size:11px;color:var(--accent);
+    background:var(--panel);border:1px solid var(--border);border-radius:5px;
+    padding:5px 12px;backdrop-filter:blur(6px);z-index:300;font-weight:700;}
+
+  #ctrl{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);display:flex;gap:6px;z-index:300;}
+  button{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:5px;
+    padding:7px 12px;font-family:var(--mono);font-size:11px;cursor:pointer;backdrop-filter:blur(6px);}
+  button:hover{border-color:var(--accent);color:var(--accent);}
+  button.on{border-color:var(--accent);color:var(--accent);}
+
+  #thought-box{position:fixed;bottom:54px;left:50%;transform:translateX(-50%);
+    max-width:min(440px,84vw);background:var(--panel);border:1px solid var(--border);
+    border-radius:8px;padding:10px 14px;backdrop-filter:blur(6px);z-index:300;display:none;}
+  #thought-persona{font-size:11px;font-weight:700;margin-bottom:3px;}
+  #thought-text{font-size:11px;color:var(--text);line-height:1.6;min-height:1.2em;}
+  .thought-cursor{display:inline-block;width:6px;height:11px;background:var(--accent);
+    vertical-align:middle;animation:blink 1s step-end infinite;}
+  @keyframes blink{50%{opacity:0}}
+
+  #dbg{position:fixed;bottom:12px;right:12px;font-size:9px;color:var(--dim);
+    background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:6px 8px;
+    max-width:46vw;z-index:300;display:none;line-height:1.6;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="scene"></canvas></div>
+
+<div id="overlay">
+  <h1>MESA PERSONA CITY</h1>
+  <div class="spinner"></div>
+  <div id="overMsg">INITIALIZING…</div>
+  <div id="overBar"><div id="overBarFill"></div></div>
+</div>
+
+<div id="status-badge"><div class="dot" id="connDot"></div><span id="connText">LOADING</span></div>
+<div id="cam-badge">📷 Overview</div>
+
+<div id="ctrl">
+  <button id="b-pause" class="on">Pause</button>
+  <button id="b-reset">Reset</button>
+  <button id="b-speed">×1</button>
+  <button id="b-newmap">🎲 New Map</button>
+</div>
+
+<div id="thought-box">
+  <div id="thought-persona"></div>
+  <div id="thought-text"><span class="thought-cursor"></span></div>
+</div>
+<div id="dbg"></div>
+
+<!-- THREE.js (overview rendering) + onnxruntime-web (DINOv2 + persona policy) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"></script>
+<script>
+'use strict';
+// ════════════════════════════════════════════════════════════════════════════
+//  MESA Persona City — クライアント単独版
+//  server.js と同一のポリシー/観測パイプラインをブラウザ内で実行する。
+//   FP描画(224×224 テクスチャ付きレイキャスタ) → dinov2_vits14.onnx → CLS(384)
+//   → persona_X.onnx(head) → logits(3) → サンプリング
+//  ※ server.js から忠実移植。重い計算(DINOv2)はクライアント側で動く。
+// ════════════════════════════════════════════════════════════════════════════
+
+const params   = new URLSearchParams(location.search);
+const IS_DEBUG = params.get('debug') === '1';
+const IS_ADMIN = params.get('admin') === '1';
+if(IS_DEBUG) document.getElementById('dbg').style.display='block';
+if(!IS_ADMIN) document.getElementById('ctrl').style.display='none';
+
+function dbg(msg){
+  if(!IS_DEBUG)return;
+  const el=document.getElementById('dbg');
+  const ts=new Date().toISOString().slice(11,23);
+  el.insertAdjacentHTML('beforeend',`<div><span style="color:#9bb">${ts}</span> ${msg}</div>`);
+  while(el.children.length>12)el.removeChild(el.firstChild);
+}
+function setOverlay(msg,pct){
+  document.getElementById('overMsg').textContent=msg;
+  if(pct!=null) document.getElementById('overBarFill').style.width=Math.round(pct*100)+'%';
+}
+function setStatus(t,ok){
+  document.getElementById('connText').textContent=t;
+  document.getElementById('connDot').className='dot'+(ok?' ok':'');
+}
+
+// ─── Sim 定数 (server.js と一致) ──────────────────────────────────────────────
+const GRID=30, CELL=2.0, TICK=300, INFER_EVERY=10;
+const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
+const PASSABLE=new Set([ROAD, BUILDING]);
+const MOVE=0.25, ROT=Math.PI/9;
+const RAY_MAX=6.0, RAY_STEP=0.15;          // biasedRandom 用
+const W=GRID*CELL;
+const FP_SKY_RGB=[6,12,20], FP_FLOOR_RGB=[26,40,32];
+
+const PERSONA_DEFS=[
+  { id:'A', name:'Explorer Rex',     color:0xff3355, hex:'#ff3355', desc:'Actively explores new areas' },
+  { id:'B', name:'Homebody Lily',    color:0x00ccff, hex:'#00ccff', desc:'Takes the shortest route' },
+  { id:'C', name:'Social Marco',     color:0x33ff88, hex:'#33ff88', desc:'Gathers near others' },
+  { id:'D', name:'Businessman Cole', color:0xffee00, hex:'#ffee00', desc:'Moves straight, efficiency first' },
+  { id:'E', name:'Tourist Elena',    color:0xff7700, hex:'#ff7700', desc:'Wanders around buildings' },
+];
+const PERSONA_THOUGHTS={
+  'Explorer Rex':     'Found a new area... heading somewhere unexplored......',
+  'Homebody Lily':    'Calculating shortest path... almost there......',
+  'Social Marco':     'Someone must be nearby... let me get a little closer......',
+  'Businessman Cole': 'No time to waste... selecting the most efficient route......',
+  'Tourist Elena':    'That building looks interesting... where should I explore next......',
+};
+
+// ─── 建物タイプ定義 (server.js と一致) ────────────────────────────────────────
+const BLDG_TYPES=[
+  { name:'gyudon',   textureFile:'./textures/50x80/gyudon.png',   fallbackColor:0xe8a020, height:1.6 },
+  { name:'ramen',    textureFile:'./textures/50x80/ramen.png',    fallbackColor:0xe03030, height:1.6 },
+  { name:'bento',    textureFile:'./textures/50x50/bento.png',    fallbackColor:0x20a020, height:1.0 },
+  { name:'cafe',     textureFile:'./textures/50x80/cafe.png',     fallbackColor:0x8B5E3C, height:1.6 },
+  { name:'office',   textureFile:'./textures/50x120/office.png',  fallbackColor:0x4060a0, height:2.4 },
+  { name:'house',    textureFile:'./textures/50x80/house.png',    fallbackColor:0xa06040, height:1.6 },
+  { name:'conbini',  textureFile:'./textures/50x50/conbini.png',  fallbackColor:0x20a8e0, height:1.0 },
+  { name:'hospital', textureFile:'./textures/50x80/hospital.png', fallbackColor:0xe0e0f0, height:1.6 },
+];
+let BUILDING_TYPES={};   // "r_c" -> typeIdx (buildScene で割当・renderFPImageCfg と共有)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  マップ生成 (server.js makeMap と完全一致)
+// ════════════════════════════════════════════════════════════════════════════
+function makeMap(size, seed){
+  let s=seed>>>0;
+  const rng=()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff};
+  const ri=n=>Math.floor(rng()*n);
+  const pick=a=>a[ri(a.length)];
+  const g=Array.from({length:size},()=>new Array(size).fill(OTHER));
+  const step=4, rows=[], cols=[];
+  for(let i=0;i<size;i+=step){rows.push(i);cols.push(i);}
+  rows.forEach(r=>{for(let c=0;c<size;c++)g[r][c]=ROAD;});
+  cols.forEach(c=>{for(let r=0;r<size;r++)g[r][c]=ROAD;});
+  for(let ri2=0;ri2<rows.length-1;ri2++){
+    for(let ci=0;ci<cols.length-1;ci++){
+      const r0=rows[ri2]+1,r1=rows[ri2+1],c0=cols[ci]+1,c1=cols[ci+1];
+      const cells=[];
+      for(let r=r0;r<r1;r++)for(let c=c0;c<c1;c++)cells.push([r,c]);
+      if(!cells.length)continue;
+      const b=pick(cells);g[b[0]][b[1]]=BUILDING;
+      cells.forEach(([r,c])=>{
+        if(r===b[0]&&c===b[1])return;
+        const v=rng();
+        if(v<.25)g[r][c]=TREE;else if(v<.45)g[r][c]=BUILDING;
+      });
+    }
+  }
+  rows.forEach(r=>{for(let c=0;c<size;c++)g[r][c]=ROAD;});
+  cols.forEach(c=>{for(let r=0;r<size;r++)g[r][c]=ROAD;});
+  const isX=(r,c)=>rows.includes(r)&&cols.includes(c);
+  const cands=[];
+  for(let r=0;r<size;r++)for(let c=0;c<size;c++)
+    if(g[r][c]===ROAD&&!isX(r,c))cands.push([r,c]);
+  for(let i=cands.length-1;i>0;i--){const j=ri(i+1);[cands[i],cands[j]]=[cands[j],cands[i]];}
+  function roadOK(grid){
+    let sr=-1,sc=-1;
+    outer:for(let r=0;r<size;r++)for(let c=0;c<size;c++)if(grid[r][c]===ROAD){sr=r;sc=c;break outer;}
+    if(sr<0)return true;
+    const vis=new Set(),q=[[sr,sc]];vis.add(sr*size+sc);
+    const D=[[-1,0],[1,0],[0,-1],[0,1]];
+    while(q.length){const[r,c]=q.shift();for(const[dr,dc]of D){const nr=r+dr,nc=c+dc;if(nr<0||nr>=size||nc<0||nc>=size)continue;const k=nr*size+nc;if(!vis.has(k)&&grid[nr][nc]===ROAD){vis.add(k);q.push([nr,nc]);}}}
+    for(let r=0;r<size;r++)for(let c=0;c<size;c++)if(grid[r][c]===ROAD&&!vis.has(r*size+c))return false;
+    return true;
+  }
+  const maxRm=Math.floor(cands.length*(0.30+rng()*0.25));let rm=0;
+  for(const[r,c]of cands){if(rm>=maxRm)break;g[r][c]=OTHER;if(roadOK(g)){g[r][c]=rng()<0.4?TREE:OTHER;rm++;}else g[r][c]=ROAD;}
+  return g;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  テクスチャ読み込み
+// ════════════════════════════════════════════════════════════════════════════
+const RC_TW=64, RC_TH=64;
+let rcTex=[], rcTexReady=false;        // レイキャスタ用 (64×64 RGB [0,1])
+const overviewTex={};                  // 俯瞰表示用 THREE.Texture
+
+function loadImage(src){
+  return new Promise((res,rej)=>{
+    const im=new Image(); im.crossOrigin='anonymous';
+    im.onload=()=>res(im); im.onerror=()=>rej(new Error('img '+src)); im.src=src;
+  });
+}
+
+// レイキャスタ用: PNG を 64×64 RGB Float32 [0,1] に。失敗時は fallbackColor で塗りつぶす。
+async function loadRaycastTextures(){
+  const cv=document.createElement('canvas'); cv.width=RC_TW; cv.height=RC_TH;
+  const cx=cv.getContext('2d',{willReadFrequently:true});
+  rcTex=new Array(BLDG_TYPES.length);
+  for(let i=0;i<BLDG_TYPES.length;i++){
+    const bt=BLDG_TYPES[i];
+    const f=new Float32Array(RC_TW*RC_TH*3);
+    try{
+      const im=await loadImage(bt.textureFile);
+      cx.clearRect(0,0,RC_TW,RC_TH); cx.drawImage(im,0,0,RC_TW,RC_TH);
+      const d=cx.getImageData(0,0,RC_TW,RC_TH).data;
+      for(let k=0;k<RC_TW*RC_TH;k++){ f[k*3]=d[k*4]/255; f[k*3+1]=d[k*4+1]/255; f[k*3+2]=d[k*4+2]/255; }
+    }catch(e){
+      const r=((bt.fallbackColor>>16)&255)/255, g=((bt.fallbackColor>>8)&255)/255, b=(bt.fallbackColor&255)/255;
+      for(let k=0;k<RC_TW*RC_TH;k++){ f[k*3]=r; f[k*3+1]=g; f[k*3+2]=b; }
+      dbg('raycast tex fallback: '+bt.name);
+    }
+    rcTex[i]=f;
+  }
+  rcTexReady=true;
+}
+
+// 俯瞰表示用: THREE.Texture を読み込む (失敗は無視 → fallbackColor マテリアル)
+async function loadOverviewTextures(){
+  const loader=new THREE.TextureLoader();
+  await Promise.all(BLDG_TYPES.map(bt=>new Promise(res=>{
+    loader.load(bt.textureFile, t=>{
+      t.wrapS=t.wrapT=THREE.RepeatWrapping; t.flipY=true; overviewTex[bt.textureFile]=t; res();
+    }, undefined, ()=>{ overviewTex[bt.textureFile]=null; res(); });
+  })));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  FP観測レンダリング (server.js renderFPImageCfg と一致) — DINOv2 入力
+// ════════════════════════════════════════════════════════════════════════════
+const _renderBufs={};
+function getRenderBuf(w,h){ const k=w+'x'+h; if(!_renderBufs[k])_renderBufs[k]=new Float32Array(3*h*w); return _renderBufs[k]; }
+
+function renderFPImageCfg(map, agent, cfg){
+  const Wc=cfg.w, Hc=cfg.h, HW=Hc*Wc;
+  const sky=cfg.sky, fl=cfg.floor, FOV=cfg.fov;
+  const buf=getRenderBuf(Wc,Hc);
+  for(let yi=0;yi<Hc;yi++){
+    const col=(yi<Hc*0.5)?sky:fl;
+    for(let xi=0;xi<Wc;xi++){ const pi=yi*Wc+xi; buf[pi]=col[0]; buf[HW+pi]=col[1]; buf[2*HW+pi]=col[2]; }
+  }
+  if(!rcTexReady) return buf;
+  const dirX=Math.cos(agent.th), dirY=Math.sin(agent.th);
+  const pl=Math.tan(FOV/2), planeX=-dirY*pl, planeY=dirX*pl;
+  for(let x=0;x<Wc;x++){
+    const cam=2*x/Wc-1;
+    const rdx=dirX+planeX*cam, rdy=dirY+planeY*cam;
+    let mapX=Math.floor(agent.x), mapY=Math.floor(agent.y);
+    const ddx=rdx===0?1e30:Math.abs(1/rdx), ddy=rdy===0?1e30:Math.abs(1/rdy);
+    let stepX,stepY,sdx,sdy;
+    if(rdx<0){stepX=-1;sdx=(agent.x-mapX)*ddx;}else{stepX=1;sdx=(mapX+1-agent.x)*ddx;}
+    if(rdy<0){stepY=-1;sdy=(agent.y-mapY)*ddy;}else{stepY=1;sdy=(mapY+1-agent.y)*ddy;}
+    let hit=-1, side=0, g=0;
+    while(g++<64){
+      if(sdx<sdy){sdx+=ddx;mapX+=stepX;side=0;}else{sdy+=ddy;mapY+=stepY;side=1;}
+      if(mapX<0||mapX>=GRID||mapY<0||mapY>=GRID) break;
+      if(map[mapX][mapY]===BUILDING){ const ti=BUILDING_TYPES[mapX+'_'+mapY]; hit=(ti==null?0:ti); break; }
+    }
+    if(hit<0) continue;
+    const tex=rcTex[hit % rcTex.length]; if(!tex) continue;
+    const perp=Math.max(1e-4, side===0?(sdx-ddx):(sdy-ddy));
+    const lineH=Hc/perp;
+    const dsC=Math.min(Hc-1, Math.max(0, -lineH/2+Hc/2));
+    const deC=Math.min(Hc-1, Math.max(0,  lineH/2+Hc/2));
+    let wallX=side===0?agent.y+perp*rdy:agent.x+perp*rdx; wallX-=Math.floor(wallX);
+    let texXi=Math.floor(wallX*RC_TW);
+    if((side===0&&rdx>0)||(side===1&&rdy<0)) texXi=RC_TW-1-texXi;
+    if(texXi<0)texXi=0; if(texXi>=RC_TW)texXi=RC_TW-1;
+    const br=Math.min(1.0, Math.max(0.35, 1.0-perp/9));
+    for(let yi=Math.ceil(dsC); yi<=deC; yi++){
+      let texYi=Math.floor((yi-dsC)/lineH*RC_TH);
+      if(texYi<0)texYi=0; if(texYi>=RC_TH)texYi=RC_TH-1;
+      const ti=(texYi*RC_TW+texXi)*3, pi=yi*Wc+x;
+      buf[pi]=tex[ti]*br; buf[HW+pi]=tex[ti+1]*br; buf[2*HW+pi]=tex[ti+2]*br;
+    }
+  }
+  return buf;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ONNX セッション (DINOv2 + persona heads)
+// ════════════════════════════════════════════════════════════════════════════
+let dinoSession=null, dinoIn='image', dinoClsOut='cls';
+const ortSessions={}, personaMeta={};
+
+async function loadONNX(progress){
+  ort.env.wasm.wasmPaths='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+  const EP_DINO=['webgpu','wasm'], EP_HEAD=['wasm'];
+
+  // DINOv2 本体 (自己ホスト 88MB)。webgpu があれば高速。
+  // 重みは外部データ (dinov2_vits14.onnx.data) なので externalData を明示する。
+  setOverlay('Loading DINOv2 (≈88MB, first time only)…', progress(0));
+  try{
+    dinoSession=await ort.InferenceSession.create('./data/dinov2_vits14.onnx',{
+      executionProviders:EP_DINO,
+      externalData:[{ path:'dinov2_vits14.onnx.data', data:'./data/dinov2_vits14.onnx.data' }],
+    });
+    dinoIn=dinoSession.inputNames[0];
+    dinoClsOut=dinoSession.outputNames.find(n=>/cls/i.test(n))||dinoSession.outputNames[0];
+    dbg('dinov2 in='+dinoIn+' out='+dinoSession.outputNames.join(','));
+  }catch(e){ console.warn('[DINOv2] load failed:',e); dinoSession=null; }
+
+  // persona heads + meta
+  for(let i=0;i<PERSONA_DEFS.length;i++){
+    const p=PERSONA_DEFS[i];
+    setOverlay(`Loading persona ${p.id}…`, progress((i+1)/(PERSONA_DEFS.length+1)));
+    try{
+      const m=await fetch(`./data/persona_${p.id}_meta.json`).then(r=>r.ok?r.json():null);
+      if(m){
+        personaMeta[p.id]={
+          inputSize:m.input_size,
+          dino:m.input_size!==(m.img_w*m.img_h*m.img_ch),
+          cfg:{ w:m.img_w, h:m.img_h, fov:(m.fov_deg||60)*Math.PI/180,
+                sky:FP_SKY_RGB.map(v=>v/255), floor:FP_FLOOR_RGB.map(v=>v/255) },
+        };
+      }
+      ortSessions[p.id]=await ort.InferenceSession.create(`./data/persona_${p.id}.onnx`,{executionProviders:EP_HEAD});
+    }catch(e){ console.warn(`[persona ${p.id}] load failed:`,e); ortSessions[p.id]=null; }
+  }
+}
+
+// ─── 推論 ─────────────────────────────────────────────────────────────────────
+function sampleLogits(lg){
+  const mx=Math.max(...lg), ex=lg.map(v=>Math.exp(v-mx));
+  const sm=ex.reduce((a,b)=>a+b,0), pr=ex.map(v=>v/sm);
+  let rv=Math.random();
+  for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}
+  return 0;
+}
+function biasedRandom(map, agent){
+  const dx=Math.cos(agent.th), dy=Math.sin(agent.th);
+  let fwd=ROAD;
+  for(let d=RAY_STEP;d<RAY_MAX;d+=RAY_STEP){
+    const r=Math.floor(agent.x+dx*d), c=Math.floor(agent.y+dy*d);
+    if(r<0||r>=GRID||c<0||c>=GRID){fwd=ROAD;break;}
+    const ct=map[r][c]; if(ct===BUILDING||ct===TREE){fwd=ct;break;}
+  }
+  return (fwd===ROAD && Math.random()<0.55) ? 0 : (Math.random()<0.5?1:2);
+}
+
+async function inferAction(map, agent){
+  const id=agent.def.id, sess=ortSessions[id], meta=personaMeta[id];
+  if(!sess) return biasedRandom(map, agent);
+  try{
+    if(meta && meta.dino){
+      if(!dinoSession) return biasedRandom(map, agent);
+      const img=renderFPImageCfg(map, agent, meta.cfg);
+      const di=await dinoSession.run({[dinoIn]:new ort.Tensor('float32', img, [1,3,meta.cfg.h,meta.cfg.w])});
+      const cls=di[dinoClsOut];
+      const ho=await sess.run({[sess.inputNames[0]]:new ort.Tensor('float32', cls.data, [1, cls.data.length])});
+      return sampleLogits(Array.from(ho[sess.outputNames[0]].data));
+    }
+    // legacy 生画像方式 (現行ポリシーでは未使用だが一応保持)
+    const img=renderFPImageCfg(map, agent, meta?meta.cfg:{w:64,h:64,fov:Math.PI/3,sky:FP_SKY_RGB.map(v=>v/255),floor:FP_FLOOR_RGB.map(v=>v/255)});
+    const dim=(meta&&meta.inputSize)||img.length;
+    const out=await sess.run({[sess.inputNames[0]]:new ort.Tensor('float32', img, [1, dim])});
+    return sampleLogits(Array.from(out[sess.outputNames[0]].data));
+  }catch(e){ dbg('infer '+id+' fallback: '+e.message); return biasedRandom(map, agent); }
+}
+
+const actionCache={};
+let stepCount=0;
+async function prefetchAllActions(map, ags){
+  if(stepCount % INFER_EVERY !== 0) return;
+  for(const a of ags) actionCache[a.def.id]=await inferAction(map, a);
+}
+function selectAction(agent){ return actionCache[agent.def.id] ?? Math.floor(Math.random()*3); }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  THREE 俯瞰シーン (server.js buildScene と一致 / 淡い配色)
+// ════════════════════════════════════════════════════════════════════════════
+function pushQuad(arr,size,tx,ty,z){
+  const h=size/2,x0=tx-h,x1=tx+h,y0=ty-h,y1=ty+h;
+  arr.push(x0,y0,z, x1,y0,z, x1,y1,z,  x0,y0,z, x1,y1,z, x0,y1,z);
+}
+function quadMesh(posArr,color){
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(posArr),3));
+  g.computeVertexNormals();
+  return new THREE.Mesh(g,new THREE.MeshLambertMaterial({color}));
+}
+function mergeGeos(geos,includeUV){
+  let posLen=0,uvLen=0;
+  for(const g of geos){ posLen+=g.attributes.position.array.length; if(includeUV)uvLen+=g.attributes.uv.array.length; }
+  const pos=new Float32Array(posLen), uv=includeUV?new Float32Array(uvLen):null;
+  let po=0,uo=0;
+  for(const g of geos){ const pa=g.attributes.position.array; pos.set(pa,po); po+=pa.length;
+    if(includeUV){ const ua=g.attributes.uv.array; uv.set(ua,uo); uo+=ua.length; } }
+  const m=new THREE.BufferGeometry();
+  m.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  if(includeUV) m.setAttribute('uv',new THREE.BufferAttribute(uv,2));
+  m.computeVertexNormals();
+  return m;
+}
+function extractFace(boxGeo,group,tx,ty,tz){
+  const idx=boxGeo.index.array, P=boxGeo.attributes.position.array, U=boxGeo.attributes.uv.array;
+  const n=group.count, pos=new Float32Array(n*3), uv=new Float32Array(n*2);
+  for(let k=0;k<n;k++){ const vi=idx[group.start+k];
+    pos[k*3]=P[vi*3]+tx; pos[k*3+1]=P[vi*3+1]+ty; pos[k*3+2]=P[vi*3+2]+tz;
+    uv[k*2]=U[vi*2]; uv[k*2+1]=U[vi*2+1]; }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setAttribute('uv',new THREE.BufferAttribute(uv,2));
+  return g;
+}
+
+let buildingMatCache={};
+function getBuildingMaterial(typeIdx){
+  const key=typeIdx%BLDG_TYPES.length;
+  if(buildingMatCache[key]) return buildingMatCache[key];
+  const bt=BLDG_TYPES[key], sideTex=overviewTex[bt.textureFile];
+  function makeMat(flipU,rotateDeg){
+    if(!sideTex) return new THREE.MeshLambertMaterial({color:bt.fallbackColor});
+    const t=sideTex.clone(); t.needsUpdate=true;
+    if(rotateDeg!==0){ t.rotation=rotateDeg*Math.PI/180; t.center.set(0.5,0.5); }
+    t.repeat.set(flipU?-1:1,1); t.offset.set(flipU?1:0,0);
+    return new THREE.MeshLambertMaterial({map:t});
+  }
+  const mats=[
+    makeMat(false, 90), makeMat(false,-90), makeMat(false,0), makeMat(true,0),
+    new THREE.MeshLambertMaterial({color:0xb0b4ac}),  // 屋上
+    new THREE.MeshLambertMaterial({color:0x666666}),  // 底面
+  ];
+  buildingMatCache[key]=mats;
+  return mats;
+}
+
+function buildScene(map){
+  buildingMatCache={}; BUILDING_TYPES={};
+  const rng=(()=>{let s=42;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
+    if(map[r][c]===BUILDING) BUILDING_TYPES[r+'_'+c]=Math.floor(rng()*BLDG_TYPES.length);
+
+  const S=new THREE.Scene(); S.background=new THREE.Color(0xeaf2f7);
+  S.add(new THREE.AmbientLight(0xbcd0e0,1.3));
+  S.add(new THREE.HemisphereLight(0xeaf2f7,0xc8c0b0,1.1));
+  const sun=new THREE.DirectionalLight(0xfff4e0,1.7);
+  sun.position.set(W*.4,-W*.3,W*.8); S.add(sun);
+  const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshLambertMaterial({color:0xe6e9e2}));
+  gnd.position.set(W/2,W/2,0); S.add(gnd);
+
+  const roadPos=[], groundPos=[], trunkGeos=[], coneGeos=[];
+  const trunkBaseNI=new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4).toNonIndexed();
+  const coneBaseNI =new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45).toNonIndexed();
+  const boxGeoByH={}, bldgFaces={};
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    const t=map[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
+    if(t===BUILDING){
+      const typeIdx=BUILDING_TYPES[r+'_'+c]||0, bt=BLDG_TYPES[typeIdx%BLDG_TYPES.length], h=bt.height*CELL;
+      if(!boxGeoByH[h]) boxGeoByH[h]=new THREE.BoxGeometry(CELL*.8,CELL*.8,h);
+      const bg=boxGeoByH[h];
+      if(!bldgFaces[typeIdx]) bldgFaces[typeIdx]=[[],[],[],[],[],[]];
+      for(const grp of bg.groups) bldgFaces[typeIdx][grp.materialIndex].push(extractFace(bg,grp,cx,cy,h/2));
+    }else if(t===TREE){
+      const g1=trunkBaseNI.clone(); g1.translate(cx,cy,CELL*.2); trunkGeos.push(g1);
+      const g2=coneBaseNI.clone();  g2.translate(cx,cy,CELL*.58); coneGeos.push(g2);
+    }else if(t===ROAD){ pushQuad(roadPos,CELL*.97,cx,cy,.008); }
+    else{ pushQuad(groundPos,CELL*.97,cx,cy,.005); }
+  }
+  if(roadPos.length)   S.add(quadMesh(roadPos,0xc4c8cc));
+  if(groundPos.length) S.add(quadMesh(groundPos,0x9ccc65));
+  if(trunkGeos.length) S.add(new THREE.Mesh(mergeGeos(trunkGeos,false),new THREE.MeshLambertMaterial({color:0x8a5a32})));
+  if(coneGeos.length)  S.add(new THREE.Mesh(mergeGeos(coneGeos,false),new THREE.MeshLambertMaterial({color:0x4f9e44})));
+  for(const typeIdx of Object.keys(bldgFaces)){
+    const mats=getBuildingMaterial(Number(typeIdx)), faces=bldgFaces[typeIdx];
+    for(let i=0;i<6;i++) if(faces[i].length) S.add(new THREE.Mesh(mergeGeos(faces[i],true),mats[i]));
+  }
+  trunkBaseNI.dispose(); coneBaseNI.dispose();
+  for(const h in boxGeoByH) boxGeoByH[h].dispose();
+  return S;
+}
+
+function createAgentMesh(S,color){
+  const body=new THREE.Mesh(new THREE.BoxGeometry(CELL*.3,CELL*.3,CELL*.52),new THREE.MeshLambertMaterial({color}));
+  const head=new THREE.Mesh(new THREE.BoxGeometry(CELL*.22,CELL*.22,CELL*.22),new THREE.MeshLambertMaterial({color:0xffd9aa}));
+  head.position.set(0,0,CELL*.4); body.add(head);
+  const nose=new THREE.Mesh(new THREE.BoxGeometry(CELL*.08,CELL*.08,CELL*.12),new THREE.MeshLambertMaterial({color:0xffffff}));
+  nose.position.set(0,CELL*.18,CELL*.12); body.add(nose);
+  S.add(body); return body;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  シミュレーション状態
+// ════════════════════════════════════════════════════════════════════════════
+let MAP=makeMap(GRID,42), BUILDINGS=[];
+function rebuildBuildings(map){BUILDINGS.length=0;for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)if(map[r][c]===BUILDING)BUILDINGS.push([r,c]);}
+function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
+
+let agents=[], agentMeshes=[], trailMats={}, scene=null, paused=false, speedMul=1;
+const TRAIL_GEO=new THREE.PlaneGeometry(CELL*.2,CELL*.2);
+
+function initAgents(S){
+  agentMeshes.forEach(m=>S.remove(m));
+  agents.forEach(a=>a.trail.forEach(m=>S.remove(m)));
+  agents=[]; agentMeshes=[];
+  PERSONA_DEFS.forEach(def=>{
+    if(!trailMats[def.id]) trailMats[def.id]=new THREE.MeshBasicMaterial({color:def.color,transparent:true,opacity:0.28,depthWrite:false});
+    const b=randB(null), g=randB(b);
+    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],explored:0,visited:new Set()});
+    agentMeshes.push(createAgentMesh(S,def.color));
+  });
+}
+function addTrail(S,agent){
+  const m=new THREE.Mesh(TRAIL_GEO,trailMats[agent.def.id]);
+  m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
+  S.add(m); agent.trail.push(m);
+  if(agent.trail.length>50){ const old=agent.trail.shift(); S.remove(old); }
+}
+
+async function stepAll(){
+  if(paused||!scene) return;
+  stepCount++;
+  await prefetchAllActions(MAP, agents);
+  for(const a of agents){
+    const px=a.x,py=a.y, action=selectAction(a);
+    if(action===1)a.th-=ROT; else if(action===2)a.th+=ROT;
+    a.th=(a.th+Math.PI*2)%(Math.PI*2);
+    if(action===0){
+      const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*MOVE));
+      const ny=Math.max(0.01,Math.min(GRID-0.01,a.y+Math.sin(a.th)*MOVE));
+      const r=Math.max(0,Math.min(GRID-1,Math.floor(nx)));
+      const c=Math.max(0,Math.min(GRID-1,Math.floor(ny)));
+      if(PASSABLE.has(MAP[r][c])){
+        a.x=nx;a.y=ny;
+        const key=r+','+c; if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
+        addTrail(scene,a);
+      }else a.viols++;
+    }
+    a.steps++;
+    const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>0.05;
+    a.stall=moved?0:Math.min(a.stall+1,10);
+    const dist=Math.sqrt((a.x-a.gx)**2+(a.y-a.gy)**2);
+    if(dist<0.8){a.trips++;const g=randB([Math.floor(a.x),Math.floor(a.y)]);a.gx=g[0]+0.5;a.gy=g[1]+0.5;}
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  レンダラ / カメラ / ループ
+// ════════════════════════════════════════════════════════════════════════════
+const canvas=document.getElementById('scene');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=0.9;
+const mainCam=new THREE.PerspectiveCamera(60,1,0.1,1200);
+mainCam.up.set(0,0,1);
+
+function resize(){
+  const s=Math.min(window.innerWidth,window.innerHeight)-24;
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(s,s,true);
+  mainCam.aspect=1; mainCam.updateProjectionMatrix();
+}
+window.addEventListener('resize',resize); resize();
+
+const CAM_OVERVIEW_INTERVAL=5000;
+let camTargetIdx=0, camSwitchTimer=Date.now();
+function updateTrackingCamera(cam){
+  const now=Date.now();
+  if(now-camSwitchTimer>CAM_OVERVIEW_INTERVAL){ camTargetIdx=(camTargetIdx+1)%(agents.length+1); camSwitchTimer=now; updateCamBadge(); }
+  cam.up.set(0,1,0);
+  if(camTargetIdx===0||agents.length===0){
+    cam.position.set(W*.5,W*.5,W*0.75); cam.lookAt(W*.5,W*.5+1,0);
+  }else{
+    const a=agents[camTargetIdx-1]; if(!a)return;
+    const tx=a.y*CELL+CELL*.5, ty=a.x*CELL+CELL*.5;
+    cam.position.set(tx,ty-CELL*5,CELL*7); cam.lookAt(tx,ty+CELL*1.5,0);
+  }
+}
+function updateCamBadge(){
+  const badge=document.getElementById('cam-badge');
+  if(camTargetIdx===0){ badge.textContent='📷 Overview'; showThought(null); }
+  else{ const a=agents[camTargetIdx-1]; if(a){ badge.textContent='🎯 '+a.def.name; showThought(a.def.name); } }
+}
+
+let lastT=performance.now();
+function renderLoop(){
+  requestAnimationFrame(renderLoop);
+  if(!scene) return;
+  const now=performance.now(), dt=Math.min(0.05,(now-lastT)/1000); lastT=now;
+  agents.forEach((a,i)=>{
+    const tx=a.y*CELL+CELL*.5, ty=a.x*CELL+CELL*.5, m=agentMeshes[i]; if(!m)return;
+    m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
+    m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
+    m.position.z=CELL*.26;
+    const tar=-a.th+Math.PI*.5; let dr=tar-m.rotation.z;
+    while(dr>Math.PI)dr-=Math.PI*2; while(dr<-Math.PI)dr+=Math.PI*2;
+    m.rotation.z+=dr*Math.min(1,dt*14);
+  });
+  updateTrackingCamera(mainCam);
+  renderer.render(scene,mainCam);
+}
+
+let simRunning=false;
+async function simLoop(){
+  if(simRunning) return; simRunning=true;
+  try{ for(let s=0;s<speedMul;s++) await stepAll(); }
+  catch(e){ console.error('[Sim]',e); }
+  finally{ simRunning=false; }
+}
+
+// ─── 思考ウィンドウ ───────────────────────────────────────────────────────────
+let thoughtTimer=null;
+function showThought(name){
+  const box=document.getElementById('thought-box'), nameEl=document.getElementById('thought-persona'), textEl=document.getElementById('thought-text');
+  if(thoughtTimer) clearInterval(thoughtTimer);
+  if(!name||!PERSONA_THOUGHTS[name]){ box.style.display='none'; return; }
+  const persona=PERSONA_DEFS.find(p=>p.name===name);
+  nameEl.textContent='💭 '+name; nameEl.style.color=persona?persona.hex:'var(--accent)';
+  const full=PERSONA_THOUGHTS[name]; let idx=0;
+  textEl.innerHTML='<span class="thought-cursor"></span>'; box.style.display='block';
+  thoughtTimer=setInterval(()=>{
+    if(idx>=full.length){ clearInterval(thoughtTimer); return; }
+    textEl.innerHTML=full.slice(0,++idx)+'<span class="thought-cursor"></span>';
+  },40);
+}
+
+// ─── コントロール (admin) ──────────────────────────────────────────────────────
+document.getElementById('b-pause').addEventListener('click',function(){ paused=!paused; this.classList.toggle('on',!paused); this.textContent=paused?'Resume':'Pause'; });
+document.getElementById('b-reset').addEventListener('click',()=>{ if(scene) initAgents(scene); });
+document.getElementById('b-speed').addEventListener('click',function(){ const l=[1,2,4]; speedMul=l[(l.indexOf(speedMul)+1)%3]; this.textContent='×'+speedMul; });
+document.getElementById('b-newmap').addEventListener('click',()=>{
+  MAP=makeMap(GRID,Math.floor(Math.random()*100000)); rebuildBuildings(MAP);
+  scene=buildScene(MAP); initAgents(scene); camTargetIdx=0; camSwitchTimer=Date.now(); updateCamBadge();
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  起動
+// ════════════════════════════════════════════════════════════════════════════
+(async ()=>{
+  try{
+    setStatus('LOADING',false);
+    setOverlay('Loading textures…',0.05);
+    await Promise.all([loadOverviewTextures(), loadRaycastTextures()]);
+    await loadONNX(p=>0.1+p*0.85);
+    setOverlay('Building scene…',0.97);
+    rebuildBuildings(MAP);
+    scene=buildScene(MAP);
+    initAgents(scene);
+    updateCamBadge();
+    const ready=dinoSession?Object.values(ortSessions).some(Boolean):false;
+    setStatus(ready?'RUNNING':'FALLBACK', ready);
+    dbg('boot done. dino='+!!dinoSession+' webgpu='+(navigator.gpu?'yes':'no'));
+    document.getElementById('overlay').style.display='none';
+    renderLoop();
+    setInterval(simLoop,TICK);
+  }catch(e){
+    console.error(e);
+    setOverlay('Init failed: '+e.message,1);
+    setStatus('ERROR',false);
+  }
+})();
+</script>
+</body>
+</html>

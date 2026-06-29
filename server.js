@@ -32,10 +32,10 @@ try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 140;
-const HEIGHT = parseInt(process.env.HEIGHT) || 140;
-const FPS    = parseInt(process.env.FPS)    || 12;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 90;   // JPEG品質 (0-100)
+const WIDTH  = parseInt(process.env.WIDTH)  || 720;
+const HEIGHT = parseInt(process.env.HEIGHT) || 720;
+const FPS    = parseInt(process.env.FPS)    || 30;
+const JPEG_Q = parseInt(process.env.JPEG_Q) || 100;   // JPEG品質 (0-100)
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
@@ -459,7 +459,7 @@ function getBuildingMaterial(typeIdx) {
   const sideTex = texCache[bt.textureFile];
 
   function makeMat(flipU = false, flipV = false, rotateDeg = 0) {
-    if (!sideTex) return new THREE.MeshBasicMaterial({ color: bt.fallbackColor });
+    if (!sideTex) return new THREE.MeshLambertMaterial({ color: bt.fallbackColor });
     const t = sideTex.clone();
     t.needsUpdate = true;
     if (rotateDeg !== 0) {
@@ -468,7 +468,7 @@ function getBuildingMaterial(typeIdx) {
     }
     t.repeat.set(flipU ? -1 : 1, flipV ? -1 : 1);
     t.offset.set(flipU ?  1 : 0, flipV ?  1 : 0);
-    return new THREE.MeshBasicMaterial({ map: t });
+    return new THREE.MeshLambertMaterial({ map: t });
   }
 
   const mats = [
@@ -476,8 +476,8 @@ function getBuildingMaterial(typeIdx) {
     makeMat(false, false,   -90), // 1: -X 左側面
     makeMat(false, false,   0), // 2: +Y 正面
     makeMat(true,  false,   0), // 3: -Y 背面
-    new THREE.MeshBasicMaterial({ color: 0x888888 }), // 4: 屋上
-    new THREE.MeshBasicMaterial({ color: 0x444444 }), // 5: 底面
+    new THREE.MeshLambertMaterial({ color: 0xb0b4ac }), // 4: 屋上
+    new THREE.MeshLambertMaterial({ color: 0x666666 }), // 5: 底面
   ];
   buildingMatCache[cacheKey] = mats;
   return mats;
@@ -500,6 +500,8 @@ function createRenderer(){
   const canvasMock={width:WIDTH,height:HEIGHT,style:{},addEventListener:()=>{},removeEventListener:()=>{},setAttribute:()=>{},getContext:()=>glCtx};
   const renderer=new THREE.WebGLRenderer({canvas:canvasMock,context:glCtx,antialias:false});
   renderer.setSize(WIDTH,HEIGHT,false);renderer.setPixelRatio(1);
+  renderer.toneMapping=THREE.ACESFilmicToneMapping;   // dinov2seg と同じ淡いフィルミック調
+  renderer.toneMappingExposure=0.6;
   return{renderer,glCtx};
 }
 
@@ -539,7 +541,8 @@ function pushQuad(arr, size, tx, ty, z){
 function quadMesh(posArr, color){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posArr), 3));
-  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({color}));
+  g.computeVertexNormals();   // Lambert ライティング用
+  return new THREE.Mesh(g, new THREE.MeshLambertMaterial({color}));
 }
 
 // 複数の非インデックス geometry を1つに連結 (position 必須, uv は任意)。
@@ -559,6 +562,7 @@ function mergeGeos(geos, includeUV){
   const m=new THREE.BufferGeometry();
   m.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   if(includeUV) m.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  m.computeVertexNormals();   // Lambert ライティング用
   return m;
 }
 
@@ -593,9 +597,12 @@ function buildScene(map){
     if(map[r][c]===BUILDING) BUILDING_TYPES[r+'_'+c]=Math.floor(rng()*BLDG_TYPES.length);
   }
 
-  const S=new THREE.Scene();S.background=new THREE.Color(0x020406);
-  S.add(new THREE.AmbientLight(0xffffff,1.0));
-  const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshBasicMaterial({color:0x060a0f}));
+  const S=new THREE.Scene();S.background=new THREE.Color(0xeaf2f7);
+  S.add(new THREE.AmbientLight(0xbcd0e0,1.3));
+  S.add(new THREE.HemisphereLight(0xeaf2f7,0xc8c0b0,1.1));
+  const sun=new THREE.DirectionalLight(0xfff4e0,1.7);
+  sun.position.set(W*.4,-W*.3,W*.8);S.add(sun);
+  const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshLambertMaterial({color:0xe6e9e2}));
   gnd.position.set(W/2,W/2,0);S.add(gnd);
 
   // セルごとに個別メッシュを作らず、種類ごとに集約して最後にマージする。
@@ -630,10 +637,10 @@ function buildScene(map){
   }
 
   // ── マージ済みメッシュを追加 ──
-  if(roadPos.length)   S.add(quadMesh(roadPos,   0x555555));
-  if(groundPos.length) S.add(quadMesh(groundPos, 0x1a3020));
-  if(trunkGeos.length) S.add(new THREE.Mesh(mergeGeos(trunkGeos,false), new THREE.MeshBasicMaterial({color:0x4a3020})));
-  if(coneGeos.length)  S.add(new THREE.Mesh(mergeGeos(coneGeos, false), new THREE.MeshBasicMaterial({color:0x236826})));
+  if(roadPos.length)   S.add(quadMesh(roadPos,   0xc4c8cc));
+  if(groundPos.length) S.add(quadMesh(groundPos, 0x9ccc65));
+  if(trunkGeos.length) S.add(new THREE.Mesh(mergeGeos(trunkGeos,false), new THREE.MeshLambertMaterial({color:0x8a5a32})));
+  if(coneGeos.length)  S.add(new THREE.Mesh(mergeGeos(coneGeos, false), new THREE.MeshLambertMaterial({color:0x4f9e44})));
 
   // 建物は (タイプ × 面) 単位でマージ → 1建物6ドローコールが、1タイプ最大6に。
   for(const typeIdx of Object.keys(bldgFaces)){
@@ -830,11 +837,55 @@ function updateTrackingCamera(cam) {
 const clients = new Set();
 
 // ─── HTTP + WebSocket サーバー ─────────────────────────────────────────────────
+// 既存: / と /index.html は WebSocket版クライアント (client.html) を返す。
+// 追加: /client/ で「ブラウザ単独版 (index.html)」を配信。これは DINOv2/persona
+//       モデル + テクスチャをブラウザで直接ロードするため、data/ と textures/ も
+//       静的配信する。WebSocket配信の仕組みには一切手を入れない。
+const MIME={'.html':'text/html','.js':'text/javascript','.json':'application/json',
+  '.onnx':'application/octet-stream','.data':'application/octet-stream',
+  '.png':'image/png','.jpg':'image/jpeg','.wasm':'application/wasm'};
+
+function serveFile(res, filePath, cache){
+  fs.stat(filePath,(err,st)=>{
+    if(err||!st.isFile()){res.writeHead(404);res.end('Not Found');return;}
+    const ext=path.extname(filePath).toLowerCase();
+    const headers={'Content-Type':MIME[ext]||'application/octet-stream','Content-Length':st.size};
+    if(cache) headers['Cache-Control']='public, max-age=86400';
+    res.writeHead(200,headers);
+    fs.createReadStream(filePath).pipe(res);
+  });
+}
+
 const httpServer=http.createServer((req,res)=>{
-  if(req.url==='/'||req.url==='/index.html'){
+  let urlPath=decodeURIComponent(req.url.split('?')[0]);
+
+  // 既存の WebSocket版クライアント
+  if(urlPath==='/'||urlPath==='/index.html'){
     res.writeHead(200,{'Content-Type':'text/html'});
     res.end(fs.readFileSync(path.join(__dirname,'client.html')));
-  }else{res.writeHead(404);res.end();}
+    return;
+  }
+
+  // /client → /client/ に正規化 (相対パス ./data ./textures を正しく解決させる)
+  if(urlPath==='/client'){ res.writeHead(301,{'Location':'/client/'}); res.end(); return; }
+
+  // ブラウザ単独版 index.html
+  if(urlPath==='/client/'||urlPath==='/client/index.html'){
+    return serveFile(res, path.join(__dirname,'index.html'));
+  }
+
+  // /client/ 配下のパスは root 直下の static として解決 (例: /client/data/x → data/x)
+  if(urlPath.startsWith('/client/')) urlPath=urlPath.slice('/client'.length);
+
+  // 静的資産は data/ textures/ のみ許可 (ディレクトリトラバーサル防止)
+  if(urlPath.startsWith('/data/')||urlPath.startsWith('/textures/')){
+    const safe=path.normalize(urlPath).replace(/^(\.\.[\/\\])+/,'');
+    const fp=path.join(__dirname, safe);
+    if(!fp.startsWith(__dirname)){res.writeHead(403);res.end();return;}
+    return serveFile(res, fp, true);
+  }
+
+  res.writeHead(404);res.end();
 });
 
 const wss=new WebSocket.Server({server:httpServer});
