@@ -43,6 +43,9 @@ const SEG_GATE = process.env.SEG_GATE === '1';
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
+// 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える。
+// 環境変数 MAX_TRAIL で可変。例: MAX_TRAIL=300 node server.js
+const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||500;
 const INFER_EVERY=parseInt(process.env.INFER_EVERY)||10;
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
@@ -202,6 +205,7 @@ async function loadOnnxSessions(){
         const div=v=>v/255;
         personaMeta[p.id]={
           inputSize: isize,
+          goalDim: m.goal_dim||0,             // >0 なら goal条件付け (cls+z)。0=従来(clsのみ)
           dino: isize!==iw*ih*ic,             // 生画像サイズと違う → DINOv2方式
           cfg:{
             w:iw, h:ih,
@@ -354,9 +358,19 @@ async function inferAction(map, agent){
       const di=await dinoSession.run({[dinoIn]:new ort.Tensor('float32', img, [1,3,meta.cfg.h,meta.cfg.w])});
       const cls=di[dinoClsOut];
 
-      // ヘッド入力: CLSのみ(384) か CLS+建物分類(392)
+      // ヘッド入力の組み立て:
+      //   goal条件付け(meta.goalDim>0): [cls(384), z(goalDim)]
+      //     z(=agent.goalZ) 未設定はゼロ → 「目標なし」= 従来挙動 (学習側もzゼロを混ぜてある)
+      //   それ以外: CLSのみ(384) か CLS+建物分類(392)(legacy)
       let inData=cls.data, inDim=cls.data.length;
-      if(meta.inputSize>cls.data.length && bldgSession){
+      if(meta.goalDim>0){
+        inDim=cls.data.length+meta.goalDim;
+        const cat=new Float32Array(inDim);
+        cat.set(cls.data,0);
+        const z=agent.goalZ;                          // Float32Array(goalDim) をセットすれば誘導できる
+        if(z && z.length===meta.goalDim) cat.set(z, cls.data.length);
+        inData=cat;
+      }else if(meta.inputSize>cls.data.length && bldgSession){
         const bo=await bldgSession.run({[bldgIn]:new ort.Tensor('float32', cls.data, [1, cls.data.length])});
         const bl=bo[bldgOut].data;
         const bmx=Math.max(...bl), bex=Array.from(bl).map(v=>Math.exp(v-bmx));
@@ -783,7 +797,7 @@ function addTrail(S,agent){
   const m=new THREE.Mesh(TRAIL_GEO,trailMats[agent.def.id]);
   m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
   S.add(m);agent.trail.push(m);
-  if(agent.trail.length>50){
+  while(agent.trail.length>MAX_TRAIL){
     const old=agent.trail.shift();
     S.remove(old);   // geometry は共有・material はパーソナ共有なので dispose 不要
   }
@@ -914,6 +928,35 @@ const httpServer=http.createServer((req,res)=>{
   if(urlPath==='/'||urlPath==='/index.html'){
     res.writeHead(200,{'Content-Type':'text/html'});
     res.end(fs.readFileSync(path.join(__dirname,'client.html')));
+    return;
+  }
+
+  // ── goal(z) 設定の口 (LLM/手動/外部制御用) ──
+  //   設定: /goal?persona=A&type=7   (type=建物タイプ index / -1 or 省略でクリア)
+  //   一覧: /goal                    (現在の各エージェントの goal を返す)
+  //   goalDim 未対応(384)モデルでは保持のみで挙動には反映されない。
+  if(urlPath==='/goal'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!q.has('persona')){
+      res.writeHead(200);
+      res.end(JSON.stringify({agents:agents.map(a=>({
+        persona:a.def.id, name:a.def.name,
+        goalDim:(personaMeta[a.def.id]&&personaMeta[a.def.id].goalDim)||0,
+        goal:a.goalZ?Array.from(a.goalZ).indexOf(1):-1,
+      }))}));
+      return;
+    }
+    const pid=(q.get('persona')||'').toUpperCase();
+    const type=parseInt(q.get('type'),10);
+    const a=agents.find(ag=>ag.def.id===pid);
+    if(!a){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:'persona not found',personas:agents.map(x=>x.def.id)})); return; }
+    const gd=(personaMeta[pid]&&personaMeta[pid].goalDim)||0;
+    if(isNaN(type)||type<0){ a.goalZ=null; }
+    else { const z=new Float32Array(gd||8); if(type<z.length) z[type]=1; a.goalZ=z; }
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true,persona:pid,type:(isNaN(type)?-1:type),goalDim:gd,
+      note:gd>0?'applied':'保持のみ(このpersonaは384モデル。392に差し替えると有効)'}));
     return;
   }
 
