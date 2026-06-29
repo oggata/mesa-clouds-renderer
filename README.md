@@ -160,7 +160,10 @@ data/
 
 ```
 server.js            メインサーバー（headless-gl + Three.js + WebSocket/JPEG + 推論）
-client.html          ブラウザクライアント
+client.html          ブラウザクライアント（WebSocket受信版）
+standalone/
+  └── index.html     ブラウザ単独版（DINOv2/persona をブラウザで直接推論）
+                     起動中の server から /standalone.html で配信。data/ textures/ は共有。
 data/                ONNX モデル（dinov2_vits14 / persona_* + meta）
 textures/            建物テクスチャ（3D描画 & 観測レイキャスタ用）
 docs/images/         README 用の図

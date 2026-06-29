@@ -658,13 +658,62 @@ function buildScene(map){
   return S;
 }
 
+// 洒落た人型: 箱の積み木をやめ、丸み・テーパー・陰影のある立ち姿にする。
+// Z が上方向、+Y が正面 (進行方向)。親オブジェクトは renderLoop で z=CELL*.26 に置かれ、
+// 足元のローカル z は -CELL*.26 (地面)。MeshLambert にしてシーンのライトで陰影を付ける。
 function createAgentMesh(S,color){
-  const body=new THREE.Mesh(new THREE.BoxGeometry(CELL*.3,CELL*.3,CELL*.52),new THREE.MeshBasicMaterial({color}));
-  const head=new THREE.Mesh(new THREE.BoxGeometry(CELL*.22,CELL*.22,CELL*.22),new THREE.MeshBasicMaterial({color:0xffd9aa}));
-  head.position.set(0,0,CELL*.4);body.add(head);
-  const nose=new THREE.Mesh(new THREE.BoxGeometry(CELL*.08,CELL*.08,CELL*.12),new THREE.MeshBasicMaterial({color:0xffffff}));
-  nose.position.set(0,CELL*.18,CELL*.12);body.add(nose);
-  S.add(body);return body;
+  const g=new THREE.Group();
+  const base=-CELL*.26;                                   // 地面 (足元)
+  const skin=0xf1c9a5, hair=0x4a3b2f, pants=0x2b303a;
+  const bodyMat =new THREE.MeshLambertMaterial({color});
+  const skinMat =new THREE.MeshLambertMaterial({color:skin});
+  const hairMat =new THREE.MeshLambertMaterial({color:hair});
+  const pantsMat=new THREE.MeshLambertMaterial({color:pants});
+  const upZ=geo=>{geo.rotateX(Math.PI/2);return geo;};    // Y軸ジオメトリを Z 上向きに
+
+  // 脚 (細身・左右)
+  const legGeo=upZ(new THREE.CylinderGeometry(CELL*.032,CELL*.028,CELL*.22,8));
+  for(const sx of [-1,1]){
+    const leg=new THREE.Mesh(legGeo,pantsMat);
+    leg.position.set(sx*CELL*.05,0,base+CELL*.11);
+    g.add(leg);
+  }
+
+  // 胴体: 裾に向かってわずかに広がるテーパー (コート/ワンピース風シルエット)
+  const torso=new THREE.Mesh(
+    upZ(new THREE.CylinderGeometry(CELL*.095,CELL*.135,CELL*.30,16)),bodyMat);
+  torso.position.set(0,0,base+CELL*.35);
+  g.add(torso);
+
+  // 丸い肩
+  const shoulders=new THREE.Mesh(new THREE.SphereGeometry(CELL*.12,16,10),bodyMat);
+  shoulders.scale.set(1.05,.8,.7);
+  shoulders.position.set(0,0,base+CELL*.49);
+  g.add(shoulders);
+
+  // 首
+  const neck=new THREE.Mesh(upZ(new THREE.CylinderGeometry(CELL*.04,CELL*.045,CELL*.06,8)),skinMat);
+  neck.position.set(0,0,base+CELL*.55);
+  g.add(neck);
+
+  // 頭
+  const head=new THREE.Mesh(new THREE.SphereGeometry(CELL*.115,18,14),skinMat);
+  head.scale.set(1,.95,1.05);
+  head.position.set(0,0,base+CELL*.66);
+  g.add(head);
+
+  // 髪 (頭頂のドーム)
+  const hairGeo=upZ(new THREE.SphereGeometry(CELL*.122,18,12,0,Math.PI*2,0,Math.PI*.62));
+  const hairMesh=new THREE.Mesh(hairGeo,hairMat);
+  hairMesh.position.set(0,-CELL*.012,base+CELL*.665);
+  g.add(hairMesh);
+
+  // 正面マーカー (鼻) — 進行方向の判別用に控えめに残す。Cone は既定で +Y を向く。
+  const nose=new THREE.Mesh(new THREE.ConeGeometry(CELL*.03,CELL*.06,8),skinMat);
+  nose.position.set(0,CELL*.11,base+CELL*.655);
+  g.add(nose);
+
+  S.add(g);return g;
 }
 
 // ─── RGBA → JPEG ─────────────────────────────────────────────────────────────
@@ -838,9 +887,11 @@ const clients = new Set();
 
 // ─── HTTP + WebSocket サーバー ─────────────────────────────────────────────────
 // 既存: / と /index.html は WebSocket版クライアント (client.html) を返す。
-// 追加: /client/ で「ブラウザ単独版 (index.html)」を配信。これは DINOv2/persona
-//       モデル + テクスチャをブラウザで直接ロードするため、data/ と textures/ も
-//       静的配信する。WebSocket配信の仕組みには一切手を入れない。
+// 追加: /standalone.html で「ブラウザ単独版 (standalone/index.html)」を配信。これは
+//       DINOv2/persona モデル + テクスチャをブラウザで直接ロードするため、data/ と
+//       textures/ も静的配信する (これらは headless 側と共有)。URL を /standalone.html
+//       に揃えてあるので、HTML 内の相対参照 ./data ./textures はルート直下に解決される。
+//       WebSocket配信の仕組みには一切手を入れない。
 const MIME={'.html':'text/html','.js':'text/javascript','.json':'application/json',
   '.onnx':'application/octet-stream','.data':'application/octet-stream',
   '.png':'image/png','.jpg':'image/jpeg','.wasm':'application/wasm'};
@@ -866,16 +917,15 @@ const httpServer=http.createServer((req,res)=>{
     return;
   }
 
-  // /client → /client/ に正規化 (相対パス ./data ./textures を正しく解決させる)
-  if(urlPath==='/client'){ res.writeHead(301,{'Location':'/client/'}); res.end(); return; }
-
-  // ブラウザ単独版 index.html
-  if(urlPath==='/client/'||urlPath==='/client/index.html'){
-    return serveFile(res, path.join(__dirname,'index.html'));
+  // ブラウザ単独版 (standalone/index.html)。/standalone.html という分かりやすい URL で配信。
+  // URL がルート直下なので HTML 内の ./data ./textures は /data /textures に解決される。
+  if(urlPath==='/standalone.html'||urlPath==='/standalone'||urlPath==='/standalone/'){
+    return serveFile(res, path.join(__dirname,'standalone','index.html'));
   }
-
-  // /client/ 配下のパスは root 直下の static として解決 (例: /client/data/x → data/x)
-  if(urlPath.startsWith('/client/')) urlPath=urlPath.slice('/client'.length);
+  // 旧 /client/ からの後方互換リダイレクト
+  if(urlPath==='/client'||urlPath==='/client/'||urlPath==='/client/index.html'){
+    res.writeHead(301,{'Location':'/standalone.html'}); res.end(); return;
+  }
 
   // 静的資産は data/ textures/ のみ許可 (ディレクトリトラバーサル防止)
   if(urlPath.startsWith('/data/')||urlPath.startsWith('/textures/')){
