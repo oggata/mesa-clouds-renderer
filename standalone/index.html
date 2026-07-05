@@ -677,7 +677,7 @@ function resize(){
 }
 window.addEventListener('resize',resize); resize();
 
-const CAM_OVERVIEW_INTERVAL=5000;
+const CAM_OVERVIEW_INTERVAL=20000;
 let camTargetIdx=0, camSwitchTimer=Date.now();
 function updateTrackingCamera(cam){
   const now=Date.now();

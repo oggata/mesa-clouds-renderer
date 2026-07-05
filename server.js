@@ -872,7 +872,7 @@ const mainCam = new THREE.PerspectiveCamera(60, WIDTH/HEIGHT, 0.1, 1200);
 mainCam.up.set(0,0,1);
 
 // ── 追跡カメラ ────────────────────────────────────────────────
-const CAM_OVERVIEW_INTERVAL = 5000;
+const CAM_OVERVIEW_INTERVAL = 20000;
 let camTargetIdx  = 0;
 let camSwitchTimer = Date.now();
 
