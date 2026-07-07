@@ -206,6 +206,12 @@ async function loadOnnxSessions(){
         personaMeta[p.id]={
           inputSize: isize,
           goalDim: m.goal_dim||0,             // >0 なら goal条件付け (cls+z)。0=従来(clsのみ)
+          auxDim: m.aux_dim||0,               // >0 なら補助観測 (compass/visited/social) 付き = 401モデル
+          visitR: m.visit_radius||5,
+          visitWin: m.visit_window_ticks||4000,
+          socialRange: m.social_range||8,
+          // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
+          rotPerTick: ((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
           dino: isize!==iw*ih*ic,             // 生画像サイズと違う → DINOv2方式
           cfg:{
             w:iw, h:ih,
@@ -345,6 +351,48 @@ async function computeSegPassable(patchTensor){
 // 推論結果キャッシュ (エージェントごと)
 const actionCache = {};
 
+// ─── 補助観測 aux(9) の組み立て ───────────────────────────────────────────────
+// 学習側 PersonaVecEnvGoal.aux() と同一レイアウト・同一式にすること。
+//   compass(3): 目的地の相対方位 sin/cos + 距離/GRID
+//   visited(4): 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
+//   social(2) : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+function buildAux(agent, meta){
+  const aux=new Float32Array(meta.auxDim);
+  // compass(3)
+  const dx=agent.gx-agent.x, dy=agent.gy-agent.y, d=Math.hypot(dx,dy);
+  let b=Math.atan2(dy,dx)-agent.th; b=Math.atan2(Math.sin(b),Math.cos(b));
+  aux[0]=Math.sin(b); aux[1]=Math.cos(b); aux[2]=Math.min(d/GRID,1);
+  // visited(4): 学習側は 1 エピソード(4000tick)ぶんの記憶なので、visitWin より古い訪問は忘れる
+  const R=meta.visitR, r0=Math.floor(agent.x), c0=Math.floor(agent.y);
+  const cnt=[0,0,0,0], hit=[0,0,0,0];
+  for(let dr=-R;dr<=R;dr++)for(let dc=-R;dc<=R;dc++){
+    let a2=Math.atan2(dc,dr)-agent.th; a2=Math.atan2(Math.sin(a2),Math.cos(a2));
+    const s = Math.abs(a2)<=Math.PI/4 ? 0
+            : (a2<-Math.PI/4&&a2>-3*Math.PI/4 ? 1
+            : (a2> Math.PI/4&&a2< 3*Math.PI/4 ? 2 : 3));
+    cnt[s]++;
+    const rr=r0+dr, cc=c0+dc;
+    if(rr<0||cc<0||rr>=GRID||cc>=GRID){ hit[s]++; continue; }
+    const t=agent.visMem&&agent.visMem.get(rr+','+cc);
+    if(t!=null && (stepCount-t)<=meta.visitWin) hit[s]++;
+  }
+  for(let s=0;s<4;s++) aux[3+s]=hit[s]/Math.max(1,cnt[s]);
+  // social(2): 最寄りの他エージェント
+  let best=Infinity,ox=0,oy=0;
+  for(const o of agents){
+    if(o===agent||!o.active) continue;
+    const dd=(o.x-agent.x)**2+(o.y-agent.y)**2;
+    if(dd<best){best=dd;ox=o.x;oy=o.y;}
+  }
+  if(best<Infinity){
+    const sd=Math.sqrt(best);
+    let sb=Math.atan2(oy-agent.y,ox-agent.x)-agent.th; sb=Math.atan2(Math.sin(sb),Math.cos(sb));
+    const prox=Math.max(0,1-sd/meta.socialRange);
+    aux[7]=Math.sin(sb)*prox; aux[8]=Math.cos(sb)*prox;
+  }
+  return aux;
+}
+
 async function inferAction(map, agent){
   const id=agent.def.id;
   const sess=ortSessions[id];
@@ -363,12 +411,13 @@ async function inferAction(map, agent){
       //     z(=agent.goalZ) 未設定はゼロ → 「目標なし」= 従来挙動 (学習側もzゼロを混ぜてある)
       //   それ以外: CLSのみ(384) か CLS+建物分類(392)(legacy)
       let inData=cls.data, inDim=cls.data.length;
-      if(meta.goalDim>0){
-        inDim=cls.data.length+meta.goalDim;
+      if(meta.goalDim>0 || meta.auxDim>0){
+        inDim=cls.data.length+(meta.goalDim||0)+(meta.auxDim||0);
         const cat=new Float32Array(inDim);
         cat.set(cls.data,0);
         const z=agent.goalZ;                          // Float32Array(goalDim) をセットすれば誘導できる
-        if(z && z.length===meta.goalDim) cat.set(z, cls.data.length);
+        if(z && meta.goalDim>0 && z.length===meta.goalDim) cat.set(z, cls.data.length);
+        if(meta.auxDim>0) cat.set(buildAux(agent,meta), cls.data.length+(meta.goalDim||0));
         inData=cat;
       }else if(meta.inputSize>cls.data.length && bldgSession){
         const bo=await bldgSession.run({[bldgIn]:new ort.Tensor('float32', cls.data, [1, cls.data.length])});
@@ -781,7 +830,7 @@ function initAgents(S){
   agents=[];agentMeshes=[];
   PERSONA_DEFS.forEach(def=>{
     const b=randB(null),g=randB(b);
-    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0});
+    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map()});
     agentMeshes.push(createAgentMesh(S,def.color));
   });
   console.log(`[Sim] ${agents.length} agents initialized`);
@@ -811,7 +860,10 @@ async function stepAll(){
     const a=agents[i];
     const px=a.x,py=a.y;
     const action=selectAction(a);
-    if(action===1)a.th-=ROT;else if(action===2)a.th+=ROT;
+    const meta=personaMeta[a.def.id];
+    // 旋回量は学習時 meta の rot_per_tick_deg と一致させる (旧モデルは 20°/tick のまま)
+    const rot=(meta&&meta.rotPerTick)||ROT;
+    if(action===1)a.th-=rot;else if(action===2)a.th+=rot;
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
       const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*MOVE));
@@ -821,7 +873,6 @@ async function stepAll(){
       // 通行判定: 既定は実マップ配列(=前方セルが道路/建物か)。確実で、
       // 学習時(マップ配列で通行判定)とも一致するため「seg誤判定で止まる」を防ぐ。
       // SEG_GATE=1 かつ seg_head ありのときだけ seg 判定を使う。
-      const meta=personaMeta[a.def.id];
       const useSeg = SEG_GATE && segSession && meta && meta.dino;
       const passable = useSeg ? (segPassCache[a.def.id] ?? true) : PASSABLE.has(MAP[r][c]);
       if(passable){
@@ -830,11 +881,25 @@ async function stepAll(){
         addTrail(scene,a);
       }else a.viols++;
     }
+    // 訪問メモリ (aux の visited セクタ率が参照。学習側と同じく毎tick現在セルを記録)
+    if(a.visMem) a.visMem.set(Math.floor(a.x)+','+Math.floor(a.y), stepCount);
     a.steps++;
     const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>0.05;
     a.stall=moved?0:Math.min(a.stall+1,10);
     const dist=Math.sqrt((a.x-a.gx)**2+(a.y-a.gy)**2);
-    if(dist<0.8){a.trips++;const g=randB([Math.floor(a.x),Math.floor(a.y)]);a.gx=g[0]+0.5;a.gy=g[1]+0.5;}
+    if(dist<0.8){
+      a.trips++;
+      // goal(z) 設定中は同タイプの建物を次の目的地に選ぶ (学習時は z=目的地建物のタイプ)
+      let g=null;
+      if(a.goalZ){
+        const ti=Array.from(a.goalZ).indexOf(1);
+        const cands=BUILDINGS.filter(b=>(BUILDING_TYPES[b[0]+'_'+b[1]]||0)===ti
+          &&(Math.abs(b[0]-Math.floor(a.x))>1||Math.abs(b[1]-Math.floor(a.y))>1));
+        if(cands.length) g=cands[Math.floor(Math.random()*cands.length)];
+      }
+      if(!g) g=randB([Math.floor(a.x),Math.floor(a.y)]);
+      a.gx=g[0]+0.5;a.gy=g[1]+0.5;
+    }
   }
 }
 
@@ -953,7 +1018,13 @@ const httpServer=http.createServer((req,res)=>{
     if(!a){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:'persona not found',personas:agents.map(x=>x.def.id)})); return; }
     const gd=(personaMeta[pid]&&personaMeta[pid].goalDim)||0;
     if(isNaN(type)||type<0){ a.goalZ=null; }
-    else { const z=new Float32Array(gd||8); if(type<z.length) z[type]=1; a.goalZ=z; }
+    else {
+      const z=new Float32Array(gd||8); if(type<z.length) z[type]=1; a.goalZ=z;
+      // 学習時は z=目的地建物のタイプ なので、目的地も同タイプの建物へ張り替える
+      // (z と compass の指す先が食い違う入力は学習分布に無い)
+      const cands=BUILDINGS.filter(b=>(BUILDING_TYPES[b[0]+'_'+b[1]]||0)===type);
+      if(cands.length){ const g=cands[Math.floor(Math.random()*cands.length)]; a.gx=g[0]+0.5; a.gy=g[1]+0.5; }
+    }
     res.writeHead(200);
     res.end(JSON.stringify({ok:true,persona:pid,type:(isNaN(type)?-1:type),goalDim:gd,
       note:gd>0?'applied':'保持のみ(このpersonaは384モデル。392に差し替えると有効)'}));

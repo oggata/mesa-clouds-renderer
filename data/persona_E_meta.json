@@ -21,16 +21,29 @@
     "ent_coef": 0.06,
     "gamma": 0.97,
     "turn_penalty": 0.01,
-    "offroad_penalty": 0.1
+    "offroad_penalty": 0.1,
+    "approach_coef": 0.6666666666666666
   },
   "obs_type": "fp_image",
-  "input_size": 392,
+  "input_size": 401,
   "obs_components": [
     "cls",
-    "goal"
+    "goal",
+    "compass",
+    "visited",
+    "social"
   ],
   "cls_dim": 384,
   "goal_dim": 8,
+  "aux_dim": 9,
+  "aux_layout": {
+    "compass": 3,
+    "visited": 4,
+    "social": 2
+  },
+  "visit_radius": 5,
+  "visit_window_ticks": 4000,
+  "social_range": 8.0,
   "goal_classes": [
     "gyudon",
     "ramen",
@@ -64,7 +77,10 @@
     "turn_right"
   ],
   "move_dist": 0.25,
-  "rot_deg": 20.0,
+  "rot_deg": 4.0,
+  "rot_per_tick_deg": 4.0,
+  "rot_decision_deg": 40.0,
+  "action_repeat": 10,
   "grid_size": 30,
   "map": [
     [
