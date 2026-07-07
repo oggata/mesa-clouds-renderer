@@ -46,7 +46,7 @@
     "goal_reward": 15.0,
     "step_penalty": 0.08,
     "social_bonus": 3.0,
-    "stall_penalty": 0.3,
+    "stall_penalty": 0.8,
     "food_bonus": 0.0,
     "food_classes": []
   },
@@ -80,7 +80,7 @@
     "goal_reward": 20.0,
     "step_penalty": 0.02,
     "social_bonus": 0.5,
-    "stall_penalty": 0.1,
+    "stall_penalty": 0.5,
     "food_bonus": 0.0,
     "food_classes": []
   }
