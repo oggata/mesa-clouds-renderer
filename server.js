@@ -20,6 +20,7 @@ const WebSocket = require('ws');
 const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
+const { spawn } = require('child_process');
 
 // JPEG エンコードに sharp を使う（なければ簡易RGB返し）
 let sharp = null;
@@ -40,6 +41,15 @@ const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
 const SEG_GATE = process.env.SEG_GATE === '1';
+
+// ─── YouTube ライブ配信 (任意) ─────────────────────────────────────────────────
+// YT_STREAM_KEY がセットされている時だけ有効化。renderLoop の JPEG フレームを
+// ffmpeg の stdin (image2pipe) へ流し込み、H.264/AAC(無音) で RTMP 送出する。
+// WebSocket 配信には一切影響しない (フレームを追加コピーで横流しするだけ)。
+const YT_STREAM_KEY = process.env.YT_STREAM_KEY || '';
+const YT_RTMP_BASE  = process.env.YT_RTMP_URL || 'rtmp://a.rtmp.youtube.com/live2';
+const YT_BITRATE_K  = parseInt(process.env.YT_VIDEO_BITRATE_K) || 2500;
+const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
@@ -945,6 +955,113 @@ process.on('uncaughtException', (err)=>{
   console.error('[uncaughtException]', err && err.message ? err.message : err);
 });
 
+// ─── YouTube ライブ配信ワーカー ──────────────────────────────────────────────────
+// renderLoop が生成する JPEG フレームを ffmpeg の stdin へ書き込み、RTMP 送出する。
+// ffmpeg が死んでも指数バックオフで自動再起動する (demo の index.js と同方針)。
+const YT = {
+  child: null,
+  shuttingDown: false,
+  backoff: 2000,
+  MAX_BACKOFF: 60000,
+  ready: false,   // stdin が書き込み可能か
+};
+
+function buildYtArgs(){
+  const gop = FPS * 2;   // 2秒に1キーフレーム (YouTube 推奨)
+  return [
+    // --- 映像入力: stdin から流れてくる JPEG 連番 (image2pipe) ---
+    '-f', 'image2pipe',
+    '-framerate', String(FPS),
+    '-i', 'pipe:0',
+    // --- 音声入力: 無音 ---
+    '-f', 'lavfi',
+    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+    // --- 映像出力 ---
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-pix_fmt', 'yuv420p',
+    '-b:v', `${YT_BITRATE_K}k`,
+    '-maxrate', `${YT_BITRATE_K}k`,
+    '-bufsize', `${YT_BITRATE_K * 2}k`,
+    '-g', String(gop),
+    '-keyint_min', String(gop),
+    '-r', String(FPS),
+    // --- 音声出力 ---
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-ar', '44100',
+    '-map', '0:v:0',
+    '-map', '1:a:0',
+    '-f', 'flv', `${YT_RTMP_BASE}/${YT_STREAM_KEY}`,
+  ];
+}
+
+function startYtStream(){
+  if (!YT_ENABLED || YT.shuttingDown) return;
+
+  const args = buildYtArgs();
+  const started = Date.now();
+  console.log(`[YT] ffmpeg 起動 (${WIDTH}x${HEIGHT} @ ${FPS}fps, ${YT_BITRATE_K}k, rtmp=${YT_RTMP_BASE}/****)`);
+
+  const child = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] });
+  YT.child = child;
+  YT.ready = true;
+
+  // stdin が詰まったり切れたりしても本体を巻き込まないよう握りつぶす
+  child.stdin.on('error', (err)=>{
+    YT.ready = false;
+    console.error('[YT] stdin error:', err.message);
+  });
+
+  child.stderr.on('data', (d)=>{
+    const s = d.toString();
+    // 冗長な進捗行 (frame=... fps=...) は抑制し、警告/エラーだけ出す
+    if (/error|Error|failed|Cannot|Invalid/.test(s)) process.stderr.write(`[YT/ffmpeg] ${s}`);
+  });
+
+  child.on('exit', (code, signal)=>{
+    YT.child = null;
+    YT.ready = false;
+    if (YT.shuttingDown) { console.log('[YT] シャットダウン中のため再起動しません'); return; }
+    const ranForSec = Math.round((Date.now() - started) / 1000);
+    if (ranForSec > 60) YT.backoff = 2000;   // 60秒以上安定したらバックオフをリセット
+    console.error(`[YT] ffmpeg 終了 (code=${code}, signal=${signal}, 稼働=${ranForSec}s)。${YT.backoff/1000}秒後に再起動`);
+    setTimeout(startYtStream, YT.backoff);
+    YT.backoff = Math.min(YT.backoff * 2, YT.MAX_BACKOFF);
+  });
+
+  child.on('error', (err)=>{
+    YT.ready = false;
+    console.error(`[YT] ffmpeg 起動失敗: ${err.message} (ffmpeg はインストール済みですか?)`);
+  });
+}
+
+// renderLoop から呼ばれる: 1フレーム分の JPEG を ffmpeg stdin へ書き込む
+function pushYtFrame(jpeg){
+  if (!YT.ready || !YT.child) return;
+  const stdin = YT.child.stdin;
+  if (!stdin.writable) return;
+  // backpressure 時は破棄せず書き込む (write は内部バッファに積む)。
+  // 戻り値 false は無視 — ライブ配信は多少の遅延より欠落回避を優先。
+  stdin.write(jpeg);
+}
+
+function shutdownYt(sig, done){
+  if (!YT_ENABLED) { if (done) done(); return; }
+  console.log(`[YT] ${sig} 受信。ffmpeg を停止します`);
+  YT.shuttingDown = true;
+  const child = YT.child;
+  if (!child) { if (done) done(); return; }
+  try { child.stdin.end(); } catch(_){}
+  child.kill('SIGTERM');
+  setTimeout(()=>{ try { child.kill('SIGKILL'); } catch(_){}; if (done) done(); }, 5000);
+}
+
+if (YT_ENABLED) {
+  process.on('SIGTERM', ()=>shutdownYt('SIGTERM', ()=>process.exit(0)));
+  process.on('SIGINT',  ()=>shutdownYt('SIGINT',  ()=>process.exit(0)));
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
 const mainCam = new THREE.PerspectiveCamera(60, WIDTH/HEIGHT, 0.1, 1200);
@@ -1124,7 +1241,8 @@ async function renderLoop(){
     renderer.render(scene, mainCam);
     frameCount++;
 
-    if(clients.size===0) return;
+    // WebSocket 視聴者も YouTube 配信も無ければエンコード自体を省略
+    if(clients.size===0 && !YT.ready) return;
 
     const rgba=readPixels(glCtx);
     const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
@@ -1133,7 +1251,8 @@ async function renderLoop(){
         ws.send(jpeg,(err)=>{if(err)clients.delete(ws);});
       }
     }
-    if(frameCount%(FPS*10)===0)console.log(`[Render] frame=${frameCount} clients=${clients.size}`);
+    pushYtFrame(jpeg);   // 同じフレームを YouTube へも横流し (YT_STREAM_KEY 設定時のみ)
+    if(frameCount%(FPS*10)===0)console.log(`[Render] frame=${frameCount} clients=${clients.size} yt=${YT.ready?'on':'off'}`);
   }catch(e){
     console.error('[Render]',e.message);
   }finally{
@@ -1160,6 +1279,8 @@ function startLoops(){
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
   console.log('[Loops] sim / render / stats loops started');
+  if (YT_ENABLED) startYtStream();
+  else console.log('[YT] YT_STREAM_KEY 未設定 — YouTube 配信は無効 (WebSocket のみ)');
 }
 
 // ─── エントリポイント ──────────────────────────────────────────────────────────
