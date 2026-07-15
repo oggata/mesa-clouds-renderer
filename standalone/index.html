@@ -63,6 +63,13 @@
     border-radius:4px;padding:3px 6px;font-family:var(--mono);font-size:11px;cursor:pointer;}
   #goal-note{font-size:9px;color:var(--dim);margin-top:7px;line-height:1.5;}
 
+  #stream-panel{position:fixed;bottom:54px;left:50%;transform:translateX(-50%);
+    background:var(--panel);border:1px solid var(--border);border-radius:8px;
+    padding:10px 14px;backdrop-filter:blur(6px);z-index:301;display:none;
+    max-width:min(360px,88vw);font-family:var(--mono);}
+  #stream-title{font-size:11px;font-weight:700;margin-bottom:6px;color:var(--accent);}
+  #stream-note{font-size:9px;color:var(--dim);margin-top:7px;line-height:1.5;}
+
   #dbg{position:fixed;bottom:12px;right:12px;font-size:9px;color:var(--dim);
     background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:6px 8px;
     max-width:46vw;z-index:300;display:none;line-height:1.6;}
@@ -87,6 +94,23 @@
   <button id="b-speed">×1</button>
   <button id="b-newmap">🎲 New Map</button>
   <button id="b-goal">🎯 Goal</button>
+  <button id="b-stream">⚙ 配信</button>
+</div>
+
+<div id="stream-panel">
+  <div id="stream-title">⚙ 配信設定</div>
+  <div class="goal-row"><span class="goal-name">アスペクト比</span>
+    <select id="cfg-aspect">
+      <option value="square">正方形 (1:1)</option>
+      <option value="wide">横長 (16:9)</option>
+    </select></div>
+  <div class="goal-row"><span class="goal-name">画質 / FPS</span>
+    <select id="cfg-quality">
+      <option value="H">H — 高画質 60fps</option>
+      <option value="M">M — 中 30fps</option>
+      <option value="L">L — 低負荷 20fps</option>
+    </select></div>
+  <div id="stream-note">※ 回線が不安定なときは M / L を選ぶと配信の遅延が減ります。</div>
 </div>
 
 <div id="goal-panel">
@@ -816,6 +840,35 @@ async function stepAll(){
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  配信設定 (アスペクト比 / 画質 / FPS) — YouTube配信用
+//  ─ ここの数値を書き換えれば起動時のデフォルトを変えられます。
+//  ─ 画面右下の「⚙ 配信」ボタンからも切替でき、選択はブラウザに保存されます。
+// ════════════════════════════════════════════════════════════════════════════
+const STREAM_ASPECTS = {
+  square: { w:1,  h:1, label:'正方形 (1:1)'    },   // ← 従来の正方形
+  wide:   { w:16, h:9, label:'横長 (16:9)'     },   // ← YouTube配信向け
+};
+const STREAM_PRESETS = {
+  //          scale = 内部描画解像度の倍率(1=最高) /  fps = 目標フレームレート
+  H: { scale:1.0,  fps:60, label:'H — 高画質 60fps'          },   // 回線良好時
+  M: { scale:0.75, fps:30, label:'M — 中 30fps'              },   // 中間
+  L: { scale:0.5,  fps:20, label:'L — 低負荷 20fps'          },   // 回線が不安定なとき
+};
+const streamCfg = {
+  aspect : 'square',   // 'square' | 'wide'  ← デフォルトのアスペクト比
+  quality: 'H',        // 'H' | 'M' | 'L'    ← デフォルトの画質/FPS
+};
+function loadStreamCfg(){
+  try{
+    const s=JSON.parse(localStorage.getItem('streamCfg')||'{}');
+    if(STREAM_ASPECTS[s.aspect])  streamCfg.aspect =s.aspect;
+    if(STREAM_PRESETS[s.quality]) streamCfg.quality=s.quality;
+  }catch(e){}
+}
+function saveStreamCfg(){ try{ localStorage.setItem('streamCfg',JSON.stringify(streamCfg)); }catch(e){} }
+loadStreamCfg();
+
+// ════════════════════════════════════════════════════════════════════════════
 //  レンダラ / カメラ / ループ
 // ════════════════════════════════════════════════════════════════════════════
 const canvas=document.getElementById('scene');
@@ -826,10 +879,16 @@ const mainCam=new THREE.PerspectiveCamera(60,1,0.1,1200);
 mainCam.up.set(0,0,1);
 
 function resize(){
-  const s=Math.min(window.innerWidth,window.innerHeight)-24;
-  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
-  renderer.setSize(s,s,true);
-  mainCam.aspect=1; mainCam.updateProjectionMatrix();
+  const asp=STREAM_ASPECTS[streamCfg.aspect]||STREAM_ASPECTS.square;
+  const ar=asp.w/asp.h;
+  // ウィンドウ内に指定アスペクト比の最大矩形をフィットさせる
+  const availW=window.innerWidth-24, availH=window.innerHeight-24;
+  let w=availW, h=w/ar;
+  if(h>availH){ h=availH; w=h*ar; }
+  const scale=(STREAM_PRESETS[streamCfg.quality]||STREAM_PRESETS.H).scale;
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2)*scale);
+  renderer.setSize(w,h,true);
+  mainCam.aspect=ar; mainCam.updateProjectionMatrix();
 }
 window.addEventListener('resize',resize); resize();
 
@@ -853,11 +912,16 @@ function updateCamBadge(){
   else{ const a=agents[camTargetIdx-1]; if(a){ badge.textContent='🎯 '+a.def.name; showThought(a.def.name); } }
 }
 
-let lastT=performance.now();
+let lastT=performance.now(), lastFrameT=0;
 function renderLoop(){
   requestAnimationFrame(renderLoop);
   if(!scene) return;
-  const now=performance.now(), dt=Math.min(0.05,(now-lastT)/1000); lastT=now;
+  const now=performance.now();
+  // 目標FPSに合わせて描画を間引く (回線/負荷対策)
+  const cap=(STREAM_PRESETS[streamCfg.quality]||STREAM_PRESETS.H).fps;
+  if(now-lastFrameT < 1000/cap - 0.5) return;
+  lastFrameT=now;
+  const dt=Math.min(0.05,(now-lastT)/1000); lastT=now;
   agents.forEach((a,i)=>{
     const tx=a.y*CELL+CELL*.5, ty=a.x*CELL+CELL*.5, m=agentMeshes[i]; if(!m)return;
     m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
@@ -923,6 +987,19 @@ document.getElementById('b-goal').addEventListener('click',function(){
   const show=pnl.style.display!=='block';
   pnl.style.display=show?'block':'none'; this.classList.toggle('on',show);
   if(show) buildGoalPanel();
+});
+
+// ─── 配信設定 (アスペクト比 / 画質 / FPS) ──────────────────────────────────────
+(function initStreamPanel(){
+  const aSel=document.getElementById('cfg-aspect'), qSel=document.getElementById('cfg-quality');
+  aSel.value=streamCfg.aspect; qSel.value=streamCfg.quality;
+  aSel.addEventListener('change',()=>{ streamCfg.aspect =aSel.value; saveStreamCfg(); resize(); });
+  qSel.addEventListener('change',()=>{ streamCfg.quality=qSel.value; saveStreamCfg(); resize(); });
+})();
+document.getElementById('b-stream').addEventListener('click',function(){
+  const pnl=document.getElementById('stream-panel');
+  const show=pnl.style.display!=='block';
+  pnl.style.display=show?'block':'none'; this.classList.toggle('on',show);
 });
 
 // ════════════════════════════════════════════════════════════════════════════

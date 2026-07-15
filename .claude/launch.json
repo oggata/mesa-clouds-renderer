@@ -2,17 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "mesa-static",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8137"],
-      "port": 8137
-    },
-    {
       "name": "mesa-server",
       "runtimeExecutable": "node",
       "runtimeArgs": ["server.js"],
-      "env": { "PORT": "8081" },
-      "port": 8081
+      "port": 8080
     }
   ]
 }

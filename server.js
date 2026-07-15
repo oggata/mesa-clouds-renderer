@@ -32,11 +32,28 @@ let ort = null;
 try { ort = require('onnxruntime-node'); console.log('[ONNX] loaded'); }
 catch(e) { console.warn('[ONNX] not found — random mode'); }
 
-// ─── Config ──────────────────────────────────────────────────────────────────
-const WIDTH  = parseInt(process.env.WIDTH)  || 720;
-const HEIGHT = parseInt(process.env.HEIGHT) || 720;
-const FPS    = parseInt(process.env.FPS)    || 30;
-const JPEG_Q = parseInt(process.env.JPEG_Q) || 100;   // JPEG品質 (0-100)
+// ─── Config: 配信解像度 / アスペクト比 / 画質 / FPS ─────────────────────────────
+// アスペクト比と画質を ASPECT / QUALITY プリセットで簡単に切替できる。
+//   ASPECT  : 'square' (1:1・従来)      | 'wide' (16:9・YouTube向け)
+//   QUALITY : 'H'(高画質) | 'M'(中) | 'L'(低負荷・回線が不安定なとき)
+//   例:  ASPECT=wide QUALITY=L node server.js
+// WIDTH/HEIGHT/FPS/JPEG_Q/YT_VIDEO_BITRATE_K を個別指定した場合はそちらが優先される。
+const STREAM_ASPECTS = { square: 1/1, wide: 16/9 };
+const STREAM_PRESETS = {
+  //     h = 縦解像度(px) / fps / jpeg品質(0-100) / ytk = YouTube動画ビットレート(kbps)
+  H: { h:720, fps:30, jpeg:95, ytk:2500 },   // 高画質 (回線良好時)
+  M: { h:540, fps:30, jpeg:85, ytk:1500 },   // 中
+  L: { h:360, fps:20, jpeg:75, ytk:800  },   // 低負荷 (回線が不安定なとき)
+};
+const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
+const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
+const _preset = STREAM_PRESETS[QUALITY];
+const HEIGHT = parseInt(process.env.HEIGHT) || _preset.h;
+// アスペクト比から横幅を算出 (動画エンコード要件で偶数へ丸める)
+const WIDTH  = parseInt(process.env.WIDTH)  || (Math.round(HEIGHT * STREAM_ASPECTS[ASPECT] / 2) * 2);
+const FPS    = parseInt(process.env.FPS)    || _preset.fps;
+const JPEG_Q = parseInt(process.env.JPEG_Q) || _preset.jpeg;   // JPEG品質 (0-100)
+console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q})`);
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
@@ -48,7 +65,7 @@ const SEG_GATE = process.env.SEG_GATE === '1';
 // WebSocket 配信には一切影響しない (フレームを追加コピーで横流しするだけ)。
 const YT_STREAM_KEY = process.env.YT_STREAM_KEY || '';
 const YT_RTMP_BASE  = process.env.YT_RTMP_URL || 'rtmp://a.rtmp.youtube.com/live2';
-const YT_BITRATE_K  = parseInt(process.env.YT_VIDEO_BITRATE_K) || 2500;
+const YT_BITRATE_K  = parseInt(process.env.YT_VIDEO_BITRATE_K) || _preset.ytk;
 const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
@@ -56,6 +73,10 @@ const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
 // 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える。
 // 環境変数 MAX_TRAIL で可変。例: MAX_TRAIL=300 node server.js
 const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||500;
+// キャラクター / 軌跡マーカーの大きさ倍率 (1=従来)。街や建物に対して小さくしたい時に下げる。
+// 環境変数 CHAR_SCALE / TRAIL_SCALE で可変。例: CHAR_SCALE=0.5 node server.js
+const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
+const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マーカーの大きさ
 const INFER_EVERY=parseInt(process.env.INFER_EVERY)||10;
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
@@ -862,6 +883,7 @@ function createAgentMesh(S,color){
   nose.position.set(0,CELL*.11,base+CELL*.655);
   g.add(nose);
 
+  g.scale.setScalar(CHAR_SCALE);   // 街に対する大きさ調整 (足元は renderLoop 側で接地補正)
   S.add(g);return g;
 }
 
@@ -926,7 +948,7 @@ function initAgents(S){
 // 以前は毎回 new PlaneGeometry していて、50個超で remove するだけ (dispose なし)
 // だったため GPU バッファがリークし続けていた。共有 geometry なら 1個で済み、
 // disposeScene では破棄しない (TRAIL_GEO で除外)。
-const TRAIL_GEO = new THREE.PlaneGeometry(CELL*.2, CELL*.2);
+const TRAIL_GEO = new THREE.PlaneGeometry(CELL*.2*TRAIL_SCALE, CELL*.2*TRAIL_SCALE);
 
 function addTrail(S,agent){
   const m=new THREE.Mesh(TRAIL_GEO,trailMats[agent.def.id]);
@@ -1291,7 +1313,7 @@ async function renderLoop(){
       if(!m) return;
       m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
       m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
-      m.position.z=CELL*.26;
+      m.position.z=CELL*.26*CHAR_SCALE;   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
       const tar=-a.th+Math.PI*.5;
       let dr=tar-m.rotation.z;
       while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
