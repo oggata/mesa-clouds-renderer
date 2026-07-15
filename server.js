@@ -92,9 +92,17 @@ function makeMap(size, seed){
       const cells=[];
       for(let r=r0;r<r1;r++)for(let c=c0;c<c1;c++)cells.push([r,c]);
       if(!cells.length)continue;
+      // 敷地に余裕があれば一定確率で 2x2 の建物パッチを塗る (学校/病院/駅などの大型敷地)
+      let patch=null;
+      if(r1-r0>=2 && c1-c0>=2 && rng()<0.42){
+        const pr=(rng()<0.5)?r0:r1-2, pc=(rng()<0.5)?c0:c1-2;
+        for(let r=pr;r<pr+2;r++)for(let c=pc;c<pc+2;c++)g[r][c]=BUILDING;
+        patch={pr,pc};
+      }
       const b=pick(cells);g[b[0]][b[1]]=BUILDING;
       cells.forEach(([r,c])=>{
         if(r===b[0]&&c===b[1])return;
+        if(patch && r>=patch.pr && r<patch.pr+2 && c>=patch.pc && c<patch.pc+2)return; // パッチ内は保持
         const v=rng();
         if(v<.25)g[r][c]=TREE;else if(v<.45)g[r][c]=BUILDING;
       });
@@ -474,17 +482,43 @@ function selectAction(agent){
   return actionCache[agent.def.id] ?? Math.floor(Math.random()*3);
 }
 
-// ─── 建物タイプ定義 ────────────────────────────────────────────────────────────
+// ─── 建物タイプ定義 (マスター) ───────────────────────────────────────────────
+//   footprint: 1=1x1マス, 2=2x2マス / height: 実寸=height*CELL の高さ倍率(8段階)
+//   category : 行動/用途カテゴリ (eat/shop/work/home/health/learn/civic/tour/leisure/transit)
+//   persona  : 主に引き寄せるペルソナID ('*'=全般, 'CA'=C優先+A 等)
+//   texture  : ./textures/v2/<name>.png (側面比 = footprint*CELL*0.8 : height*CELL)
 const BLDG_TYPES = [
-  { label: '🥩 牛丼屋',    name: 'gyudon',   textureFile: './textures/50x80/gyudon.png', fallbackColor: 0xe8a020, height: 1.6 },
-  { label: '🍜 ラーメン屋', name: 'ramen',    textureFile: './textures/50x80/ramen.png',   fallbackColor: 0xe03030, height: 1.6 },
-  { label: '🍱 弁当屋',    name: 'bento',    textureFile: './textures/50x50/bento.png',  fallbackColor: 0x20a020, height: 1.0 },
-  { label: '☕ カフェ',    name: 'cafe',     textureFile: './textures/50x80/cafe.png',  fallbackColor: 0x8B5E3C, height: 1.6 },
-  { label: '🏢 オフィス',  name: 'office',   textureFile: './textures/50x120/office.png',  fallbackColor: 0x4060a0, height: 2.4 },
-  { label: '🏠 住宅',      name: 'house',    textureFile: './textures/50x80/house.png',  fallbackColor: 0xa06040, height: 1.6 },
-  { label: '🏪 コンビニ',  name: 'conbini',  textureFile: './textures/50x50/conbini.png',   fallbackColor: 0x20a8e0, height: 1.0 },
-  { label: '🏥 病院',      name: 'hospital', textureFile: './textures/50x80/hospital.png',  fallbackColor: 0xe0e0f0, height: 1.6 },
+  // ── 1x1 ──
+  { label:'🍢 屋台',      name:'kiosk',       footprint:1, height:0.7, category:'eat',     persona:'CA', fallbackColor:0xd08030, textureFile:'./textures/v2/kiosk.png' },
+  { label:'🏪 コンビニ',   name:'conbini',     footprint:1, height:0.9, category:'shop',    persona:'*',  fallbackColor:0x20a8e0, textureFile:'./textures/v2/conbini.png' },
+  { label:'💊 薬局',      name:'pharmacy',    footprint:1, height:0.9, category:'shop',    persona:'B',  fallbackColor:0x30b070, textureFile:'./textures/v2/pharmacy.png' },
+  { label:'☕ カフェ',    name:'cafe',        footprint:1, height:1.1, category:'eat',     persona:'C',  fallbackColor:0x8B5E3C, textureFile:'./textures/v2/cafe.png' },
+  { label:'🥩 牛丼屋',    name:'gyudon',      footprint:1, height:1.1, category:'eat',     persona:'D',  fallbackColor:0xe8a020, textureFile:'./textures/v2/gyudon.png' },
+  { label:'🍜 ラーメン屋', name:'ramen',       footprint:1, height:1.1, category:'eat',     persona:'*',  fallbackColor:0xe03030, textureFile:'./textures/v2/ramen.png' },
+  { label:'🍱 弁当屋',    name:'bento',       footprint:1, height:1.1, category:'eat',     persona:'B',  fallbackColor:0x20a020, textureFile:'./textures/v2/bento.png' },
+  { label:'🛍 商店',      name:'shop',        footprint:1, height:1.4, category:'shop',    persona:'E',  fallbackColor:0xc060a0, textureFile:'./textures/v2/shop.png' },
+  { label:'🏠 住宅',      name:'house',       footprint:1, height:1.4, category:'home',    persona:'B',  fallbackColor:0xa06040, textureFile:'./textures/v2/house.png' },
+  { label:'📮 郵便局',    name:'post',        footprint:1, height:1.4, category:'civic',   persona:'D',  fallbackColor:0xd04040, textureFile:'./textures/v2/post.png' },
+  { label:'🏦 銀行',      name:'bank',        footprint:1, height:1.7, category:'civic',   persona:'D',  fallbackColor:0x808890, textureFile:'./textures/v2/bank.png' },
+  { label:'🏬 マンション', name:'apartment',   footprint:1, height:2.1, category:'home',    persona:'B',  fallbackColor:0x9088a0, textureFile:'./textures/v2/apartment.png' },
+  { label:'🏨 ホテル',    name:'hotel',       footprint:1, height:2.1, category:'tour',    persona:'E',  fallbackColor:0xc0a060, textureFile:'./textures/v2/hotel.png' },
+  { label:'🏢 オフィス',  name:'office',      footprint:1, height:2.6, category:'work',    persona:'D',  fallbackColor:0x4060a0, textureFile:'./textures/v2/office.png' },
+  { label:'🗼 タワー',    name:'tower',       footprint:1, height:3.3, category:'work',    persona:'AE', fallbackColor:0x6070b0, textureFile:'./textures/v2/tower.png' },
+  // ── 2x2 ──
+  { label:'🛒 スーパー',   name:'supermarket', footprint:2, height:1.1, category:'shop',    persona:'CB', fallbackColor:0x40a060, textureFile:'./textures/v2/supermarket.png' },
+  { label:'⛩ 神社仏閣',   name:'temple',      footprint:2, height:1.1, category:'tour',    persona:'EA', fallbackColor:0xc04040, textureFile:'./textures/v2/temple.png' },
+  { label:'🏫 学校',      name:'school',      footprint:2, height:1.4, category:'learn',   persona:'C',  fallbackColor:0xe0b040, textureFile:'./textures/v2/school.png' },
+  { label:'🚉 駅',        name:'station',     footprint:2, height:1.4, category:'transit', persona:'CA', fallbackColor:0x7080a0, textureFile:'./textures/v2/station.png' },
+  { label:'📚 図書館',    name:'library',     footprint:2, height:1.4, category:'learn',   persona:'BE', fallbackColor:0x8060a0, textureFile:'./textures/v2/library.png' },
+  { label:'🏥 病院',      name:'hospital',    footprint:2, height:1.7, category:'health',  persona:'*',  fallbackColor:0xe0e0f0, textureFile:'./textures/v2/hospital.png' },
+  { label:'🏛 市役所',    name:'cityhall',    footprint:2, height:1.7, category:'civic',   persona:'D',  fallbackColor:0xb0b4b8, textureFile:'./textures/v2/cityhall.png' },
+  { label:'🖼 博物館',    name:'museum',      footprint:2, height:1.7, category:'tour',    persona:'E',  fallbackColor:0xa09060, textureFile:'./textures/v2/museum.png' },
+  { label:'🏟 競技場',    name:'stadium',     footprint:2, height:2.1, category:'leisure', persona:'C',  fallbackColor:0x60a080, textureFile:'./textures/v2/stadium.png' },
+  { label:'🏬 複合ビル',  name:'mall',        footprint:2, height:2.6, category:'shop',    persona:'CD', fallbackColor:0x5878a0, textureFile:'./textures/v2/mall.png' },
 ];
+// footprint 別インデックス (型割当で使用)
+const FP1_IDX = BLDG_TYPES.map((b,i)=>b.footprint===1?i:-1).filter(i=>i>=0);
+const FP2_IDX = BLDG_TYPES.map((b,i)=>b.footprint===2?i:-1).filter(i=>i>=0);
 
 let BUILDING_TYPES = {};
 const texCache = {};
@@ -500,13 +534,17 @@ async function loadTextureFile(filePath) {
   const fullPath = path.join(__dirname, filePath);
   if (!sharp || !fs.existsSync(fullPath)) { texCache[filePath] = null; return; }
   try {
+    // 元PNGの縦横比を保持したまま読み込む (箱の側面比に合わせて撮影した写真がそのまま貼れる)。
+    // NPOT テクスチャは WebGL1(headless-gl) でも Linear+ClampToEdge+mipmap無しなら使用可。
     const { data, info } = await sharp(fullPath)
-      .resize(512, 512)   // ← 2のべき乗サイズに強制リサイズ
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
     const tex = new THREE.DataTexture(new Uint8Array(data), info.width, info.height, THREE.RGBAFormat);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
     tex.flipY = true;
     tex.needsUpdate = true;
     texCache[filePath] = tex;
@@ -547,8 +585,8 @@ function getBuildingMaterial(typeIdx) {
   const mats = [
     makeMat(false, false,  90), // 0: +X 右側面
     makeMat(false, false,   -90), // 1: -X 左側面
-    makeMat(false, false,   0), // 2: +Y 正面
-    makeMat(true,  false,   0), // 3: -Y 背面
+    makeMat(true,  true,    0), // 2: +Y 正面 (BoxGeometry の +Y UV は 180°回転なので flipU+flipV で補正)
+    makeMat(false, false,   0), // 3: -Y 背面 (無変換で正立)
     new THREE.MeshLambertMaterial({ color: 0xb0b4ac }), // 4: 屋上
     new THREE.MeshLambertMaterial({ color: 0x666666 }), // 5: 底面
   ];
@@ -671,8 +709,26 @@ function buildScene(map){
   BUILDING_TYPES = {};
   occluders = {};
   const rng=(()=>{let s=42;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
+  // 建物を「構造 (1x1 or 2x2)」として型割当。全4セルが BUILDING の正方形を貪欲に 2x2 として検出し、
+  // 残りは 1x1。BUILDING_TYPES は全セルに構造の型を記録 (レイキャスト観測が参照)。
+  const assigned=new Set(), structures=[];
+  const isB=(r,c)=>r>=0&&r<GRID&&c>=0&&c<GRID&&map[r][c]===BUILDING;
+  for(let r=0;r<GRID-1;r++)for(let c=0;c<GRID-1;c++){
+    if(assigned.has(r+'_'+c))continue;
+    if(isB(r,c)&&isB(r+1,c)&&isB(r,c+1)&&isB(r+1,c+1)
+       && !assigned.has((r+1)+'_'+c) && !assigned.has(r+'_'+(c+1)) && !assigned.has((r+1)+'_'+(c+1))){
+      const typeIdx=FP2_IDX[Math.floor(rng()*FP2_IDX.length)];
+      for(let dr=0;dr<2;dr++)for(let dc=0;dc<2;dc++){
+        const kk=(r+dr)+'_'+(c+dc); assigned.add(kk); BUILDING_TYPES[kk]=typeIdx;
+      }
+      structures.push({r,c,fp:2,typeIdx});
+    }
+  }
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
-    if(map[r][c]===BUILDING) BUILDING_TYPES[r+'_'+c]=Math.floor(rng()*BLDG_TYPES.length);
+    if(map[r][c]!==BUILDING || assigned.has(r+'_'+c))continue;
+    const typeIdx=FP1_IDX[Math.floor(rng()*FP1_IDX.length)];
+    assigned.add(r+'_'+c); BUILDING_TYPES[r+'_'+c]=typeIdx;
+    structures.push({r,c,fp:1,typeIdx});
   }
 
   const S=new THREE.Scene();S.background=new THREE.Color(0xeaf2f7);
@@ -695,15 +751,7 @@ function buildScene(map){
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     const t=map[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
     if(t===BUILDING){
-      const typeIdx=BUILDING_TYPES[r+'_'+c]||0;
-      const bt=BLDG_TYPES[typeIdx%BLDG_TYPES.length];
-      const h=bt.height*CELL;
-      if(!boxGeoByH[h]) boxGeoByH[h]=new THREE.BoxGeometry(CELL*.8,CELL*.8,h);
-      const mats=getBuildingMaterial(typeIdx).map(m=>m.clone());
-      const mesh=new THREE.Mesh(boxGeoByH[h], mats);
-      mesh.position.set(cx,cy,h/2);
-      S.add(mesh);
-      occluders[r+'_'+c+'_b']={mesh,cx,cy,faded:false};
+      // 建物は下の structures ループで構造単位 (1x1/2x2) にまとめて描画
     }else if(t===TREE){
       const trunk=new THREE.Mesh(trunkGeo, trunkMat.clone());
       trunk.position.set(cx,cy,CELL*.2); S.add(trunk);
@@ -718,6 +766,20 @@ function buildScene(map){
     }
   }
 
+  // 建物を構造単位で描画 (1x1 / 2x2)。箱幅 = footprint*CELL の 80%、位置 = footprint 中心。
+  for(const st of structures){
+    const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
+    const h=bt.height*CELL, span=st.fp, bw=span*CELL*0.8;
+    const cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
+    const gkey=span+'_'+h;
+    if(!boxGeoByH[gkey]) boxGeoByH[gkey]=new THREE.BoxGeometry(bw,bw,h);
+    const mats=getBuildingMaterial(st.typeIdx).map(m=>m.clone());
+    const mesh=new THREE.Mesh(boxGeoByH[gkey], mats);
+    mesh.position.set(cx,cy,h/2);
+    S.add(mesh);
+    occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
+  }
+
   if(roadPos.length)   S.add(quadMesh(roadPos,   0xc4c8cc));
   if(groundPos.length) S.add(quadMesh(groundPos, 0x9ccc65));
 
@@ -725,7 +787,7 @@ function buildScene(map){
 }
 
 // ─── 近接フェード: キャラクターが建物/木のそばに来たら半透明にして視認性を保つ ──
-const FADE_DIST = CELL*1.3, FADE_OPACITY = 0.4;
+const FADE_DIST = CELL*2.3, FADE_OPACITY = 0.4;
 function updateOcclusionFade(){
   const near=new Set();
   for(const a of agents){
