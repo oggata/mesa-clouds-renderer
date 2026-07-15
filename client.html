@@ -139,9 +139,8 @@ const PERSONA_DEFS=[
 const canvas=document.getElementById('canvas');
 const ctx2d=canvas.getContext('2d');
 
-// サーバーの解像度比率 (server.js の WIDTH/HEIGHT と合わせる)
-const STREAM_W = 240, STREAM_H = 240;
-const ASPECT = STREAM_W / STREAM_H;  // 1.0 = 正方形
+// アスペクト比は受信フレームの実サイズから自動判定する。
+// → server.js の ASPECT 設定 (square 1:1 / wide 16:9) に自動追従し、手動指定は不要。
 
 function resizeCanvas(){
   canvas.width  = window.innerWidth;
@@ -156,6 +155,7 @@ function drawFrame(blob){
   const img = new Image();
   img.onload = () => {
     const cw = canvas.width, ch = canvas.height;
+    const ASPECT = img.naturalWidth / img.naturalHeight;  // 受信フレームの実比率
 
     // letterbox: 画面に収まる最大サイズを計算
     let dw, dh;
