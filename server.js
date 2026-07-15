@@ -43,10 +43,10 @@ const STREAM_PRESETS = {
   //     h = 縦解像度(px) / fps / jpeg品質(0-100) / ytk = YouTube動画ビットレート(kbps)
   H: { h:720, fps:30, jpeg:95, ytk:2500 },   // 高画質 (回線良好時)
   M: { h:540, fps:30, jpeg:85, ytk:1500 },   // 中
-  L: { h:320, fps:15, jpeg:75, ytk:500  },   // 低負荷 (回線が不安定なとき)
+  L: { h:400, fps:15, jpeg:80, ytk:1200  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
-const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'M';
+const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
 const _preset = STREAM_PRESETS[QUALITY];
 const HEIGHT = parseInt(process.env.HEIGHT) || _preset.h;
 // アスペクト比から横幅を算出 (動画エンコード要件で偶数へ丸める)
@@ -60,8 +60,8 @@ const JPEG_Q = parseInt(process.env.JPEG_Q) || _preset.jpeg;   // JPEG品質 (0-
 //   ONNX_THREADS : ONNX推論に使うスレッド数 (既定2)。小さいほど CPU を空ける (推論は遅くなる)。
 //   INFER_EVERY  : 何 sim ステップごとに推論し直すか (既定10)。大きいほど推論回数が減り CPU が下がる。
 //   例:  ONNX_THREADS=1 INFER_EVERY=30 node server.js
-const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 1;
-const INFER_EVERY  = parseInt(process.env.INFER_EVERY)  || 60;
+const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 2;
+const INFER_EVERY  = parseInt(process.env.INFER_EVERY)  || 30;
 // 全 ONNX セッション共通のオプション (スレッド数を絞って全コア占有を防ぐ)
 const ORT_OPTS = { executionProviders:['cpu'], intraOpNumThreads:ONNX_THREADS, interOpNumThreads:ONNX_THREADS };
 
