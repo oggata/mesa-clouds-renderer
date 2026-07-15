@@ -65,7 +65,21 @@ const INFER_EVERY  = parseInt(process.env.INFER_EVERY)  || 60;
 // 全 ONNX セッション共通のオプション (スレッド数を絞って全コア占有を防ぐ)
 const ORT_OPTS = { executionProviders:['cpu'], intraOpNumThreads:ONNX_THREADS, interOpNumThreads:ONNX_THREADS };
 
-console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY}`);
+// ─── カメラ演出 (追跡モード) ─────────────────────────────────────────────────────
+//   CAM_MODE = 'A' : 既存ロジック。俯瞰 + 各エージェントを一定間隔で順番に巡回。
+//              'B' : 動いているエージェントを優先的に追う。誰も動いていなければランダム。
+//   CAM_INTERVAL_MS  : ターゲット切替の間隔 (既定20000ms)。
+//   CAM_STALL_SWITCH : (Bのみ) 追跡中の対象がこの step 数ぶん停止したら、動いてる人へ早めに切替 (既定6)。
+//   例:  CAM_MODE=B node server.js
+//const CAM_MODE         = (process.env.CAM_MODE||'A').toUpperCase()==='B' ? 'B' : 'A';
+const CAM_MODE = 'B';
+const CAM_INTERVAL_MS  = parseInt(process.env.CAM_INTERVAL_MS)  || 20000;
+const CAM_STALL_SWITCH = parseInt(process.env.CAM_STALL_SWITCH) || 6;
+// FPV_CHANCE: ターゲット切替時に、そのキャラの一人称視点(目線)ショットになる確率 (0..1, 既定0.25)。
+//             A/B どちらでも「たまに挟む」形で入る。0 で無効。 例: FPV_CHANCE=0.3 node server.js
+const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); return isNaN(v)?0.25:Math.max(0,Math.min(1,v)); })();
+
+console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY} | camMode=${CAM_MODE} fpv=${FPV_CHANCE}`);
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
@@ -1164,27 +1178,80 @@ const mainCam = new THREE.PerspectiveCamera(60, WIDTH/HEIGHT, 0.1, 1200);
 mainCam.up.set(0,0,1);
 
 // ── 追跡カメラ ────────────────────────────────────────────────
-const CAM_OVERVIEW_INTERVAL = 20000;
+// camTargetIdx: 0=俯瞰(overview) / 1..agents.length=各エージェント。
+// camFPV: true のあいだは、対象キャラの一人称視点(目線)ショットにする。
 let camTargetIdx  = 0;
 let camSwitchTimer = Date.now();
+let camFPV = false;
+
+// ターゲット切替が起きた瞬間に呼び、たまに一人称視点ショットにする。
+// FPV はエージェント対象のときのみ (俯瞰では無効)。
+function rollFPV() {
+  camFPV = (camTargetIdx > 0) && (Math.random() < FPV_CHANCE);
+}
+
+// 次に映すターゲットを決める (モード別)。camTargetIdx を更新する。
+function pickCameraTarget() {
+  const now = Date.now();
+  const timeUp = now - camSwitchTimer > CAM_INTERVAL_MS;
+
+  if (CAM_MODE === 'B') {
+    // 動いている(直近stepで移動した = stall が小さい)エージェントの index を集める
+    const moving = [];
+    for (let i = 0; i < agents.length; i++) if (agents[i].stall <= 1) moving.push(i);
+    const cur = camTargetIdx > 0 ? agents[camTargetIdx - 1] : null;
+    // 俯瞰中、または追跡中の対象がしばらく停止していて、他に動いてる人が居れば早めに切替
+    const curStalled = !cur || cur.stall >= CAM_STALL_SWITCH;
+    if (!(timeUp || (curStalled && moving.length > 0))) return;
+
+    if (moving.length > 0) {
+      // 動いている人を優先。できれば今と違う人を選ぶ (同じ人ばかり映さない)
+      const others = moving.filter(i => i !== camTargetIdx - 1);
+      const pool = others.length ? others : moving;
+      camTargetIdx = pool[Math.floor(Math.random() * pool.length)] + 1;
+    } else {
+      // 誰も動いていない → ランダム (俯瞰 or いずれかのエージェント)
+      camTargetIdx = Math.floor(Math.random() * (agents.length + 1));
+    }
+    camSwitchTimer = now;
+    rollFPV();
+  } else {
+    // パターンA (既存): 俯瞰 → 各エージェントを順番に巡回
+    if (timeUp) {
+      camTargetIdx = (camTargetIdx + 1) % (agents.length + 1);
+      camSwitchTimer = now;
+      rollFPV();
+    }
+  }
+}
 
 function updateTrackingCamera(cam) {
-  const now = Date.now();
-  if (now - camSwitchTimer > CAM_OVERVIEW_INTERVAL) {
-    camTargetIdx = (camTargetIdx + 1) % (agents.length + 1);
-    camSwitchTimer = now;
-  }
-  cam.up.set(0, 1, 0);
+  pickCameraTarget();
   if (camTargetIdx === 0 || agents.length === 0) {
+    cam.up.set(0, 1, 0);
     cam.position.set(W*.5, W*.5, W*0.75);
     cam.lookAt(W*.5, W*.5 + 1, 0);
   } else {
     const a = agents[camTargetIdx - 1];
     if (!a) return;
-    const tx = a.y * CELL + CELL * .5;
-    const ty = a.x * CELL + CELL * .5;
-    cam.position.set(tx, ty - CELL*5, CELL*7);
-    cam.lookAt(tx, ty + CELL * 1.5, 0);
+    const tx = a.y * CELL + CELL * .5;   // world X (=足元)
+    const ty = a.x * CELL + CELL * .5;   // world Y
+    if (camFPV) {
+      // ── 一人称視点 (キャラの目線) ──
+      // world 進行方向 = (sin th, cos th) (stepAll の移動則より導出)。
+      const dwx = Math.sin(a.th), dwy = Math.cos(a.th);
+      // 目の高さ: キャラの頭の高さ (接地スケール準拠) を基準に、見やすさのため下限を設ける。
+      const eyeZ = Math.max(CELL*0.5, CELL*0.66*CHAR_SCALE);
+      const fwd  = CELL*0.3;   // 自分のメッシュに潜り込まないよう少し前へ出す
+      cam.up.set(0, 0, 1);     // Z が上 → 水平線が水平に見える
+      cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
+      cam.lookAt(tx + dwx*(fwd+4), ty + dwy*(fwd+4), eyeZ*0.85);   // 進行方向やや下向き
+    } else {
+      // ── 追跡カメラ (既存: 斜め後方から) ──
+      cam.up.set(0, 1, 0);
+      cam.position.set(tx, ty - CELL*5, CELL*7);
+      cam.lookAt(tx, ty + CELL * 1.5, 0);
+    }
   }
 }
 
