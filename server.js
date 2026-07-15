@@ -46,14 +46,26 @@ const STREAM_PRESETS = {
   L: { h:320, fps:15, jpeg:75, ytk:500  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
-const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'M';
+const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
 const _preset = STREAM_PRESETS[QUALITY];
 const HEIGHT = parseInt(process.env.HEIGHT) || _preset.h;
 // アスペクト比から横幅を算出 (動画エンコード要件で偶数へ丸める)
 const WIDTH  = parseInt(process.env.WIDTH)  || (Math.round(HEIGHT * STREAM_ASPECTS[ASPECT] / 2) * 2);
 const FPS    = parseInt(process.env.FPS)    || _preset.fps;
 const JPEG_Q = parseInt(process.env.JPEG_Q) || _preset.jpeg;   // JPEG品質 (0-100)
-console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q})`);
+
+// ─── CPU負荷 (推論スレッド数 / 推論頻度) ─────────────────────────────────────────
+// しょぼいサーバーで CPU が張り付くとき用の負荷調整。DINOv2 をエージェント5体ぶん CPU で回すため、
+// 未調整だと推論のたびに全コアを奪い 100% に張り付く。下の2つで抑えられる。
+//   ONNX_THREADS : ONNX推論に使うスレッド数 (既定2)。小さいほど CPU を空ける (推論は遅くなる)。
+//   INFER_EVERY  : 何 sim ステップごとに推論し直すか (既定10)。大きいほど推論回数が減り CPU が下がる。
+//   例:  ONNX_THREADS=1 INFER_EVERY=30 node server.js
+const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 1;
+const INFER_EVERY  = parseInt(process.env.INFER_EVERY)  || 60;
+// 全 ONNX セッション共通のオプション (スレッド数を絞って全コア占有を防ぐ)
+const ORT_OPTS = { executionProviders:['cpu'], intraOpNumThreads:ONNX_THREADS, interOpNumThreads:ONNX_THREADS };
+
+console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY}`);
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
@@ -77,7 +89,7 @@ const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||500;
 // 環境変数 CHAR_SCALE / TRAIL_SCALE で可変。例: CHAR_SCALE=0.5 node server.js
 const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
 const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マーカーの大きさ
-const INFER_EVERY=parseInt(process.env.INFER_EVERY)||10;
+// INFER_EVERY / ONNX_THREADS は先頭の「CPU負荷」設定ブロックに移動
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
 const MOVE=0.25, ROT=Math.PI/9;
@@ -198,7 +210,7 @@ async function loadSharedSessions(){
   const dinoPath=path.join(__dirname,'data','dinov2_vits14.onnx');
   if(fs.existsSync(dinoPath)){
     try{
-      dinoSession=await ort.InferenceSession.create(dinoPath,{executionProviders:['cpu']});
+      dinoSession=await ort.InferenceSession.create(dinoPath,ORT_OPTS);
       dinoIn=dinoSession.inputNames[0];
       // 出力名: cls / patch を名前で拾い、無ければ順番で割り当て
       const outs=dinoSession.outputNames;
@@ -213,7 +225,7 @@ async function loadSharedSessions(){
   const segMetaPath=path.join(__dirname,'data','seg_head_meta.json');
   if(fs.existsSync(segPath)){
     try{
-      segSession=await ort.InferenceSession.create(segPath,{executionProviders:['cpu']});
+      segSession=await ort.InferenceSession.create(segPath,ORT_OPTS);
       segIn=segSession.inputNames[0]; segOut=segSession.outputNames[0];
       segMeta=fs.existsSync(segMetaPath)?JSON.parse(fs.readFileSync(segMetaPath,'utf8')):{open_class_id:2,n_classes:5};
       console.log(`[ONNX] seg_head OK  open_class_id=${segMeta.open_class_id}`);
@@ -222,7 +234,7 @@ async function loadSharedSessions(){
   const bldgPath=path.join(__dirname,'data','building_classifier.onnx');
   if(fs.existsSync(bldgPath)){
     try{
-      bldgSession=await ort.InferenceSession.create(bldgPath,{executionProviders:['cpu']});
+      bldgSession=await ort.InferenceSession.create(bldgPath,ORT_OPTS);
       bldgIn=bldgSession.inputNames[0]; bldgOut=bldgSession.outputNames[0];
       console.log(`[ONNX] building_classifier OK`);
     }catch(e){console.warn('[ONNX] building_classifier load failed:',e.message);bldgSession=null;}
@@ -266,7 +278,7 @@ async function loadOnnxSessions(){
     }
     if(fs.existsSync(op)){
       try{
-        ortSessions[p.id]=await ort.InferenceSession.create(op,{executionProviders:['cpu']});
+        ortSessions[p.id]=await ort.InferenceSession.create(op,ORT_OPTS);
         const dim=obsDims[p.id]||(IMG_CH*IMG_H*IMG_W);
         const nm=ortSessions[p.id].inputNames[0];
         await ortSessions[p.id].run({[nm]:new ort.Tensor('float32',new Float32Array(dim),[1,dim])});
