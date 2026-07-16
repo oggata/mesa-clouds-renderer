@@ -114,13 +114,51 @@ const FP_FOV=Math.PI/3, FP_RAY_MAX=8.0, FP_RAY_STEP=0.1;
 const FP_CELL_RGB=[[45,100,45],[80,80,80],[196,32,32],[35,104,40]];
 const FP_SKY_RGB=[6,12,20], FP_FLOOR_RGB=[26,40,32];
 
-const PERSONA_DEFS = [
+// ─── ペルソナ定義 (外部設定ファイル personas.json から読み込み) ────────────────────
+//   PERSONAS_FILE でパス変更可。ファイルが無い/壊れている場合は下記の既定5体を使う。
+//   各ペルソナの id は行動モデル data/persona_<id>.onnx と対応 (無ければランダム移動)。
+const PERSONA_FALLBACK = [
   { id:'A', name:'Explorer Rex',    color:0xff3355, hex:'#ff3355', desc:'Actively explores new areas' },
   { id:'B', name:'Homebody Lily',   color:0x00ccff, hex:'#00ccff', desc:'Takes the shortest route' },
   { id:'C', name:'Social Marco',    color:0x33ff88, hex:'#33ff88', desc:'Gathers near others' },
   { id:'D', name:'Businessman Cole',color:0xffee00, hex:'#ffee00', desc:'Moves straight, efficiency first' },
   { id:'E', name:'Tourist Elena',   color:0xff7700, hex:'#ff7700', desc:'Wanders around buildings' },
 ];
+function loadPersonaDefs(){
+  const fp = process.env.PERSONAS_FILE || path.join(__dirname,'personas.json');
+  let raw = PERSONA_FALLBACK;
+  try{
+    if(fs.existsSync(fp)){
+      const j = JSON.parse(fs.readFileSync(fp,'utf8'));
+      const arr = Array.isArray(j) ? j : j.personas;
+      if(Array.isArray(arr) && arr.length) raw = arr;
+      else console.warn(`[Persona] ${fp} に personas 配列が無い → 既定5体を使用`);
+    }else{
+      console.warn(`[Persona] ${fp} が見つからない → 既定5体を使用`);
+    }
+  }catch(e){ console.warn(`[Persona] ${fp} 読み込み失敗: ${e.message} → 既定5体を使用`); }
+  // 正規化: color(数値) と hex(文字列) を両方揃える (設定ファイルは "#RRGGBB" 文字列で書ける)
+  return raw.map((p,i)=>{
+    const col = (typeof p.color==='number')
+      ? p.color
+      : (parseInt(String(p.color||p.hex||'#888888').replace('#',''),16) || 0x888888);
+    return {
+      id:   String(p.id ?? String.fromCharCode(65+i)),
+      name: p.name || `Persona ${p.id ?? i}`,
+      color: col,
+      hex:  '#'+col.toString(16).padStart(6,'0'),
+      desc: p.desc || '',
+    };
+  });
+}
+const PERSONA_DEFS = loadPersonaDefs();
+// キャラクター数 (1-50)。未設定ならペルソナ数。ペルソナ数より多い場合は一覧を巡回して割り当てる。
+//const _numAgentsEnv = parseInt(process.env.NUM_AGENTS);
+const _numAgentsEnv = 50;
+const NUM_AGENTS = Number.isFinite(_numAgentsEnv)
+  ? Math.max(1, Math.min(50, _numAgentsEnv))
+  : PERSONA_DEFS.length;
+console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`);
 
 // ─── マップ生成 ───────────────────────────────────────────────────────────────
 function makeMap(size, seed){
@@ -216,7 +254,7 @@ let dinoSession=null, segSession=null, bldgSession=null, segMeta=null;
 let dinoIn='image', dinoClsOut='cls', dinoPatchOut='patch';
 let segIn='patch_tokens', segOut=null, bldgIn='dino_feat', bldgOut=null;
 const inferErrLogged={};        // ペルソナごと: フォールバック警告を1回だけ出す
-const segPassCache={};          // ペルソナごと: seg による前方通行可否 (キャッシュ)
+const segPassCache={};          // エージェント(aid)ごと: seg による前方通行可否 (キャッシュ)
 
 // 共有 ONNX (DINOv2 / seg_head / building_classifier) をロード
 async function loadSharedSessions(){
@@ -499,8 +537,8 @@ async function inferAction(map, agent){
 
       // seg による前方通行可否を更新 (使う場合のみ)
       if(segSession){
-        try{ segPassCache[id]=await computeSegPassable(di[dinoPatchOut]); }
-        catch(e){ segPassCache[id]=true; }
+        try{ segPassCache[agent.aid]=await computeSegPassable(di[dinoPatchOut]); }
+        catch(e){ segPassCache[agent.aid]=true; }
       }
       return sampleLogits(lg);
     }
@@ -521,12 +559,12 @@ async function prefetchAllActions(map, agents){
   if(stepCount % INFER_EVERY !== 0) return;
   // 逐次実行: DINOv2/seg のピークメモリを抑えつつ描画バッファを再利用できる
   for(const a of agents){
-    actionCache[a.def.id] = await inferAction(map, a);
+    actionCache[a.aid] = await inferAction(map, a);
   }
 }
 
 function selectAction(agent){
-  return actionCache[agent.def.id] ?? Math.floor(Math.random()*3);
+  return actionCache[agent.aid] ?? Math.floor(Math.random()*3);
 }
 
 // ─── 建物タイプ定義 (マスター) ───────────────────────────────────────────────
@@ -962,12 +1000,14 @@ function initAgents(S){
   agentMeshes.forEach(m=>{S.remove(m);disposeMesh(m);});
   agents.forEach(a=>{a.trail.forEach(m=>S.remove(m));});  // trail geo/mat は共有なので dispose しない
   agents=[];agentMeshes=[];
-  PERSONA_DEFS.forEach(def=>{
+  // NUM_AGENTS 体を生成。ペルソナ数を超える場合は一覧を巡回して割り当て、aid で個体を一意化する。
+  for(let i=0;i<NUM_AGENTS;i++){
+    const def=PERSONA_DEFS[i % PERSONA_DEFS.length];
     const b=randB(null),g=randB(b);
-    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map()});
+    agents.push({aid:`${def.id}#${i}`,x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map()});
     agentMeshes.push(createAgentMesh(S,def.color));
-  });
-  console.log(`[Sim] ${agents.length} agents initialized`);
+  }
+  console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
 }
 
 // トレイルは毎ステップ生成されるため、geometry を全トレイルで共有する。
@@ -1008,7 +1048,7 @@ async function stepAll(){
       // 学習時(マップ配列で通行判定)とも一致するため「seg誤判定で止まる」を防ぐ。
       // SEG_GATE=1 かつ seg_head ありのときだけ seg 判定を使う。
       const useSeg = SEG_GATE && segSession && meta && meta.dino;
-      const passable = useSeg ? (segPassCache[a.def.id] ?? true) : PASSABLE.has(MAP[r][c]);
+      const passable = useSeg ? (segPassCache[a.aid] ?? true) : PASSABLE.has(MAP[r][c]);
       if(passable){
         a.x=nx;a.y=ny;
         const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
@@ -1308,16 +1348,18 @@ const httpServer=http.createServer((req,res)=>{
     }
     const pid=(q.get('persona')||'').toUpperCase();
     const type=parseInt(q.get('type'),10);
-    const a=agents.find(ag=>ag.def.id===pid);
-    if(!a){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:'persona not found',personas:agents.map(x=>x.def.id)})); return; }
+    const matched=agents.filter(ag=>ag.def.id===pid);   // 同ペルソナの個体すべてに適用
+    if(!matched.length){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:'persona not found',personas:[...new Set(agents.map(x=>x.def.id))]})); return; }
     const gd=(personaMeta[pid]&&personaMeta[pid].goalDim)||0;
-    if(isNaN(type)||type<0){ a.goalZ=null; }
-    else {
-      const z=new Float32Array(gd||8); if(type<z.length) z[type]=1; a.goalZ=z;
-      // 学習時は z=目的地建物のタイプ なので、目的地も同タイプの建物へ張り替える
-      // (z と compass の指す先が食い違う入力は学習分布に無い)
-      const cands=BUILDINGS.filter(b=>(BUILDING_TYPES[b[0]+'_'+b[1]]||0)===type);
-      if(cands.length){ const g=cands[Math.floor(Math.random()*cands.length)]; a.gx=g[0]+0.5; a.gy=g[1]+0.5; }
+    for(const a of matched){
+      if(isNaN(type)||type<0){ a.goalZ=null; }
+      else {
+        const z=new Float32Array(gd||8); if(type<z.length) z[type]=1; a.goalZ=z;
+        // 学習時は z=目的地建物のタイプ なので、目的地も同タイプの建物へ張り替える
+        // (z と compass の指す先が食い違う入力は学習分布に無い)
+        const cands=BUILDINGS.filter(b=>(BUILDING_TYPES[b[0]+'_'+b[1]]||0)===type);
+        if(cands.length){ const g=cands[Math.floor(Math.random()*cands.length)]; a.gx=g[0]+0.5; a.gy=g[1]+0.5; }
+      }
     }
     res.writeHead(200);
     res.end(JSON.stringify({ok:true,persona:pid,type:(isNaN(type)?-1:type),goalDim:gd,
