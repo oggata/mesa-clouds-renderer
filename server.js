@@ -86,9 +86,10 @@ const PORT   = process.env.PORT || 8080;
 const SEG_GATE = process.env.SEG_GATE === '1';
 
 // ─── YouTube ライブ配信 (任意) ─────────────────────────────────────────────────
-// YT_STREAM_KEY がセットされている時だけ有効化。renderLoop の JPEG フレームを
-// ffmpeg の stdin (image2pipe) へ流し込み、H.264/AAC(無音) で RTMP 送出する。
-// WebSocket 配信には一切影響しない (フレームを追加コピーで横流しするだけ)。
+// YT_STREAM_KEY がセットされている時だけ有効化。renderLoop の「生RGBAフレーム」を
+// ffmpeg の stdin (rawvideo) へ直接流し込み、H.264/AAC(無音) で RTMP 送出する。
+// JPEGを経由しないため sharp のエンコードが不要 = CPU減・画質向上。
+// エンコーダは YT_VENC で変更可 (Mac: h264_videotoolbox でHWエンコード)。
 const YT_STREAM_KEY = process.env.YT_STREAM_KEY || '';
 const YT_RTMP_BASE  = process.env.YT_RTMP_URL || 'rtmp://a.rtmp.youtube.com/live2';
 const YT_BITRATE_K  = parseInt(process.env.YT_VIDEO_BITRATE_K) || _preset.ytk;
@@ -154,7 +155,7 @@ function loadPersonaDefs(){
 const PERSONA_DEFS = loadPersonaDefs();
 // キャラクター数 (1-50)。未設定ならペルソナ数。ペルソナ数より多い場合は一覧を巡回して割り当てる。
 //const _numAgentsEnv = parseInt(process.env.NUM_AGENTS);
-const _numAgentsEnv = 50;
+const _numAgentsEnv = 5;
 const NUM_AGENTS = Number.isFinite(_numAgentsEnv)
   ? Math.max(1, Math.min(50, _numAgentsEnv))
   : PERSONA_DEFS.length;
@@ -1106,30 +1107,37 @@ process.on('uncaughtException', (err)=>{
 });
 
 // ─── YouTube ライブ配信ワーカー ──────────────────────────────────────────────────
-// renderLoop が生成する JPEG フレームを ffmpeg の stdin へ書き込み、RTMP 送出する。
+// renderLoop が生成する生RGBAフレームを ffmpeg の stdin へ書き込み、RTMP 送出する。
 // ffmpeg が死んでも指数バックオフで自動再起動する (demo の index.js と同方針)。
 const YT = {
   child: null,
   shuttingDown: false,
   backoff: 2000,
   MAX_BACKOFF: 60000,
-  ready: false,   // stdin が書き込み可能か
+  ready: false,        // stdin が書き込み可能か
+  backpressure: false, // ffmpeg が追いついていない間 true (このフレームは捨てる)
 };
 
 function buildYtArgs(){
   const gop = FPS * 2;   // 2秒に1キーフレーム (YouTube 推奨)
+  // 映像エンコーダ。既定 libx264。Mac は YT_VENC=h264_videotoolbox でHWエンコード(CPUほぼ0)。
+  const venc = process.env.YT_VENC || 'libx264';
+  const vout = (venc === 'libx264')
+    ? ['-c:v','libx264','-preset', process.env.YT_PRESET || 'veryfast','-tune','zerolatency','-pix_fmt','yuv420p']
+    : ['-c:v', venc, '-pix_fmt','yuv420p','-realtime','1'];   // videotoolbox 等
   return [
-    // --- 映像入力: stdin から流れてくる JPEG 連番 (image2pipe) ---
-    '-f', 'image2pipe',
+    // --- 映像入力: stdin から流れてくる「生RGBAフレーム」(rawvideo) ---
+    //     JPEGを挟まず生画素を直接渡す → sharpのJPEGエンコードが不要になりCPU減・画質向上。
+    '-f', 'rawvideo',
+    '-pix_fmt', 'rgba',
+    '-s', `${WIDTH}x${HEIGHT}`,
     '-framerate', String(FPS),
     '-i', 'pipe:0',
     // --- 音声入力: 無音 ---
     '-f', 'lavfi',
     '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
     // --- 映像出力 ---
-    '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-pix_fmt', 'yuv420p',
+    ...vout,
     '-b:v', `${YT_BITRATE_K}k`,
     '-maxrate', `${YT_BITRATE_K}k`,
     '-bufsize', `${YT_BITRATE_K * 2}k`,
@@ -1151,7 +1159,7 @@ function startYtStream(){
 
   const args = buildYtArgs();
   const started = Date.now();
-  console.log(`[YT] ffmpeg 起動 (${WIDTH}x${HEIGHT} @ ${FPS}fps, ${YT_BITRATE_K}k, rtmp=${YT_RTMP_BASE}/****)`);
+  console.log(`[YT] ffmpeg 起動 (${WIDTH}x${HEIGHT} @ ${FPS}fps, ${YT_BITRATE_K}k, venc=${process.env.YT_VENC||'libx264'}, rawvideo入力, rtmp=${YT_RTMP_BASE}/****)`);
 
   const child = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] });
   YT.child = child;
@@ -1186,14 +1194,16 @@ function startYtStream(){
   });
 }
 
-// renderLoop から呼ばれる: 1フレーム分の JPEG を ffmpeg stdin へ書き込む
-function pushYtFrame(jpeg){
+// renderLoop から呼ばれる: 1フレーム分の「生RGBA」を ffmpeg stdin へ書き込む。
+// raw は毎フレーム使い回すバッファ(_flBuf)なので、必ずコピーして渡す (上書き対策)。
+function pushYtFrame(raw){
   if (!YT.ready || !YT.child) return;
   const stdin = YT.child.stdin;
   if (!stdin.writable) return;
-  // backpressure 時は破棄せず書き込む (write は内部バッファに積む)。
-  // 戻り値 false は無視 — ライブ配信は多少の遅延より欠落回避を優先。
-  stdin.write(jpeg);
+  // ffmpeg が追いつかない間はこのフレームを捨てる (renderLoop をブロックしない = 非力サーバー対策)。
+  if (YT.backpressure) return;
+  const ok = stdin.write(Buffer.from(raw));   // Uint8ClampedArray → コピー付き Buffer
+  if (!ok) { YT.backpressure = true; stdin.once('drain', ()=>{ YT.backpressure = false; }); }
 }
 
 function shutdownYt(sig, done){
@@ -1446,17 +1456,21 @@ async function renderLoop(){
     renderer.render(scene, mainCam);
     frameCount++;
 
-    // WebSocket 視聴者も YouTube 配信も無ければエンコード自体を省略
+    // WebSocket 視聴者も YouTube 配信も無ければ読み出し/エンコード自体を省略
     if(clients.size===0 && !YT.ready) return;
 
     const rgba=readPixels(glCtx);
-    const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
-    for(const ws of clients){
-      if(ws.readyState===WebSocket.OPEN){
-        ws.send(jpeg,(err)=>{if(err)clients.delete(ws);});
+    // YouTube: 生RGBAフレームを直接 ffmpeg へ (JPEGを経由しない)
+    if(YT.ready) pushYtFrame(rgba);
+    // ブラウザ視聴者がいる時だけ JPEG 化して送る (視聴者0なら JPEGエンコードもしない)
+    if(clients.size>0){
+      const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
+      for(const ws of clients){
+        if(ws.readyState===WebSocket.OPEN){
+          ws.send(jpeg,(err)=>{if(err)clients.delete(ws);});
+        }
       }
     }
-    pushYtFrame(jpeg);   // 同じフレームを YouTube へも横流し (YT_STREAM_KEY 設定時のみ)
     if(frameCount%(FPS*10)===0)console.log(`[Render] frame=${frameCount} clients=${clients.size} yt=${YT.ready?'on':'off'}`);
   }catch(e){
     console.error('[Render]',e.message);
