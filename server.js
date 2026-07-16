@@ -98,7 +98,7 @@ const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
 // 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える。
 // 環境変数 MAX_TRAIL で可変。例: MAX_TRAIL=300 node server.js
-const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||500;
+const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||50;
 // キャラクター / 軌跡マーカーの大きさ倍率 (1=従来)。街や建物に対して小さくしたい時に下げる。
 // 環境変数 CHAR_SCALE / TRAIL_SCALE で可変。例: CHAR_SCALE=0.5 node server.js
 const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
