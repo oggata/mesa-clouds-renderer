@@ -78,8 +78,10 @@ const CAM_STALL_SWITCH = parseInt(process.env.CAM_STALL_SWITCH) || 6;
 // FPV_CHANCE: ターゲット切替時に、そのキャラの一人称視点(目線)ショットになる確率 (0..1, 既定0.25)。
 //             A/B どちらでも「たまに挟む」形で入る。0 で無効。 例: FPV_CHANCE=0.3 node server.js
 const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); return isNaN(v)?0.25:Math.max(0,Math.min(1,v)); })();
-
-console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY} | camMode=${CAM_MODE} fpv=${FPV_CHANCE}`);
+// CAM_DIST: 追跡カメラのプレイヤーまでの距離倍率 (1.0=従来)。小さいほど寄る。 例: CAM_DIST=0.5 node server.js
+//const CAM_DIST         = (()=>{ const v=parseFloat(process.env.CAM_DIST); return isNaN(v)?1.0:Math.max(0.2,Math.min(3.0,v)); })();
+const CAM_DIST = 0.6;
+console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY} | camMode=${CAM_MODE} fpv=${FPV_CHANCE} camDist=${CAM_DIST}`);
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
@@ -1297,9 +1299,9 @@ function updateTrackingCamera(cam) {
       cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
       cam.lookAt(tx + dwx*(fwd+4), ty + dwy*(fwd+4), eyeZ*0.85);   // 進行方向やや下向き
     } else {
-      // ── 追跡カメラ (既存: 斜め後方から) ──
+      // ── 追跡カメラ (斜め後方から) ── CAM_DIST でプレイヤーまでの距離を調整 (小さいほど寄る)
       cam.up.set(0, 1, 0);
-      cam.position.set(tx, ty - CELL*5, CELL*7);
+      cam.position.set(tx, ty - CELL*5*CAM_DIST, CELL*7*CAM_DIST);
       cam.lookAt(tx, ty + CELL * 1.5, 0);
     }
   }
