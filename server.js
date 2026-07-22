@@ -43,7 +43,7 @@ const STREAM_PRESETS = {
   //     h = 縦解像度(px) / fps / jpeg品質(0-100) / ytk = YouTube動画ビットレート(kbps)
   H: { h:720, fps:30, jpeg:95, ytk:2500 },   // 高画質 (回線良好時)
   M: { h:540, fps:30, jpeg:85, ytk:1500 },   // 中
-  L: { h:320, fps:5, jpeg:80, ytk:2000  },   // 低負荷 (回線が不安定なとき)
+  L: { h:280, fps:30, jpeg:80, ytk:2000  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
 const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
