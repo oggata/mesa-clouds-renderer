@@ -624,11 +624,27 @@ async function inferAction(map, agent){
 }
 
 let stepCount = 0;
+let inferWarmed = false;   // 初回の一括推論が済んだか (initAgents でリセット)
+
+// 推論の位相分散 (配信のコマ落ち対策)。
+//   旧: INFER_EVERY tick ごとに「全エージェントをまとめて」推論 → 50体ぶんの
+//       FPVレイキャスト + DINOv2 が一気に走り、イベントループが数秒ブロックされる。
+//       その間 renderLoop が1枚も描けず YouTube への供給が途切れていた。
+//   新: エージェントに位相 (index % INFER_EVERY) を持たせ、自分の番のtickだけ推論する。
+//       1エージェントあたりの推論間隔は INFER_EVERY tick のままなので、
+//       「1意思決定=学習時と同じ変位」という前提は一切変わらない。実行タイミングが
+//       ばらけるだけで、1tickあたりの負荷が 1/INFER_EVERY に平準化される。
 async function prefetchAllActions(map, agents){
-  if(stepCount % INFER_EVERY !== 0) return;
-  // 逐次実行: DINOv2/seg のピークメモリを抑えつつ描画バッファを再利用できる
-  for(const a of agents){
-    actionCache[a.aid] = await inferAction(map, a);
+  // 初回だけ全員ぶん推論しておく (自分の位相が来るまでランダム行動になるのを防ぐ)
+  if(!inferWarmed){
+    inferWarmed = true;
+    for(const a of agents) actionCache[a.aid] = await inferAction(map, a);
+    return;
+  }
+  const phase = stepCount % INFER_EVERY;
+  for(let i=0;i<agents.length;i++){
+    if(i % INFER_EVERY !== phase) continue;   // 自分の番のtickだけ
+    actionCache[agents[i].aid] = await inferAction(map, agents[i]);
   }
 }
 
@@ -1247,6 +1263,7 @@ function initAgents(S){
       personaVec:null});   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
     agentMeshes.push(createAgentMesh(S,def.color));
   }
+  inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
 }
 
