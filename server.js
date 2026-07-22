@@ -43,7 +43,7 @@ const STREAM_PRESETS = {
   //     h = 縦解像度(px) / fps / jpeg品質(0-100) / ytk = YouTube動画ビットレート(kbps)
   H: { h:720, fps:30, jpeg:95, ytk:2500 },   // 高画質 (回線良好時)
   M: { h:540, fps:30, jpeg:85, ytk:1500 },   // 中
-  L: { h:320, fps:15, jpeg:80, ytk:1500  },   // 低負荷 (回線が不安定なとき)
+  L: { h:320, fps:12, jpeg:80, ytk:1500  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
 const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
@@ -60,7 +60,7 @@ const JPEG_Q = parseInt(process.env.JPEG_Q) || _preset.jpeg;   // JPEG品質 (0-
 //   ONNX_THREADS : ONNX推論に使うスレッド数 (既定2)。小さいほど CPU を空ける (推論は遅くなる)。
 //   INFER_EVERY  : 何 sim ステップごとに推論し直すか (既定10)。大きいほど推論回数が減り CPU が下がる。
 //   例:  ONNX_THREADS=1 INFER_EVERY=30 node server.js
-const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 2;
+const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 1;
 // CPU負荷モード PERF=H|M|L → 推論頻度(INFER_EVERY)。下の MOVE/rot が INFER_EVERY に反比例して
 // 自動スケールするので、どのモードでも「1意思決定あたりの変位」は学習時と同じ = 分布内に保たれる。
 // 明示的な INFER_EVERY 環境変数があればそれを最優先。
@@ -105,7 +105,7 @@ const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
 // 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える。
 // 環境変数 MAX_TRAIL で可変。例: MAX_TRAIL=300 node server.js
-const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||50;
+const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||10;
 // キャラクター / 軌跡マーカーの大きさ倍率 (1=従来)。街や建物に対して小さくしたい時に下げる。
 // 環境変数 CHAR_SCALE / TRAIL_SCALE で可変。例: CHAR_SCALE=0.5 node server.js
 const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
