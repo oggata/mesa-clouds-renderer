@@ -43,7 +43,7 @@ const STREAM_PRESETS = {
   //     h = 縦解像度(px) / fps / jpeg品質(0-100) / ytk = YouTube動画ビットレート(kbps)
   H: { h:720, fps:30, jpeg:95, ytk:2500 },   // 高画質 (回線良好時)
   M: { h:540, fps:30, jpeg:85, ytk:1500 },   // 中
-  L: { h:280, fps:30, jpeg:80, ytk:2000  },   // 低負荷 (回線が不安定なとき)
+  L: { h:320, fps:15, jpeg:80, ytk:1500  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
 const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
@@ -1363,6 +1363,16 @@ const YT = {
   MAX_BACKOFF: 60000,
   ready: false,        // stdin が書き込み可能か
   backpressure: false, // ffmpeg が追いついていない間 true (このフレームは捨てる)
+  // ── 固定レート送出 (YouTube 供給不足対策) ──
+  //   rawvideo のパイプ入力にはタイムスタンプが無く、ffmpeg は「届いたフレーム=1/FPS秒」として
+  //   PTS を振る。つまり実時間1秒に FPS 枚渡せないと、出力の時間軸が実時間より遅れていき
+  //   YouTube から「受信している動画が少ない」と警告される。
+  //   → renderLoop の出来に依存せず、ポンプが毎秒 FPS 枚を必ず書く (新しい絵が無ければ直前を複製)。
+  //     複製フレームは x264 ではほぼゼロビットの P フレームになるので帯域はむしろ減る。
+  lastFrame: null,     // 直近の描画結果 (Buffer。置き換えのみで in-place 変更はしない)
+  hasNew: false,       // 前回のポンプ以降に新しい絵が来たか
+  t0: 0, sent: 0,      // 送出の基準時刻と累計枚数 (実時間との同期に使う)
+  statNew: 0, statDup: 0, statDrop: 0,
 };
 
 function buildYtArgs(){
@@ -1411,6 +1421,7 @@ function startYtStream(){
   const child = spawn('ffmpeg', args, { stdio: ['pipe', 'ignore', 'pipe'] });
   YT.child = child;
   YT.ready = true;
+  YT.t0 = 0; YT.sent = 0; YT.hasNew = false;   // 送出タイムラインを再起動時にリセット
 
   // stdin が詰まったり切れたりしても本体を巻き込まないよう握りつぶす
   child.stdin.on('error', (err)=>{
@@ -1441,16 +1452,57 @@ function startYtStream(){
   });
 }
 
-// renderLoop から呼ばれる: 1フレーム分の「生RGBA」を ffmpeg stdin へ書き込む。
-// raw は毎フレーム使い回すバッファ(_flBuf)なので、必ずコピーして渡す (上書き対策)。
-function pushYtFrame(raw){
-  if (!YT.ready || !YT.child) return;
+// renderLoop から呼ばれる: 最新フレームを保持するだけ (送出はポンプが固定レートで行う)。
+// raw は毎フレーム使い回すバッファ(_flBuf)なので、必ずコピーして保持する (上書き対策)。
+function setYtFrame(raw){
+  if (!YT_ENABLED) return;
+  YT.lastFrame = Buffer.from(raw);   // Uint8ClampedArray → コピー付き Buffer
+  YT.hasNew = true;
+}
+
+// 固定レートポンプ: 実時間に対して「送るべき総枚数」との差分を埋める。
+// イベントループが長時間ブロックされた後でも、複製フレームで追いついて実時間同期を保つ。
+function ytPumpTick(){
+  if (!YT_ENABLED || !YT.ready || !YT.child) return;
   const stdin = YT.child.stdin;
-  if (!stdin.writable) return;
-  // ffmpeg が追いつかない間はこのフレームを捨てる (renderLoop をブロックしない = 非力サーバー対策)。
-  if (YT.backpressure) return;
-  const ok = stdin.write(Buffer.from(raw));   // Uint8ClampedArray → コピー付き Buffer
-  if (!ok) { YT.backpressure = true; stdin.once('drain', ()=>{ YT.backpressure = false; }); }
+  if (!stdin || !stdin.writable) return;
+  if (!YT.lastFrame) return;                 // まだ1枚も描けていない
+
+  // ★ write() の戻り値を詰まり判定に使ってはいけない:
+  //   Node のストリームは highWaterMark(既定16KB)超で false を返すため、1枚が数百KBある
+  //   本用途では「毎回 false」になる。元実装はそれを backpressure とみなし drain まで
+  //   フレームを捨てていたので、正常時でも大量にコマ落ちしていた。
+  //   実際の滞留は writableLength(未送出バイト数) で見る。
+  const FRAME_BYTES = WIDTH * HEIGHT * 4;
+  YT.backpressure = stdin.writableLength > FRAME_BYTES * 3;   // 3枚ぶん以上溜まったら本当に詰まり
+  if (YT.backpressure) { YT.statDrop++; return; }
+
+  const now = Date.now();
+  if (!YT.t0) { YT.t0 = now; YT.sent = 0; }
+  const due = Math.floor((now - YT.t0) * FPS / 1000);   // 今までに送っておくべき総枚数
+  let need = due - YT.sent;
+  if (need <= 0) return;
+  // 遅れが大きすぎるときは一気に埋めず、基準をずらして最大1秒ぶんに制限 (バースト暴走防止)
+  if (need > FPS) { YT.sent = due - FPS; need = FPS; }
+
+  for (let i = 0; i < need; i++){
+    stdin.write(YT.lastFrame);               // 戻り値は見ない (上記の理由)
+    if (YT.hasNew) { YT.statNew++; YT.hasNew = false; } else { YT.statDup++; }
+    YT.sent++;
+    if (stdin.writableLength > FRAME_BYTES * 3) break;   // 溜まってきたら今回はここまで
+  }
+}
+
+// 診断ログ: 送出fps / 複製 / 詰まり。CPU不足か帯域不足かの切り分けに使う。
+//   new が低く dup が高い  → 描画が追いついていない (CPU側)
+//   drop が多い / bp=true  → ffmpeg・回線側が詰まっている (帯域側)
+function ytStatsTick(){
+  if (!YT_ENABLED || !YT.ready) return;
+  const sec = 5;
+  console.log(`[YT] 送出 ${((YT.statNew+YT.statDup)/sec).toFixed(1)}fps `
+            + `(新規 ${(YT.statNew/sec).toFixed(1)} / 複製 ${(YT.statDup/sec).toFixed(1)}) `
+            + `drop=${YT.statDrop} bp=${YT.backpressure} 目標=${FPS}fps`);
+  YT.statNew = YT.statDup = YT.statDrop = 0;
 }
 
 function shutdownYt(sig, done){
@@ -1818,7 +1870,7 @@ async function renderLoop(){
 
     const rgba=readPixels(glCtx);
     // YouTube: 生RGBAフレームを直接 ffmpeg へ (JPEGを経由しない)
-    if(YT.ready) pushYtFrame(rgba);
+    if(YT.ready) setYtFrame(rgba);
     // ブラウザ視聴者がいる時だけ JPEG 化して送る (視聴者0なら JPEGエンコードもしない)
     if(clients.size>0){
       const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
@@ -1854,7 +1906,13 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  console.log('[Loops] sim / render / stats loops started');
+  if(YT_ENABLED){
+    // 固定レートで ffmpeg へ送出 (renderLoop の出来に依存させない)
+    setInterval(ytPumpTick,  Math.max(1, Math.round(1000/FPS)));
+    setInterval(ytStatsTick, 5000);
+  }
+  console.log('[Loops] sim / render / stats loops started'
+    + (YT_ENABLED ? ` / yt pump ${FPS}fps` : ''));
   if (YT_ENABLED) startYtStream();
   else console.log('[YT] YT_STREAM_KEY 未設定 — YouTube 配信は無効 (WebSocket のみ)');
 }
