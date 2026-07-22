@@ -46,7 +46,7 @@ const STREAM_PRESETS = {
   L: { h:320, fps:5, jpeg:80, ytk:800  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
-const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'H';
+const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
 const _preset = STREAM_PRESETS[QUALITY];
 const HEIGHT = parseInt(process.env.HEIGHT) || _preset.h;
 // アスペクト比から横幅を算出 (動画エンコード要件で偶数へ丸める)
@@ -60,7 +60,7 @@ const JPEG_Q = parseInt(process.env.JPEG_Q) || _preset.jpeg;   // JPEG品質 (0-
 //   ONNX_THREADS : ONNX推論に使うスレッド数 (既定2)。小さいほど CPU を空ける (推論は遅くなる)。
 //   INFER_EVERY  : 何 sim ステップごとに推論し直すか (既定10)。大きいほど推論回数が減り CPU が下がる。
 //   例:  ONNX_THREADS=1 INFER_EVERY=30 node server.js
-const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 50;
+const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 2;
 // CPU負荷モード PERF=H|M|L → 推論頻度(INFER_EVERY)。下の MOVE/rot が INFER_EVERY に反比例して
 // 自動スケールするので、どのモードでも「1意思決定あたりの変位」は学習時と同じ = 分布内に保たれる。
 // 明示的な INFER_EVERY 環境変数があればそれを最優先。
@@ -303,9 +303,70 @@ async function loadSharedSessions(){
   }
 }
 
+// meta(JSON) → personaMeta エントリ。個別モデル / 1モデル化 で共通に使う。
+function buildPersonaMeta(m){
+  const iw=m.img_w||IMG_W, ih=m.img_h||IMG_H, ic=m.img_ch||IMG_CH;
+  const isize=m.input_size||(iw*ih*ic);
+  const div=v=>v/255;
+  return {
+    inputSize: isize,
+    goalDim: m.goal_dim||0,             // >0 なら goal条件付け (cls+z)。0=従来(clsのみ)
+    goalClasses: m.goal_classes||[],    // z の index が意味する建物名の並び (モデル固有)
+    bldgToZ: buildBldgToZ(m.goal_classes||[]),  // 正準index -> z index (名前で対応。-1=未対応)
+    auxDim: m.aux_dim||0,               // >0 なら補助観測 (compass/visited/social/obstacle) 付き
+    visitR: m.visit_radius||5,
+    visitWin: m.visit_window_ticks||4000,
+    socialRange: m.social_range||8,
+    // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
+    obstRayMax: m.obst_ray_max||3.0,
+    obstStep:   m.obst_step||0.25,
+    obstOff:    ((m.obst_off_deg!=null?m.obst_off_deg:40)*Math.PI)/180,
+    // ── 1モデル化: 性格ベクトル (personaDim>0 なら入力の末尾に付く) ──
+    personaDim: m.persona_dim||0,
+    personaKeys: m.persona_keys||[],
+    personaScale: m.persona_scale||[],
+    personaVectors: m.persona_vectors||{},   // { 'A':[...], 'B':[...] }
+    // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
+    rotPerTick: ((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
+    // 1意思決定あたりの変位 (INFER_EVERY で割って毎tick量にする)。train/deploy 一致の要。
+    fwdPerDecision: (m.move_dist||0.25) * (m.action_repeat||10),
+    rotPerDecision: (((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180) * (m.action_repeat||10),
+    dino: isize!==iw*ih*ic,             // 生画像サイズと違う → DINOv2方式
+    cfg:{
+      w:iw, h:ih,
+      fov:(m.fov_deg||60)*Math.PI/180,
+      rayMax:m.ray_max||FP_RAY_MAX,
+      rayStep:FP_RAY_STEP,
+      cell:(m.cell_rgb||[[12,30,74],[176,180,172],[196,32,32],[35,104,40]]).map(c=>c.map(div)),
+      sky:(m.sky_rgb||FP_SKY_RGB).map(div),
+      floor:(m.floor_rgb||FP_FLOOR_RGB).map(div),
+    },
+  };
+}
+
 async function loadOnnxSessions(){
   if(!ort)return;
   await loadSharedSessions();
+  // ── 1モデル化: data/persona_multi.* があれば全ペルソナで1セッションを共有 ──
+  //   性格は入力末尾の persona ベクトルで切り替える (agent.personaVec で実行時変更可)。
+  const mop=path.join(__dirname,'data','persona_multi.onnx');
+  const mmp=path.join(__dirname,'data','persona_multi_meta.json');
+  if(fs.existsSync(mop)&&fs.existsSync(mmp)){
+    try{
+      const m=JSON.parse(fs.readFileSync(mmp,'utf8'));
+      const meta=buildPersonaMeta(m);
+      const sess=await ort.InferenceSession.create(mop,ORT_OPTS);
+      const dim=meta.inputSize, nm=sess.inputNames[0];
+      await sess.run({[nm]:new ort.Tensor('float32',new Float32Array(dim),[1,dim])});
+      for(const p of PERSONA_DEFS){ personaMeta[p.id]=meta; ortSessions[p.id]=sess; obsDims[p.id]=dim; }
+      const have=Object.keys(meta.personaVectors);
+      console.log(`[ONNX] persona_multi OK  DINOv2(${dim})  personaDim=${meta.personaDim}  性格=${have.join(',')||'(なし)'}`);
+      const miss=PERSONA_DEFS.filter(p=>!meta.personaVectors[p.id]).map(p=>p.id);
+      if(miss.length) console.warn(`[ONNX] persona_multi: 性格ベクトル未収録 ${miss.join(',')} → ゼロベクトルで動作`);
+      return;
+    }catch(e){ console.warn('[ONNX] persona_multi 読み込み失敗 → 個別モデルへフォールバック:',e.message); }
+  }
+  // ── 従来: ペルソナごとに個別モデル ──
   for(const p of PERSONA_DEFS){
     const op=path.join(__dirname,'data',`persona_${p.id}.onnx`);
     const mp=path.join(__dirname,'data',`persona_${p.id}_meta.json`);
@@ -313,38 +374,7 @@ async function loadOnnxSessions(){
       try{
         const m=JSON.parse(fs.readFileSync(mp,'utf8'));
         if(m.input_size)obsDims[p.id]=m.input_size;
-        const iw=m.img_w||IMG_W, ih=m.img_h||IMG_H, ic=m.img_ch||IMG_CH;
-        const isize=m.input_size||(iw*ih*ic);
-        const div=v=>v/255;
-        personaMeta[p.id]={
-          inputSize: isize,
-          goalDim: m.goal_dim||0,             // >0 なら goal条件付け (cls+z)。0=従来(clsのみ)
-          goalClasses: m.goal_classes||[],    // z の index が意味する建物名の並び (モデル固有)
-          bldgToZ: buildBldgToZ(m.goal_classes||[]),  // 正準index -> z index (名前で対応。-1=未対応)
-          auxDim: m.aux_dim||0,               // >0 なら補助観測 (compass/visited/social) 付き = 401モデル
-          visitR: m.visit_radius||5,
-          visitWin: m.visit_window_ticks||4000,
-          socialRange: m.social_range||8,
-          // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
-          obstRayMax: m.obst_ray_max||3.0,
-          obstStep:   m.obst_step||0.25,
-          obstOff:    ((m.obst_off_deg!=null?m.obst_off_deg:40)*Math.PI)/180,
-          // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
-          rotPerTick: ((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
-          // 1意思決定あたりの変位 (INFER_EVERY で割って毎tick量にする)。train/deploy 一致の要。
-          fwdPerDecision: (m.move_dist||0.25) * (m.action_repeat||10),
-          rotPerDecision: (((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180) * (m.action_repeat||10),
-          dino: isize!==iw*ih*ic,             // 生画像サイズと違う → DINOv2方式
-          cfg:{
-            w:iw, h:ih,
-            fov:(m.fov_deg||60)*Math.PI/180,
-            rayMax:m.ray_max||FP_RAY_MAX,
-            rayStep:FP_RAY_STEP,
-            cell:(m.cell_rgb||[[12,30,74],[176,180,172],[196,32,32],[35,104,40]]).map(c=>c.map(div)),
-            sky:(m.sky_rgb||FP_SKY_RGB).map(div),
-            floor:(m.floor_rgb||FP_FLOOR_RGB).map(div),
-          },
-        };
+        personaMeta[p.id]=buildPersonaMeta(m);
       }catch(e){console.warn(`[Meta] persona_${p.id}:`,e.message);}
     }
     if(fs.existsSync(op)){
@@ -547,13 +577,19 @@ async function inferAction(map, agent){
       //     z(=agent.goalZ) 未設定はゼロ → 「目標なし」= 従来挙動 (学習側もzゼロを混ぜてある)
       //   それ以外: CLSのみ(384) か CLS+建物分類(392)(legacy)
       let inData=cls.data, inDim=cls.data.length;
-      if(meta.goalDim>0 || meta.auxDim>0){
-        inDim=cls.data.length+(meta.goalDim||0)+(meta.auxDim||0);
+      if(meta.goalDim>0 || meta.auxDim>0 || meta.personaDim>0){
+        inDim=cls.data.length+(meta.goalDim||0)+(meta.auxDim||0)+(meta.personaDim||0);
         const cat=new Float32Array(inDim);
         cat.set(cls.data,0);
         const z=agent.goalZ;                          // Float32Array(goalDim) をセットすれば誘導できる
         if(z && meta.goalDim>0 && z.length===meta.goalDim) cat.set(z, cls.data.length);
         if(meta.auxDim>0) cat.set(buildAux(agent,meta), cls.data.length+(meta.goalDim||0));
+        // 1モデル化: 性格ベクトル。agent.personaVec があればそれを優先 (実行時の性格切替/ブレンド)。
+        if(meta.personaDim>0){
+          const pv=agent.personaVec||meta.personaVectors[agent.def.id];
+          if(pv && pv.length===meta.personaDim)
+            cat.set(pv, cls.data.length+(meta.goalDim||0)+(meta.auxDim||0));
+        }
         inData=cat;
       }else if(meta.inputSize>cls.data.length && bldgSession){
         const bo=await bldgSession.run({[bldgIn]:new ort.Tensor('float32', cls.data, [1, cls.data.length])});
@@ -1207,7 +1243,8 @@ function initAgents(S){
     const b=randB(null),g=randB(b);
     agents.push({aid:`${def.id}#${i}`,x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map(),
       // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
-      mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false});
+      mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
+      personaVec:null});   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
     agentMeshes.push(createAgentMesh(S,def.color));
   }
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
@@ -1603,6 +1640,56 @@ const httpServer=http.createServer((req,res)=>{
       note: T<0 ? 'A(自由行動)へ'
            : (zi>=0 ? 'B(ナビ)へ。経路追従＋最終区間で z 条件付け'
                     : `B(ナビ)へ。ただしこのモデルの goal_classes に "${BLDG_TYPES[T].name}" が無いため z 条件付けは無効(目的地誘導のみ)`)}));
+    return;
+  }
+
+  // ── 1モデル化: 実行時のペルソナ切替 / ブレンド (persona_multi.onnx 使用時のみ) ──
+  //   /persona                        … 性格ベクトルと各agentの状態を返す
+  //   /persona?persona=A&as=C         … A のエージェントを C の性格で動かす
+  //   /persona?persona=A&as=C&mix=0.3 … A:C = 0.7:0.3 でブレンド
+  //   /persona?off=1                  … 既定の性格へ戻す (persona 省略で全員)
+  if(urlPath==='/persona'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    const meta=personaMeta[PERSONA_DEFS[0].id]||{};
+    const P=meta.personaDim||0, PV=meta.personaVectors||{};
+    if(!P){
+      res.writeHead(400);
+      res.end(JSON.stringify({ok:false,error:'このモデルは性格ベクトル非対応 (persona_multi.onnx が必要)'}));
+      return;
+    }
+    if(!q.has('persona') && !q.has('as') && !q.has('off')){
+      res.writeHead(200);
+      res.end(JSON.stringify({ok:true, personaDim:P, keys:meta.personaKeys, available:Object.keys(PV),
+        agents:agents.map(a=>({aid:a.aid, base:a.def.id, custom:!!a.personaVec}))}));
+      return;
+    }
+    const pid=(q.get('persona')||'').toUpperCase();
+    const targets=pid?agents.filter(a=>a.def.id===pid):agents;
+    if(!targets.length){
+      res.writeHead(404);
+      res.end(JSON.stringify({ok:false,error:'persona not found',personas:[...new Set(agents.map(x=>x.def.id))]}));
+      return;
+    }
+    if(q.has('off')){
+      for(const a of targets) a.personaVec=null;
+      res.writeHead(200); res.end(JSON.stringify({ok:true,reset:targets.length,persona:pid||'(all)'}));
+      return;
+    }
+    const asId=(q.get('as')||'').toUpperCase();
+    if(!PV[asId]){
+      res.writeHead(400);
+      res.end(JSON.stringify({ok:false,error:`unknown persona: ${asId}`,available:Object.keys(PV)}));
+      return;
+    }
+    const mix=q.has('mix')?Math.max(0,Math.min(1,parseFloat(q.get('mix')))):1.0;
+    for(const a of targets){
+      const base=PV[a.def.id]||new Array(P).fill(0), tgt=PV[asId];
+      a.personaVec=Float32Array.from({length:P},(_,i)=>base[i]*(1-mix)+tgt[i]*mix);
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true,applied:targets.length,persona:pid||'(all)',as:asId,mix,
+      note:'/persona?off=1 で既定へ戻す'}));
     return;
   }
 
