@@ -418,6 +418,10 @@ async function loadONNX(progress){
           visitR:m.visit_radius||5,
           visitWin:m.visit_window_ticks||4000,
           socialRange:m.social_range||8,
+          // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
+          obstRayMax:m.obst_ray_max||3.0,
+          obstStep:m.obst_step||0.25,
+          obstOff:((m.obst_off_deg!=null?m.obst_off_deg:40)*Math.PI)/180,
           // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
           rotPerTick:((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
           dino:m.input_size!==(m.img_w*m.img_h*m.img_ch),
@@ -483,6 +487,20 @@ function buildAux(agent, meta){
     let sb=Math.atan2(oy-agent.y,ox-agent.x)-agent.th; sb=Math.atan2(Math.sin(sb),Math.cos(sb));
     const prox=Math.max(0,1-sd/meta.socialRange);
     aux[7]=Math.sin(sb)*prox; aux[8]=Math.cos(sb)*prox;
+  }
+  // obstacle(3): front/left/right の通れないセル(木/空地/範囲外)までの距離 → clearance[0,1]
+  //   学習側 PersonaVecEnvGoal.aux() / server.js buildAux() と同一式。建物は通れるので壁にしない。
+  if(meta.auxDim>=12){
+    const oMax=meta.obstRayMax, oStep=meta.obstStep, offs=[0,-meta.obstOff,meta.obstOff];
+    for(let k=0;k<3;k++){
+      const ca=Math.cos(agent.th+offs[k]), sa=Math.sin(agent.th+offs[k]);
+      let hitD=oMax;
+      for(let od=oStep; od<=oMax+1e-6; od+=oStep){
+        const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
+        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
+      }
+      aux[9+k]=Math.min(1, hitD/oMax);
+    }
   }
   return aux;
 }
