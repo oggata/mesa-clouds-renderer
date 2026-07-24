@@ -60,7 +60,7 @@ const JPEG_Q = parseInt(process.env.JPEG_Q) || _preset.jpeg;   // JPEG品質 (0-
 //   ONNX_THREADS : ONNX推論に使うスレッド数 (既定2)。小さいほど CPU を空ける (推論は遅くなる)。
 //   INFER_EVERY  : 何 sim ステップごとに推論し直すか (既定10)。大きいほど推論回数が減り CPU が下がる。
 //   例:  ONNX_THREADS=1 INFER_EVERY=30 node server.js
-const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 2;
+const ONNX_THREADS = parseInt(process.env.ONNX_THREADS) || 1;
 // CPU負荷モード PERF=H|M|L → 推論頻度(INFER_EVERY)。下の MOVE/rot が INFER_EVERY に反比例して
 // 自動スケールするので、どのモードでも「1意思決定あたりの変位」は学習時と同じ = 分布内に保たれる。
 // 明示的な INFER_EVERY 環境変数があればそれを最優先。
