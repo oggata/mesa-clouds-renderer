@@ -1042,15 +1042,45 @@ function updateDayNight(S){
   L.hemi.intensity = 0.25+0.85*d;
 }
 
-// ── 欲求アイコン: キャラの頭上に出す小さな板 ──────────────────────────────
-//   eat=オレンジ / sleep=青 / work=緑。何も無ければ非表示。
-//   スプライト画像を持たずに色だけで示すので追加アセット不要。
-const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a};
-const _iconGeo=new THREE.PlaneGeometry(CELL*.26,CELL*.26);
+// ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
+//   絵文字は sharp で SVG→PNG にラスタライズしてテクスチャ化する (canvas 依存を増やさない)。
+//   フォントが無い環境では描画が空になるので、その場合は色板にフォールバックする。
+const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱'};
+const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
+                   sick:0xff5a5a, shop:0xffd23a, bored:0xb07aff};
+const ICON_PX=72;
+const _iconGeo=new THREE.PlaneGeometry(CELL*.3,CELL*.3);
 const _iconMats={};
+
+// 起動時に全絵文字をテクスチャ化しておく (毎フレーム生成しない)
+async function buildNeedIcons(){
+  for(const [kind,emoji] of Object.entries(NEED_EMOJI)){
+    let mat=null;
+    try{
+      const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_PX}" height="${ICON_PX}">`
+        +`<circle cx="${ICON_PX/2}" cy="${ICON_PX/2}" r="${ICON_PX/2-2}" fill="#ffffff" fill-opacity="0.82"/>`
+        +`<text x="${ICON_PX/2}" y="${ICON_PX*0.74}" font-size="${ICON_PX*0.62}" text-anchor="middle"`
+        +` font-family="Apple Color Emoji, Noto Color Emoji, Segoe UI Emoji, sans-serif">${emoji}</text></svg>`;
+      const png=await sharp(Buffer.from(svg)).png().toBuffer();
+      const {data,info}=await sharp(png).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+      let opaque=0; for(let i=3;i<data.length;i+=4) if(data[i]>10) opaque++;
+      if(opaque>50){
+        const tex=new THREE.DataTexture(new Uint8Array(data), info.width, info.height, THREE.RGBAFormat);
+        tex.flipY=true; tex.needsUpdate=true;
+        mat=new THREE.MeshBasicMaterial({map:tex,transparent:true,depthTest:false});
+      }
+    }catch(e){ /* フォント無し等 → 色板へ */ }
+    if(!mat) mat=new THREE.MeshBasicMaterial(
+      {color:ICON_COLORS[kind],transparent:true,opacity:0.95,depthTest:false});
+    _iconMats[kind]=mat;
+  }
+  const emojiOk=Object.values(_iconMats).filter(m=>m.map).length;
+  console.log(`[Life] 欲求アイコン生成: ${emojiOk}/${Object.keys(NEED_EMOJI).length} 種が絵文字`
+            + (emojiOk<Object.keys(NEED_EMOJI).length ? ' (残りは色板フォールバック)' : ''));
+}
 function iconMat(kind){
   if(!_iconMats[kind]) _iconMats[kind]=new THREE.MeshBasicMaterial(
-    {color:ICON_COLORS[kind],transparent:true,opacity:0.95,depthTest:false});
+    {color:ICON_COLORS[kind]||0xffffff,transparent:true,opacity:0.95,depthTest:false});
   return _iconMats[kind];
 }
 // 頭上アイコンを現在の欲求に合わせて更新 (カメラの方を向かせる)
@@ -1196,16 +1226,30 @@ const FATIGUE_RATE  = 1/(14*60);   // 1秒あたりの疲労上昇
 const EAT_RECOVER   = 0.75;        // 飲食店に着いたときの空腹回復量
 const SLEEP_RECOVER = 0.55;        // 自宅に着いたときの疲労回復量
 const NEED_HI       = 0.62;        // これを超えると「その欲求で目的地を選ぶ」
+const SUPPLY_RATE   = 1/(16*60);   // 日用品の消費 (買い物欲)
+const BORED_RATE    = 1/(11*60);   // 退屈の蓄積 (人と会う/娯楽で解消)
+const SICK_PROB     = 1/(60*90);   // 1秒あたりの発症確率 (平均90分に1回)
+const SICK_HEAL     = 1/(4*60);    // 病院/薬局での回復速度
+const BUY_RECOVER   = 0.85;        // 店に着いたときの補充量
+const FUN_RECOVER   = 0.5;         // 娯楽施設での退屈解消
+const SICK_HI       = 0.35;        // これを超えたら病院へ (低めの閾値=すぐ向かう)
 
 // 建物カテゴリ → 正準index (BLDG_TYPES から動的に引く。名前変更に強い)
 const IDX_OF   = n => BLDG_NAME_TO_IDX[n];
 const FOOD_IDX = ['kiosk','ramen','gyudon','cafe','bento'].map(IDX_OF).filter(v=>v!=null);
 const HOME_IDX = ['house','apartment'].map(IDX_OF).filter(v=>v!=null);
-const WORK_IDX = ['office','bank','post','shop'].map(IDX_OF).filter(v=>v!=null);
+const WORK_IDX = ['office','tower','bank','post','cityhall'].map(IDX_OF).filter(v=>v!=null);
+const CARE_IDX = ['hospital','pharmacy'].map(IDX_OF).filter(v=>v!=null);        // 病気
+const BUY_IDX  = ['conbini','supermarket','shop','mall'].map(IDX_OF).filter(v=>v!=null); // 買い物
+const FUN_IDX  = ['stadium','temple','museum','library'].map(IDX_OF).filter(v=>v!=null);  // 退屈しのぎ
 
-// ゲーム内時刻 [0,24)
+// ゲーム内時刻 [0,24)。起動時刻は START_HOUR から始まる (既定 8時 = 朝の活動時間)。
+//   実時間に直接紐づけると、起動タイミング次第で深夜(=全員sleep)から始まってしまうため。
+const START_HOUR = (()=>{ const v=parseFloat(process.env.START_HOUR); return isNaN(v)?8:((v%24)+24)%24; })();
+const _bootMs = Date.now();
 function gameHour(){
-  return ((Date.now()/1000) % (DAY_MINUTES*60)) / (DAY_MINUTES*60) * 24;
+  const elapsed=(Date.now()-_bootMs)/1000;
+  return (START_HOUR + elapsed/(DAY_MINUTES*60)*24) % 24;
 }
 // 昼夜の明るさ [0,1] (0=真夜中, 1=正午)。日の出6時/日の入18時あたりで滑らかに遷移。
 function daylight(){
@@ -1265,9 +1309,30 @@ function stepNeeds(dtSec){
     a.hunger  = Math.min(1, (a.hunger ||0) + HUNGER_RATE *dtSec);
     // 夜は疲れやすい / 自宅に居るときは休息
     a.fatigue = Math.min(1, (a.fatigue||0) + FATIGUE_RATE*dtSec*(night?1.6:1.0));
+    a.supply  = Math.min(1, (a.supply ||0) + SUPPLY_RATE *dtSec);
+    // 退屈は「一人でいる時間」で溜まる → 近くに人が居れば溜まらない (社交と連動)
+    let alone=true;
+    for(const o of agents){ if(o===a) continue;
+      if(Math.abs(o.x-a.x)<3 && Math.abs(o.y-a.y)<3){ alone=false; break; } }
+    a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
+    // 病気: 低確率で発症。疲労が高いほどかかりやすい (内部状態同士の因果)
+    if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
+      a.sick = 0.6 + Math.random()*0.4;
+
     const r=Math.floor(a.x), c=Math.floor(a.y);
     const t=BUILDING_TYPES[r+'_'+c];
-    if(t!=null && FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
+    if(t!=null){
+      if(FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
+      if(BUY_IDX.includes(t))  a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec);
+      if(FUN_IDX.includes(t))  a.bored  = Math.max(0, a.bored  - FUN_RECOVER*dtSec);
+    }
+    // 病院/薬局は隣接でも受診とみなす (建物セル中心に完全に乗れず治らないのを防ぐ)
+    if((a.sick||0) > 0){
+      for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+        const tt=BUILDING_TYPES[(r+dr)+'_'+(c+dc)];
+        if(tt!=null && CARE_IDX.includes(tt)){ a.sick = Math.max(0, a.sick - SICK_HEAL*dtSec); dr=dc=2; }
+      }
+    }
     // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
     if(a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1)
       a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
@@ -1275,11 +1340,15 @@ function stepNeeds(dtSec){
 }
 
 // いま何を求めているか (アイコン表示と目的地抽選で共用)
+//   優先順位: 病気 > 睡眠 > 空腹 > 勤務 > 買い物 > 退屈 (生命に関わる順、最後は暇つぶし)
 function needOf(a){
   const h=gameHour();
+  if((a.sick   ||0) > SICK_HI)                 return 'sick';
   if((a.fatigue||0) > NEED_HI || h<6 || h>=22) return 'sleep';
   if((a.hunger ||0) > NEED_HI)                 return 'eat';
   if(h>=9 && h<17)                             return 'work';
+  if((a.supply ||0) > NEED_HI)                 return 'shop';
+  if((a.bored  ||0) > NEED_HI)                 return 'bored';
   return null;
 }
 
@@ -1288,11 +1357,14 @@ function pickLifeGoal(a, ex){
   const n=needOf(a);
   if(n==='sleep' && a.home) return [...a.home];
   if(n==='work'  && a.work) return [...a.work];
-  if(n==='eat'){
-    const f=buildingsOfTypes(FOOD_IDX);
-    if(f.length){                                  // 近い方から数軒のランダム
+  // 欲求 → 行き先カテゴリ。近い方から数軒のランダムで選ぶ (最寄り固定だと往復しやすい)
+  const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX}[n];
+  if(CAT){
+    const f=buildingsOfTypes(CAT);
+    if(f.length){
       f.sort((p,q)=>((p[0]-a.x)**2+(p[1]-a.y)**2)-((q[0]-a.x)**2+(q[1]-a.y)**2));
-      return [...f[Math.floor(Math.random()*Math.min(4,f.length))]];
+      const k = n==='sick' ? 2 : 4;                // 病気のときは近い所へ
+      return [...f[Math.floor(Math.random()*Math.min(k,f.length))]];
     }
   }
   return randB(ex);
@@ -1457,10 +1529,22 @@ function initAgents(S){
       mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
       personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
       // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
-      home:null, work:null, hunger:Math.random()*0.4, fatigue:Math.random()*0.4, needIcon:null});
+      home:null, work:null, needIcon:null,
+      hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
+      supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0});
     agentMeshes.push(createAgentMesh(S,def.color));
   }
   assignHomes();         // 拠点(自宅/職場)を決定的に割当 (再起動しても同じ住所)
+  // 自宅から一日を始める。夜間起動でも「家に居るのに眠くて彷徨う」不自然さを避ける。
+  //   自宅セル中心だと同居人が完全に重なるので、わずかにばらけさせる。
+  for(const a of agents){
+    if(!a.home) continue;
+    a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
+    a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
+    a.fatigue=Math.random()*0.15;          // 起床直後 = 疲労は低い
+    const g=pickLifeGoal(a,[Math.floor(a.x),Math.floor(a.y)]);
+    a.gx=g[0]+0.5; a.gy=g[1]+0.5;          // 行き先も今の時刻に合わせて決め直す
+  }
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
 }
@@ -1923,7 +2007,10 @@ const httpServer=http.createServer((req,res)=>{
       agents:agents.map(a=>({aid:a.aid, persona:a.def.id,
         home:a.home, work:a.work,
         hunger:+(a.hunger||0).toFixed(2), fatigue:+(a.fatigue||0).toFixed(2),
-        need:needOf(a), pos:[+a.x.toFixed(1),+a.y.toFixed(1)]}))}));
+        supply:+(a.supply||0).toFixed(2), bored:+(a.bored||0).toFixed(2),
+        sick:+(a.sick||0).toFixed(2),
+        need:needOf(a), emoji:NEED_EMOJI[needOf(a)]||null,
+        pos:[+a.x.toFixed(1),+a.y.toFixed(1)]}))}));
     return;
   }
 
@@ -2160,6 +2247,7 @@ function startLoops(){
   console.log('[Init] preloading textures...');
   await preloadTextures();
   await loadRaycastTextures();   // エージェント観測(FPV)用の64×64テクスチャ
+  await buildNeedIcons();        // 頭上の欲求アイコン(絵文字)をテクスチャ化
 
   console.log('[Init] building scene...');
   scene = buildScene(MAP);
