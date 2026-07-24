@@ -418,6 +418,8 @@ async function loadONNX(progress){
           visitR:m.visit_radius||5,
           visitWin:m.visit_window_ticks||4000,
           socialRange:m.social_range||8,
+          socialFovDeg:m.social_fov_deg||120,
+          socialLosSamples:m.social_los_samples||16,
           // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
           obstRayMax:m.obst_ray_max||3.0,
           obstStep:m.obst_step||0.25,
@@ -457,6 +459,20 @@ function biasedRandom(map, agent){
 //   compass(3): 目的地の相対方位 sin/cos + 距離/GRID
 //   visited(4): 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
 //   social(2) : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+// 2点間に建物が無いか (視界の遮蔽判定)。学習側 _los_clear() / server.js losClear() と同一式。
+function losClear(x0,y0,x1,y1,samples){
+  const S=samples||16;
+  const r0=Math.floor(x0), c0=Math.floor(y0), r1=Math.floor(x1), c1=Math.floor(y1);
+  for(let i=0;i<S;i++){
+    const t=i/(S-1);
+    const r=Math.floor(x0+(x1-x0)*t), c=Math.floor(y0+(y1-y0)*t);
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    if((r===r0&&c===c0)||(r===r1&&c===c1)) continue;
+    if(MAP[r][c]===BUILDING) return false;
+  }
+  return true;
+}
+
 function buildAux(agent, meta){
   const aux=new Float32Array(meta.auxDim);
   const dx=agent.gx-agent.x, dy=agent.gy-agent.y, d=Math.hypot(dx,dy);
@@ -476,11 +492,19 @@ function buildAux(agent, meta){
     if(t!=null && (stepCount-t)<=meta.visitWin) hit[s]++;
   }
   for(let s=0;s<4;s++) aux[3+s]=hit[s]/Math.max(1,cnt[s]);
+  // social(2): 「視界に入っている」最寄り (距離/視界角/建物遮蔽)。学習側 social_visible() と同一。
+  const sHalf=(meta.socialFovDeg*Math.PI/180)*0.5;
   let best=Infinity,ox=0,oy=0;
   for(const o of agents){
     if(o===agent) continue;
-    const dd=(o.x-agent.x)**2+(o.y-agent.y)**2;
-    if(dd<best){best=dd;ox=o.x;oy=o.y;}
+    const dx=o.x-agent.x, dy=o.y-agent.y, dd=dx*dx+dy*dy;
+    if(dd>=best) continue;
+    const d=Math.sqrt(dd);
+    if(d>meta.socialRange) continue;
+    let b=Math.atan2(dy,dx)-agent.th; b=Math.atan2(Math.sin(b),Math.cos(b));
+    if(Math.abs(b)>sHalf) continue;
+    if(!losClear(agent.x,agent.y,o.x,o.y,meta.socialLosSamples)) continue;
+    best=dd; ox=o.x; oy=o.y;
   }
   if(best<Infinity){
     const sd=Math.sqrt(best);
@@ -492,12 +516,16 @@ function buildAux(agent, meta){
   //   学習側 PersonaVecEnvGoal.aux() / server.js buildAux() と同一式。建物は通れるので壁にしない。
   if(meta.auxDim>=12){
     const oMax=meta.obstRayMax, oStep=meta.obstStep, offs=[0,-meta.obstOff,meta.obstOff];
+    // 目的地セル: ここだけは建物でも「避ける対象」から外す (目的として入るのは許す)
+    const gr=Math.floor(agent.gx), gc=Math.floor(agent.gy);
     for(let k=0;k<3;k++){
       const ca=Math.cos(agent.th+offs[k]), sa=Math.sin(agent.th+offs[k]);
       let hitD=oMax;
       for(let od=oStep; od<=oMax+1e-6; od+=oStep){
         const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
-        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
+        if(px<0||px>=GRID||py<0||py>=GRID){ hitD=od; break; }
+        // 通れない(木/空地) or 目的地でない建物 = 入るべきでないセル
+        if(!PASSABLE.has(MAP[r][c]) || (MAP[r][c]===BUILDING && !(r===gr&&c===gc))){ hitD=od; break; }
       }
       aux[9+k]=Math.min(1, hitD/oMax);
     }

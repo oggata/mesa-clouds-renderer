@@ -317,6 +317,9 @@ function buildPersonaMeta(m){
     visitR: m.visit_radius||5,
     visitWin: m.visit_window_ticks||4000,
     socialRange: m.social_range||8,
+    // 視界判定 (社交行動)。学習側 SOCIAL_FOV_DEG / SOCIAL_LOS_SAMPLES と一致させる。
+    socialFovDeg: m.social_fov_deg||120,
+    socialLosSamples: m.social_los_samples||16,
     // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
     obstRayMax: m.obst_ray_max||3.0,
     obstStep:   m.obst_step||0.25,
@@ -508,6 +511,21 @@ const actionCache = {};
 //   compass(3): 目的地の相対方位 sin/cos + 距離/GRID
 //   visited(4): 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
 //   social(2) : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+// 2点間に建物が無いか (視界の遮蔽判定)。両端のセルは除外 = 建物は通行可なので人が建物上に立ち得る。
+// 学習側 _los_clear() と同一式。
+function losClear(x0,y0,x1,y1,samples){
+  const S=samples||16;
+  const r0=Math.floor(x0), c0=Math.floor(y0), r1=Math.floor(x1), c1=Math.floor(y1);
+  for(let i=0;i<S;i++){
+    const t=i/(S-1);
+    const r=Math.floor(x0+(x1-x0)*t), c=Math.floor(y0+(y1-y0)*t);
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    if((r===r0&&c===c0)||(r===r1&&c===c1)) continue;   // 両端セルは遮蔽とみなさない
+    if(MAP[r][c]===BUILDING) return false;
+  }
+  return true;
+}
+
 function buildAux(agent, meta){
   const aux=new Float32Array(meta.auxDim);
   // compass(3)
@@ -529,12 +547,21 @@ function buildAux(agent, meta){
     if(t!=null && (stepCount-t)<=meta.visitWin) hit[s]++;
   }
   for(let s=0;s<4;s++) aux[3+s]=hit[s]/Math.max(1,cnt[s]);
-  // social(2): 最寄りの他エージェント
+  // social(2): 「視界に入っている」最寄りの他エージェント。
+  //   見える = (a) socialRange内 (b) 視界角内 (c) 建物に遮られていない。学習側 social_visible() と同一条件。
+  //   誰も見えていなければ 0 のまま (= 人が視界に入って初めて反応する)。
+  const sHalf=(meta.socialFovDeg*Math.PI/180)*0.5;
   let best=Infinity,ox=0,oy=0;
   for(const o of agents){
     if(o===agent||!o.active) continue;
-    const dd=(o.x-agent.x)**2+(o.y-agent.y)**2;
-    if(dd<best){best=dd;ox=o.x;oy=o.y;}
+    const dx=o.x-agent.x, dy=o.y-agent.y, dd=dx*dx+dy*dy;
+    if(dd>=best) continue;                                  // より近い候補だけ調べる
+    const d=Math.sqrt(dd);
+    if(d>meta.socialRange) continue;                        // (a) 距離
+    let b=Math.atan2(dy,dx)-agent.th; b=Math.atan2(Math.sin(b),Math.cos(b));
+    if(Math.abs(b)>sHalf) continue;                         // (b) 視界角
+    if(!losClear(agent.x,agent.y,o.x,o.y,meta.socialLosSamples)) continue;   // (c) 遮蔽
+    best=dd; ox=o.x; oy=o.y;
   }
   if(best<Infinity){
     const sd=Math.sqrt(best);
@@ -546,12 +573,16 @@ function buildAux(agent, meta){
   //   学習側 PersonaVecEnvGoal.aux() と同一式。建物は通れるので壁にしない=移動を止める木/空地だけ拾う。
   if(meta.auxDim>=12){
     const oMax=meta.obstRayMax, oStep=meta.obstStep, offs=[0,-meta.obstOff,meta.obstOff];
+    // 目的地セル: ここだけは建物でも「避ける対象」から外す (目的として入るのは許す)
+    const gr=Math.floor(agent.gx), gc=Math.floor(agent.gy);
     for(let k=0;k<3;k++){
       const ca=Math.cos(agent.th+offs[k]), sa=Math.sin(agent.th+offs[k]);
       let hitD=oMax;
       for(let od=oStep; od<=oMax+1e-6; od+=oStep){
         const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
-        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
+        if(px<0||px>=GRID||py<0||py>=GRID){ hitD=od; break; }
+        // 通れない(木/空地) or 目的地でない建物 = 入るべきでないセル
+        if(!PASSABLE.has(MAP[r][c]) || (MAP[r][c]===BUILDING && !(r===gr&&c===gc))){ hitD=od; break; }
       }
       aux[9+k]=Math.min(1, hitD/oMax);
     }
@@ -913,10 +944,12 @@ function buildScene(map){
   }
 
   const S=new THREE.Scene();S.background=new THREE.Color(0xeaf2f7);
-  S.add(new THREE.AmbientLight(0xbcd0e0,1.3));
-  S.add(new THREE.HemisphereLight(0xeaf2f7,0xc8c0b0,1.1));
+  const amb=new THREE.AmbientLight(0xbcd0e0,1.3);   S.add(amb);
+  const hemi=new THREE.HemisphereLight(0xeaf2f7,0xc8c0b0,1.1); S.add(hemi);
   const sun=new THREE.DirectionalLight(0xfff4e0,1.7);
   sun.position.set(W*.4,-W*.3,W*.8);S.add(sun);
+  // 昼夜表現のため参照を保持 (updateDayNight が毎フレーム色/強度を更新)
+  S.userData.lights={amb,hemi,sun};
   const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshLambertMaterial({color:0xe6e9e2}));
   gnd.position.set(W/2,W/2,0);S.add(gnd);
 
@@ -991,6 +1024,53 @@ function updateOcclusionFade(){
 // 洒落た人型: 箱の積み木をやめ、丸み・テーパー・陰影のある立ち姿にする。
 // Z が上方向、+Y が正面 (進行方向)。親オブジェクトは renderLoop で z=CELL*.26 に置かれ、
 // 足元のローカル z は -CELL*.26 (地面)。MeshLambert にしてシーンのライトで陰影を付ける。
+// ── 昼夜: 時刻に応じて空の色・光の色/強さを変える ────────────────────────────
+//   d=1(正午) 昼白色で明るい / d=0(深夜) 青く暗い。夕方は朝焼け/夕焼け色を混ぜる。
+const _cDay=new THREE.Color(0xeaf2f7), _cNight=new THREE.Color(0x0b1a33);
+const _sDay=new THREE.Color(0xfff4e0), _sDusk =new THREE.Color(0xff9a5c), _sNight=new THREE.Color(0x2a4a8a);
+const _gDay=new THREE.Color(0xbcd0e0), _gNight=new THREE.Color(0x24304a);
+function updateDayNight(S){
+  const L=S&&S.userData&&S.userData.lights; if(!L) return;
+  const d=daylight();
+  // 朝夕(d が中間)のときだけ夕焼け色を強く混ぜる
+  const dusk=Math.max(0,1-Math.abs(d-0.5)*4);
+  S.background.copy(_cNight).lerp(_cDay,d);
+  L.sun.color.copy(_sNight).lerp(_sDay,d).lerp(_sDusk,dusk*0.55);
+  L.sun.intensity  = 0.15+1.55*d;
+  L.amb.color.copy(_gNight).lerp(_gDay,d);
+  L.amb.intensity  = 0.45+0.85*d;
+  L.hemi.intensity = 0.25+0.85*d;
+}
+
+// ── 欲求アイコン: キャラの頭上に出す小さな板 ──────────────────────────────
+//   eat=オレンジ / sleep=青 / work=緑。何も無ければ非表示。
+//   スプライト画像を持たずに色だけで示すので追加アセット不要。
+const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a};
+const _iconGeo=new THREE.PlaneGeometry(CELL*.26,CELL*.26);
+const _iconMats={};
+function iconMat(kind){
+  if(!_iconMats[kind]) _iconMats[kind]=new THREE.MeshBasicMaterial(
+    {color:ICON_COLORS[kind],transparent:true,opacity:0.95,depthTest:false});
+  return _iconMats[kind];
+}
+// 頭上アイコンを現在の欲求に合わせて更新 (カメラの方を向かせる)
+function updateNeedIcons(cam){
+  for(let i=0;i<agents.length;i++){
+    const a=agents[i], m=agentMeshes[i]; if(!m) continue;
+    const kind=needOf(a);
+    if(a.needIcon && a.needIcon.userData.kind!==kind){ m.remove(a.needIcon); a.needIcon=null; }
+    if(!kind){ continue; }
+    if(!a.needIcon){
+      const ic=new THREE.Mesh(_iconGeo, iconMat(kind));
+      ic.userData.kind=kind;
+      ic.position.set(0,0,CELL*1.05);      // 頭上
+      m.add(ic); a.needIcon=ic;
+    }
+    // 板を常にカメラへ向ける (親の回転を打ち消す)
+    if(cam) a.needIcon.quaternion.copy(cam.quaternion).premultiply(m.getWorldQuaternion(new THREE.Quaternion()).invert());
+  }
+}
+
 function createAgentMesh(S,color){
   const g=new THREE.Group();
   const base=-CELL*.26;                                   // 地面 (足元)
@@ -1106,6 +1186,118 @@ function rebuildBuildings(map){
   if(isolated) console.log(`[Map] 孤立建物 ${isolated} 件を湧き先/目的地から除外 (道路網から到達不可)`);
 }
 rebuildBuildings(MAP);
+// ═══ 生活シミュレーション (拠点 / 内部状態 / 時刻) ═════════════════════════════
+//   ポリシーの観測は一切変えない。内部状態は「目的地の抽選確率」だけを動かすので
+//   再学習は不要 (ポリシーから見れば compass の指す先が変わるだけ)。
+//   ※ 将来ここを観測(aux)にも入れると、方策自身が空腹/疲労を理解して動けるようになる。
+const DAY_MINUTES   = parseFloat(process.env.DAY_MINUTES) || 24;  // 実時間 何分で 24h が一周するか
+const HUNGER_RATE   = 1/(9*60);    // 1秒あたりの空腹上昇 (約9分で満腹→空腹)
+const FATIGUE_RATE  = 1/(14*60);   // 1秒あたりの疲労上昇
+const EAT_RECOVER   = 0.75;        // 飲食店に着いたときの空腹回復量
+const SLEEP_RECOVER = 0.55;        // 自宅に着いたときの疲労回復量
+const NEED_HI       = 0.62;        // これを超えると「その欲求で目的地を選ぶ」
+
+// 建物カテゴリ → 正準index (BLDG_TYPES から動的に引く。名前変更に強い)
+const IDX_OF   = n => BLDG_NAME_TO_IDX[n];
+const FOOD_IDX = ['kiosk','ramen','gyudon','cafe','bento'].map(IDX_OF).filter(v=>v!=null);
+const HOME_IDX = ['house','apartment'].map(IDX_OF).filter(v=>v!=null);
+const WORK_IDX = ['office','bank','post','shop'].map(IDX_OF).filter(v=>v!=null);
+
+// ゲーム内時刻 [0,24)
+function gameHour(){
+  return ((Date.now()/1000) % (DAY_MINUTES*60)) / (DAY_MINUTES*60) * 24;
+}
+// 昼夜の明るさ [0,1] (0=真夜中, 1=正午)。日の出6時/日の入18時あたりで滑らかに遷移。
+function daylight(){
+  const h=gameHour();
+  return Math.max(0, Math.min(1, (Math.cos((h-13)/24*Math.PI*2)+1)/2 ));
+}
+
+// 指定タイプ群の建物セル一覧
+function buildingsOfTypes(idxs){
+  const set=new Set(idxs);
+  return BUILDINGS.filter(b=>set.has(BUILDING_TYPES[b[0]+'_'+b[1]]));
+}
+
+// 拠点(自宅/職場)の割当。house は少人数、apartment は集合住宅として複数人で共有する。
+//   乱数を使わず aid 順の決定的な割当にしているので、再起動しても同じ住所になる。
+function assignHomes(){
+  const homes=buildingsOfTypes(HOME_IDX), works=buildingsOfTypes(WORK_IDX);
+  const houses=homes.filter(b=>BUILDING_TYPES[b[0]+'_'+b[1]]===IDX_OF('house'));
+  const apts  =homes.filter(b=>BUILDING_TYPES[b[0]+'_'+b[1]]===IDX_OF('apartment'));
+  const HOUSE_CAP=2;                     // 戸建ての定員
+  const slots=[];
+  for(const h of houses) for(let i=0;i<HOUSE_CAP;i++) slots.push(h);   // 戸建てを先に埋める
+  agents.forEach((a,i)=>{
+    a.home = slots[i] || (apts.length ? apts[i % apts.length]          // あふれたらマンションで同居
+                        : (homes.length ? homes[i%homes.length] : null));
+    a.work = works.length ? works[i % works.length] : null;
+  });
+  // 同居人/同僚を記録 (社交の「知り合い」判定に使える)
+  const key=b=>b?b[0]+'_'+b[1]:'';
+  const byHome={};
+  agents.forEach(a=>{ const k=key(a.home); if(k){ (byHome[k]=byHome[k]||[]).push(a.aid); } });
+  const shared=Object.values(byHome).filter(v=>v.length>1).length;
+  console.log(`[Life] 拠点割当: 戸建て${houses.length}軒(定員${HOUSE_CAP}) / マンション${apts.length}軒 / 職場${works.length}件`
+            + ` — 同居のある建物 ${shared}件`);
+}
+
+// 欲求が切り替わった wander エージェントの行き先を選び直す。
+//   これが無いと「夜になっても昼に決めた遠い目的地へ歩き続ける」→ 帰宅できず疲労が飽和する。
+//   navigate(rally) 中は命令優先なので触らない。
+function retargetOnNeedChange(){
+  for(const a of agents){
+    const n=needOf(a);
+    if(n===a.lastNeed) continue;
+    a.lastNeed=n;
+    if(a.mode==='wander'){
+      const g=pickLifeGoal(a,[Math.floor(a.x),Math.floor(a.y)]);
+      a.gx=g[0]+0.5; a.gy=g[1]+0.5;
+    }
+  }
+}
+
+// 内部状態を進める (1秒ごと)。到着していれば回復させる。
+function stepNeeds(dtSec){
+  const h=gameHour();
+  const night = (h<6 || h>=22);
+  for(const a of agents){
+    a.hunger  = Math.min(1, (a.hunger ||0) + HUNGER_RATE *dtSec);
+    // 夜は疲れやすい / 自宅に居るときは休息
+    a.fatigue = Math.min(1, (a.fatigue||0) + FATIGUE_RATE*dtSec*(night?1.6:1.0));
+    const r=Math.floor(a.x), c=Math.floor(a.y);
+    const t=BUILDING_TYPES[r+'_'+c];
+    if(t!=null && FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
+    // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
+    if(a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1)
+      a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
+  }
+}
+
+// いま何を求めているか (アイコン表示と目的地抽選で共用)
+function needOf(a){
+  const h=gameHour();
+  if((a.fatigue||0) > NEED_HI || h<6 || h>=22) return 'sleep';
+  if((a.hunger ||0) > NEED_HI)                 return 'eat';
+  if(h>=9 && h<17)                             return 'work';
+  return null;
+}
+
+// 内部状態にもとづく目的地抽選。該当が無ければ従来のランダムに落とす。
+function pickLifeGoal(a, ex){
+  const n=needOf(a);
+  if(n==='sleep' && a.home) return [...a.home];
+  if(n==='work'  && a.work) return [...a.work];
+  if(n==='eat'){
+    const f=buildingsOfTypes(FOOD_IDX);
+    if(f.length){                                  // 近い方から数軒のランダム
+      f.sort((p,q)=>((p[0]-a.x)**2+(p[1]-a.y)**2)-((q[0]-a.x)**2+(q[1]-a.y)**2));
+      return [...f[Math.floor(Math.random()*Math.min(4,f.length))]];
+    }
+  }
+  return randB(ex);
+}
+
 function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
 
 // ═══ 行動モード A/B ══════════════════════════════════════════════════════════
@@ -1125,7 +1317,9 @@ const REPLAN_STALL = 8;  // これだけ足踏みしたら経路を引き直す
 //   道路を安く・建物を高くして「基本は道路を辿るが、必要なら建物を抜ける」ナビらしい経路にする。
 //   ※ 道路のみに限定すると、区画の奥にある建物(道路に隣接していない)から出られず経路が引けない。
 //     エージェントは建物上に湧くため、これだと大半がナビに入れなかった。
-const COST_ROAD = 1, COST_BLDG = 6;
+// 建物は通行可だが『経路として突っ切る』のは不自然なので強く忌避する。
+// 不可(Infinity)にはしない: 区画の奥の建物は建物経由でしか出入りできない場合があるため。
+const COST_ROAD = 1, COST_BLDG = 40;
 function planPath(sr, sc, gr, gc){
   const N=GRID*GRID, key=(r,c)=>r*GRID+c;
   const passable=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID && PASSABLE.has(MAP[r][c]);
@@ -1179,7 +1373,8 @@ function applyGoalZ(a){
 // A: 自由行動へ。z=0 + ランダム建物を compass の的にする (現状の既定動作)。
 function enterWander(a){
   a.mode='wander'; a.goalType=null; a.goalZ=null; a.path=null; a.pathIdx=0; a.rally=false;
-  const g=randB([Math.floor(a.x),Math.floor(a.y)]);
+  // 内部状態(空腹/疲労/時刻)で行き先を決める。該当が無ければ従来のランダム建物。
+  const g=pickLifeGoal(a, [Math.floor(a.x),Math.floor(a.y)]);
   a.gx=g[0]+0.5; a.gy=g[1]+0.5;
 }
 
@@ -1260,9 +1455,12 @@ function initAgents(S){
     agents.push({aid:`${def.id}#${i}`,x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map(),
       // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
       mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
-      personaVec:null});   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
+      personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
+      // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
+      home:null, work:null, hunger:Math.random()*0.4, fatigue:Math.random()*0.4, needIcon:null});
     agentMeshes.push(createAgentMesh(S,def.color));
   }
+  assignHomes();         // 拠点(自宅/職場)を決定的に割当 (再起動しても同じ住所)
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
 }
@@ -1335,7 +1533,7 @@ async function stepAll(){
       a.goalZ=null;
       if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){
         a.trips++;
-        const g=randB([Math.floor(a.x),Math.floor(a.y)]);
+        const g=pickLifeGoal(a, [Math.floor(a.x),Math.floor(a.y)]);
         a.gx=g[0]+0.5; a.gy=g[1]+0.5;
       }
     }
@@ -1712,6 +1910,23 @@ const httpServer=http.createServer((req,res)=>{
     return;
   }
 
+  // ── 生活状態の可視化: 時刻 / 各エージェントの拠点・空腹・疲労・いまの欲求 ──
+  if(urlPath==='/life'){
+    res.setHeader('Content-Type','application/json');
+    const h=gameHour();
+    const hh=String(Math.floor(h)).padStart(2,'0'), mm=String(Math.floor(h%1*60)).padStart(2,'0');
+    const byNeed={};
+    for(const a of agents){ const n=needOf(a)||'-'; byNeed[n]=(byNeed[n]||0)+1; }
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, time:`${hh}:${mm}`, hour:+h.toFixed(2),
+      daylight:+daylight().toFixed(3), dayMinutes:DAY_MINUTES, needCounts:byNeed,
+      agents:agents.map(a=>({aid:a.aid, persona:a.def.id,
+        home:a.home, work:a.work,
+        hunger:+(a.hunger||0).toFixed(2), fatigue:+(a.fatigue||0).toFixed(2),
+        need:needOf(a), pos:[+a.x.toFixed(1),+a.y.toFixed(1)]}))}));
+    return;
+  }
+
   // ── 1モデル化: 実行時のペルソナ切替 / ブレンド (persona_multi.onnx 使用時のみ) ──
   //   /persona                        … 性格ベクトルと各agentの状態を返す
   //   /persona?persona=A&as=C         … A のエージェントを C の性格で動かす
@@ -1879,6 +2094,8 @@ async function renderLoop(){
 
     updateTrackingCamera(mainCam);
     updateOcclusionFade();
+    updateDayNight(scene);        // 時刻で空と光を変える
+    updateNeedIcons(mainCam);     // 欲求アイコン (空腹/眠気/勤務) を頭上に
     renderer.render(scene, mainCam);
     frameCount++;
 
@@ -1923,6 +2140,7 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
+  setInterval(()=>{ stepNeeds(1); retargetOnNeedChange(); }, 1000);   // 空腹/疲労の進行と行き先の見直し
   if(YT_ENABLED){
     // 固定レートで ffmpeg へ送出 (renderLoop の出来に依存させない)
     setInterval(ytPumpTick,  Math.max(1, Math.round(1000/FPS)));
