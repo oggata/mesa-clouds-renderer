@@ -113,6 +113,12 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マー�
 // INFER_EVERY / ONNX_THREADS は先頭の「CPU負荷」設定ブロックに移動
 const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
 const PASSABLE = new Set([ROAD, BUILDING]);
+// FREE_MOVE: 物理的な通行判定を無効化 (木/空地も通れる)。詰まりが原理的に消えて活性が上がる。
+//   A* 経路探索は道路優先のまま残すので「狙いは道路沿い・でも外れても固まらない」挙動になる。
+//   既定ON。FREE_MOVE=0 で従来の通行判定に戻す。
+const FREE_MOVE = process.env.FREE_MOVE === '1';   // 既定OFF (センサ修正で通行判定を活用)
+// 診断/調整: 障害物クリアランスを強気側へスケール (過度に臆病で前進しない対策)。既定1.0。
+const OBST_BOLD = parseFloat(process.env.OBST_BOLD)||1.0;
 // 学習時の「1意思決定あたり」の変位 (= move_dist × action_repeat / rot_decision_deg)。
 // meta が無い/古いモデルのフォールバック。実際は persona ごとに meta から算出する(下記 personaMeta)。
 const FWD_PER_DECISION_DEF = 0.25 * 10;              // = 2.5 セル/意思決定
@@ -580,11 +586,12 @@ function buildAux(agent, meta){
       let hitD=oMax;
       for(let od=oStep; od<=oMax+1e-6; od+=oStep){
         const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
-        if(px<0||px>=GRID||py<0||py>=GRID){ hitD=od; break; }
-        // 通れない(木/空地) or 目的地でない建物 = 入るべきでないセル
-        if(!PASSABLE.has(MAP[r][c]) || (MAP[r][c]===BUILDING && !(r===gr&&c===gc))){ hitD=od; break; }
+        // 障害物 = 通れないセル(木/空地/範囲外)のみ。建物は歩行可なので障害物にしない。
+        //   (建物を障害物に含めると、建物密集マップでセンサが常時ブロックを報告し、
+        //    障害物回避を学んだモデルが延々と旋回して前進しなくなる)
+        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
       }
-      aux[9+k]=Math.min(1, hitD/oMax);
+      aux[9+k]=Math.min(1, hitD/oMax*OBST_BOLD);
     }
   }
   return aux;
@@ -666,6 +673,7 @@ let inferWarmed = false;   // 初回の一括推論が済んだか (initAgents �
 //       「1意思決定=学習時と同じ変位」という前提は一切変わらない。実行タイミングが
 //       ばらけるだけで、1tickあたりの負荷が 1/INFER_EVERY に平準化される。
 async function prefetchAllActions(map, agents){
+  if(MOVE_MODE==='pursuit') return;   // 決定論追従は推論不要 → DINOv2を回さない (CPU/滑らかさに効く)
   // 初回だけ全員ぶん推論しておく (自分の位相が来るまでランダム行動になるのを防ぐ)
   if(!inferWarmed){
     inferWarmed = true;
@@ -1383,6 +1391,16 @@ const WP_REACH  = 0.9;   // ウェイポイント通過とみなす距離
 const LOOKAHEAD = 2;     // 経路上を何マス先取りして狙うか (pure pursuit の「ニンジン」)
 const NAV_PICK_K = 3;    // 目的地は「近い方から k 軒」のランダム (最寄り固定だと往復しやすい)
 const REPLAN_STALL = 8;  // これだけ足踏みしたら経路を引き直す
+// アンスティック: これだけ足踏みしたら、方策の行動を上書きして「通れる向き」へ強制回避する。
+//   反応型ポリシーが障害物に押し付けられて動けなくなるのを、決定論で救出する (再学習不要)。
+//   通常移動中(stall小)は一切介入しないので、学習した挙動は保たれる。
+const UNSTICK_STALL = 3;
+// 詰まり対処の方式: 'release'=行き先を選び直す(既定) / 'steer'=通れる向きへ毎tick操舵。
+const UNSTICK_MODE = (process.env.UNSTICK_MODE==='release') ? 'release' : 'steer';   // 既定steer (障害物を操舵回避)
+// 移動の駆動方式: 'pursuit'=決定論の目的地追従(確実に街が動く/DINOv2推論スキップで軽い) / 'policy'=学習方策
+//   pursuit でも「どこへ向かうか」は生活ロジック(pickLifeGoal)と rally が決めるので、性格・生活リズムは出る。
+const MOVE_MODE = (process.env.MOVE_MODE==='policy') ? 'policy' : 'pursuit';
+const PURSUIT_SUB = parseFloat(process.env.PURSUIT_SUB)||5;   // pursuit の per-tick 分割 (小=速い)。5→0.5セル/8°/tick
 
 // 経路探索 (道路優先のダイクストラ)。
 //   通れるのは PASSABLE(=ROAD|BUILDING) のみ。木/空地は実際の移動でも通れないので除外する。
@@ -1444,10 +1462,18 @@ function applyGoalZ(a){
 
 // A: 自由行動へ。z=0 + ランダム建物を compass の的にする (現状の既定動作)。
 function enterWander(a){
-  a.mode='wander'; a.goalType=null; a.goalZ=null; a.path=null; a.pathIdx=0; a.rally=false;
+  a.mode='wander'; a.goalZ=null; a.rally=false;
   // 内部状態(空腹/疲労/時刻)で行き先を決める。該当が無ければ従来のランダム建物。
   const g=pickLifeGoal(a, [Math.floor(a.x),Math.floor(a.y)]);
-  a.gx=g[0]+0.5; a.gy=g[1]+0.5;
+  // ★ 行き先の建物タイプで z を立てる。BC学習した「compassに従って目的地へ行く」挙動(感度~1.0)を
+  //   使うため。z=0 の徘徊挙動は compass 追従が弱く、経路上で足踏みして活性が上がらなかった。
+  //   「性格」は wiggle ではなく“どこへ向かうか”(pickLifeGoal が persona/内部状態で決める)で出す。
+  a.goalType = (BUILDING_TYPES[g[0]+'_'+g[1]] != null) ? BUILDING_TYPES[g[0]+'_'+g[1]] : null;
+  // 行き先まで A* 経路を引いて「道沿いに」向かわせる (直線 compass だと途中の建物/木に突っ込んで詰まる)。
+  const path=planPath(Math.floor(a.x), Math.floor(a.y), g[0], g[1]);
+  if(path && path.length>1){ a.path=path; a.pathIdx=0; a.navDest=[g[0],g[1]]; }
+  else { a.path=null; a.pathIdx=0; a.gx=g[0]+0.5; a.gy=g[1]+0.5; }   // 経路が引けなければ直線
+  applyGoalZ(a);   // goalType に応じて z をセット (未対応タイプなら z=0 に落ちる)
 }
 
 // B: ナビ行動へ。T=正準の建物タイプindex。失敗したら A に落として理由を返す。
@@ -1542,8 +1568,7 @@ function initAgents(S){
     a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
     a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
     a.fatigue=Math.random()*0.15;          // 起床直後 = 疲労は低い
-    const g=pickLifeGoal(a,[Math.floor(a.x),Math.floor(a.y)]);
-    a.gx=g[0]+0.5; a.gy=g[1]+0.5;          // 行き先も今の時刻に合わせて決め直す
+    enterWander(a);                         // 行き先を決めて A* 経路を引く (pursuit が道沿いに追従)
   }
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
@@ -1565,6 +1590,45 @@ function addTrail(S,agent){
   }
 }
 
+// (x,y) から角度 th へ move 進んだ先のセルが通行可能か
+function passableToward(x, y, th, move){
+  const nx=x+Math.cos(th)*move, ny=y+Math.sin(th)*move;
+  const r=Math.floor(nx), c=Math.floor(ny);
+  if(r<0||r>=GRID||c<0||c>=GRID) return false;
+  return PASSABLE.has(MAP[r][c]);
+}
+// 詰まったエージェントを通れる向きへ回頭させる行動を返す (0=前進,1=左,2=右)。
+//   前方が空いていれば前進、塞がっていれば左右で空いている側へ、両方塞がれば回頭を続ける。
+// 目的地(gx,gy)へ向かう決定論コントローラ。通れる候補向きのうち、ゴール方位に最も近いものを選ぶ。
+//   前方(現在向き)が通れてゴール方向に十分近ければ前進、そうでなければゴール側の通れる向きへ回頭。
+function pursueAction(a, move, rot){
+  const gb=Math.atan2(a.gy-a.y, a.gx-a.x);                 // ゴールへの絶対方位
+  const wrap=x=>Math.atan2(Math.sin(x),Math.cos(x));
+  // だいたいゴール方向(±50°)で前方が通れるなら、完全整列を待たず前進 (曲がりながら進む)
+  if(Math.abs(wrap(gb-a.th))<0.87 && passableToward(a.x,a.y,a.th,move)) return 0;
+  let bestK=null, bestErr=Infinity;
+  for(let k=0;k<=6;k++){
+    for(const sgn of (k===0?[0]:[-1,1])){
+      const th2=a.th+sgn*k*rot;
+      if(!passableToward(a.x,a.y,th2,move)) continue;       // 通れる向きだけ候補
+      const err=Math.abs(wrap(gb-th2));                     // その向きがどれだけゴールを向くか
+      if(err<bestErr){ bestErr=err; bestK=sgn*k; }
+    }
+  }
+  if(bestK===null) return (a.aid.charCodeAt(0)&1)?1:2;      // 全方位ふさがり → 回頭
+  if(bestK===0) return 0;                                   // 現在向きが通れて最もゴール寄り → 前進
+  return bestK>0 ? 2 : 1;                                   // ゴール側の通れる向きへ回頭
+}
+
+function unstickAction(a, move, rot){
+  if(passableToward(a.x,a.y,a.th,move)) return 0;                 // 前が空いた → 進む
+  // 少し先まで見て、左右どちらがより開けているか
+  const scan=(dir)=>{ for(let k=1;k<=4;k++){ if(passableToward(a.x,a.y,a.th+dir*rot*k,move)) return k; } return 99; };
+  const L=scan(-1), R=scan(1);
+  if(L===99 && R===99) return (a.aid.charCodeAt(0)&1)?1:2;        // 全方位ふさがり → とりあえず回頭
+  return (L<=R) ? 1 : 2;                                          // 近い方の開いた向きへ
+}
+
 async function stepAll(){
   if(paused || !scene) return;   // ★ scene null ガード
   stepCount++;
@@ -1573,12 +1637,26 @@ async function stepAll(){
     const a=agents[i];
     if(a.mode==='hold') continue;   // rally 集合後は静止 (デバッグ用)
     const px=a.x,py=a.y;
-    const action=selectAction(a);
     const meta=personaMeta[a.def.id];
+    let action;
     // 1意思決定あたりの変位を INFER_EVERY で割って毎tick量にする。これで INFER_EVERY をいくつにしても
     // 「1意思決定=学習時と同じ変位(前進2.5セル/旋回40°)」が保たれ、推論の狭間でのオーバーシュート/嵌りを防ぐ。
-    const move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/INFER_EVERY;
-    const rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/INFER_EVERY;
+    let move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/INFER_EVERY;
+    let rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/INFER_EVERY;
+    if(MOVE_MODE==='pursuit'){   // 毎tick再計算なので大きめステップで機敏に (policyの÷INFER_EVERYは不要)
+      const sub=PURSUIT_SUB;
+      move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/sub;
+      rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/sub;
+    }
+    if(MOVE_MODE==='pursuit'){
+      action=pursueAction(a, move, rot);                   // 決定論の目的地追従 (推論不要)
+    }else{
+      action=selectAction(a);                              // 学習方策
+      if(a.stall>=UNSTICK_STALL){                          // 詰まり救出 (policyモードのみ)
+        if(UNSTICK_MODE==='steer') action=unstickAction(a, move, rot);
+        else if(a.mode==='wander'){ enterWander(a); a.stall=0; }
+      }
+    }
     if(action===1)a.th-=rot;else if(action===2)a.th+=rot;
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
@@ -1590,7 +1668,8 @@ async function stepAll(){
       // 学習時(マップ配列で通行判定)とも一致するため「seg誤判定で止まる」を防ぐ。
       // SEG_GATE=1 かつ seg_head ありのときだけ seg 判定を使う。
       const useSeg = SEG_GATE && segSession && meta && meta.dino;
-      const passable = useSeg ? (segPassCache[a.aid] ?? true) : PASSABLE.has(MAP[r][c]);
+      const passable = FREE_MOVE ? true
+                     : (useSeg ? (segPassCache[a.aid] ?? true) : PASSABLE.has(MAP[r][c]));
       if(passable){
         a.x=nx;a.y=ny;
         const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
@@ -1613,12 +1692,12 @@ async function stepAll(){
         else enterWander(a);   // 用事が済んだら自由行動へ (滞在させたいならここで dwell を挟む)
       }
     }else{
-      // A: z=0 のままランダム建物へ (学習時 GOAL_NONE regime と同じ)。到着で次を抽選。
+      // A: wander。生活の行き先へ A* 経路追従 (z=0 のまま = 学習時 GOAL_NONE regime)。
       a.goalZ=null;
-      if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){
-        a.trips++;
-        const g=pickLifeGoal(a, [Math.floor(a.x),Math.floor(a.y)]);
-        a.gx=g[0]+0.5; a.gy=g[1]+0.5;
+      if(a.path){
+        if(stepNavigate(a)){ a.trips++; enterWander(a); }   // 到着 → 次の行き先を選び直す
+      }else{
+        if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){ a.trips++; enterWander(a); }  // 経路なし=直線fallback
       }
     }
   }

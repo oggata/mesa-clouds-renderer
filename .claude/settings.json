@@ -61,7 +61,8 @@
       "WebSearch",
       "WebFetch(domain:zenn.dev)",
       "WebFetch(domain:arxiv.org)",
-      "WebFetch(domain:proceedings.mlr.press)"
+      "WebFetch(domain:proceedings.mlr.press)",
+      "Bash"
     ],
     "deny": [
       "Bash(rm -rf /*)",

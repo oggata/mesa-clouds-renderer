@@ -523,9 +523,7 @@ function buildAux(agent, meta){
       let hitD=oMax;
       for(let od=oStep; od<=oMax+1e-6; od+=oStep){
         const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
-        if(px<0||px>=GRID||py<0||py>=GRID){ hitD=od; break; }
-        // 通れない(木/空地) or 目的地でない建物 = 入るべきでないセル
-        if(!PASSABLE.has(MAP[r][c]) || (MAP[r][c]===BUILDING && !(r===gr&&c===gc))){ hitD=od; break; }
+        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
       }
       aux[9+k]=Math.min(1, hitD/oMax);
     }
