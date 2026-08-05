@@ -170,9 +170,9 @@ function loadPersonaDefs(){
 const PERSONA_DEFS = loadPersonaDefs();
 // キャラクター数 (1-50)。未設定ならペルソナ数。ペルソナ数より多い場合は一覧を巡回して割り当てる。
 //const _numAgentsEnv = parseInt(process.env.NUM_AGENTS);
-const _numAgentsEnv = 50;
+const _numAgentsEnv = 200;
 const NUM_AGENTS = Number.isFinite(_numAgentsEnv)
-  ? Math.max(1, Math.min(50, _numAgentsEnv))
+  ? Math.max(1, Math.min(_numAgentsEnv, _numAgentsEnv))
   : PERSONA_DEFS.length;
 console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`);
 
