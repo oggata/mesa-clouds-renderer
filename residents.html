@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>住民一覧 — MESA Persona City Sim</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#030507;--panel:rgba(4,8,14,0.92);--border:rgba(0,210,160,0.15);
+  --accent:#00d2a0;--warn:#ff4858;
+  --mono:'Orbitron',monospace;--text:#a8c8c0;--dim:#2a4a44;
+}
+html,body{width:100%;min-height:100%;background:var(--bg);color:var(--text);font-family:var(--mono);}
+#wrap{max-width:1200px;margin:0 auto;padding:24px 20px 60px;}
+header{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:10px;
+  margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border);}
+h1{font-size:16px;font-weight:900;color:var(--accent);letter-spacing:.14em;}
+#meta{font-size:10px;color:var(--dim);letter-spacing:.08em;display:flex;gap:16px;align-items:center;}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--warn);display:inline-block;margin-right:5px;}
+.dot.ok{background:var(--accent);box-shadow:0 0 8px var(--accent);}
+
+#toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;}
+#search{background:var(--panel);border:1px solid var(--border);color:var(--text);
+  padding:8px 10px;border-radius:4px;font-family:var(--mono);font-size:11px;flex:1;min-width:180px;}
+#search:focus{outline:none;border-color:var(--accent);}
+select{background:var(--panel);border:1px solid var(--border);color:var(--text);
+  padding:8px 10px;border-radius:4px;font-family:var(--mono);font-size:11px;}
+
+.tablewrap{background:var(--panel);border:1px solid var(--border);border-radius:6px;overflow-x:auto;}
+table{width:100%;border-collapse:collapse;font-size:11px;white-space:nowrap;}
+thead th{position:sticky;top:0;background:#081016;text-align:left;padding:10px 12px;
+  font-size:9px;letter-spacing:.1em;color:var(--dim);border-bottom:1px solid var(--border);}
+tbody td{padding:9px 12px;border-bottom:1px solid rgba(0,210,160,0.06);}
+tbody tr:hover{background:rgba(0,210,160,0.04);}
+.swatch{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:middle;}
+.name{color:#e8f4f0;font-weight:700;}
+.id{color:var(--dim);font-size:10px;}
+.need{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:12px;
+  font-size:10px;background:rgba(255,255,255,0.04);border:1px solid var(--border);}
+.need.calm{color:var(--accent);border-color:rgba(0,210,160,0.3);}
+.need.warn{color:#ffcf5a;border-color:rgba(255,207,90,0.3);}
+.need.crit{color:var(--warn);border-color:rgba(255,72,88,0.3);}
+.activity{color:var(--text);}
+#empty{padding:40px;text-align:center;color:var(--dim);font-size:11px;display:none;}
+#count-badge{color:var(--accent);}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <h1>住民一覧</h1>
+    <div id="meta">
+      <span><span class="dot" id="conn-dot"></span><span id="conn-text">接続中…</span></span>
+      <span>時刻 <b id="sim-time" style="color:var(--accent)">--:--</b></span>
+      <span>住民数 <b id="count-badge">-</b></span>
+    </div>
+  </header>
+
+  <div id="toolbar">
+    <input id="search" type="text" placeholder="名前 / ID / ペルソナタイプで検索…">
+    <select id="need-filter">
+      <option value="">状態: すべて</option>
+      <option value="eat">🍚 お腹が空いている</option>
+      <option value="sleep">😴 眠い</option>
+      <option value="work">💼 仕事中</option>
+      <option value="sick">🤒 体調が悪い</option>
+      <option value="shop">🛒 買い物に行きたい</option>
+      <option value="bored">🥱 退屈</option>
+      <option value="none">🙂 元気</option>
+    </select>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>仮の名前</th>
+          <th>ペルソナタイプ</th>
+          <th>状態</th>
+          <th>今していること</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty">該当する住民がいません</div>
+  </div>
+</div>
+
+<script>
+const rowsEl = document.getElementById('rows');
+const emptyEl = document.getElementById('empty');
+const searchEl = document.getElementById('search');
+const needFilterEl = document.getElementById('need-filter');
+const connDot = document.getElementById('conn-dot');
+const connText = document.getElementById('conn-text');
+const simTime = document.getElementById('sim-time');
+const countBadge = document.getElementById('count-badge');
+
+let residents = [];
+const NEED_SEVERITY = { sick:'crit', sleep:'crit', eat:'warn', work:'calm', shop:'warn', bored:'warn' };
+
+function render(){
+  const q = searchEl.value.trim().toLowerCase();
+  const needFilter = needFilterEl.value;
+  const filtered = residents.filter(r=>{
+    if(needFilter==='none' && r.need) return false;
+    if(needFilter && needFilter!=='none' && r.need!==needFilter) return false;
+    if(!q) return true;
+    return r.id.toLowerCase().includes(q) || r.name.toLowerCase().includes(q) || r.personaType.toLowerCase().includes(q);
+  });
+
+  rowsEl.innerHTML = filtered.map(r=>{
+    const sev = r.need ? (NEED_SEVERITY[r.need]||'warn') : 'calm';
+    const needLabel = r.need ? `${r.needEmoji||''} ${r.needLabel}` : '🙂 元気';
+    return `<tr>
+      <td class="id">${r.id}</td>
+      <td class="name"><span class="swatch" style="background:${r.color}"></span>${r.name}</td>
+      <td>${r.personaType} <span class="id">${r.personaDesc||''}</span></td>
+      <td><span class="need ${sev}">${needLabel}</span></td>
+      <td class="activity">${r.activity}</td>
+    </tr>`;
+  }).join('');
+
+  emptyEl.style.display = filtered.length ? 'none' : 'block';
+}
+
+async function poll(){
+  try{
+    const res = await fetch('/api/residents');
+    const data = await res.json();
+    if(!data.ok) throw new Error('bad response');
+    residents = data.residents;
+    simTime.textContent = data.time;
+    countBadge.textContent = data.count;
+    connDot.classList.add('ok');
+    connText.textContent = '接続中';
+    render();
+  }catch(e){
+    connDot.classList.remove('ok');
+    connText.textContent = '切断';
+  }
+}
+
+searchEl.addEventListener('input', render);
+needFilterEl.addEventListener('change', render);
+
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

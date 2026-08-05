@@ -1,0 +1,121 @@
+{
+  "_comment": "アイコン画像の設定ファイル。key: 意味, file: icons/ 配下の画像ファイル名, replaces: 現在UIで使われている絵文字, usedIn: 差し替え対象の箇所 (要編集して実際にHTMLへ反映)",
+  "iconDir": "icons/",
+  "icons": {
+    "newMap": {
+      "file": "dice.svg",
+      "replaces": "🎲",
+      "label": "New Map ボタン",
+      "usedIn": [
+        "client.html:101",
+        "standalone/index.html:95",
+        "dinov2seg/index.html:151",
+        "webrtc-version/client.html:116"
+      ]
+    },
+    "overviewCamera": {
+      "file": "camera.svg",
+      "replaces": "📷",
+      "label": "Overview カメラバッジ",
+      "usedIn": [
+        "client.html:104",
+        "standalone/index.html:89,955"
+      ]
+    },
+    "goal": {
+      "file": "target.svg",
+      "replaces": "🎯",
+      "label": "カメラ追従バッジ / Goal ボタン・パネルタイトル",
+      "usedIn": [
+        "client.html:236",
+        "standalone/index.html:96,117,956"
+      ]
+    },
+    "thought": {
+      "file": "thought.svg",
+      "replaces": "💭",
+      "label": "ペルソナの吹き出し",
+      "usedIn": [
+        "client.html:286",
+        "standalone/index.html:998"
+      ]
+    },
+    "stream": {
+      "file": "settings.svg",
+      "replaces": "⚙",
+      "label": "配信設定 ボタン・パネルタイトル",
+      "usedIn": [
+        "standalone/index.html:97,101"
+      ]
+    },
+    "play": {
+      "file": "play.svg",
+      "replaces": "▶",
+      "label": "開始ボタン / コンパスのGOALラベル",
+      "usedIn": [
+        "webrtc-version/client.html:223",
+        "dinov2seg/index.html:123,1367"
+      ]
+    },
+    "statusOk": {
+      "file": "check.svg",
+      "replaces": "✓",
+      "label": "DINOv2/ONNX ロード成功ステータス",
+      "usedIn": [
+        "dinov2seg/index.html:179,183,295,299,321,324,328,393,398"
+      ]
+    },
+    "statusWarning": {
+      "file": "warning.svg",
+      "replaces": "⚠",
+      "label": "DINOv2/ONNX ロード警告ステータス",
+      "usedIn": [
+        "dinov2seg/index.html:179,183,295,299,321,324,328,393,398"
+      ]
+    },
+    "statusError": {
+      "file": "cross.svg",
+      "replaces": "❌",
+      "label": "DINOv2/ONNX ロード失敗ステータス",
+      "usedIn": [
+        "dinov2seg/index.html:179,183,295,299,321,324,328,393,398"
+      ]
+    },
+    "needEat": {
+      "file": "need-eat.svg",
+      "replaces": "🍚",
+      "label": "空腹ニーズ (キャラクター頭上バッジ)",
+      "usedIn": ["server.js:1056"]
+    },
+    "needSleep": {
+      "file": "need-sleep.svg",
+      "replaces": "😴",
+      "label": "睡眠ニーズ (キャラクター頭上バッジ)",
+      "usedIn": ["server.js:1056"]
+    },
+    "needWork": {
+      "file": "need-work.svg",
+      "replaces": "💼",
+      "label": "仕事ニーズ (キャラクター頭上バッジ)",
+      "usedIn": ["server.js:1056"]
+    },
+    "needSick": {
+      "file": "need-sick.svg",
+      "replaces": "🤒",
+      "label": "体調不良ニーズ (キャラクター頭上バッジ)",
+      "usedIn": ["server.js:1056"]
+    },
+    "needShopping": {
+      "file": "need-shopping.svg",
+      "replaces": "🛒",
+      "label": "買い物ニーズ (キャラクター頭上バッジ)",
+      "usedIn": ["server.js:1056"]
+    },
+    "needTired": {
+      "file": "need-tired.svg",
+      "replaces": "🥱",
+      "label": "疲労ニーズ (キャラクター頭上バッジ)",
+      "usedIn": ["server.js:1056"]
+    }
+  }
+}

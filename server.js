@@ -1054,6 +1054,7 @@ function updateDayNight(S){
 //   絵文字は sharp で SVG→PNG にラスタライズしてテクスチャ化する (canvas 依存を増やさない)。
 //   フォントが無い環境では描画が空になるので、その場合は色板にフォールバックする。
 const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱'};
+const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈'};
 const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
                    sick:0xff5a5a, shop:0xffd23a, bored:0xb07aff};
 const ICON_PX=72;
@@ -1358,6 +1359,37 @@ function needOf(a){
   if((a.supply ||0) > NEED_HI)                 return 'shop';
   if((a.bored  ||0) > NEED_HI)                 return 'bored';
   return null;
+}
+
+// いま何をしているか (住民一覧ページ用)。既に到着済みなら「〜している」、移動中なら「〜へ向かっている」。
+//   建物到着時の欲求回復 (stepNeeds) と同じ判定基準 (現在地/隣接の建物カテゴリ) を使う。
+function describeActivity(a){
+  const r=Math.floor(a.x), c=Math.floor(a.y);
+  const t=BUILDING_TYPES[r+'_'+c];
+  const near=(idxList)=>{
+    for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+      const tt=BUILDING_TYPES[(r+dr)+'_'+(c+dc)];
+      if(tt!=null && idxList.includes(tt)) return true;
+    }
+    return false;
+  };
+  const atHome = a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1;
+  const atWork = a.work && Math.abs(r-a.work[0])<=1 && Math.abs(c-a.work[1])<=1;
+  const h=gameHour();
+
+  if((a.sick||0)>0 && near(CARE_IDX)) return '🏥 病院・薬局で治療を受けている';
+  if(t!=null && FOOD_IDX.includes(t)) return `${BLDG_TYPES[t].label} で食事をしている`;
+  if(t!=null && BUY_IDX.includes(t))  return `${BLDG_TYPES[t].label} で買い物をしている`;
+  if(t!=null && FUN_IDX.includes(t))  return `${BLDG_TYPES[t].label} で過ごしている`;
+  if(atWork && h>=9 && h<17)          return '💼 職場で働いている';
+  if(atHome)                          return '🏠 自宅で休んでいる';
+
+  // 移動中: 目的地の建物と、その理由になっている欲求があれば添える
+  const bldg = a.goalType!=null ? BLDG_TYPES[a.goalType] : null;
+  const need = needOf(a);
+  if(bldg && need) return `${bldg.label} へ向かっている（${NEED_LABEL_JA[need]}）`;
+  if(bldg)         return `${bldg.label} の方へ歩いている`;
+  return 'うろうろしている';
 }
 
 // 内部状態にもとづく目的地抽選。該当が無ければ従来のランダムに落とす。
@@ -2091,6 +2123,30 @@ const httpServer=http.createServer((req,res)=>{
         need:needOf(a), emoji:NEED_EMOJI[needOf(a)]||null,
         pos:[+a.x.toFixed(1),+a.y.toFixed(1)]}))}));
     return;
+  }
+
+  // ── 住民一覧ページ用 API: ID/仮の名前/ペルソナタイプ/状態/現在の行動をまとめて返す ──
+  if(urlPath==='/api/residents'){
+    res.setHeader('Content-Type','application/json');
+    const h=gameHour();
+    const hh=String(Math.floor(h)).padStart(2,'0'), mm=String(Math.floor(h%1*60)).padStart(2,'0');
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, time:`${hh}:${mm}`, count:agents.length,
+      residents:agents.map(a=>{
+        const need=needOf(a);
+        return {
+          id:a.aid, name:a.def.name, personaType:a.def.id, personaDesc:a.def.desc, color:a.def.hex,
+          need, needEmoji:NEED_EMOJI[need]||null, needLabel:need?(NEED_LABEL_JA[need]||need):'元気',
+          activity: describeActivity(a),
+          pos:[+a.x.toFixed(1),+a.y.toFixed(1)]
+        };
+      })}));
+    return;
+  }
+
+  // ── 住民一覧ページ ──
+  if(urlPath==='/residents'){
+    return serveFile(res, path.join(__dirname,'residents.html'));
   }
 
   // ── 1モデル化: 実行時のペルソナ切替 / ブレンド (persona_multi.onnx 使用時のみ) ──

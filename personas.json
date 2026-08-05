@@ -12,6 +12,16 @@
     { "id": "B", "name": "Homebody Lily",    "color": "#00ccff", "desc": "Takes the shortest route" },
     { "id": "C", "name": "Social Marco",     "color": "#33ff88", "desc": "Gathers near others" },
     { "id": "D", "name": "Businessman Cole", "color": "#ffee00", "desc": "Moves straight, efficiency first" },
-    { "id": "E", "name": "Tourist Elena",    "color": "#ff7700", "desc": "Wanders around buildings" }
+    { "id": "E", "name": "Tourist Elena",    "color": "#ff7700", "desc": "Wanders around buildings" },
+    { "id": "F", "name": "Curious Kid Mia",     "color": "#ff4fa3", "desc": "Runs around excitedly, easily distracted" },
+    { "id": "G", "name": "Grandpa Ken",         "color": "#8892a6", "desc": "Shuffles slowly, sticks to familiar streets" },
+    { "id": "H", "name": "Student Yui",         "color": "#2dd4bf", "desc": "Commutes briskly between school and home" },
+    { "id": "I", "name": "Teen Jay",            "color": "#a855f7", "desc": "Hangs around with friends, rarely alone" },
+    { "id": "J", "name": "Grandma Rose",        "color": "#e8879e", "desc": "Takes frequent rest stops, moves gently" },
+    { "id": "K", "name": "Freelancer Noah",     "color": "#3b82f6", "desc": "Flexible hours, drifts between cafés" },
+    { "id": "L", "name": "Toddler Sora",        "color": "#ffb454", "desc": "Wanders unpredictably, stays close to home" },
+    { "id": "M", "name": "Retired Artist Haru", "color": "#b08968", "desc": "Strolls slowly toward quiet, scenic spots" },
+    { "id": "N", "name": "Athletic Teen Riku",  "color": "#84cc16", "desc": "Moves briskly, drawn to the stadium" },
+    { "id": "O", "name": "Night-shift Mika",    "color": "#1e3a8a", "desc": "Active after dark, rests through the day" }
   ]
 }
