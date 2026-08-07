@@ -119,6 +119,9 @@ const PASSABLE = new Set([ROAD, BUILDING]);
 const FREE_MOVE = process.env.FREE_MOVE === '1';   // 既定OFF (センサ修正で通行判定を活用)
 // 診断/調整: 障害物クリアランスを強気側へスケール (過度に臆病で前進しない対策)。既定1.0。
 const OBST_BOLD = parseFloat(process.env.OBST_BOLD)||1.0;
+// 障害物レイに『目的地でない建物』を含めるか。既定ON = 学習側 aux() と同じ判定。
+// OBST_BLDG=0 で「通れないセルだけを障害物にする」旧挙動に戻せる (A/B 検証用)。
+const OBST_BLDG = process.env.OBST_BLDG !== '0';
 // 学習時の「1意思決定あたり」の変位 (= move_dist × action_repeat / rot_decision_deg)。
 // meta が無い/古いモデルのフォールバック。実際は persona ごとに meta から算出する(下記 personaMeta)。
 const FWD_PER_DECISION_DEF = 0.25 * 10;              // = 2.5 セル/意思決定
@@ -330,6 +333,15 @@ function buildPersonaMeta(m){
     obstRayMax: m.obst_ray_max||3.0,
     obstStep:   m.obst_step||0.25,
     obstOff:    ((m.obst_off_deg!=null?m.obst_off_deg:40)*Math.PI)/180,
+    // 学習側 aux() の障害物レイは『目的地でない建物』もブロック扱いにする (NB の _isb & ~_isgoal)。
+    // 既定を true にしているのは、obstacle センサを持つモデル(aux_dim>=12)は歴代すべて
+    // この判定で学習されているため。ここを false にすると建物が clearance に現れず、
+    // 「学習では壁だった物が本番では見えない」ズレになる。OBST_BLDG=0 で従来式に戻せる。
+    obstBlocksBldg: OBST_BLDG && m.obst_blocks_buildings!==false,
+    // compass の的の作り方。学習側 (NB aux()) が経路ウェイポイントを見ているモデルは
+    // compass_mode='route_waypoint' を持つ。lookahead も meta 側を真とする。
+    compassMode:      m.compass_mode||'goal',
+    compassLookahead: m.compass_lookahead||null,
     // ── 1モデル化: 性格ベクトル (personaDim>0 なら入力の末尾に付く) ──
     personaDim: m.persona_dim||0,
     personaKeys: m.persona_keys||[],
@@ -338,6 +350,7 @@ function buildPersonaMeta(m){
     // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
     rotPerTick: ((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
     // 1意思決定あたりの変位 (INFER_EVERY で割って毎tick量にする)。train/deploy 一致の要。
+    actionRepeat: m.action_repeat||null,   // 学習時の 1意思決定 = 何tick か (歩行速度の基準)
     fwdPerDecision: (m.move_dist||0.25) * (m.action_repeat||10),
     rotPerDecision: (((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180) * (m.action_repeat||10),
     dino: isize!==iw*ih*ic,             // 生画像サイズと違う → DINOv2方式
@@ -370,8 +383,21 @@ async function loadOnnxSessions(){
       for(const p of PERSONA_DEFS){ personaMeta[p.id]=meta; ortSessions[p.id]=sess; obsDims[p.id]=dim; }
       const have=Object.keys(meta.personaVectors);
       console.log(`[ONNX] persona_multi OK  DINOv2(${dim})  personaDim=${meta.personaDim}  性格=${have.join(',')||'(なし)'}`);
+      // personas.json に居るのに学習に含まれていない id への手当て。
+      // ここを放置すると inferAction がゼロベクトルを渡すが、それは学習中に一度も
+      // 現れない入力 (全報酬係数=0 の性格) なので挙動が未定義になり、止まりやすい。
+      // 暫定として学習済みベクトルを巡回で借りる。恒久対応は NB の persona_rewards.json に
+      // その id を足して再学習すること。
       const miss=PERSONA_DEFS.filter(p=>!meta.personaVectors[p.id]).map(p=>p.id);
-      if(miss.length) console.warn(`[ONNX] persona_multi: 性格ベクトル未収録 ${miss.join(',')} → ゼロベクトルで動作`);
+      if(miss.length){
+        if(have.length){
+          miss.forEach((id,i)=>{ meta.personaVectors[id]=meta.personaVectors[have[i%have.length]]; });
+          console.warn(`[ONNX] persona_multi: 性格ベクトル未収録 ${miss.join(',')} → 学習済み(${have.join(',')})を巡回で代用。`
+                     + ` 個別の性格を出すには persona_rewards.json に追加して再学習すること`);
+        }else{
+          console.warn(`[ONNX] persona_multi: persona_vectors が空 → 全ペルソナがゼロベクトル (挙動未定義)`);
+        }
+      }
       return;
     }catch(e){ console.warn('[ONNX] persona_multi 読み込み失敗 → 個別モデルへフォールバック:',e.message); }
   }
@@ -512,11 +538,12 @@ async function computeSegPassable(patchTensor){
 // 推論結果キャッシュ (エージェントごと)
 const actionCache = {};
 
-// ─── 補助観測 aux(9) の組み立て ───────────────────────────────────────────────
+// ─── 補助観測 aux(12) の組み立て ──────────────────────────────────────────────
 // 学習側 PersonaVecEnvGoal.aux() と同一レイアウト・同一式にすること。
-//   compass(3): 目的地の相対方位 sin/cos + 距離/GRID
-//   visited(4): 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
-//   social(2) : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+//   compass(3) : 目的地の相対方位 sin/cos + 距離/GRID
+//   visited(4) : 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
+//   social(2)  : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+//   obstacle(3): 前/左/右の clearance (1=開けている, 0=直前が障害物)
 // 2点間に建物が無いか (視界の遮蔽判定)。両端のセルは除外 = 建物は通行可なので人が建物上に立ち得る。
 // 学習側 _los_clear() と同一式。
 function losClear(x0,y0,x1,y1,samples){
@@ -575,21 +602,30 @@ function buildAux(agent, meta){
     const prox=Math.max(0,1-sd/meta.socialRange);
     aux[7]=Math.sin(sb)*prox; aux[8]=Math.cos(sb)*prox;
   }
-  // obstacle(3): front/left/right の通れないセル(木/空地/範囲外)までの距離 → clearance[0,1]
-  //   学習側 PersonaVecEnvGoal.aux() と同一式。建物は通れるので壁にしない=移動を止める木/空地だけ拾う。
+  // obstacle(3): front/left/right の「入るべきでないセル」までの距離 → clearance[0,1]
+  //   学習側 PersonaVecEnvGoal.aux() と同一式にすること。ここがズレると、SAFE_BC で
+  //   「前が塞がったら曲がる」を教えた方策に学習時と違う clearance が入り、
+  //   建物前で止まらない / 何もない所で回り続ける といった破綻になる。
+  //   判定内容はモデルの meta が決める:
+  //     obst_blocks_buildings=true (persona_multi 系) → 通行不可セル ∪ 目的地でない建物
+  //     フラグ無し (旧モデル)                        → 通行不可セル(木/空地/範囲外)のみ
   if(meta.auxDim>=12){
     const oMax=meta.obstRayMax, oStep=meta.obstStep, offs=[0,-meta.obstOff,meta.obstOff];
     // 目的地セル: ここだけは建物でも「避ける対象」から外す (目的として入るのは許す)
     const gr=Math.floor(agent.gx), gc=Math.floor(agent.gy);
+    // 自分が今いるセルは障害物にしない。レイは oStep(0.25) で自セルに当たるので、
+    // これが無いと建物の上に立った瞬間 front≈0.08 になる (obstBlocksBldg 時)。
+    const cr=Math.floor(agent.x), cc=Math.floor(agent.y);
     for(let k=0;k<3;k++){
       const ca=Math.cos(agent.th+offs[k]), sa=Math.sin(agent.th+offs[k]);
       let hitD=oMax;
       for(let od=oStep; od<=oMax+1e-6; od+=oStep){
         const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
-        // 障害物 = 通れないセル(木/空地/範囲外)のみ。建物は歩行可なので障害物にしない。
-        //   (建物を障害物に含めると、建物密集マップでセンサが常時ブロックを報告し、
-        //    障害物回避を学んだモデルが延々と旋回して前進しなくなる)
-        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
+        if(px<0||px>=GRID||py<0||py>=GRID){ hitD=od; break; }
+        if(r===cr&&c===cc) continue;
+        const cell=MAP[r][c];
+        const bldgBlock = meta.obstBlocksBldg && cell===BUILDING && !(r===gr&&c===gc);
+        if(!PASSABLE.has(cell) || bldgBlock){ hitD=od; break; }
       }
       aux[9+k]=Math.min(1, hitD/oMax*OBST_BOLD);
     }
@@ -673,17 +709,21 @@ let inferWarmed = false;   // 初回の一括推論が済んだか (initAgents �
 //       「1意思決定=学習時と同じ変位」という前提は一切変わらない。実行タイミングが
 //       ばらけるだけで、1tickあたりの負荷が 1/INFER_EVERY に平準化される。
 async function prefetchAllActions(map, agents){
-  if(MOVE_MODE==='pursuit') return;   // 決定論追従は推論不要 → DINOv2を回さない (CPU/滑らかさに効く)
+  if(MOVE_MODE==='pursuit' || !agents.some(hasUsablePolicy)) return;
+  // 決定論追従、または対応するONNX/DINOv2が無い場合は推論不要。
+  // 後者は stepAll() 側で pursuit に安全フォールバックする。
   // 初回だけ全員ぶん推論しておく (自分の位相が来るまでランダム行動になるのを防ぐ)
   if(!inferWarmed){
     inferWarmed = true;
-    for(const a of agents) actionCache[a.aid] = await inferAction(map, a);
+    for(const a of agents){
+      if(hasUsablePolicy(a)) actionCache[a.aid] = await inferAction(map, a);
+    }
     return;
   }
   const phase = stepCount % INFER_EVERY;
   for(let i=0;i<agents.length;i++){
     if(i % INFER_EVERY !== phase) continue;   // 自分の番のtickだけ
-    actionCache[agents[i].aid] = await inferAction(map, agents[i]);
+    if(hasUsablePolicy(agents[i])) actionCache[agents[i].aid] = await inferAction(map, agents[i]);
   }
 }
 
@@ -1429,10 +1469,36 @@ const REPLAN_STALL = 8;  // これだけ足踏みしたら経路を引き直す
 const UNSTICK_STALL = 3;
 // 詰まり対処の方式: 'release'=行き先を選び直す(既定) / 'steer'=通れる向きへ毎tick操舵。
 const UNSTICK_MODE = (process.env.UNSTICK_MODE==='release') ? 'release' : 'steer';   // 既定steer (障害物を操舵回避)
-// 移動の駆動方式: 'pursuit'=決定論の目的地追従(確実に街が動く/DINOv2推論スキップで軽い) / 'policy'=学習方策
-//   pursuit でも「どこへ向かうか」は生活ロジック(pickLifeGoal)と rally が決めるので、性格・生活リズムは出る。
-const MOVE_MODE = (process.env.MOVE_MODE==='policy') ? 'policy' : 'pursuit';
+// 移動の駆動方式: 既定は 'policy'。MOVE_MODE=pursuit で決定論の目的地追従へ戻せる。
+// persona_multi.onnx または必要なDINOv2が無いペルソナは、モデル未配備時にランダム化せず
+// stepAll() で pursuit へ安全フォールバックする。
+const MOVE_MODE = (process.env.MOVE_MODE==='pursuit') ? 'pursuit' : 'policy';
 const PURSUIT_SUB = parseFloat(process.env.PURSUIT_SUB)||5;   // pursuit の per-tick 分割 (小=速い)。5→0.5セル/8°/tick
+console.log(`[Move] mode=${MOVE_MODE} (missing model → pursuit fallback)`);
+
+// policy と pursuit で「1tickあたりの歩幅」が違う点を起動時に明示する。
+//   policy : fwdPerDecision / INFER_EVERY   (1意思決定を INFER_EVERY tick かけて消化)
+//   pursuit: fwdPerDecision / PURSUIT_SUB   (毎tick再計算するので分割数が小さい)
+// 変位/意思決定はどちらも学習時と同じだが、それを何tickかけて歩くかは別物。
+// INFER_EVERY を学習の action_repeat より大きくすると、方策が完璧でも
+// 見た目の歩行速度がその比だけ遅くなる (pursuit と比べて「鈍い」と感じる主因)。
+function logMoveCadence(){
+  const meta=personaMeta[PERSONA_DEFS[0] && PERSONA_DEFS[0].id];
+  const fwd=(meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF;
+  const ar=(meta&&meta.actionRepeat)||null;
+  const pol=(fwd/INFER_EVERY).toFixed(3), pur=(fwd/PURSUIT_SUB).toFixed(3);
+  console.log(`[Move] 歩幅/tick: policy=${pol} (INFER_EVERY=${INFER_EVERY}) / pursuit=${pur} (PURSUIT_SUB=${PURSUIT_SUB})`);
+  if(ar && INFER_EVERY!==ar){
+    console.warn(`[Move] INFER_EVERY=${INFER_EVERY} が学習時の action_repeat=${ar} と違う → `
+               + `policy の歩行速度が学習時の ${(ar/INFER_EVERY).toFixed(2)} 倍になる。`
+               + ` 見た目を揃えるなら INFER_EVERY=${ar} (CPU負荷は上がる)`);
+  }
+}
+
+function hasUsablePolicy(agent){
+  const meta=personaMeta[agent.def.id];
+  return !!ortSessions[agent.def.id] && (!meta || !meta.dino || !!dinoSession);
+}
 
 // 経路探索 (道路優先のダイクストラ)。
 //   通れるのは PASSABLE(=ROAD|BUILDING) のみ。木/空地は実際の移動でも通れないので除外する。
@@ -1538,7 +1604,11 @@ function stepNavigate(a){
     const [r,c]=a.path[a.pathIdx];
     if(Math.hypot(a.x-(r+0.5), a.y-(c+0.5)) < WP_REACH) a.pathIdx++; else break;
   }
-  const ti=Math.min(a.pathIdx+LOOKAHEAD, a.path.length-1);
+  // 先読み量はモデル側 (meta.compass_lookahead) を優先する。学習の compass が
+  // 「経路を何セル先取りした点」を見ていたかと一致していないと観測がズレる。
+  const _pm=personaMeta[a.def.id];
+  const look=(_pm&&_pm.compassLookahead)||LOOKAHEAD;
+  const ti=Math.min(a.pathIdx+look, a.path.length-1);
   const [tr,tc]=a.path[ti];
   a.gx=tr+0.5; a.gy=tc+0.5;
   // navigate 中は全区間で z(目的タイプ one-hot) を立てる。
@@ -1675,12 +1745,13 @@ async function stepAll(){
     // 「1意思決定=学習時と同じ変位(前進2.5セル/旋回40°)」が保たれ、推論の狭間でのオーバーシュート/嵌りを防ぐ。
     let move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/INFER_EVERY;
     let rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/INFER_EVERY;
-    if(MOVE_MODE==='pursuit'){   // 毎tick再計算なので大きめステップで機敏に (policyの÷INFER_EVERYは不要)
+    const usePursuit = MOVE_MODE==='pursuit' || !hasUsablePolicy(a);
+    if(usePursuit){   // 毎tick再計算なので大きめステップで機敏に (policyの÷INFER_EVERYは不要)
       const sub=PURSUIT_SUB;
       move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/sub;
       rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/sub;
     }
-    if(MOVE_MODE==='pursuit'){
+    if(usePursuit){
       action=pursueAction(a, move, rot);                   // 決定論の目的地追従 (推論不要)
     }else{
       action=selectAction(a);                              // 学習方策
@@ -2378,6 +2449,7 @@ function startLoops(){
 (async()=>{
   console.log('[Init] loading ONNX sessions...');
   await loadOnnxSessions();
+  logMoveCadence();
 
   console.log('[Init] preloading textures...');
   await preloadTextures();

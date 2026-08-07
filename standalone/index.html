@@ -424,33 +424,69 @@ async function loadONNX(progress){
     dbg('dinov2 in='+dinoIn+' out='+dinoSession.outputNames.join(','));
   }catch(e){ console.warn('[DINOv2] load failed:',e); dinoSession=null; }
 
-  // persona heads + meta
+  // meta(JSON) → personaMeta エントリ。1モデル化 / 個別モデル で共通に使う。
+  function toMeta(m){
+    return {
+      inputSize:m.input_size,
+      goalDim:m.goal_dim||0,
+      auxDim:m.aux_dim||0,               // >0 なら補助観測 (compass/visited/social/obstacle) 付き
+      visitR:m.visit_radius||5,
+      visitWin:m.visit_window_ticks||4000,
+      socialRange:m.social_range||8,
+      socialFovDeg:m.social_fov_deg||120,
+      socialLosSamples:m.social_los_samples||16,
+      // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
+      obstRayMax:m.obst_ray_max||3.0,
+      obstStep:m.obst_step||0.25,
+      obstOff:((m.obst_off_deg!=null?m.obst_off_deg:40)*Math.PI)/180,
+      // 既定 true: obstacle センサ付き(aux_dim>=12)モデルは学習側で『目的地でない建物』も
+      // 障害物として扱っている。ここを false にすると学習と本番で観測がズレる。
+      obstBlocksBldg:m.obst_blocks_buildings!==false,
+      // compass の的の作り方 (学習側と一致していること)
+      compassMode:m.compass_mode||'goal',
+      compassLookahead:m.compass_lookahead||null,
+      // 1モデル化: 性格ベクトル (personaDim>0 なら入力の末尾に付く)
+      personaDim:m.persona_dim||0,
+      personaVectors:m.persona_vectors||{},   // { 'A':[...], 'B':[...] }
+      // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
+      rotPerTick:((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
+      dino:m.input_size!==(m.img_w*m.img_h*m.img_ch),
+      cfg:{ w:m.img_w, h:m.img_h, fov:(m.fov_deg||60)*Math.PI/180,
+            sky:FP_SKY_RGB.map(v=>v/255), floor:FP_FLOOR_RGB.map(v=>v/255) },
+    };
+  }
+
+  // ── 1モデル化: data/persona_multi.* があれば全ペルソナで1セッションを共有 ──
+  //   性格は入力末尾の persona ベクトルで切り替える (server.js loadOnnxSessions と同じ方針)。
+  setOverlay('Loading persona_multi…', progress(1/(PERSONA_DEFS.length+1)));
+  try{
+    const m=await fetch('./data/persona_multi_meta.json').then(r=>r.ok?r.json():null);
+    if(m){
+      const meta=toMeta(m);
+      const sess=await ort.InferenceSession.create('./data/persona_multi.onnx',{executionProviders:EP_HEAD});
+      for(const p of PERSONA_DEFS){ personaMeta[p.id]=meta; ortSessions[p.id]=sess; }
+      dbg(`persona_multi in=${meta.inputSize} personaDim=${meta.personaDim}`);
+      // 学習に含まれていない id はゼロベクトル (= 全報酬係数0 の、学習中に一度も
+      // 現れない性格) になってしまうので、学習済みベクトルを巡回で借りる。server.js と同じ方針。
+      const have=Object.keys(meta.personaVectors);
+      const miss=PERSONA_DEFS.filter(p=>!meta.personaVectors[p.id]).map(p=>p.id);
+      if(miss.length && have.length){
+        miss.forEach((id,i)=>{ meta.personaVectors[id]=meta.personaVectors[have[i%have.length]]; });
+        console.warn(`[persona_multi] 性格ベクトル未収録 ${miss.join(',')} → 学習済み(${have.join(',')})を巡回で代用`);
+      }else if(miss.length){
+        console.warn('[persona_multi] persona_vectors が空 → 全ペルソナがゼロベクトル (挙動未定義)');
+      }
+      return;
+    }
+  }catch(e){ console.warn('[persona_multi] load failed → 個別モデルへフォールバック:',e); }
+
+  // ── 従来: ペルソナごとに個別モデル ──
   for(let i=0;i<PERSONA_DEFS.length;i++){
     const p=PERSONA_DEFS[i];
     setOverlay(`Loading persona ${p.id}…`, progress((i+1)/(PERSONA_DEFS.length+1)));
     try{
       const m=await fetch(`./data/persona_${p.id}_meta.json`).then(r=>r.ok?r.json():null);
-      if(m){
-        personaMeta[p.id]={
-          inputSize:m.input_size,
-          goalDim:m.goal_dim||0,
-          auxDim:m.aux_dim||0,               // >0 なら補助観測 (compass/visited/social) 付き = 401モデル
-          visitR:m.visit_radius||5,
-          visitWin:m.visit_window_ticks||4000,
-          socialRange:m.social_range||8,
-          socialFovDeg:m.social_fov_deg||120,
-          socialLosSamples:m.social_los_samples||16,
-          // 前方障害物センサ (aux_dim>=12 のとき有効)。学習側 OBST_* と一致させる。
-          obstRayMax:m.obst_ray_max||3.0,
-          obstStep:m.obst_step||0.25,
-          obstOff:((m.obst_off_deg!=null?m.obst_off_deg:40)*Math.PI)/180,
-          // 学習時の 1tick あたり旋回量。旧モデル(rot_deg=20)は 20°/tick のまま動かす
-          rotPerTick:((m.rot_per_tick_deg!=null?m.rot_per_tick_deg:(m.rot_deg||20))*Math.PI)/180,
-          dino:m.input_size!==(m.img_w*m.img_h*m.img_ch),
-          cfg:{ w:m.img_w, h:m.img_h, fov:(m.fov_deg||60)*Math.PI/180,
-                sky:FP_SKY_RGB.map(v=>v/255), floor:FP_FLOOR_RGB.map(v=>v/255) },
-        };
-      }
+      if(m) personaMeta[p.id]=toMeta(m);
       ortSessions[p.id]=await ort.InferenceSession.create(`./data/persona_${p.id}.onnx`,{executionProviders:EP_HEAD});
     }catch(e){ console.warn(`[persona ${p.id}] load failed:`,e); ortSessions[p.id]=null; }
   }
@@ -475,10 +511,11 @@ function biasedRandom(map, agent){
   return (fwd===ROAD && Math.random()<0.55) ? 0 : (Math.random()<0.5?1:2);
 }
 
-// 補助観測 aux(9)。学習側 PersonaVecEnvGoal.aux() / server.js buildAux() と同一式。
-//   compass(3): 目的地の相対方位 sin/cos + 距離/GRID
-//   visited(4): 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
-//   social(2) : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+// 補助観測 aux(12)。学習側 PersonaVecEnvGoal.aux() / server.js buildAux() と同一式。
+//   compass(3) : 目的地の相対方位 sin/cos + 距離/GRID
+//   visited(4) : 前/左/右/後セクタ(半径 visitR)の訪問済みセル率 (範囲外=訪問済み扱い)
+//   social(2)  : 最寄りの他エージェントの相対方位 sin/cos × 近接度
+//   obstacle(3): 前/左/右の clearance (1=開けている, 0=直前が障害物)
 // 2点間に建物が無いか (視界の遮蔽判定)。学習側 _los_clear() / server.js losClear() と同一式。
 function losClear(x0,y0,x1,y1,samples){
   const S=samples||16;
@@ -493,9 +530,77 @@ function losClear(x0,y0,x1,y1,samples){
   return true;
 }
 
+// ─── 経路 compass ────────────────────────────────────────────────────────────
+// meta.compassMode==='route_waypoint' のモデルは、学習時 compass が「経路を lookahead
+// セル先取りした点」を向いている (server.js stepNavigate と同じ)。standalone には経路探索が
+// 無く直線でゴールを指していたため、そのままだと学習と観測がズレる。
+// server.js planPath と同じコスト (道路1/建物40) で goal から後ろ向きに距離場を作り、
+// 「次の一歩」を辿って先読み点を求める。goal ごとに 1 回だけ計算してキャッシュする。
+const COST_ROAD=1, COST_BLDG=40;
+const _flowCache=new Map();
+function flowField(gr,gc){
+  const key=gr+','+gc;
+  const hit=_flowCache.get(key); if(hit) return hit;
+  const N=GRID*GRID, INF=Infinity;
+  const dist=new Float64Array(N).fill(INF);
+  dist[gr*GRID+gc]=0;
+  // 小さなグリッドなので単純な線形探索ダイクストラで十分 (900セル)
+  const done=new Uint8Array(N);
+  for(let it=0; it<N; it++){
+    let u=-1, bv=INF;
+    for(let i=0;i<N;i++) if(!done[i] && dist[i]<bv){ bv=dist[i]; u=i; }
+    if(u<0) break;
+    done[u]=1;
+    const r=(u/GRID)|0, c=u%GRID;
+    for(const [dr,dc] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nr=r+dr, nc=c+dc;
+      if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+      if(!PASSABLE.has(MAP[nr][nc])) continue;
+      // ★ コストは「そのセルから出るとき」に計上する。学習側 build_flow_fields の
+      //   d[i][j] = min(近傍 d) + step_cost[i][j] と同じ式にするため、u ではなく v の
+      //   コストを足す。ここを取り違えると同コスト経路の選ばれ方がズレる。
+      const nd=dist[u]+(MAP[nr][nc]===ROAD?COST_ROAD:COST_BLDG);
+      const vi=nr*GRID+nc;
+      if(nd<dist[vi]) dist[vi]=nd;
+    }
+  }
+  const f={dist};
+  if(_flowCache.size>64) _flowCache.clear();   // マップ更新時も含めて上限を切る
+  _flowCache.set(key,f);
+  return f;
+}
+function routeWaypoint(agent, look){
+  const gr=Math.floor(agent.gx), gc=Math.floor(agent.gy);
+  if(!PASSABLE.has(MAP[gr][gc])) return null;
+  const f=flowField(gr,gc);
+  let r=Math.floor(agent.x), c=Math.floor(agent.y);
+  if(!isFinite(f.dist[r*GRID+c])) return null;     // 到達不能 → 直線にフォールバック
+  // ★ 学習側 flow_waypoint() と同じ「距離場の貪欲降下」にする。近傍の走査順も
+  //   NB の _FLOW_DR/_FLOW_DC と揃える (同値のときの選び方が変わると先読み点がズレる)。
+  const DR=[-1,1,0,0], DC=[0,0,-1,1];
+  for(let k=0;k<look;k++){
+    let bv=INF, br=-1, bc=-1;
+    for(let i=0;i<4;i++){
+      const nr=r+DR[i], nc=c+DC[i];
+      if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+      const v=f.dist[nr*GRID+nc];
+      if(v<bv){ bv=v; br=nr; bc=nc; }
+    }
+    if(br<0||!isFinite(bv)) break;
+    r=br; c=bc;
+  }
+  return [r,c];
+}
+
 function buildAux(agent, meta){
   const aux=new Float32Array(meta.auxDim);
-  const dx=agent.gx-agent.x, dy=agent.gy-agent.y, d=Math.hypot(dx,dy);
+  // compass の的: route_waypoint モデルなら経路の先読み点、それ以外は従来どおり最終ゴール
+  let cgx=agent.gx, cgy=agent.gy;
+  if(meta.compassMode==='route_waypoint'){
+    const w=routeWaypoint(agent, meta.compassLookahead||2);
+    if(w){ cgx=w[0]+0.5; cgy=w[1]+0.5; }
+  }
+  const dx=cgx-agent.x, dy=cgy-agent.y, d=Math.hypot(dx,dy);
   let b=Math.atan2(dy,dx)-agent.th; b=Math.atan2(Math.sin(b),Math.cos(b));
   aux[0]=Math.sin(b); aux[1]=Math.cos(b); aux[2]=Math.min(d/GRID,1);
   const R=meta.visitR, r0=Math.floor(agent.x), c0=Math.floor(agent.y);
@@ -532,18 +637,26 @@ function buildAux(agent, meta){
     const prox=Math.max(0,1-sd/meta.socialRange);
     aux[7]=Math.sin(sb)*prox; aux[8]=Math.cos(sb)*prox;
   }
-  // obstacle(3): front/left/right の通れないセル(木/空地/範囲外)までの距離 → clearance[0,1]
-  //   学習側 PersonaVecEnvGoal.aux() / server.js buildAux() と同一式。建物は通れるので壁にしない。
+  // obstacle(3): front/left/right の「入るべきでないセル」までの距離 → clearance[0,1]
+  //   学習側 PersonaVecEnvGoal.aux() / server.js buildAux() と同一式にすること。
+  //   obstBlocksBldg (meta.obst_blocks_buildings) が立つモデルは、通行不可セルに加えて
+  //   『目的地でない建物』もブロック扱いにする (学習側と同じ判定)。
   if(meta.auxDim>=12){
     const oMax=meta.obstRayMax, oStep=meta.obstStep, offs=[0,-meta.obstOff,meta.obstOff];
     // 目的地セル: ここだけは建物でも「避ける対象」から外す (目的として入るのは許す)
     const gr=Math.floor(agent.gx), gc=Math.floor(agent.gy);
+    // 自分が今いるセルは障害物にしない (レイは oStep で自セルに当たるため)。学習側と同じ。
+    const cr=Math.floor(agent.x), cc=Math.floor(agent.y);
     for(let k=0;k<3;k++){
       const ca=Math.cos(agent.th+offs[k]), sa=Math.sin(agent.th+offs[k]);
       let hitD=oMax;
       for(let od=oStep; od<=oMax+1e-6; od+=oStep){
         const px=agent.x+ca*od, py=agent.y+sa*od, r=Math.floor(px), c=Math.floor(py);
-        if(px<0||px>=GRID||py<0||py>=GRID || !PASSABLE.has(MAP[r][c])){ hitD=od; break; }
+        if(px<0||px>=GRID||py<0||py>=GRID){ hitD=od; break; }
+        if(r===cr&&c===cc) continue;
+        const cell=MAP[r][c];
+        const bldgBlock = meta.obstBlocksBldg && cell===BUILDING && !(r===gr&&c===gc);
+        if(!PASSABLE.has(cell) || bldgBlock){ hitD=od; break; }
       }
       aux[9+k]=Math.min(1, hitD/oMax);
     }
@@ -562,12 +675,18 @@ async function inferAction(map, agent){
       const cls=di[dinoClsOut];
       // goal条件付け(meta.goalDim>0): [cls, z(, aux)]。z(=agent.goalZ)未設定はゼロ=目標なし=従来挙動。
       let inData=cls.data, inDim=cls.data.length;
-      if(meta.goalDim>0 || meta.auxDim>0){
-        inDim=cls.data.length+(meta.goalDim||0)+(meta.auxDim||0);
+      if(meta.goalDim>0 || meta.auxDim>0 || meta.personaDim>0){
+        inDim=cls.data.length+(meta.goalDim||0)+(meta.auxDim||0)+(meta.personaDim||0);
         const cat=new Float32Array(inDim); cat.set(cls.data,0);
         const z=agent.goalZ;
         if(z && meta.goalDim>0 && z.length===meta.goalDim) cat.set(z, cls.data.length);
         if(meta.auxDim>0) cat.set(buildAux(agent,meta), cls.data.length+(meta.goalDim||0));
+        // 1モデル化: 性格ベクトル。agent.personaVec があればそれを優先 (実行時の性格切替/ブレンド)。
+        if(meta.personaDim>0){
+          const pv=agent.personaVec||meta.personaVectors[agent.def.id];
+          if(pv && pv.length===meta.personaDim)
+            cat.set(pv, cls.data.length+(meta.goalDim||0)+(meta.auxDim||0));
+        }
         inData=cat;
       }
       const ho=await sess.run({[sess.inputNames[0]]:new ort.Tensor('float32', inData, [1, inDim])});
@@ -819,7 +938,8 @@ function initAgents(S){
   PERSONA_DEFS.forEach(def=>{
     if(!trailMats[def.id]) trailMats[def.id]=new THREE.MeshBasicMaterial({color:def.color,transparent:true,opacity:0.28,depthWrite:false});
     const b=randB(null), g=randB(b);
-    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],explored:0,visited:new Set(),visMem:new Map()});
+    agents.push({x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],explored:0,visited:new Set(),visMem:new Map(),
+      personaVec:null});   // 1モデル化: null=meta の既定の性格 / セットすると実行時に上書き
     agentMeshes.push(createAgentMesh(S,def.color));
   });
   applyGoals();          // 既存の goal 設定を再作成したエージェントへ反映
@@ -1030,6 +1150,7 @@ document.getElementById('b-reset').addEventListener('click',()=>{ if(scene) init
 document.getElementById('b-speed').addEventListener('click',function(){ const l=[1,2,4]; speedMul=l[(l.indexOf(speedMul)+1)%3]; this.textContent='×'+speedMul; });
 document.getElementById('b-newmap').addEventListener('click',()=>{
   MAP=makeMap(GRID,Math.floor(Math.random()*100000)); rebuildBuildings(MAP);
+  _flowCache.clear();   // 経路 compass の距離場はマップに依存するので破棄する
   scene=buildScene(MAP); initAgents(scene); camTargetIdx=0; camSwitchTimer=Date.now(); updateCamBadge();
 });
 
