@@ -1471,7 +1471,8 @@ const UNSTICK_MODE = (process.env.UNSTICK_MODE==='release') ? 'release' : 'steer
 // 移動の駆動方式: 既定は 'policy'。MOVE_MODE=pursuit で決定論の目的地追従へ戻せる。
 // persona_multi.onnx または必要なDINOv2が無いペルソナは、モデル未配備時にランダム化せず
 // stepAll() で pursuit へ安全フォールバックする。
-const MOVE_MODE = (process.env.MOVE_MODE==='pursuit') ? 'pursuit' : 'policy';
+//const MOVE_MODE = (process.env.MOVE_MODE==='pursuit') ? 'pursuit' : 'pursuit';
+const MOVE_MODE = 'pursuit';
 const PURSUIT_SUB = parseFloat(process.env.PURSUIT_SUB)||5;   // pursuit の per-tick 分割 (小=速い)。5→0.5セル/8°/tick
 console.log(`[Move] mode=${MOVE_MODE} (missing model → pursuit fallback)`);
 
