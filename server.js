@@ -111,8 +111,28 @@ const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||10;
 const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
 const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マーカーの大きさ
 // INFER_EVERY / ONNX_THREADS は先頭の「CPU負荷」設定ブロックに移動
-const OTHER=0, ROAD=1, BUILDING=2, TREE=3;
-const PASSABLE = new Set([ROAD, BUILDING]);
+// ─── 世界の物理 (world.js に一本化) ─────────────────────────────────────────
+// マップ生成・通行判定・マップ補修・屋内状態は world.js が持つ。Python 側
+// (mesa_env) と同じ実装で、js/map_conformance.cjs が一致を検証する。
+// 変数名は MW (mesa world)。W は既存の const W=GRID*CELL と衝突する。
+const MW = require('./world.js');
+const { OTHER, ROAD, BUILDING, TREE } = MW;
+
+// ALIGNED: 建物が通行不可 / 木が可視 / 空き地が通行可。
+//   見えるもの   = {建物, 木}     = 通れない
+//   見えないもの = {道路, 空き地} = 通れる
+// が成立し、描画レイの距離がそのまま進行可能距離になる (実測誤差 0.017 セル)。
+// LEGACY ではこれが反転していて相関 0.19 しかなく、画像から通行可否を導けない。
+//
+// 【重要】現在の重みは LEGACY 世界で学習している。物理だけ先に変えると
+// buildAux の obstacle が学習時と別分布になり方策が壊れる。ALIGNED 世界で
+// 再学習した重みに差し替えてから有効化すること。理想は meta.json から
+// MW.worldFromMeta(meta) で自動判定する形。
+const WORLD = process.env.WORLD_ALIGNED === '1' ? MW.ALIGNED : MW.LEGACY;
+const PASSABLE = MW.passableSet(WORLD);
+const OPTICS_OK = WORLD.solidBuildings && WORLD.visibleTrees && WORLD.walkableEmpty;
+console.log(`[World] ${WORLD.solidBuildings?'ALIGNED':'LEGACY'} `
+          + `passable={${[...PASSABLE].join(',')}} 光学=物理:${OPTICS_OK}`);
 // FREE_MOVE: 物理的な通行判定を無効化 (木/空地も通れる)。詰まりが原理的に消えて活性が上がる。
 //   A* 経路探索は道路優先のまま残すので「狙いは道路沿い・でも外れても固まらない」挙動になる。
 //   既定ON。FREE_MOVE=0 で従来の通行判定に戻す。
@@ -172,65 +192,24 @@ function loadPersonaDefs(){
 }
 const PERSONA_DEFS = loadPersonaDefs();
 // キャラクター数 (1-50)。未設定ならペルソナ数。ペルソナ数より多い場合は一覧を巡回して割り当てる。
-const _numAgentsEnv = parseInt(process.env.CAM_INTERVAL_MS)  || 300;
+const _numAgentsEnv = parseInt(process.env.CAM_INTERVAL_MS)  || 1000;
 const NUM_AGENTS = Number.isFinite(_numAgentsEnv)
   ? Math.max(1, Math.min(_numAgentsEnv, _numAgentsEnv))
   : PERSONA_DEFS.length;
 console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`);
 
 // ─── マップ生成 ───────────────────────────────────────────────────────────────
+// world.js に移動。旧実装は道路削除率が 0.30+rng*0.25 で、学習側 (0.25+rng*0.25)
+// とズレていた — 本番のほうが道路が少なく街が詰まっていた。golden vector は
+// マップを「データとして」受け取るのでこのズレを検出できず長く残っていた。
+// 実装は world.js に一本化し、js/map_conformance.cjs で Python と照合する。
 function makeMap(size, seed){
-  let s=seed>>>0;
-  const rng=()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff};
-  const ri=n=>Math.floor(rng()*n);
-  const pick=a=>a[ri(a.length)];
-  const g=Array.from({length:size},()=>new Array(size).fill(OTHER));
-  const step=4, rows=[], cols=[];
-  for(let i=0;i<size;i+=step){rows.push(i);cols.push(i);}
-  rows.forEach(r=>{for(let c=0;c<size;c++)g[r][c]=ROAD;});
-  cols.forEach(c=>{for(let r=0;r<size;r++)g[r][c]=ROAD;});
-  for(let ri2=0;ri2<rows.length-1;ri2++){
-    for(let ci=0;ci<cols.length-1;ci++){
-      const r0=rows[ri2]+1,r1=rows[ri2+1],c0=cols[ci]+1,c1=cols[ci+1];
-      const cells=[];
-      for(let r=r0;r<r1;r++)for(let c=c0;c<c1;c++)cells.push([r,c]);
-      if(!cells.length)continue;
-      // 敷地に余裕があれば一定確率で 2x2 の建物パッチを塗る (学校/病院/駅などの大型敷地)
-      let patch=null;
-      if(r1-r0>=2 && c1-c0>=2 && rng()<0.42){
-        const pr=(rng()<0.5)?r0:r1-2, pc=(rng()<0.5)?c0:c1-2;
-        for(let r=pr;r<pr+2;r++)for(let c=pc;c<pc+2;c++)g[r][c]=BUILDING;
-        patch={pr,pc};
-      }
-      const b=pick(cells);g[b[0]][b[1]]=BUILDING;
-      cells.forEach(([r,c])=>{
-        if(r===b[0]&&c===b[1])return;
-        if(patch && r>=patch.pr && r<patch.pr+2 && c>=patch.pc && c<patch.pc+2)return; // パッチ内は保持
-        const v=rng();
-        if(v<.25)g[r][c]=TREE;else if(v<.45)g[r][c]=BUILDING;
-      });
-    }
-  }
-  rows.forEach(r=>{for(let c=0;c<size;c++)g[r][c]=ROAD;});
-  cols.forEach(c=>{for(let r=0;r<size;r++)g[r][c]=ROAD;});
-  const isX=(r,c)=>rows.includes(r)&&cols.includes(c);
-  const cands=[];
-  for(let r=0;r<size;r++)for(let c=0;c<size;c++)
-    if(g[r][c]===ROAD&&!isX(r,c))cands.push([r,c]);
-  for(let i=cands.length-1;i>0;i--){const j=ri(i+1);[cands[i],cands[j]]=[cands[j],cands[i]];}
-  function roadOK(grid){
-    let sr=-1,sc=-1;
-    outer:for(let r=0;r<size;r++)for(let c=0;c<size;c++)if(grid[r][c]===ROAD){sr=r;sc=c;break outer;}
-    if(sr<0)return true;
-    const vis=new Set(),q=[[sr,sc]];vis.add(sr*size+sc);
-    const D=[[-1,0],[1,0],[0,-1],[0,1]];
-    while(q.length){const[r,c]=q.shift();for(const[dr,dc]of D){const nr=r+dr,nc=c+dc;if(nr<0||nr>=size||nc<0||nc>=size)continue;const k=nr*size+nc;if(!vis.has(k)&&grid[nr][nc]===ROAD){vis.add(k);q.push([nr,nc]);}}}
-    for(let r=0;r<size;r++)for(let c=0;c<size;c++)if(grid[r][c]===ROAD&&!vis.has(r*size+c))return false;
-    return true;
-  }
-  const maxRm=Math.floor(cands.length*(0.30+rng()*0.25));let rm=0;
-  for(const[r,c]of cands){if(rm>=maxRm)break;g[r][c]=OTHER;if(roadOK(g)){g[r][c]=rng()<0.4?TREE:OTHER;rm++;}else g[r][c]=ROAD;}
-  return g;
+  const g = MW.makeMap(size, seed);
+  // solidBuildings では建物に立てない。通行可能領域に接していない建物は
+  // ゴールにも拠点にもできないので、隣の木を空き地に変えて入口を作る。
+  // 抽選から外す (建物が減る) のではなく補修する: 実測 93.7% -> 100%、
+  // 建物数はほぼ維持 (3814 -> 3774)。
+  return WORLD.solidBuildings ? MW.ensureAllBuildingsReachable(g, WORLD) : g;
 }
 
 // ─── FP画像 (ONNX観測) ───────────────────────────────────────────────────────
@@ -434,10 +413,16 @@ function getRenderBuf(w,h){
 }
 // ── レイキャスタ用テクスチャ (学習と同じ 64×64・BLDG_TYPES順) ──
 const RC_TW=64, RC_TH=64;
+// 木の描画タイプ = 建物 25 タイプの次。**goal の 25 クラスではない**ので
+// BUILDING_TYPES には入れないこと (入れると到着判定と z の組み立てが壊れる)。
+// BLDG_TYPES はこの下で定義されるため、関数にして評価を実行時まで遅らせる
+// (const で即時評価すると TDZ で ReferenceError になる)。
+const treeTexIndex = () => BLDG_TYPES.length;
 let rcTex=[], rcTexReady=false;
 async function loadRaycastTextures(){
   if(!sharp){ console.warn('[Raycast] sharp 無し → テクスチャ観測不可'); return; }
-  rcTex=new Array(BLDG_TYPES.length).fill(null);
+  // +1 は木。visibleTrees のときレイを止めるので専用テクスチャが要る。
+  rcTex=new Array(BLDG_TYPES.length+1).fill(null);
   await Promise.all(BLDG_TYPES.map(async (bt,i)=>{
     const fp=path.join(__dirname, bt.textureFile);
     if(!fs.existsSync(fp)) return;
@@ -448,14 +433,65 @@ async function loadRaycastTextures(){
       rcTex[i]=f;
     }catch(e){ console.warn(`[Raycast] tex ${bt.name}:`,e.message); }
   }));
+  // 木: mesa_textures/tree.jpg があれば使い、無ければ緑の無地で代替する。
+  // 「見える」ことが本質で、絵柄は二次的。
+  const treeFp = path.join(__dirname, 'mesa_textures', 'tree.jpg');
+  if(sharp && fs.existsSync(treeFp)){
+    try{
+      const {data}=await sharp(treeFp).resize(RC_TW,RC_TH,{fit:'fill'}).removeAlpha().raw().toBuffer({resolveWithObject:true});
+      const f=new Float32Array(RC_TW*RC_TH*3);
+      for(let k=0;k<f.length;k++) f[k]=data[k]/255;
+      rcTex[treeTexIndex()]=f;
+    }catch(e){ console.warn('[Raycast] tree tex:', e.message); }
+  }
+  if(!rcTex[treeTexIndex()]){
+    const f=new Float32Array(RC_TW*RC_TH*3);
+    for(let k=0;k<f.length;k+=3){ f[k]=0.14; f[k+1]=0.41; f[k+2]=0.16; }
+    rcTex[treeTexIndex()]=f;
+    console.log('[Raycast] tree.jpg 無し → 無地で代替');
+  }
   rcTexReady = rcTex.length>0 && rcTex.every(t=>t);
-  console.log(`[Raycast] textures ${rcTex.filter(t=>t).length}/${BLDG_TYPES.length} loaded  ready=${rcTexReady}`);
+  console.log(`[Raycast] textures ${rcTex.filter(t=>t).length}/${rcTex.length} loaded  ready=${rcTexReady}`);
 }
 
 // テクスチャ付きDDAレイキャスタ (学習 render_fp_batch と一致)。返り値 CHW [0,1]。
 // 壁=建物セルのみ (BUILDING_TYPES でタイプ決定)。木/空地/道路は通過。
-function renderFPImageCfg(map, agent, cfg){
+// 他エージェントをビルボードとして壁の手前に重ねる。
+// **social aux と同じ相手を描くこと。** 視覚と数値センサが別の相手を指すと、
+// 方策が両者を結び付けられない。
+function drawAgentSprites(buf, cfg, self, others, zbuf){
+  const W=cfg.w, H=cfg.h, HW=H*W, half=Math.tan(cfg.fov/2);
+  for(const o of others){
+    if(o===self || o.indoors) continue;                  // 屋内の人は見えない
+    const dx=o.x-self.x, dy=o.y-self.y;
+    // 重なったエージェント (距離ほぼ 0) は描かない。そのまま射影すると
+    // スプライトが画面全体を埋め、観測が壊れる。
+    const dist=Math.hypot(dx,dy);
+    if(dist<SPRITE_MIN_DIST || dist>SPRITE_MAX_DIST) continue;
+    let b=Math.atan2(dy,dx)-self.th;
+    b=Math.atan2(Math.sin(b),Math.cos(b));
+    if(Math.abs(b)>cfg.fov/2*1.2) continue;
+    const colc=W/2*(1+Math.tan(b)/half);
+    const wpx=(AGENT_SPRITE_W/dist)*(W/2)/half;
+    const bot=H/2+(H/dist)*EYE_HEIGHT, top=bot-(AGENT_SPRITE_H/dist)*H;
+    const sh=Math.min(1,Math.max(0.35,1-dist/9));
+    const x0=Math.max(0,Math.ceil(colc-wpx/2)), x1=Math.min(W-1,Math.floor(colc+wpx/2));
+    const y0=Math.max(0,Math.ceil(top)),        y1=Math.min(H-1,Math.floor(bot));
+    for(let x=x0;x<=x1;x++){
+      if(zbuf && dist>=zbuf[x]) continue;                // 壁の裏なら描かない
+      for(let y=y0;y<=y1;y++){
+        const pi=y*W+x;
+        buf[pi]=AGENT_SPRITE_RGB[0]*sh;
+        buf[HW+pi]=AGENT_SPRITE_RGB[1]*sh;
+        buf[2*HW+pi]=AGENT_SPRITE_RGB[2]*sh;
+      }
+    }
+  }
+}
+
+function renderFPImageCfg(map, agent, cfg, others){
   const W=cfg.w, H=cfg.h, HW=H*W;
+  const zbuf = FPV_AGENTS ? new Float32Array(W).fill(1e9) : null;
   const sky=cfg.sky, fl=cfg.floor, FOV=cfg.fov;
   const buf=getRenderBuf(W,H);
   // 背景: 上半分=空 / 下半分=地面
@@ -478,26 +514,41 @@ function renderFPImageCfg(map, agent, cfg){
     while(g++<64){
       if(sdx<sdy){sdx+=ddx;mapX+=stepX;side=0;}else{sdy+=ddy;mapY+=stepY;side=1;}
       if(mapX<0||mapX>=GRID||mapY<0||mapY>=GRID) break;
-      if(map[mapX][mapY]===BUILDING){ const ti=BUILDING_TYPES[mapX+'_'+mapY]; hit=(ti==null?0:ti); break; }
+      const cell=map[mapX][mapY];
+      if(cell===BUILDING){ const ti=BUILDING_TYPES[mapX+'_'+mapY]; hit=(ti==null?0:ti); break; }
+      // 木もレイを止める。これが無いと「見えないのに通れない」が残り、
+      // 画像から通行可否を導けない (木を出すと相関 0.68 -> 1.00)。
+      if(WORLD.visibleTrees && cell===TREE){ hit=treeTexIndex(); break; }
     }
+    const perp0=Math.max(1e-4, side===0?(sdx-ddx):(sdy-ddy));
+    if(zbuf) zbuf[x]=(hit<0?1e9:perp0);         // スプライトの奥行き判定に使う
     if(hit<0) continue;
     const tex=rcTex[hit % rcTex.length]; if(!tex) continue;
-    const perp=Math.max(1e-4, side===0?(sdx-ddx):(sdy-ddy));
-    const lineH=H/perp;
-    const dsC=Math.min(H-1, Math.max(0, -lineH/2+H/2));
-    const deC=Math.min(H-1, Math.max(0,  lineH/2+H/2));
+    const perp=perp0;
+    // 1 セル分の高さが画面上で何 px か。壁は床から高さ h まで立ち上がる。
+    // h=1, eye=0.5 のとき従来の「中央に lineH」と一致する (後方互換)。
+    const unit=H/perp;
+    const bh = FPV_HEIGHTS ? (hit===treeTexIndex()?TREE_HEIGHT
+                             :(BLDG_TYPES[hit]?BLDG_TYPES[hit].height:1.0)) : 1.0;
+    const top=H/2-unit*(bh-EYE_HEIGHT), bot=H/2+unit*EYE_HEIGHT;
+    const lineH=Math.max(1e-6, bot-top);
+    const dsC=Math.min(H-1, Math.max(0, top));
+    const deC=Math.min(H-1, Math.max(0, bot));
     let wallX=side===0?agent.y+perp*rdy:agent.x+perp*rdx; wallX-=Math.floor(wallX);
     let texXi=Math.floor(wallX*RC_TW);
     if((side===0&&rdx>0)||(side===1&&rdy<0)) texXi=RC_TW-1-texXi;
     if(texXi<0)texXi=0; if(texXi>=RC_TW)texXi=RC_TW-1;
     const br=Math.min(1.0, Math.max(0.35, 1.0-perp/9));
     for(let yi=Math.ceil(dsC); yi<=deC; yi++){
-      let texYi=Math.floor((yi-dsC)/lineH*RC_TH);
+      // 縦は「切り取られる前の壁全体」に対して張る。画面外にはみ出した高い
+      // 建物でも模様が縦に潰れないようにするため (top は負になりうる)。
+      let texYi=Math.floor((yi-top)/lineH*RC_TH);
       if(texYi<0)texYi=0; if(texYi>=RC_TH)texYi=RC_TH-1;
       const ti=(texYi*RC_TW+texXi)*3, pi=yi*W+x;
       buf[pi]=tex[ti]*br; buf[HW+pi]=tex[ti+1]*br; buf[2*HW+pi]=tex[ti+2]*br;
     }
   }
+  if(FPV_AGENTS && others) drawAgentSprites(buf, cfg, agent, others, zbuf);
   return buf;
 }
 
@@ -641,7 +692,8 @@ async function inferAction(map, agent){
     if(meta && meta.dino){
       if(!dinoSession) return biasedRandom(map, agent);   // DINOv2未ロード
       // 224画像 → DINOv2 → CLS(384) + patch(256,384)
-      const img=renderFPImageCfg(map, agent, meta.cfg);
+      // 他エージェントを見せる場合は全体を渡す (自分と屋内は drawAgentSprites 側で除外)
+      const img=renderFPImageCfg(map, agent, meta.cfg, FPV_AGENTS?agents:null);
       const di=await dinoSession.run({[dinoIn]:new ort.Tensor('float32', img, [1,3,meta.cfg.h,meta.cfg.w])});
       const cls=di[dinoClsOut];
 
@@ -1231,37 +1283,20 @@ function readPixels(glCtx){
 // ─── Simulation state ─────────────────────────────────────────────────────────
 let MAP=makeMap(GRID,42), BUILDINGS=[];
 
-// 道路網から PASSABLE(=ROAD|BUILDING) を辿って到達できるセルを塗る。
-// 区画の奥で木/空地に四方を囲まれた建物は道路網から孤立する。そこに湧いたエージェントは
-// 前進判定が常に false になり一生動けず、ナビも経路を引けない (unreachable)。
-// → 湧き先/目的地の候補からは除外する。描画はされるので見た目は変わらない。
-function computeReachable(map){
-  const key=(r,c)=>r*GRID+c;
-  const seen=new Uint8Array(GRID*GRID), q=[];
-  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
-    if(map[r][c]===ROAD && !seen[key(r,c)]){ seen[key(r,c)]=1; q.push([r,c]); }
-  const D=[[-1,0],[1,0],[0,-1],[0,1]];
-  for(let head=0; head<q.length; head++){
-    const [r,c]=q[head];
-    for(const [dr,dc] of D){
-      const nr=r+dr, nc=c+dc;
-      if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
-      const k=key(nr,nc);
-      if(seen[k] || !PASSABLE.has(map[nr][nc])) continue;
-      seen[k]=1; q.push([nr,nc]);
-    }
-  }
-  return seen;
-}
+// 到達可能性の判定は world.js の largestComponent / reachableBuildings に統合。
+// 区画の奥で四方を囲まれた建物は通行可能領域から孤立し、湧いても動けず経路も
+// 引けない。ALIGNED では makeMap が入口を作って補修するので発生しない。
 function rebuildBuildings(map){
   BUILDINGS.length=0;
-  const reach=computeReachable(map);
-  let isolated=0;
-  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
-    if(map[r][c]!==BUILDING) continue;
-    if(reach[r*GRID+c]) BUILDINGS.push([r,c]); else isolated++;
-  }
-  if(isolated) console.log(`[Map] 孤立建物 ${isolated} 件を湧き先/目的地から除外 (道路網から到達不可)`);
+  // 通行可能領域の最大連結成分に接する建物だけがゴール/拠点になれる。
+  // ALIGNED では makeMap が補修済みなので全建物が該当するはず。
+  const usable = MW.reachableBuildings(map, WORLD);
+  for(const b of usable) BUILDINGS.push(b);
+  let total=0;
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++) if(map[r][c]===BUILDING) total++;
+  const isolated = total - BUILDINGS.length;
+  if(isolated) console.log(`[Map] 孤立建物 ${isolated}/${total} 件を湧き先/目的地から除外`);
+  else console.log(`[Map] ゴール可能な建物 ${BUILDINGS.length}/${total}`);
 }
 rebuildBuildings(MAP);
 // ═══ 生活シミュレーション (拠点 / 内部状態 / 時刻) ═════════════════════════════
@@ -1367,8 +1402,10 @@ function stepNeeds(dtSec){
     if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
       a.sick = 0.6 + Math.random()*0.4;
 
+    // 屋内なら「その建物の中に居る」ので、自分のセルではなく屋内の建物で判定する。
     const r=Math.floor(a.x), c=Math.floor(a.y);
-    const t=BUILDING_TYPES[r+'_'+c];
+    const t = MW.isIndoors(a) ? BUILDING_TYPES[a.indoors[0]+'_'+a.indoors[1]]
+                             : BUILDING_TYPES[r+'_'+c];
     if(t!=null){
       if(FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
       if(BUY_IDX.includes(t))  a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec);
@@ -1385,6 +1422,25 @@ function stepNeeds(dtSec){
     if(a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1)
       a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
   }
+}
+
+// 屋内から出るべきか。needOf() が示す用事と、いま居る建物が合っているかで決める。
+//   自宅で寝ている間は sleep が解消するまで出ない。飲食店で食べ終えたら出る。
+//   用事が無い (need=null) なら出て徘徊する。
+function shouldLeaveBuilding(a){
+  if(!MW.isIndoors(a)) return true;
+  const [br,bc]=a.indoors;
+  const t=BUILDING_TYPES[br+'_'+bc];
+  const n=needOf(a);
+  if(n===null) return true;                                   // 用事なし → 外へ
+  if(n==='sleep') return !(a.home && br===a.home[0] && bc===a.home[1]);
+  if(n==='work')  return !(a.work && br===a.work[0] && bc===a.work[1]);
+  if(t==null) return true;
+  if(n==='eat')   return !FOOD_IDX.includes(t);               // 飲食店に居るなら留まる
+  if(n==='shop')  return !BUY_IDX.includes(t);
+  if(n==='bored') return !FUN_IDX.includes(t);
+  if(n==='sick')  return !CARE_IDX.includes(t);
+  return true;
 }
 
 // いま何を求めているか (アイコン表示と目的地抽選で共用)
@@ -1508,9 +1564,25 @@ function hasUsablePolicy(agent){
 // 建物は通行可だが『経路として突っ切る』のは不自然なので強く忌避する。
 // 不可(Infinity)にはしない: 区画の奥の建物は建物経由でしか出入りできない場合があるため。
 const COST_ROAD = 1, COST_BLDG = 40;
+const COST_OFFROAD = parseFloat(process.env.COST_OFFROAD) || 4;   // 実軌跡を見て調整すること
+
+// ── FPV の忠実度 ──
+// FPV は 3D シーンと別のレンダラなので、次の 2 つが欠けていた:
+//   建物の高さ  … タワーも売店も画面上は同じ大きさの壁になる
+//   他エージェント … 画像に一切映らず、social は aux の数値センサだけ
+// どちらも観測を変えるので、有効化したら再学習が必要。既定 OFF。
+const FPV_HEIGHTS = process.env.FPV_HEIGHTS === '1';
+const FPV_AGENTS  = process.env.FPV_AGENTS  === '1';
+const EYE_HEIGHT  = 0.5;                     // 目線の高さ (セル)。地平線を決める
+const TREE_HEIGHT = 1.0;
+const AGENT_SPRITE_W = 0.35, AGENT_SPRITE_H = 0.9;
+const AGENT_SPRITE_RGB = [0.95, 0.75, 0.35];
+const SPRITE_MIN_DIST = 0.25, SPRITE_MAX_DIST = 8.0;   // 重なりで画面が埋まるのを防ぐ
 function planPath(sr, sc, gr, gc){
   const N=GRID*GRID, key=(r,c)=>r*GRID+c;
-  const passable=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID && PASSABLE.has(MAP[r][c]);
+  // ゴールの建物セルだけは終点として許可する (玄関まで経路を引くため)。
+  const passable=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID
+    && (PASSABLE.has(MAP[r][c]) || (r===gr&&c===gc));
   if(!passable(sr,sc) || !passable(gr,gc)) return null;
   const dist=new Float64Array(N).fill(Infinity), prev=new Int32Array(N).fill(-1), done=new Uint8Array(N);
   const sk=key(sr,sc), gk=key(gr,gc);
@@ -1526,7 +1598,11 @@ function planPath(sr, sc, gr, gc){
       const nr=r+dr, nc=c+dc;
       if(!passable(nr,nc)) continue;
       const k=key(nr,nc); if(done[k]) continue;
-      const nd=dist[u]+(MAP[nr][nc]===ROAD?COST_ROAD:COST_BLDG);
+      // ALIGNED では建物を経路に使えない。空き地が「道を外れた近道」になるので
+      // 道路より高いコストを与えて道路優先を保つ。COST_OFFROAD は暫定値で、
+      // 大きすぎると空き地を使わず遠回り、小さすぎると道路を無視する。
+      const nd=dist[u]+(MAP[nr][nc]===ROAD?COST_ROAD
+                       :(WORLD.solidBuildings?COST_OFFROAD:COST_BLDG));
       if(nd<dist[k]){ dist[k]=nd; prev[k]=u; }
     }
   }
@@ -1652,12 +1728,17 @@ function initAgents(S){
   for(let i=0;i<NUM_AGENTS;i++){
     const def=PERSONA_DEFS[i % PERSONA_DEFS.length];
     const b=randB(null),g=randB(b);
+    // solidBuildings では建物セルに立てないが、直後の initAgents で
+    // enterBuilding により屋内へ移すので、ここは仮置きで良い。
     agents.push({aid:`${def.id}#${i}`,x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map(),
       // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
       mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
       personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
       // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
       home:null, work:null, needIcon:null,
+      // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
+      // 屋内は物理と方策の外: 推論・移動・obstacle をスキップし描画も隠す。
+      indoors:null,
       hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
       supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0});
     agentMeshes.push(createAgentMesh(S,def.color));
@@ -1667,10 +1748,14 @@ function initAgents(S){
   //   自宅セル中心だと同居人が完全に重なるので、わずかにばらけさせる。
   for(const a of agents){
     if(!a.home) continue;
-    a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
-    a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
     a.fatigue=Math.random()*0.15;          // 起床直後 = 疲労は低い
-    enterWander(a);                         // 行き先を決めて A* 経路を引く (pursuit が道沿いに追従)
+    if(WORLD.solidBuildings){
+      MW.enterBuilding(a, a.home[0], a.home[1]);   // 自宅の中から一日を始める
+    }else{
+      a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
+      a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
+      enterWander(a);                       // 行き先を決めて A* 経路を引く
+    }
   }
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
@@ -1683,6 +1768,7 @@ function initAgents(S){
 const TRAIL_GEO = new THREE.PlaneGeometry(CELL*.2*TRAIL_SCALE, CELL*.2*TRAIL_SCALE);
 
 function addTrail(S,agent){
+  if(MW.isIndoors(agent)) return;   // 建物の中に点が溜まるのを防ぐ
   const m=new THREE.Mesh(TRAIL_GEO,trailMats[agent.def.id]);
   m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
   S.add(m);agent.trail.push(m);
@@ -1738,6 +1824,14 @@ async function stepAll(){
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
     if(a.mode==='hold') continue;   // rally 集合後は静止 (デバッグ用)
+    // ── 屋内は物理と方策の外 ──
+    // 建物セルは通行不可なので、屋内エージェントに推論や移動を適用すると
+    // 「壁の中で前進が常に失敗する」状態になる。欲求だけ進めて、外出条件が
+    // 立ったら玄関に出す。欲求の更新は stepNeeds が別インターバルで回している。
+    if(MW.isIndoors(a)){
+      if(shouldLeaveBuilding(a) && MW.exitBuilding(a, MAP, WORLD)) enterWander(a);
+      continue;
+    }
     const px=a.x,py=a.y;
     const meta=personaMeta[a.def.id];
     let action;
@@ -1791,14 +1885,20 @@ async function stepAll(){
       // B: 経路上の先読み点を追う。最終目的地に着いたら A(自由) に戻す。
       if(stepNavigate(a)){
         a.trips++;
+        // 到着 = 玄関に着いた。建物の中へ入る (滞在は屋内状態が担う)。
+        if(WORLD.solidBuildings && a.navDest) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
         if(a.rally) a.mode='hold';   // rally: 集合点に到着したら静止 (解除は /rally?off=1)
-        else enterWander(a);   // 用事が済んだら自由行動へ (滞在させたいならここで dwell を挟む)
+        else if(!MW.isIndoors(a)) enterWander(a);
       }
     }else{
       // A: wander。生活の行き先へ A* 経路追従 (z=0 のまま = 学習時 GOAL_NONE regime)。
       a.goalZ=null;
       if(a.path){
-        if(stepNavigate(a)){ a.trips++; enterWander(a); }   // 到着 → 次の行き先を選び直す
+        if(stepNavigate(a)){
+          a.trips++;
+          if(WORLD.solidBuildings && a.navDest) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
+          if(!MW.isIndoors(a)) enterWander(a);   // 到着 → 次の行き先を選び直す
+        }
       }else{
         if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){ a.trips++; enterWander(a); }  // 経路なし=直線fallback
       }
@@ -2113,6 +2213,116 @@ function serveFile(res, filePath, cache){
 const httpServer=http.createServer((req,res)=>{
   let urlPath=decodeURIComponent(req.url.split('?')[0]);
 
+  // ── /fpv : エージェントの一人称観測を PNG で返す ──
+  //   方策が実際に「何を見ているか」を確認する唯一の手段。3D俯瞰ビューとは別物で、
+  //   こちらが DINOv2 に入る 224x224。木が壁として映るか (WORLD_ALIGNED) の確認や、
+  //   train/deploy の描画一致の検証に使う。
+  //     /fpv                  最初のエージェント
+  //     /fpv?aid=A%230        aid 指定 (# は %23)
+  //     /fpv?persona=A        ペルソナ id の先頭
+  //     /fpv?scale=3          拡大 (既定 2)
+  //     /fpv?raw=1            観測ベクトルを JSON で返す (画像なし)
+  //     /fpv?grid=1           obstacle レイの当たり位置に目印を重ねる
+  if(urlPath==='/fpv'){
+    const q=new URL(req.url,'http://x').searchParams;
+    const a = q.has('aid')     ? agents.find(x=>x.aid===q.get('aid'))
+            : q.has('persona') ? agents.find(x=>x.def.id===q.get('persona'))
+            : agents[0];
+    if(!a){ res.writeHead(404); res.end('agent not found'); return; }
+    const meta = personaMeta[a.def.id];
+    if(!meta || !meta.cfg){ res.writeHead(503); res.end('persona meta not loaded'); return; }
+
+    // 観測ベクトル。画像だけ見ても方策の入力は分からないので併せて出す。
+    const auxv = (meta.auxDim>0) ? Array.from(buildAux(a, meta)) : [];
+    const info = {
+      aid:a.aid, persona:a.def.id, mode:a.mode,
+      indoors:a.indoors||null,
+      pos:[+a.x.toFixed(2),+a.y.toFixed(2)], th:+a.th.toFixed(3),
+      goal:[+a.gx.toFixed(2),+a.gy.toFixed(2)],
+      goalType:a.goalType, goalName:a.goalType!=null?BLDG_TYPES[a.goalType].name:null,
+      cellUnder: MAP[Math.max(0,Math.min(GRID-1,Math.floor(a.x)))][Math.max(0,Math.min(GRID-1,Math.floor(a.y)))],
+      world:{solidBuildings:WORLD.solidBuildings, visibleTrees:WORLD.visibleTrees,
+             walkableEmpty:WORLD.walkableEmpty},
+      aux: auxv.map(v=>+v.toFixed(4)),
+      auxNames:['compass_sin','compass_cos','compass_dist','visit_f','visit_l','visit_r',
+                'visit_b','social_x','social_y','obst_front','obst_left','obst_right'],
+      stall:a.stall, viols:a.viols, trips:a.trips,
+    };
+    if(q.get('raw')==='1'){
+      res.writeHead(200,{'Content-Type':'application/json'});
+      res.end(JSON.stringify(info,null,2)); return;
+    }
+    if(!sharp){ res.writeHead(503); res.end('sharp 無し (画像化できない)'); return; }
+
+    const W2=meta.cfg.w, H2=meta.cfg.h;
+    const buf=renderFPImageCfg(MAP, a, meta.cfg, FPV_AGENTS?agents:null);   // CHW float[0,1]
+    const rgb=Buffer.alloc(W2*H2*3);
+    for(let i=0;i<W2*H2;i++){
+      rgb[i*3  ]=Math.max(0,Math.min(255,Math.round(buf[i]*255)));
+      rgb[i*3+1]=Math.max(0,Math.min(255,Math.round(buf[W2*H2+i]*255)));
+      rgb[i*3+2]=Math.max(0,Math.min(255,Math.round(buf[2*W2*H2+i]*255)));
+    }
+    // obstacle レイの当たり位置に縦線を引く。センサと画像がズレていれば一目で分かる。
+    if(q.get('grid')==='1' && auxv.length>=12){
+      const mark=(xcol,col)=>{
+        const x=Math.max(0,Math.min(W2-1,Math.round(xcol)));
+        for(let y=0;y<H2;y++){ const i=(y*W2+x)*3; rgb[i]=col[0]; rgb[i+1]=col[1]; rgb[i+2]=col[2]; }
+      };
+      mark(W2/2, [255,80,80]);                                    // 正面 (赤)
+      const off=meta.obstOff/(meta.cfg.fov/2)*(W2/2);
+      mark(W2/2-off, [80,160,255]); mark(W2/2+off, [80,160,255]); // 左右 (青)
+    }
+    const scale=Math.max(1,Math.min(6,parseInt(q.get('scale'))||2));
+    sharp(rgb,{raw:{width:W2,height:H2,channels:3}})
+      .resize(W2*scale,H2*scale,{kernel:'nearest'}).png().toBuffer()
+      .then(png=>{
+        res.writeHead(200,{'Content-Type':'image/png','Cache-Control':'no-store',
+          'X-Fpv-Info':Buffer.from(JSON.stringify(info)).toString('base64')});
+        res.end(png);
+      })
+      .catch(e=>{ res.writeHead(500); res.end('render error: '+e.message); });
+    return;
+  }
+
+  // ── /fpv/view : 全エージェントの一人称を並べて自動更新するページ ──
+  if(urlPath==='/fpv/view'){
+    const q=new URL(req.url,'http://x').searchParams;
+    const ms=Math.max(200,parseInt(q.get('ms'))||1000);
+    const ids=[...new Set(agents.map(x=>x.aid))].slice(0,parseInt(q.get('n'))||12);
+    res.writeHead(200,{'Content-Type':'text/html'});
+    res.end(`<!doctype html><meta charset="utf-8"><title>FPV</title>
+<style>body{background:#111;color:#ddd;font:12px system-ui;margin:12px}
+.g{display:flex;flex-wrap:wrap;gap:10px}.c{background:#1b1b1b;padding:6px;border-radius:6px}
+img{display:block;image-rendering:pixelated}.m{margin-top:4px;white-space:pre;font-size:10px;color:#9ab}</style>
+<h3>一人称観測 (方策の入力) — ${ms}ms 更新</h3>
+<div class="g">${ids.map(id=>`<div class="c"><img id="i_${encodeURIComponent(id)}">
+<div class="m" id="m_${encodeURIComponent(id)}">${id}</div></div>`).join('')}</div>
+<script>
+const ids=${JSON.stringify(ids)};
+async function tick(){
+  for(const id of ids){
+    const u='/fpv?scale=2&grid=1&aid='+encodeURIComponent(id)+'&t='+Date.now();
+    try{
+      const r=await fetch(u); if(!r.ok) continue;
+      const info=JSON.parse(atob(r.headers.get('X-Fpv-Info')||'e30='));
+      const b=await r.blob();
+      const img=document.getElementById('i_'+encodeURIComponent(id));
+      if(img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+      img.src=URL.createObjectURL(b);
+      const o=info.aux||[];
+      document.getElementById('m_'+encodeURIComponent(id)).textContent=[
+        id+(info.indoors?'  [屋内]':''),
+        (info.goalName||'-')+'  obst '+(o[9]??0).toFixed(2)+'/'+(o[10]??0).toFixed(2)+'/'+(o[11]??0).toFixed(2),
+        'compass '+(o[2]??0).toFixed(2)+'  stall '+info.stall,
+      ].join(String.fromCharCode(10));
+    }catch(e){}
+  }
+}
+tick(); setInterval(tick, ${ms});
+</script>`);
+    return;
+  }
+
   // 既存の WebSocket版クライアント
   if(urlPath==='/'||urlPath==='/index.html'){
     res.writeHead(200,{'Content-Type':'text/html'});
@@ -2376,6 +2586,10 @@ async function renderLoop(){
     agents.forEach((a,i)=>{
       const tx=a.y*CELL+CELL*.5,ty=a.x*CELL+CELL*.5,m=agentMeshes[i];
       if(!m) return;
+      // 屋内 = 建物の中に居るので見えない。位置の補間も止める (玄関から
+      // 建物中心へ滑って見えるのを防ぐ)。
+      m.visible = !MW.isIndoors(a);
+      if(!m.visible) return;
       m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
       m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
       m.position.z=CELL*.26*CHAR_SCALE;   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
