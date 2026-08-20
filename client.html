@@ -195,6 +195,7 @@ const setStatus=(t,ok=false)=>{
   document.getElementById('connDot').className='dot'+(ok?' ok':'');
 };
 const hideOverlay=()=>document.getElementById('overlay').style.display='none';
+const overlayVisible=()=>document.getElementById('overlay').style.display!=='none';
 const showOverlay=msg=>{
   document.getElementById('overlay').style.display='flex';
   document.getElementById('overMsg').textContent=msg;
@@ -224,8 +225,10 @@ function connect(){
       drawFrame(e.data);
       frameCount++;
       const now=Date.now();
-      if(frameCount===1){
-        dbg('first frame received!');
+      if(frameCount===1 || overlayVisible()){
+        // 再接続後も frameCount は増え続けるので、===1 だけだと切断→復帰のときに
+        // オーバーレイが出たまま戻らなかった。フレームが来ていれば必ず隠す。
+        dbg('frame received — hide overlay');
         hideOverlay();
         setStatus('STREAMING', true);
       }

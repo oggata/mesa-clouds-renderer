@@ -1,27 +1,28 @@
 {
   "_comment": [
     "キャラクター(ペルソナ)の定義ファイル。server.js が起動時に読み込みます。",
-    "各要素: id / name / color(#RRGGBB) / desc。",
+    "各要素: id / name / color(#RRGGBB) / desc / enterprise。",
+    "enterprise は起業性向 [0,1] (既定0.3)。街に足りない業種を自分で開くかどうかの重み。0=絶対に起業しない。",
     "id は行動ポリシーモデル data/persona_<id>.onnx と対応します。",
     "  → 対応する .onnx があれば学習済みの挙動、無ければランダム移動にフォールバック。",
     "キャラクター数(NUM_AGENTS, 1-50)がペルソナ数より多い場合は、この一覧を順番に割り当てて繰り返します。",
     "この _comment キーは無視されます。"
   ],
   "personas": [
-    { "id": "A", "name": "Explorer Rex",     "color": "#ff3355", "desc": "Actively explores new areas" },
-    { "id": "B", "name": "Homebody Lily",    "color": "#00ccff", "desc": "Takes the shortest route" },
-    { "id": "C", "name": "Social Marco",     "color": "#33ff88", "desc": "Gathers near others" },
-    { "id": "D", "name": "Businessman Cole", "color": "#ffee00", "desc": "Moves straight, efficiency first" },
-    { "id": "E", "name": "Tourist Elena",    "color": "#ff7700", "desc": "Wanders around buildings" },
-    { "id": "F", "name": "Curious Kid Mia",     "color": "#ff4fa3", "desc": "Runs around excitedly, easily distracted" },
-    { "id": "G", "name": "Grandpa Ken",         "color": "#8892a6", "desc": "Shuffles slowly, sticks to familiar streets" },
-    { "id": "H", "name": "Student Yui",         "color": "#2dd4bf", "desc": "Commutes briskly between school and home" },
-    { "id": "I", "name": "Teen Jay",            "color": "#a855f7", "desc": "Hangs around with friends, rarely alone" },
-    { "id": "J", "name": "Grandma Rose",        "color": "#e8879e", "desc": "Takes frequent rest stops, moves gently" },
-    { "id": "K", "name": "Freelancer Noah",     "color": "#3b82f6", "desc": "Flexible hours, drifts between cafés" },
-    { "id": "L", "name": "Toddler Sora",        "color": "#ffb454", "desc": "Wanders unpredictably, stays close to home" },
-    { "id": "M", "name": "Retired Artist Haru", "color": "#b08968", "desc": "Strolls slowly toward quiet, scenic spots" },
-    { "id": "N", "name": "Athletic Teen Riku",  "color": "#84cc16", "desc": "Moves briskly, drawn to the stadium" },
-    { "id": "O", "name": "Night-shift Mika",    "color": "#1e3a8a", "desc": "Active after dark, rests through the day" }
+    { "id": "A", "name": "Explorer Rex",     "color": "#ff3355", "desc": "Actively explores new areas" , "enterprise": 0.45 },
+    { "id": "B", "name": "Homebody Lily",    "color": "#00ccff", "desc": "Takes the shortest route" , "enterprise": 0.05 },
+    { "id": "C", "name": "Social Marco",     "color": "#33ff88", "desc": "Gathers near others" , "enterprise": 0.5 },
+    { "id": "D", "name": "Businessman Cole", "color": "#ffee00", "desc": "Moves straight, efficiency first" , "enterprise": 0.9 },
+    { "id": "E", "name": "Tourist Elena",    "color": "#ff7700", "desc": "Wanders around buildings" , "enterprise": 0.3 },
+    { "id": "F", "name": "Curious Kid Mia",     "color": "#ff4fa3", "desc": "Runs around excitedly, easily distracted" , "enterprise": 0.1 },
+    { "id": "G", "name": "Grandpa Ken",         "color": "#8892a6", "desc": "Shuffles slowly, sticks to familiar streets" , "enterprise": 0.15 },
+    { "id": "H", "name": "Student Yui",         "color": "#2dd4bf", "desc": "Commutes briskly between school and home" , "enterprise": 0.2 },
+    { "id": "I", "name": "Teen Jay",            "color": "#a855f7", "desc": "Hangs around with friends, rarely alone" , "enterprise": 0.2 },
+    { "id": "J", "name": "Grandma Rose",        "color": "#e8879e", "desc": "Takes frequent rest stops, moves gently" , "enterprise": 0.15 },
+    { "id": "K", "name": "Freelancer Noah",     "color": "#3b82f6", "desc": "Flexible hours, drifts between cafés" , "enterprise": 0.75 },
+    { "id": "L", "name": "Toddler Sora",        "color": "#ffb454", "desc": "Wanders unpredictably, stays close to home" , "enterprise": 0.0 },
+    { "id": "M", "name": "Retired Artist Haru", "color": "#b08968", "desc": "Strolls slowly toward quiet, scenic spots" , "enterprise": 0.35 },
+    { "id": "N", "name": "Athletic Teen Riku",  "color": "#84cc16", "desc": "Moves briskly, drawn to the stadium" , "enterprise": 0.25 },
+    { "id": "O", "name": "Night-shift Mika",    "color": "#1e3a8a", "desc": "Active after dark, rests through the day" , "enterprise": 0.55 }
   ]
 }

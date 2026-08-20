@@ -236,6 +236,11 @@ data/
 | `JPEG_Q` | 100 | JPEG 品質 |
 | `MAX_TRAIL` | 500 | 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える |
 | `SEG_GATE` | 0 | 1 で seg_head による前進判定（既定はマップ配列） |
+| `WORLD_ALIGNED` | 1 | 空き地を通行可能・建物を通行不可にする。`0` で従来の LEGACY |
+| `CITY_EVOLVE` | 1 | 街の進化（踏み跡→道 / 起業 / 閉店）。`0` で無効 |
+| `HUD` | 1 | 配信画面の Day カウンタとニュースティッカー。`0` で無効 |
+
+街の進化まわりの設定は数が多いので **[docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §8** にまとめてあります。
 
 メモリ/CPU が厳しいときは `INFER_EVERY` を上げる・`WIDTH/HEIGHT` を下げるのが効きます。
 
@@ -287,6 +292,21 @@ webrtc-version/      WebRTC 配信版（別実装）
 
 ## 9. 最近の追加機能（このセッションでの変更）
 
+- **街が村から育つ**：最初は低い建物が14軒・住民8人だけ。住居が建つと人が増え、人が増えると
+  需要が生まれて店が建ち、経済（来店の累計）が回ると背の高い建物と 2x2 の施設が解禁される
+  （集落→村→町→市→都市）。仕様は [docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §11。
+- **街が育つ（不可逆な蓄積）**：仕様は [docs/city-evolution-spec.md](docs/city-evolution-spec.md)。
+  - 住民が踏んだ空き地に踏み跡が溜まり、土が露出し、やがて**道になる**（毎朝2本まで）
+  - 「近くに無いのに欲しい」時間を場所ごとに積分し、濃い場所に住民が**店を建てる**（工事中→開店）
+  - 客の来ない店は**閉店**し、しばらくすると取り壊されて空き地に戻る
+  - 建物は地面から**せり上がって**建ち、取り壊しでは地面に**沈む**。その瞬間はカメラが
+    現場に寄り、画面に「〜が建ちました」「〜がなくなりました」と出る
+    （`/city?force=found|close|demolish` で待たずに確認できる）
+  - 状態は `data/city_state.json` に保存され、**再起動しても街は元に戻らない**
+  - 配信画面に `DAY 47 12:34` とニュースティッカーを描画（`/city` で全状態を JSON 取得）
+- **通行可否の既定を ALIGNED に**：見えるもの（建物/木）＝通れない、見えないもの（道路/空き地）＝通れる。
+  併せて `stepNavigate` の到着判定を `MW.hasArrived` に修正（玄関に着いたら到着。従来は建物中心
+  まで 0.8 セルを要求していて、ALIGNED では誰も店に着けなかった）。
 - **standalone のルート整理**：`/client/index.html` → **`/standalone.html`** に変更（旧URLは301リダイレクト）。ファイルは `standalone/index.html` に移動。
 - **人型モデルの刷新**：箱の積み木から、丸い頭＋髪・テーパー胴体・脚を持つ陰影付き（`MeshLambert`）の立ち姿へ。server.js / standalone 共通。
 - **目標条件付け（z）**：ポリシー入力を `[cls, z]` に拡張（§4）。z で行き先を指示でき、`agent.goalZ` / standalone「🎯 Goal」UI / server `/goal` API から設定。z 未指定なら従来挙動。

@@ -10,6 +10,10 @@ lerna-debug.log*
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
+# 街の恒久状態 (実行時に生成される。環境ごとに違うのでコミットしない)
+data/city_state.json
+data/city_state.json.tmp
+
 # Runtime data
 pids
 *.pid

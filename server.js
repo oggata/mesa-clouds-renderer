@@ -102,6 +102,8 @@ const YT_BITRATE_K  = parseInt(process.env.YT_VIDEO_BITRATE_K) || _preset.ytk;
 const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
+// 環境変数の数値読み。`parseInt(x)||既定` は 0 を指定できないので使わない。
+const envNum=(k,d)=>{ const v=parseFloat(process.env[k]); return Number.isFinite(v)?v:d; };
 const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
 // 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える。
 // 環境変数 MAX_TRAIL で可変。例: MAX_TRAIL=300 node server.js
@@ -117,6 +119,11 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マー�
 // 変数名は MW (mesa world)。W は既存の const W=GRID*CELL と衝突する。
 const MW = require('./world.js');
 const { OTHER, ROAD, BUILDING, TREE } = MW;
+// フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
+//   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
+//   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
+//   makeMap 自体は触っていないので学習側との bit 一致は保たれる。
+const VOID = 4;
 
 // ALIGNED: 建物が通行不可 / 木が可視 / 空き地が通行可。
 //   見えるもの   = {建物, 木}     = 通れない
@@ -124,11 +131,16 @@ const { OTHER, ROAD, BUILDING, TREE } = MW;
 // が成立し、描画レイの距離がそのまま進行可能距離になる (実測誤差 0.017 セル)。
 // LEGACY ではこれが反転していて相関 0.19 しかなく、画像から通行可否を導けない。
 //
-// 【重要】現在の重みは LEGACY 世界で学習している。物理だけ先に変えると
-// buildAux の obstacle が学習時と別分布になり方策が壊れる。ALIGNED 世界で
-// 再学習した重みに差し替えてから有効化すること。理想は meta.json から
-// MW.worldFromMeta(meta) で自動判定する形。
-const WORLD = process.env.WORLD_ALIGNED === '1' ? MW.ALIGNED : MW.LEGACY;
+// 【既定を ALIGNED にした理由】街の進化 (docs/city-evolution-spec.md) は
+// 「人が空き地を踏む → 踏み跡が道になる」が起点なので、空き地が通行不可な
+// LEGACY では踏み跡が1つも付かず、機能が原理的に成立しない。
+// なお MOVE_MODE='pursuit' 固定のあいだ ONNX 方策は移動に使われない
+// (prefetchAllActions が即 return する) ため、「LEGACY で学習した重みが
+// ALIGNED で壊れる」問題は現構成では起きない。policy モードへ戻すときは
+// ALIGNED で学習し直した重みが要る (理想は meta.json から
+// MW.worldFromMeta(meta) で自動判定する形)。
+// WORLD_ALIGNED=0 で従来の LEGACY に戻せる。
+const WORLD = process.env.WORLD_ALIGNED === '0' ? MW.LEGACY : MW.ALIGNED;
 const PASSABLE = MW.passableSet(WORLD);
 const OPTICS_OK = WORLD.solidBuildings && WORLD.visibleTrees && WORLD.walkableEmpty;
 console.log(`[World] ${WORLD.solidBuildings?'ALIGNED':'LEGACY'} `
@@ -148,6 +160,13 @@ const FWD_PER_DECISION_DEF = 0.25 * 10;              // = 2.5 セル/意思決�
 const ROT_PER_DECISION_DEF = (40 * Math.PI) / 180;   // = 40°/意思決定
 const RAY_MAX=6.0, RAY_STEP=0.15;
 const W=GRID*CELL;
+// いま使っているフィールドの範囲 [lo,hi] (常に中央寄せの正方形)。CITY.size が幅。
+const fieldSize = () => (CITY && CITY.size) ? CITY.size : GRID;
+const fieldLo   = () => Math.floor((GRID-fieldSize())/2);
+const fieldHi   = () => fieldLo()+fieldSize()-1;
+const inField   = (r,c) => { const lo=fieldLo(), hi=fieldHi(); return r>=lo&&r<=hi&&c>=lo&&c<=hi; };
+// フィールド中心のワールド座標 (カメラの俯瞰位置)
+const fieldCenterW = () => ((fieldLo()+fieldSize()/2)*CELL);
 const IMG_W=64, IMG_H=64, IMG_CH=3;
 const FP_FOV=Math.PI/3, FP_RAY_MAX=8.0, FP_RAY_STEP=0.1;
 const FP_CELL_RGB=[[45,100,45],[80,80,80],[196,32,32],[35,104,40]];
@@ -187,6 +206,8 @@ function loadPersonaDefs(){
       color: col,
       hex:  '#'+col.toString(16).padStart(6,'0'),
       desc: p.desc || '',
+      // 起業性向 [0,1]。街に足りない業種を自分で開くかどうかの重み (0=絶対に起業しない)。
+      enterprise: Number.isFinite(+p.enterprise) ? Math.max(0,Math.min(1,+p.enterprise)) : 0.3,
     };
   });
 }
@@ -223,7 +244,7 @@ function renderFPImage(map,agent){
       const nx=agent.x+rdx*d,ny=agent.y+rdy*d;
       const r=Math.floor(nx),c=Math.floor(ny);
       if(r<0||r>=GRID||c<0||c>=GRID){ht=OTHER;hd=d;break;}
-      const ct=map[r][c];if(ct!==ROAD){ht=ct;hd=d;break;}
+      const ct=map[r][c];if(ct!==ROAD){ht=Math.min(ct,3);hd=d;break;}   // VOID は木として扱う
     }
     const colH=ht>=0?Math.min(IMG_H*1.5/Math.max(hd,0.1),IMG_H):0;
     const y0=Math.floor((IMG_H-colH)*0.5),y1=Math.floor(y0+colH);
@@ -515,6 +536,7 @@ function renderFPImageCfg(map, agent, cfg, others){
       if(sdx<sdy){sdx+=ddx;mapX+=stepX;side=0;}else{sdy+=ddy;mapY+=stepY;side=1;}
       if(mapX<0||mapX>=GRID||mapY<0||mapY>=GRID) break;
       const cell=map[mapX][mapY];
+      if(cell===VOID){ hit=treeTexIndex(); break; }   // 世界の果て (木と同じ見た目で塞ぐ)
       if(cell===BUILDING){ const ti=BUILDING_TYPES[mapX+'_'+mapY]; hit=(ti==null?0:ti); break; }
       // 木もレイを止める。これが無いと「見えないのに通れない」が残り、
       // 画像から通行可否を導けない (木を出すと相関 0.68 -> 1.00)。
@@ -1015,32 +1037,38 @@ function extractFace(boxGeo, group, tx, ty, tz){
 // key -> {mesh, cx, cy, faded}。mesh.material は建物ごとに clone した専用インスタンス
 // (型/面で共有される元マテリアルの opacity を書き換えると他の建物にも波及してしまうため)。
 let occluders = {};
-function buildScene(map){
-  buildingMatCache = {};
-  BUILDING_TYPES = {};
-  occluders = {};
-  const rng=(()=>{let s=42;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
-  // 建物を「構造 (1x1 or 2x2)」として型割当。全4セルが BUILDING の正方形を貪欲に 2x2 として検出し、
-  // 残りは 1x1。BUILDING_TYPES は全セルに構造の型を記録 (レイキャスト観測が参照)。
-  const assigned=new Set(), structures=[];
+// 建物の型割当。**街の創世時に一度だけ**走る (以降の正は CITY.structs)。
+//   以前はこの処理が buildScene の中にあり、シーンを作り直すたびに全建物の用途が
+//   振り直されていた。それでは「あの店が潰れた」という履歴が一切積み上がらない。
+//   1軒の追加/閉店でシーン全体を作り直さないための土台でもある。
+function planStructures(map){
+  const rng=(()=>{let s=CITY_SEED;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
+  // 全4セルが BUILDING の正方形を貪欲に 2x2 として検出し、残りは 1x1。
+  const assigned=new Set(), structs=[];
   const isB=(r,c)=>r>=0&&r<GRID&&c>=0&&c<GRID&&map[r][c]===BUILDING;
   for(let r=0;r<GRID-1;r++)for(let c=0;c<GRID-1;c++){
     if(assigned.has(r+'_'+c))continue;
     if(isB(r,c)&&isB(r+1,c)&&isB(r,c+1)&&isB(r+1,c+1)
        && !assigned.has((r+1)+'_'+c) && !assigned.has(r+'_'+(c+1)) && !assigned.has((r+1)+'_'+(c+1))){
       const typeIdx=FP2_IDX[Math.floor(rng()*FP2_IDX.length)];
-      for(let dr=0;dr<2;dr++)for(let dc=0;dc<2;dc++){
-        const kk=(r+dr)+'_'+(c+dc); assigned.add(kk); BUILDING_TYPES[kk]=typeIdx;
-      }
-      structures.push({r,c,fp:2,typeIdx});
+      for(let dr=0;dr<2;dr++)for(let dc=0;dc<2;dc++) assigned.add((r+dr)+'_'+(c+dc));
+      structs.push(newStruct(r,c,2,typeIdx,0));
     }
   }
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     if(map[r][c]!==BUILDING || assigned.has(r+'_'+c))continue;
     const typeIdx=FP1_IDX[Math.floor(rng()*FP1_IDX.length)];
-    assigned.add(r+'_'+c); BUILDING_TYPES[r+'_'+c]=typeIdx;
-    structures.push({r,c,fp:1,typeIdx});
+    assigned.add(r+'_'+c);
+    structs.push(newStruct(r,c,1,typeIdx,0));
   }
+  return structs;
+}
+
+function buildScene(map){
+  buildingMatCache = {};
+  occluders = {};
+  boxGeoByH = {};
+  syncCity();          // CITY.structs -> BUILDING_TYPES / cellStruct を作り直す
 
   const S=new THREE.Scene();S.background=new THREE.Color(0xeaf2f7);
   const amb=new THREE.AmbientLight(0xbcd0e0,1.3);   S.add(amb);
@@ -1049,52 +1077,23 @@ function buildScene(map){
   sun.position.set(W*.4,-W*.3,W*.8);S.add(sun);
   // 昼夜表現のため参照を保持 (updateDayNight が毎フレーム色/強度を更新)
   S.userData.lights={amb,hemi,sun};
-  const gnd=new THREE.Mesh(new THREE.PlaneGeometry(W,W),new THREE.MeshLambertMaterial({color:0xe6e9e2}));
-  gnd.position.set(W/2,W/2,0);S.add(gnd);
-
   // 建物/木はキャラクター近接フェードのため個別メッシュとして生成する
   // (ジオメトリ/一部マテリアルは種類ごとに共有し、ドローコール増加を抑える)。
-  const roadPos=[], groundPos=[];
-  const trunkGeo=new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4);
-  const coneGeo =new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45);
-  const trunkMat=new THREE.MeshLambertMaterial({color:0x8a5a32});
-  const coneMat =new THREE.MeshLambertMaterial({color:0x4f9e44});
-  const boxGeoByH={};                 // 高さ別 BoxGeometry (共有・indexed)
+  // 木のジオメトリ/マテリアルはシーンに持たせる。フィールドが広がったときに
+  // addTreeMesh で後から生やすため (モジュール共有だと disposeScene で壊れる)。
+  S.userData.tree={
+    trunkGeo:new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),
+    coneGeo :new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),
+    trunkMat:new THREE.MeshLambertMaterial({color:0x8a5a32}),
+    coneMat :new THREE.MeshLambertMaterial({color:0x4f9e44}),
+  };
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
+    if(map[r][c]===TREE) addTreeMesh(S, r, c);
 
-  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
-    const t=map[r][c],cx=c*CELL+CELL*.5,cy=r*CELL+CELL*.5;
-    if(t===BUILDING){
-      // 建物は下の structures ループで構造単位 (1x1/2x2) にまとめて描画
-    }else if(t===TREE){
-      const trunk=new THREE.Mesh(trunkGeo, trunkMat.clone());
-      trunk.position.set(cx,cy,CELL*.2); S.add(trunk);
-      const cone=new THREE.Mesh(coneGeo, coneMat.clone());
-      cone.position.set(cx,cy,CELL*.58); S.add(cone);
-      occluders[r+'_'+c+'_t1']={mesh:trunk,cx,cy,faded:false};
-      occluders[r+'_'+c+'_t2']={mesh:cone,cx,cy,faded:false};
-    }else if(t===ROAD){
-      pushQuad(roadPos, CELL*.97, cx, cy, .008);
-    }else{
-      pushQuad(groundPos, CELL*.97, cx, cy, .005);
-    }
-  }
-
-  // 建物を構造単位で描画 (1x1 / 2x2)。箱幅 = footprint*CELL の 80%、位置 = footprint 中心。
-  for(const st of structures){
-    const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
-    const h=bt.height*CELL, span=st.fp, bw=span*CELL*0.8;
-    const cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
-    const gkey=span+'_'+h;
-    if(!boxGeoByH[gkey]) boxGeoByH[gkey]=new THREE.BoxGeometry(bw,bw,h);
-    const mats=getBuildingMaterial(st.typeIdx).map(m=>m.clone());
-    const mesh=new THREE.Mesh(boxGeoByH[gkey], mats);
-    mesh.position.set(cx,cy,h/2);
-    S.add(mesh);
-    occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
-  }
-
-  if(roadPos.length)   S.add(quadMesh(roadPos,   0xc4c8cc));
-  if(groundPos.length) S.add(quadMesh(groundPos, 0x9ccc65));
+  // 建物は構造単位 (1x1 / 2x2) の個別メッシュ。開業/閉店/取り壊しで1軒だけ
+  // 差し替えられるよう addStructMesh に集約する。
+  for(const st of CITY.structs) addStructMesh(S, st);
+  rebuildGround(S);   // 道路 / 草地 / 摩耗 の板 (踏み跡で変わるので別関数)
 
   return S;
 }
@@ -1198,6 +1197,182 @@ function updateNeedIcons(cam){
     }
     // 板を常にカメラへ向ける (親の回転を打ち消す)
     if(cam) a.needIcon.quaternion.copy(cam.quaternion).premultiply(m.getWorldQuaternion(new THREE.Quaternion()).invert());
+  }
+}
+
+// ═══ 配信画面の HUD (Day カウンタ / ニュースティッカー) ═════════════════════
+// YouTube に出ているのは 3D をそのまま rawvideo にしたフレームで、文字は一切乗らない。
+// そこで描画を2パスにし、正射影カメラで板を重ねる。文字のラスタライズは
+// SVG→sharp→DataTexture (上の欲求アイコンと同じ手。canvas 依存を増やさない)。
+const HUD_ON        = process.env.HUD !== '0';
+const HUD_DAY_W     = 400, HUD_DAY_H = 86;
+const HUD_TICKER_H  = 44;
+const HUD_SPEED     = envNum('HUD_SPEED', 90);      // ティッカーの流れる速さ (px/秒)
+// 絵文字フォントを最後に足しておかないと 💊 や 🏛 が豆腐になる (欲求アイコンと同じ理由)。
+// ティッカーは絵文字を落として描く。sharp(librsvg) はカラー絵文字 (sbix/CBDT) を
+// 確実には描けず、フォント指定の順序を変えても豆腐が残った。文字だけで意味は通るので、
+// 表示の安定を優先する。ニュース本文 (ログ / /city / WebSocket) には絵文字を残す。
+const HUD_FONT      = 'Hiragino Sans, Noto Sans CJK JP, Noto Sans JP, sans-serif';
+const _stripEmoji = t => String(t)
+  .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '')
+  .replace(/\s{2,}/g, ' ').trim();
+let hudScene=null, hudCam=null, hudDay=null, hudTicker=null, hudBar=null;
+// 日付板とティッカーは別々の busy フラグで管理する。1つにまとめていたら、
+// ゲーム内時刻が速い設定 (DAY_MINUTES が小さい) で日付板が毎フレーム作り直され、
+// ティッカーが永久に更新されなかった。
+let hudDayText='', hudDayBusy=false, hudTickerBusy=false, hudTickerW=0, hudDayAt=0;
+
+const _esc = t => String(t).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function svgTexture(svg){
+  const png=await sharp(Buffer.from(svg)).png().toBuffer();
+  const {data,info}=await sharp(png).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+  const tex=new THREE.DataTexture(new Uint8Array(data), info.width, info.height, THREE.RGBAFormat);
+  tex.flipY=true; tex.needsUpdate=true;
+  let opaque=0; for(let i=3;i<data.length;i+=4) if(data[i]>10) opaque++;
+  return {tex, opaque, w:info.width, h:info.height};
+}
+
+function hudPlane(w,h,tex){
+  const m=new THREE.Mesh(new THREE.PlaneGeometry(w,h),
+    new THREE.MeshBasicMaterial({map:tex, transparent:true, depthTest:false}));
+  return m;
+}
+
+async function initHud(){
+  if(!HUD_ON || !sharp) return;
+  hudScene=new THREE.Scene();
+  hudCam=new THREE.OrthographicCamera(-WIDTH/2, WIDTH/2, HEIGHT/2, -HEIGHT/2, -10, 10);
+  // ティッカーの下敷き (文字板は透過。スクロールしても帯は動かない)
+  hudBar=new THREE.Mesh(new THREE.PlaneGeometry(WIDTH, HUD_TICKER_H),
+    new THREE.MeshBasicMaterial({color:0x050b10, transparent:true, opacity:0.55, depthTest:false}));
+  hudBar.position.set(0, -HEIGHT/2+HUD_TICKER_H/2+8, 0);
+  hudScene.add(hudBar);
+  // 日本語が出るフォントがあるか (Linux では fonts-noto-cjk が無いと豆腐になる)
+  try{
+    const probe=await svgTexture(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="40">`
+      +`<text x="2" y="30" font-size="28" fill="#fff" font-family="${HUD_FONT}">街</text></svg>`);
+    probe.tex.dispose();
+    if(probe.opaque<20) console.warn('[HUD] 日本語フォントが見つからない → ティッカーが豆腐になる。'
+      + ' Ubuntu なら: sudo apt-get install -y fonts-noto-cjk');
+  }catch(e){ console.warn('[HUD] フォント確認に失敗:', e.message); }
+  await refreshHudDay();
+  await refreshHudTicker();
+  console.log('[HUD] Day カウンタ / ニュースティッカーを配信画面に描画');
+}
+
+// 表示は「DAY 12  08:30 / 人口 34 · 村」の2行。人口と段階が上がっていくのが
+// 見えること自体が、この街を見続ける理由になる。
+function hudDayLines(){
+  const h=gameHour();
+  return [`DAY ${gameDay()+1}  ${String(Math.floor(h)).padStart(2,'0')}:${String(Math.floor(h%1*60)).padStart(2,'0')}`,
+          CITY ? `人口 ${agents.length} · ${levelSpec().name}` : ''];
+}
+async function refreshHudDay(){
+  const [l1,l2]=hudDayLines();
+  const txt=l1+'|'+l2;
+  if(txt===hudDayText || !hudScene) return;
+  hudDayText=txt;
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_DAY_W}" height="${HUD_DAY_H}">`
+    +`<rect width="${HUD_DAY_W}" height="${HUD_DAY_H}" rx="8" fill="#050b10" fill-opacity="0.62"/>`
+    +`<text x="18" y="38" font-size="26" font-weight="bold" fill="#00d2a0"`
+    +` font-family="Menlo, DejaVu Sans Mono, monospace">${_esc(l1)}</text>`
+    +`<text x="18" y="70" font-size="22" fill="#9fd8c8"`
+    +` font-family="${HUD_FONT}">${_esc(l2)}</text></svg>`);
+  if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
+  hudDay=hudPlane(HUD_DAY_W, HUD_DAY_H, tex);
+  hudDay.position.set(-WIDTH/2+HUD_DAY_W/2+16, HEIGHT/2-HUD_DAY_H/2-14, 1);
+  hudScene.add(hudDay);
+}
+
+async function refreshHudTicker(){
+  if(!hudScene) return;
+  const items=latestNews(6).map(n=>`Day${n.day+1} ${_stripEmoji(n.text)}`);
+  const txt=items.length ? items.reverse().join('　　◆　　')
+                         : 'この街の記録はまだありません';
+  // 文字幅の見積り (全角=font-size, 半角=その半分強)。板の幅がズレると途中で切れる。
+  let px=40;
+  for(const ch of txt) px += (ch.charCodeAt(0)<0x100 ? 13 : 25);
+  const w=Math.min(6000, Math.max(WIDTH, Math.ceil(px)));
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${HUD_TICKER_H}">`
+    +`<text x="20" y="30" font-size="24" fill="#dfeee9"`
+    +` font-family="${HUD_FONT}">${_esc(txt)}</text></svg>`);
+  if(hudTicker){ hudScene.remove(hudTicker); hudTicker.material.map.dispose(); hudTicker.material.dispose(); hudTicker.geometry.dispose(); }
+  hudTickerW=w;
+  hudTicker=hudPlane(w, HUD_TICKER_H, tex);
+  hudTicker.position.set(WIDTH/2+w/2, -HEIGHT/2+HUD_TICKER_H/2+8, 1);
+  hudScene.add(hudTicker);
+  hudNewsDirty=false;
+}
+
+// ── イベントの一言バナー ────────────────────────────────────────────────────
+//   「〇〇が建ちました」「〇〇がなくなりました」を数秒だけ大きく出す。
+//   ティッカーは一周に時間がかかるので、その瞬間に見せたいものは別枠にする。
+let hudBanner=null, hudBannerT0=0, hudBannerUntil=0, hudBannerBusy=false;
+
+async function setBanner(text, secs){
+  if(!hudScene) return;
+  let px=80;
+  for(const ch of text) px += (ch.charCodeAt(0)<0x100 ? 20 : 38);
+  const w=Math.min(WIDTH-40, Math.max(320, Math.ceil(px))), h=76;
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">`
+    +`<rect width="${w}" height="${h}" rx="10" fill="#050b10" fill-opacity="0.78"/>`
+    +`<rect x="0" y="0" width="4" height="${h}" fill="#00d2a0"/>`
+    +`<text x="26" y="50" font-size="34" fill="#eaf6f2"`
+    +` font-family="${HUD_FONT}">${_esc(text)}</text></svg>`);
+  if(hudBanner){ hudScene.remove(hudBanner); hudBanner.material.map.dispose(); hudBanner.material.dispose(); hudBanner.geometry.dispose(); }
+  hudBanner=hudPlane(w, h, tex);
+  hudBanner.material.opacity=0;
+  hudBanner.position.set(0, HEIGHT/2-h/2-96, 2);
+  hudScene.add(hudBanner);
+  hudBannerT0=Date.now(); hudBannerUntil=hudBannerT0+secs*1000;
+}
+function showBanner(text, secs){
+  if(!hudScene || hudBannerBusy) return;
+  hudBannerBusy=true;
+  setBanner(_stripEmoji(text), secs||6)
+    .catch(e=>console.warn('[HUD]',e.message))
+    .finally(()=>{ hudBannerBusy=false; });
+}
+function updateBanner(){
+  if(!hudBanner) return;
+  const now=Date.now(), left=hudBannerUntil-now;
+  if(left<=0){
+    hudScene.remove(hudBanner);
+    hudBanner.material.map.dispose(); hudBanner.material.dispose(); hudBanner.geometry.dispose();
+    hudBanner=null; return;
+  }
+  // 0.3秒でフェードイン / 0.6秒でフェードアウト
+  hudBanner.material.opacity=Math.max(0, Math.min(1, Math.min((now-hudBannerT0)/300, left/600)));
+}
+
+// 毎フレーム呼ばれる。テクスチャの作り直しは「文字が変わったとき」だけで、
+// スクロールは板を動かすだけ (sharp を毎フレーム回さない)。
+function updateHud(dt){
+  if(!hudScene) return;
+  updateBanner();
+  // 時計は最短1秒に1回だけ作り直す (SVG のラスタライズを毎フレーム回さない)
+  const now=Date.now();
+  if(!hudDayBusy && now-hudDayAt>900){
+    const want=hudDayLines().join('|');
+    if(want!==hudDayText){
+      hudDayBusy=true; hudDayAt=now;
+      refreshHudDay().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudDayBusy=false;});
+    }
+  }
+  if(hudTicker){
+    hudTicker.position.x -= HUD_SPEED*dt;
+    if(hudTicker.position.x + hudTickerW/2 < -WIDTH/2){        // 流れ切った
+      if(hudNewsDirty && !hudTickerBusy){                      // 新しいニュースがあれば作り直す
+        hudTickerBusy=true;
+        refreshHudTicker().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudTickerBusy=false;});
+      }else{
+        hudTicker.position.x = WIDTH/2 + hudTickerW/2;
+      }
+    }
   }
 }
 
@@ -1340,33 +1515,561 @@ function daylight(){
   return Math.max(0, Math.min(1, (Math.cos((h-13)/24*Math.PI*2)+1)/2 ));
 }
 
-// 指定タイプ群の建物セル一覧
-function buildingsOfTypes(idxs){
-  const set=new Set(idxs);
-  return BUILDINGS.filter(b=>set.has(BUILDING_TYPES[b[0]+'_'+b[1]]));
+// ═══ 街の恒久状態 CITY (不可逆な蓄積) ══════════════════════════════════════════
+//   仕様: docs/city-evolution-spec.md
+//   踏み跡が道になり、足りない業種を住民が起業し、客の来ない店は閉店する。
+//   変化はすべて「日次のまとめ」で起こす (dailyRollover)。理由は2つ:
+//     1. 変化量が agent 数や TICK に依存しなくなる (絶対閾値だと調整不能)
+//     2. 「朝起きたら道が伸びている」という配信のリズムになる
+const CITY_EVOLVE  = process.env.CITY_EVOLVE !== '0';
+const CITY_SEED    = envNum('CITY_SEED', 42);
+const CITY_FILE    = process.env.CITY_STATE_FILE || path.join(__dirname,'data','city_state.json');
+const CITY_SAVE_SEC= envNum('CITY_SAVE_SEC', 60);
+const DAY_ROLL_H   = envNum('DAY_ROLL_H', 5);       // 日付が変わる時刻 (朝5時)
+// 踏み跡 → 道
+const ROAD_PER_DAY = envNum('ROAD_PER_DAY', 2);     // 1日に昇格する空き地の本数
+const FOOT_MIN     = envNum('FOOT_MIN', 300);       // 昇格に必要な最低踏み跡数
+const FOOT_DECAY   = envNum('FOOT_DECAY', 0.9);     // 昇格しなかったセルの日次減衰
+// 地面の摩耗表現。踏み跡の絶対数だけで塗ると、人数が多い街では空き地が全部
+// 茶色になってしまう (300体で1分で 500 踏み)。**上位何%か**で塗り、
+// WEAR_1/WEAR_2 は「これ以下では塗らない」下限として使う。
+const WEAR_1       = envNum('WEAR_1', 60);          // 踏み固めの下限
+const WEAR_2       = envNum('WEAR_2', 160);         // 土が露出する下限
+const WEAR_TOP1    = envNum('WEAR_TOP1', 0.20);     // 踏み跡のある空き地の上位20%まで踏み固め
+const WEAR_TOP2    = envNum('WEAR_TOP2', 0.05);     // 上位5%は土が露出
+// 起業
+const FOUND_PER_POP   = envNum('FOUND_PER_POP', 40);    // 何人につき1日1軒 建てられるか
+// 発火は「その場所を通った未充足需要の濃さ」で決める。単位は agent-day
+// (= 何人日ぶんの『遠くて満たせない欲求』がそこを通ったか)。
+//   不満の合計を供給軒数で割る形も試したが、この街は 900セルに 139軒と密で
+//   「最寄りが遠い」人がほとんど居らず、合計は常にゼロに潰れた。場所ごとに見れば
+//   「この一帯にだけ飲食店が無い」が拾える。開店すればその一帯の人は D_OK 以内に
+//   店を持つので需要が止まり、飽和も自動的に収まる。
+const FOUND_SITE      = envNum('FOUND_SITE', 0.5);
+const CONSTRUCT_HOURS = envNum('CONSTRUCTION_HOURS', 2);// 工事中の長さ (ゲーム内時間)
+// 「遠い」の基準。街が密なので既定は小さめ。実測値 (平均最寄り距離) は毎日ログに出る。
+const DEMAND_D_OK     = envNum('DEMAND_D_OK', 3);       // これより近ければ需要ゼロ
+const DEMAND_D_FAR    = envNum('DEMAND_D_FAR', 10);     // これより遠ければ需要最大
+const DEMAND_DECAY    = envNum('DEMAND_DECAY', 0.75);   // ヒートマップの日次減衰
+// 閉店
+// 演出 (建物がせり上がる / 沈む + カメラを寄せる時間)
+const ANIM_RISE_SEC  = envNum('ANIM_RISE_SEC', 3.5);
+const ANIM_SINK_SEC  = envNum('ANIM_SINK_SEC', 3.0);
+const EVENT_CAM_SEC  = envNum('EVENT_CAM_SEC', 9);      // 1イベントを映す秒数
+// 閉店
+const CLOSE_PER_DAY   = envNum('CLOSE_PER_DAY', 1);
+const GRACE_DAYS      = envNum('GRACE_DAYS', 3);        // 開業直後は閉店判定を免除
+const CLOSE_FRAC      = envNum('CLOSE_FRAC', 0.25);     // 同業の来客平均のこの割合を下回ると閉店
+const MIN_PER_CAT     = envNum('MIN_PER_CAT', 2);       // カテゴリごとに残す最低軒数
+const DEMOLISH_DAYS   = envNum('DEMOLISH_DAYS', 5);     // 閉店から取り壊しまで
+// ═══ 村から始めて育てる ══════════════════════════════════════════════════════
+//   makeMap は学習側 (mesa_env) と bit-identical でなければならないので触らない。
+//   生成された「完成した街」から間引いて村に戻す後処理として実装する。
+const START_VILLAGE   = process.env.START_VILLAGE !== '0';
+const START_SIZE      = envNum('START_SIZE', 10);        // 最初のフィールドの一辺 (最大 GRID)
+const START_BUILDINGS = envNum('START_BUILDINGS', 12);   // 最初に建っている建物の数
+const START_POP       = envNum('START_POP', 8);          // 最初の人口
+// 土地が足りなくなったらフィールドを広げる (1日1回まで)
+const EXPAND_STEP     = envNum('EXPAND_STEP', 2);        // 1回に広げる幅 (両側に1セルずつ)
+// 拡張の主な判断は**建て込み具合**。空き区画の数で見ると、建物が増えるほど
+// 「建物に接した空き地」も増えてしまい、いつまでも広がらない。
+const EXPAND_DENSITY  = envNum('EXPAND_DENSITY', 0.28);  // 建物がフィールドのこの割合を超えたら広げる
+const EXPAND_FREE     = envNum('EXPAND_FREE', 6);        // 空き区画がこれ以下でも広げる (保険)
+const EXPAND_TREES    = envNum('EXPAND_TREES', 3);       // 新しい土地の木の間引き (n セルに1本)
+// 住居/職場の定員 (人口の上限を決める = 家が建つと人が増える)
+const HOUSE_CAP       = envNum('HOUSE_CAP', 2);
+const APT_CAP         = envNum('APT_CAP', 12);
+const WORK_CAP        = envNum('WORK_CAP', 6);           // 1つの職場が受け入れる人数
+const POP_GROWTH      = envNum('POP_GROWTH', 0.15);      // 1日の転入は人口の何割か
+const MOVEIN_MAX      = envNum('MOVEIN_MAX', 8);         // 1日の転入の上限
+const HOME_PRESSURE   = envNum('HOME_PRESSURE', 0.85);   // 定員のこの割合を超えたら住宅を建てる
+const WORK_PRESSURE   = envNum('WORK_PRESSURE', 0.9);    // 同上 (職場)
+
+// 発展段階。経済活動 (店への来店の累計) が溜まると上がり、**背の高い建物と 2x2 が解禁**される。
+//   高さは BLDG_TYPES の height。低い順に 0.7(屋台) … 3.3(タワー)。
+//   「経済が回ると街が高くなる」を、建てられるものの制限だけで表現する。
+//   ECON_SCALE で発展の速さをまとめて調整できる (小さいほど早く育つ)。
+const ECON_SCALE = envNum('ECON_SCALE', 1);
+const CITY_LEVELS = [
+  { name:'集落', maxH:1.4, fp2:false, econ:0     },
+  { name:'村',   maxH:1.7, fp2:false, econ:400   },
+  { name:'町',   maxH:2.1, fp2:true,  econ:2000  },
+  { name:'市',   maxH:2.6, fp2:true,  econ:8000  },
+  { name:'都市', maxH:3.3, fp2:true,  econ:25000 },
+].map(L=>({...L, econ:L.econ*ECON_SCALE}));
+
+// 需要カテゴリ (欲求 → 建物カテゴリ)
+const CATS      = ['eat','shop','fun','care'];
+const BUILD_CATS= ['home','work','eat','shop','fun','care'];   // 建てられるもの (優先順)
+const NEED_CAT  = { eat:'eat', shop:'shop', bored:'fun', sick:'care' };
+const CAT_IDX   = { eat:FOOD_IDX, shop:BUY_IDX, fun:FUN_IDX, care:CARE_IDX,
+                    home:HOME_IDX, work:WORK_IDX };
+const CAT_LABEL = { eat:'飲食店', shop:'買い物する場所', fun:'遊ぶ場所', care:'医療',
+                    home:'住むところ', work:'働くところ' };
+
+// いまの発展段階で建てられるか。方策の goal は BLDG_TYPES(25) の one-hot なので、
+// **新種を作らない限り再学習は不要**。増えるのは「いつ建つか」だけ。
+function cityLevel(){
+  if(!CITY) return 0;
+  let lv=0;
+  for(let i=0;i<CITY_LEVELS.length;i++) if(CITY.econ>=CITY_LEVELS[i].econ) lv=i;
+  return lv;
+}
+const levelSpec = () => CITY_LEVELS[cityLevel()];
+function typeAllowed(t){
+  const bt=BLDG_TYPES[t], L=levelSpec();
+  return bt.height <= L.maxH+1e-6 && (bt.footprint===1 || L.fp2);
+}
+const foundableTypes = cat => (CAT_IDX[cat]||[]).filter(typeAllowed);
+
+// 閉店しうるのは「いま建て直せる業種」だけ。住宅と職場は潰さない
+// (自宅が消えると拠点割当が壊れ、職場が消えると全員が失業する)。
+const CLOSABLE_CATS = ['eat','shop','fun','care'];
+const isClosable = t => CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(t)) && typeAllowed(t);
+
+let CITY = null;             // 街の恒久状態 (initCity で作るか読み込む)
+let cityStamp = 0;           // 建物の状態が変わるたびに増やす (カテゴリ一覧キャッシュの無効化)
+let boxGeoByH = {};          // 高さ別 BoxGeometry (建物メッシュで共有)
+let groundDirty = false;     // 地面の板を作り直す必要があるか
+const cellStruct = {};       // "r_c" -> struct (2x2 は4セルとも同じ struct を指す)
+
+function newStruct(r,c,fp,typeIdx,born){
+  return { r, c, fp, typeIdx,
+    state:'open',            // 'open' | 'construction' | 'closed' | 'gone'
+    born: born||0,           // 建った日 (0 = 創世時からある)
+    openedBy: null,          // 起業した住民の aid
+    visits: 0, visitsToday: 0, ema: 0,
+    firstCustomer: null, doneAt: null, closedDay: null };
 }
 
-// 拠点(自宅/職場)の割当。house は少人数、apartment は集合住宅として複数人で共有する。
-//   乱数を使わず aid 順の決定的な割当にしているので、再起動しても同じ住所になる。
-function assignHomes(){
-  const homes=buildingsOfTypes(HOME_IDX), works=buildingsOfTypes(WORK_IDX);
-  const houses=homes.filter(b=>BUILDING_TYPES[b[0]+'_'+b[1]]===IDX_OF('house'));
-  const apts  =homes.filter(b=>BUILDING_TYPES[b[0]+'_'+b[1]]===IDX_OF('apartment'));
-  const HOUSE_CAP=2;                     // 戸建ての定員
-  const slots=[];
-  for(const h of houses) for(let i=0;i<HOUSE_CAP;i++) slots.push(h);   // 戸建てを先に埋める
-  agents.forEach((a,i)=>{
-    a.home = slots[i] || (apts.length ? apts[i % apts.length]          // あふれたらマンションで同居
-                        : (homes.length ? homes[i%homes.length] : null));
-    a.work = works.length ? works[i % works.length] : null;
+function structAt(r,c){ return cellStruct[r+'_'+c] || null; }
+
+// CITY.structs から派生テーブルを作り直す。建物の状態を変えたら必ず呼ぶ。
+//   BUILDING_TYPES は「見た目/レイキャスト用」なので閉店中・工事中も載せる。
+//   「行き先に選べるか」は state で判定する (buildingsOfTypes / pickBuildingOfType)。
+function syncCity(){
+  for(const k in cellStruct) delete cellStruct[k];
+  BUILDING_TYPES = {};
+  if(!CITY) return;
+  for(const st of CITY.structs){
+    if(st.state==='gone') continue;
+    for(let dr=0;dr<st.fp;dr++)for(let dc=0;dc<st.fp;dc++){
+      const k=(st.r+dr)+'_'+(st.c+dc);
+      cellStruct[k]=st; BUILDING_TYPES[k]=st.typeIdx;
+    }
+  }
+  cityStamp++;
+}
+
+// カテゴリ別の「営業中の建物」一覧。1秒ごとに全エージェントぶん引くので、
+// 建物の状態が変わったときだけ作り直す (cityStamp でキャッシュを無効化)。
+let _catCache={stamp:-1, cells:{}, count:{}};
+function catBuildings(cat){
+  if(_catCache.stamp!==cityStamp){
+    _catCache={stamp:cityStamp, cells:{}, count:{}};
+    for(const c of BUILD_CATS){ _catCache.cells[c]=[]; _catCache.count[c]=0; }
+    if(CITY) for(const st of CITY.structs){
+      if(st.state!=='open') continue;
+      for(const c of BUILD_CATS){
+        if(!(CAT_IDX[c]||[]).includes(st.typeIdx)) continue;
+        _catCache.count[c]++;
+        _catCache.cells[c].push([st.r+ (st.fp-1)/2, st.c + (st.fp-1)/2]);
+      }
+    }
+  }
+  return _catCache.cells[cat]||[];
+}
+function catCount(cat){ catBuildings(cat); return _catCache.count[cat]||0; }
+
+// ── 建物メッシュ (1軒単位で差し替えられるようにする) ──
+function structMats(st){
+  if(st.state==='construction')                      // 工事中 = 灰色の低い箱
+    return new THREE.MeshLambertMaterial({color:0x8f8f86});
+  const mats=getBuildingMaterial(st.typeIdx).map(m=>m.clone());
+  if(st.state==='closed') mats.forEach(m=>m.color.setRGB(0.40,0.38,0.36));  // シャッター
+  return mats;
+}
+function structHeight(st){
+  const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
+  return st.state==='construction' ? CELL*0.3 : bt.height*CELL;
+}
+function removeStructMesh(S, st){
+  const key=st.r+'_'+st.c+'_b', o=occluders[key];
+  structAnims.delete(st.r+'_'+st.c);   // 差し替え前のメッシュを動かし続けない
+  if(!o) return;
+  if(S) S.remove(o.mesh);
+  // geometry は boxGeoByH で共有、テクスチャは建物タイプで共有。
+  // ここで dispose していいのは clone した material だけ。
+  const arr=Array.isArray(o.mesh.material)?o.mesh.material:[o.mesh.material];
+  arr.forEach(m=>m.dispose());
+  delete occluders[key];
+}
+function addStructMesh(S, st){
+  if(!S || st.state==='gone') return;
+  removeStructMesh(S, st);
+  const span=st.fp, bw=span*CELL*0.8, h=structHeight(st);
+  const cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
+  const gkey=span+'_'+h.toFixed(3);
+  if(!boxGeoByH[gkey]) boxGeoByH[gkey]=new THREE.BoxGeometry(bw,bw,h);
+  const mesh=new THREE.Mesh(boxGeoByH[gkey], structMats(st));
+  mesh.position.set(cx,cy,h/2);
+  S.add(mesh);
+  occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
+}
+
+function addTreeMesh(S, r, c){
+  const T=S && S.userData && S.userData.tree;
+  if(!T) return;
+  const cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
+  const trunk=new THREE.Mesh(T.trunkGeo, T.trunkMat.clone());
+  trunk.position.set(cx,cy,CELL*.2); S.add(trunk);
+  const cone=new THREE.Mesh(T.coneGeo, T.coneMat.clone());
+  cone.position.set(cx,cy,CELL*.58); S.add(cone);
+  occluders[r+'_'+c+'_t1']={mesh:trunk,cx,cy,faded:false};
+  occluders[r+'_'+c+'_t2']={mesh:cone,cx,cy,faded:false};
+}
+
+// 道路 / 草地 / 摩耗した地面の板。踏み跡が溜まると草地→踏み固め→土に変わる。
+//   「閾値を超えた瞬間にアスファルトが生える」より、土が露出していく過程が
+//   見えているほうが蓄積に見える。板は3枚のマージ済みメッシュにまとめる。
+function rebuildGround(S){
+  if(!S) return;
+  const g=S.userData.ground||(S.userData.ground={});
+  for(const k of ['base','road','grass','wear1','wear2']){
+    if(g[k]){ S.remove(g[k]); g[k].geometry.dispose(); g[k].material.dispose(); g[k]=null; }
+  }
+  // 下地の板。フィールドの外は何も描かない (世界の果て = 背景色) ので、
+  // 街が広がると島が大きくなっていくように見える。
+  const fs=fieldSize()*CELL, fx=fieldCenterW();
+  g.base=new THREE.Mesh(new THREE.PlaneGeometry(fs,fs),
+                        new THREE.MeshLambertMaterial({color:0xe6e9e2}));
+  g.base.position.set(fx,fx,0);
+  S.add(g.base);
+  // 上位%の閾値をその場の分布から決める (絶対数だと人数しだいで全面茶色になる)
+  let t1=Infinity, t2=Infinity;
+  if(CITY){
+    const vals=[];
+    for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
+      if(MAP[r][c]===OTHER && CITY.foot[r*GRID+c]>0) vals.push(CITY.foot[r*GRID+c]);
+    if(vals.length){
+      vals.sort((a,b)=>b-a);
+      t1=Math.max(WEAR_1, vals[Math.min(vals.length-1, Math.floor(vals.length*WEAR_TOP1))]);
+      t2=Math.max(WEAR_2, vals[Math.min(vals.length-1, Math.floor(vals.length*WEAR_TOP2))]);
+    }
+  }
+  const road=[], grass=[], w1=[], w2=[];
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    const t=MAP[r][c], cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
+    if(t===ROAD){ pushQuad(road, CELL*.97, cx, cy, .008); continue; }
+    if(t!==OTHER) continue;                       // 建物/木のセルには板を敷かない
+    const f=CITY?CITY.foot[r*GRID+c]:0;
+    if(f>=t2)      pushQuad(w2,    CELL*.97, cx, cy, .006);
+    else if(f>=t1) pushQuad(w1,    CELL*.97, cx, cy, .006);
+    else           pushQuad(grass, CELL*.97, cx, cy, .005);
+  }
+  if(road.length) { g.road =quadMesh(road,  0xc4c8cc); S.add(g.road); }
+  if(grass.length){ g.grass=quadMesh(grass, 0x9ccc65); S.add(g.grass); }
+  if(w1.length)   { g.wear1=quadMesh(w1,    0xa8a878); S.add(g.wear1); }
+  if(w2.length)   { g.wear2=quadMesh(w2,    0xb9a97e); S.add(g.wear2); }
+}
+
+// ── 建物の出現/消滅アニメーション ──────────────────────────────────────────
+//   建物は地面の下から**せり上がり**、取り壊しでは地面に**沈む**。
+//   地面 (W×W の不透明プレーン, z=0) がカメラより常に下にあるので、z<0 に潜った
+//   ぶんは自然に隠れる。クリッピング平面を足す必要はない。
+const structAnims = new Map();          // "r_c" -> {mesh, kind, t0, dur, h, onDone}
+
+// アニメの開始位置に置くだけ (カメラが来るまで動かさない)。
+//   カメラのイベントが待ち行列に並ぶので、状態変化と同時に動かすと
+//   「カメラが着いたころには沈み終わっている」ことになる。
+function prepStructAnim(st, kind){
+  const o=occluders[st.r+'_'+st.c+'_b'];
+  if(!o) return;
+  if(kind==='rise') o.mesh.position.z = -structHeight(st)/2;   // 地面の下に完全に潜る
+}
+
+function animateStruct(st, kind, onDone){
+  const o=occluders[st.r+'_'+st.c+'_b'];
+  if(!o){ if(onDone) onDone(); return; }
+  const h=structHeight(st);
+  const dur=(kind==='rise'?ANIM_RISE_SEC:ANIM_SINK_SEC)*1000;
+  if(kind==='rise') o.mesh.position.z = -h/2;
+  structAnims.set(st.r+'_'+st.c, {mesh:o.mesh, kind, t0:Date.now(), dur, h, onDone});
+}
+
+// 毎フレーム呼ぶ。終わったら onDone (取り壊しの後始末はここで走る)。
+function stepStructAnims(){
+  if(!structAnims.size) return;
+  const now=Date.now();
+  for(const [k,a] of structAnims){
+    const p=Math.min(1, (now-a.t0)/a.dur);
+    const e=1-Math.pow(1-p, 3);                  // ease-out (最後にふわっと止まる)
+    a.mesh.position.z = (a.kind==='rise') ? (-a.h/2 + e*a.h) : (a.h/2 - e*a.h);
+    if(p>=1){ structAnims.delete(k); if(a.onDone) a.onDone(); }
+  }
+}
+
+// ── 街のイベントをカメラで見せる ────────────────────────────────────────────
+//   既存のカメラは「エージェント」しかターゲットにできないので、場所を指す仕組みを足す。
+//   イベント中は追跡を止め、その場所をゆっくり回り込みながら映し、画面に一言出す。
+const camEvents = [];                   // {r,c,secs,banner}
+let camEventCur = null;
+
+// anim = {st, kind, onDone} を渡すと、カメラがその場所に着いた瞬間に動き出す。
+// opts.wide = true で引きの画 (街全体を見せたいとき。発展段階が上がった瞬間など)。
+function showCityEvent(r, c, banner, secs, anim, opts){
+  if(anim) prepStructAnim(anim.st, anim.kind);
+  camEvents.push({r, c, banner, secs:secs||EVENT_CAM_SEC, anim, wide:!!(opts&&opts.wide)});
+  while(camEvents.length>4){
+    // 溢れたぶんは映せないが、アニメだけは走らせる (地面の下に沈めたまま放置しない)
+    const drop=camEvents.shift();
+    if(drop.anim) animateStruct(drop.anim.st, drop.anim.kind, drop.anim.onDone);
+  }
+}
+// 現在映すべきイベントを返す (無ければ null)。updateTrackingCamera から毎フレーム。
+function stepCamEvents(){
+  const now=Date.now();
+  if(camEventCur && now>=camEventCur.until) camEventCur=null;
+  if(!camEventCur && camEvents.length){
+    camEventCur=camEvents.shift();
+    camEventCur.t0=now;
+    camEventCur.until=now+camEventCur.secs*1000;
+    if(camEventCur.banner) showBanner(camEventCur.banner, camEventCur.secs);
+    const an=camEventCur.anim;
+    if(an) animateStruct(an.st, an.kind, an.onDone);   // カメラが着いてから動かす
+  }
+  return camEventCur;
+}
+
+// ── ゲーム内の日付 ──────────────────────────────────────────────────────────
+//   gameHour() と同じく実時間から求める。dayBase を永続化するので再起動しても戻らない。
+//   境目は朝 DAY_ROLL_H 時。深夜に街が変わるより「朝起きたら道ができている」ほうが自然。
+function daysSinceBoot(){
+  const elapsed=(Date.now()-_bootMs)/1000;
+  return Math.max(0, Math.floor((START_HOUR - DAY_ROLL_H + elapsed/(DAY_MINUTES*60)*24)/24));
+}
+function gameDay(){ return (CITY?CITY.dayBase:0) + daysSinceBoot(); }
+
+// ── 永続化 ──────────────────────────────────────────────────────────────────
+//   マップ生成則や種を変えたら読まない (壊れた街を復元しないため)。
+function cityToJSON(){
+  const own={};
+  for(const a of agents){
+    if(a.seenMask || a.owns) own[a.aid]={m:a.seenMask||0, o:a.owns||null};
+  }
+  return {
+    version:1, seed:CITY.seed, grid:GRID, savedAt:Date.now(),
+    day:gameDay(), bornAt:CITY.bornAt,
+    econ:CITY.econ, level:CITY.level, pop:agents.length, size:CITY.size,
+    map:MAP.map(row=>row.join('')),
+    structs:CITY.structs.map(st=>({...st})),
+    foot:Array.from(CITY.foot),
+    demand:Object.fromEntries(CATS.map(c=>[c, Array.from(CITY.demand[c], v=>+v.toFixed(2))])),
+    unmet:CITY.unmet, stats:CITY.stats, news:CITY.news.slice(-200), agents:own,
+  };
+}
+function saveCity(){
+  if(!CITY) return;
+  try{
+    const tmp=CITY_FILE+'.tmp';
+    fs.mkdirSync(path.dirname(CITY_FILE),{recursive:true});
+    fs.writeFileSync(tmp, JSON.stringify(cityToJSON()));
+    fs.renameSync(tmp, CITY_FILE);
+  }catch(e){ console.warn('[City] 保存失敗:', e.message); }
+}
+function loadCity(){
+  try{
+    if(!fs.existsSync(CITY_FILE)) return null;
+    const j=JSON.parse(fs.readFileSync(CITY_FILE,'utf8'));
+    if(j.version!==1 || j.seed!==CITY_SEED || j.grid!==GRID){
+      console.warn(`[City] ${CITY_FILE} は別の街 (version/seed/grid 不一致) → 新規生成`);
+      return null;
+    }
+    return j;
+  }catch(e){ console.warn('[City] 読み込み失敗:', e.message, '→ 新規生成'); return null; }
+}
+// まっさらな街。dayBase を「起動からの経過日数」ぶん引くので、稼働中に作り直しても
+// 表示は Day 1 から始まる。
+// 生成された「完成した街」を村に戻す。makeMap 自体は学習側と bit-identical で
+// なければならないので触らず、**後処理として間引く**。
+//   ・中心から離れた道路は草地へ (道はこれから踏み跡で生えてくる)
+//   ・中心に近い建物を START_BUILDINGS 軒だけ残し、残りは空き地に
+//   ・残す建物は全部 1x1 の低い建物に置き換える (高い建物は発展段階で解禁)
+// 最初の街の構成。**先頭から順に必要なものが揃う**ように並べてある。
+//   住む → 働く → 食べる → 買う → 治す。建物数が少なくても
+//   「家・職場・飲食店」だけは必ず入るのが狙い。
+const VILLAGE_ORDER = ['house','house','post','kiosk','house','ramen','conbini',
+                       'house','cafe','pharmacy','house','bento','shop','house','gyudon'];
+function villageMix(n){
+  const T=name=>BLDG_NAME_TO_IDX[name];
+  const mix=[];
+  for(let i=0;i<n;i++) mix.push(T(VILLAGE_ORDER[i % VILLAGE_ORDER.length]));
+  return mix;
+}
+
+function villageStart(map, structs, size){
+  const lo=Math.floor((GRID-size)/2), hi=lo+size-1;
+  const cr=(lo+hi)/2, cc=(lo+hi)/2;
+  // 1) フィールドの外は VOID (まだ世界が無い)。中は建物をいったん全部さら地に。
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
+    if(r<lo||r>hi||c<lo||c>hi) map[r][c]=VOID;
+  for(const st of structs)
+    for(let dr=0;dr<st.fp;dr++)for(let dc=0;dc<st.fp;dc++){
+      const r=st.r+dr, c=st.c+dc;
+      if(r<GRID && c<GRID && map[r][c]!==VOID) map[r][c]=OTHER;
+    }
+  // 2) フィールド内で中心に近い区画を選ぶ。元の建物跡を優先し、足りなければ
+  //    道に面した空き地から補う (フィールドが小さいと元の建物が足りないため)。
+  const cand=[];
+  for(const st of structs) if(st.r>=lo&&st.r<=hi&&st.c>=lo&&st.c<=hi) cand.push([st.r,st.c]);
+  const seen=new Set(cand.map(([r,c])=>r+'_'+c));
+  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++){
+    if(map[r][c]!==OTHER || seen.has(r+'_'+c)) continue;
+    const faces=MW.D4.some(([dr,dc])=>{
+      const nr=r+dr, nc=c+dc;
+      return nr>=lo&&nr<=hi&&nc>=lo&&nc<=hi&&map[nr][nc]===ROAD;
+    });
+    if(faces) cand.push([r,c]);
+  }
+  cand.sort((a,b)=>((a[0]-cr)**2+(a[1]-cc)**2)-((b[0]-cr)**2+(b[1]-cc)**2));
+  const keep=cand.slice(0, Math.max(4, Math.min(START_BUILDINGS, cand.length)));
+  const mix=villageMix(keep.length), out=[];
+  keep.forEach(([r,c],i)=>{                   // 1x1 の低い建物として建て直す
+    map[r][c]=BUILDING;
+    out.push(newStruct(r, c, 1, mix[i], 0));
   });
-  // 同居人/同僚を記録 (社交の「知り合い」判定に使える)
-  const key=b=>b?b[0]+'_'+b[1]:'';
-  const byHome={};
-  agents.forEach(a=>{ const k=key(a.home); if(k){ (byHome[k]=byHome[k]||[]).push(a.aid); } });
-  const shared=Object.values(byHome).filter(v=>v.length>1).length;
-  console.log(`[Life] 拠点割当: 戸建て${houses.length}軒(定員${HOUSE_CAP}) / マンション${apts.length}軒 / 職場${works.length}件`
-            + ` — 同居のある建物 ${shared}件`);
+  const names=out.map(x=>BLDG_TYPES[x.typeIdx].name);
+  console.log(`[City] 村から開始: ${size}×${size} のフィールドに 建物${out.length}軒`
+    + ` (住宅${names.filter(n=>n==='house').length} 職場${names.filter(n=>n==='post').length}`
+    + ` 飲食${names.filter(n=>['kiosk','ramen','cafe','bento','gyudon'].includes(n)).length})`);
+  return out;
+}
+
+// 需要の測り方が街の密度に合っているかを見るための日次診断 (永続化しない)
+function freshDiag(){ return Object.fromEntries(CATS.map(c=>[c,{n:0,sum:0,far:0}])); }
+
+function freshCity(){
+  const size=START_VILLAGE ? Math.max(6, Math.min(GRID, Math.round(START_SIZE))) : GRID;
+  let structs=planStructures(MAP);
+  if(START_VILLAGE) structs=villageStart(MAP, structs, size);
+  return {
+    seed:CITY_SEED, dayBase:-daysSinceBoot(), bornAt:Date.now(),
+    econ:0, level:0, pop:0, size,    // 経済活動の累計 / 発展段階 / 人口 / フィールドの一辺
+    structs,
+    foot:new Int32Array(GRID*GRID),
+    demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
+    unmet:Object.fromEntries(CATS.map(c=>[c,0])),
+    stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0},
+    news:[], savedAgents:{}, diag:freshDiag(),
+  };
+}
+
+// 蓄積を捨てて街を作り直す (newmap / /city?reset=1)。
+//   keepMap=true は newmap 用 (呼び出し側が MAP を差し替え済み)。
+//   それ以外は種から生成し直す (進化で書き換わった MAP を持ち越さない)。
+function resetCity(keepMap){
+  if(!keepMap) MAP=makeMap(GRID, CITY_SEED);
+  CITY=freshCity();
+  _lastDay=null;
+  for(const a of agents){ a.owns=null; a.seenMask=0; a.unmetBy=null; }
+  syncCity(); rebuildBuildings(MAP); groundDirty=true; saveCity();
+  console.log(`[City] 街を作り直しました (建物${CITY.structs.length}軒)`);
+}
+
+function initCity(){
+  const j=loadCity();
+  if(j){
+    MAP = j.map.map(row=>row.split('').map(Number));
+    CITY = {
+      seed:CITY_SEED, dayBase:j.day||0, bornAt:j.bornAt||Date.now(),
+      econ:j.econ||0, level:j.level||0, pop:j.pop||0, size:j.size||GRID,
+      structs:j.structs.map(st=>({...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st})),
+      foot:Int32Array.from(j.foot||[]),
+      demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
+      unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
+      stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0}, j.stats||{}),
+      news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
+    };
+    if(CITY.foot.length!==GRID*GRID) CITY.foot=new Int32Array(GRID*GRID);
+    for(const c of CATS) if(CITY.demand[c].length!==GRID*GRID) CITY.demand[c]=new Float32Array(GRID*GRID);
+    const ago=Math.round((Date.now()-(j.savedAt||Date.now()))/60000);
+    console.log(`[City] 復元: day=${CITY.dayBase} 建物${CITY.structs.length}軒 `
+      + `(開店中${CITY.structs.filter(s=>s.state==='open').length}/閉店${CITY.structs.filter(s=>s.state==='closed').length}) `
+      + `道${CITY.stats.roadsBorn}本 開業${CITY.stats.shopsOpened} 閉店${CITY.stats.shopsClosed} — ${ago}分前の保存`);
+  }else{
+    CITY = freshCity();
+    console.log(`[City] 新しい街を生成: 建物${CITY.structs.length}軒`);
+  }
+  // 工事中のまま保存された建物は、落ちていた間に完成したものとして開業させる
+  for(const st of CITY.structs) if(st.state==='construction' && st.doneAt && st.doneAt<Date.now()) st.state='open';
+  // 取り壊しアニメの途中で保存された建物は閉店状態に戻す (翌日また取り壊される)
+  for(const st of CITY.structs) if(st.state==='demolishing') st.state='closed';
+  syncCity();
+  rebuildBuildings(MAP);
+  const L=levelSpec();
+  console.log(`[City] 発展段階 ${cityLevel()}:${L.name} (高さ≤${L.maxH} 2x2:${L.fp2?'可':'不可'}) `
+    + `経済 ${Math.round(CITY.econ)} / 建てられる業種 `
+    + BUILD_CATS.map(c=>`${c}=${foundableTypes(c).length}`).join(' '));
+}
+
+// 指定タイプ群の建物セル一覧。**営業中 (state='open') の建物だけ**を返す。
+//   工事中の建物と閉店した建物は目的地に選ばれない (BUILDING_TYPES は見た目/
+//   レイキャスト用に全建物ぶん入っているので、状態は struct 側で判定する)。
+function buildingsOfTypes(idxs){
+  const set=new Set(idxs);
+  return BUILDINGS.filter(b=>{
+    const st=structAt(b[0],b[1]);
+    return st && st.state==='open' && set.has(st.typeIdx);
+  });
+}
+
+// ── 住居と職場の定員 ────────────────────────────────────────────────────────
+//   人口の上限は住居の定員で決まる。**家が建つと人が増える**という因果をここで作る。
+const cellKey   = b => b ? b[0]+'_'+b[1] : '';
+const homeCapOf = t => (t===IDX_OF('apartment') ? APT_CAP : HOUSE_CAP);
+const openStructsOf = idxs => (CITY?CITY.structs:[])
+  .filter(st=>st.state==='open' && idxs.includes(st.typeIdx));
+function housingCapacity(){
+  let n=0; for(const st of openStructsOf(HOME_IDX)) n+=homeCapOf(st.typeIdx); return n;
+}
+function workplaceCapacity(){ return openStructsOf(WORK_IDX).length * WORK_CAP; }
+
+// 拠点(自宅/職場)の割当。**既に住んでいる人はそのまま**で、空きのある建物へ順に入れる。
+//   以前は index で機械的に割り当てていたので、家が1軒建つたびに全員の住所がずれた。
+//   人口が増減する街ではそれでは「引っ越してきた」が成立しない。
+function assignHomes(){
+  const okHome=b=>{ const st=b&&structAt(b[0],b[1]); return st&&st.state==='open'&&HOME_IDX.includes(st.typeIdx); };
+  const okWork=b=>{ const st=b&&structAt(b[0],b[1]); return st&&st.state==='open'; };
+  const occ={}, wocc={};
+  for(const a of agents){
+    if(a.home && !okHome(a.home)) a.home=null;
+    if(a.home) occ[cellKey(a.home)]=(occ[cellKey(a.home)]||0)+1;
+    if(a.owns) a.work=[...a.owns];                       // 店主は自分の店が職場
+    else if(a.work && !okWork(a.work)) a.work=null;
+    if(a.work && !a.owns) wocc[cellKey(a.work)]=(wocc[cellKey(a.work)]||0)+1;
+  }
+  const homeStructs=openStructsOf(HOME_IDX), workStructs=openStructsOf(WORK_IDX);
+  const take=(list, table, capOf)=>{
+    let spill=null, spillN=Infinity;
+    for(const st of list){
+      const k=st.r+'_'+st.c, n=table[k]||0;
+      if(n < capOf(st.typeIdx)){ table[k]=n+1; return [st.r,st.c]; }
+      if(n < spillN){ spillN=n; spill=st; }
+    }
+    // 全部満室でも路頭に迷わせない。ただし先頭に詰め込まず、いちばん空いている所へ。
+    if(!spill) return null;
+    const k=spill.r+'_'+spill.c; table[k]=(table[k]||0)+1;
+    return [spill.r, spill.c];
+  };
+  for(const a of agents){
+    if(!a.home) a.home=take(homeStructs, occ, homeCapOf);
+    if(!a.work) a.work=take(workStructs, wocc, ()=>WORK_CAP);
+  }
+  const homeless=agents.reduce((n,a)=>n+(a.home?0:1),0);
+  const over=Math.max(0, agents.length-housingCapacity());
+  console.log(`[Life] 拠点: 人口${agents.length} / 住居${homeStructs.length}軒(定員${housingCapacity()})`
+    + ` / 職場${workStructs.length}件(定員${workplaceCapacity()})`
+    + (over?` ⚠ 定員超過${over}人`:'') + (homeless?` ⚠ 家なし${homeless}人`:''));
 }
 
 // 欲求が切り替わった wander エージェントの行き先を選び直す。
@@ -1421,6 +2124,27 @@ function stepNeeds(dtSec){
     // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
     if(a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1)
       a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
+    else if(!a.home && t!=null && HOME_IDX.includes(t))
+      a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);   // 家なしは住居に居れば休める
+
+    // ── 需要 = 「不満 × 遠さ」の積分 ──────────────────────────────────────
+    //   近くに店があるのに空腹なのは供給不足ではない。**遠いのに欲しい**時間だけを
+    //   足し込む。同時に「どこで不満だったか」をヒートマップに落とし、起業の立地に使う。
+    if(CITY_EVOLVE && CITY && !MW.isIndoors(a)){
+      const cat=NEED_CAT[needOf(a)];
+      if(cat){
+        const d=nearestCatDist(a, cat);   // 該当が街に1軒も無ければ Infinity → 重み1
+        const w=Math.max(0, Math.min(1, (d-DEMAND_D_OK)/(DEMAND_D_FAR-DEMAND_D_OK)));
+        // 診断: 閾値 (D_OK/D_FAR) が街の密度に合っているかを毎日ログで確認できるように
+        const dg=CITY.diag[cat]; dg.n++; dg.sum+=Math.min(d,99); if(w>0) dg.far++;
+        if(w>0){
+          CITY.unmet[cat]+=w*dtSec;
+          if(!a.unmetBy) a.unmetBy={};
+          a.unmetBy[cat]=(a.unmetBy[cat]||0)+w*dtSec;
+          if(r>=0&&r<GRID&&c>=0&&c<GRID) CITY.demand[cat][r*GRID+c]+=w*dtSec;
+        }
+      }
+    }
   }
 }
 
@@ -1433,7 +2157,8 @@ function shouldLeaveBuilding(a){
   const t=BUILDING_TYPES[br+'_'+bc];
   const n=needOf(a);
   if(n===null) return true;                                   // 用事なし → 外へ
-  if(n==='sleep') return !(a.home && br===a.home[0] && bc===a.home[1]);
+  if(n==='sleep') return a.home ? !(br===a.home[0] && bc===a.home[1])
+                                : !HOME_IDX.includes(t);   // 家なしは住居なら留まる
   if(n==='work')  return !(a.work && br===a.work[0] && bc===a.work[1]);
   if(t==null) return true;
   if(n==='eat')   return !FOOD_IDX.includes(t);               // 飲食店に居るなら留まる
@@ -1488,9 +2213,26 @@ function describeActivity(a){
 }
 
 // 内部状態にもとづく目的地抽選。該当が無ければ従来のランダムに落とす。
+// 最寄りの住居 (家が無い人の逃げ場)。
+function nearestHome(a){
+  const list=buildingsOfTypes(HOME_IDX);
+  if(!list.length) return null;
+  let best=null, bd=Infinity;
+  for(const b of list){
+    const d=(b[0]-a.x)**2+(b[1]-a.y)**2;
+    if(d<bd){ bd=d; best=b; }
+  }
+  return best?[...best]:null;
+}
+
 function pickLifeGoal(a, ex){
   const n=needOf(a);
-  if(n==='sleep' && a.home) return [...a.home];
+  if(n==='sleep'){
+    // 家がある人は自宅へ。無い人は最寄りの住居へ (そこで休ませる)。
+    // これが無いと、家なしの住民は疲労が 1.0 で飽和したまま永久に徘徊する。
+    if(a.home) return [...a.home];
+    const h=nearestHome(a); if(h) return h;
+  }
   if(n==='work'  && a.work) return [...a.work];
   // 欲求 → 行き先カテゴリ。近い方から数軒のランダムで選ぶ (最寄り固定だと往復しやすい)
   const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX}[n];
@@ -1506,6 +2248,539 @@ function pickLifeGoal(a, ex){
 }
 
 function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
+
+// ═══ 街の進化: 日次の変化 ═══════════════════════════════════════════════════
+// 変化はすべて dailyRollover() に集約する。1か所を読めば「今日この街に何が
+// 起きうるか」が分かる状態を保つため。
+
+const NEWS_MAX = 200;
+const FIRST_NEWS_COOLDOWN_MS = envNum('FIRST_NEWS_COOLDOWN', 90)*1000;
+let _lastFirstNews = 0;
+let _lastDay = null;
+let hudNewsDirty = false;
+
+function news(kind, text){
+  if(!CITY) return;
+  CITY.news.push({t:Date.now(), day:gameDay(), kind, text});
+  while(CITY.news.length>NEWS_MAX) CITY.news.shift();
+  hudNewsDirty = true;
+  console.log(`[News] Day${gameDay()+1} ${text}`);
+}
+const latestNews = n => CITY ? CITY.news.slice(-n) : [];
+
+// ── 機能A: 踏み跡が道になる ────────────────────────────────────────────────
+// 絶対閾値ではなく「今日いちばん踏まれた空き地を N 本だけ道にする」日次ランキング。
+// エージェント数や TICK が変わっても1日の変化量が一定に保たれ、
+// 「毎朝2本ずつ道が伸びる」という配信のリズムにもなる。
+function promoteFootpaths(day){
+  const nearRoad=(r,c)=>MW.D4.some(([dr,dc])=>{
+    const nr=r+dr, nc=c+dc;
+    return nr>=0&&nr<GRID&&nc>=0&&nc<GRID&&MAP[nr][nc]===ROAD;
+  });
+  const cand=[];
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(MAP[r][c]!==OTHER) continue;
+    const f=CITY.foot[r*GRID+c];
+    if(f<FOOT_MIN || !nearRoad(r,c)) continue;
+    cand.push([f,r,c]);
+  }
+  cand.sort((a,b)=>b[0]-a[0]);
+  let n=0;
+  for(const [f,r,c] of cand){
+    if(n>=ROAD_PER_DAY) break;
+    MAP[r][c]=ROAD; CITY.foot[r*GRID+c]=0; n++; CITY.stats.roadsBorn++;
+    // 道は道を呼ぶ: 周囲の踏み跡を持ち上げて、点ではなく線として伸びやすくする
+    for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+      const nr=r+dr, nc=c+dc;
+      if(nr<0||nr>=GRID||nc<0||nc>=GRID||MAP[nr][nc]!==OTHER) continue;
+      CITY.foot[nr*GRID+nc]=Math.floor(CITY.foot[nr*GRID+nc]*1.5);
+    }
+  }
+  // 昇格しなかったぶんは減衰。これが無いと「たまたま1回横断した」が何週間もかけて
+  // 積み上がり、いずれ空き地が全部道路になる。
+  for(let i=0;i<CITY.foot.length;i++) CITY.foot[i]=Math.floor(CITY.foot[i]*FOOT_DECAY);
+  if(n){
+    groundDirty=true;
+    // 道が増えると、それまで空き地の奥で孤立していた建物が到達可能になることがある
+    rebuildBuildings(MAP);
+    news('road', `🛣 よく踏まれた空き地が道になった (${n}本)`);
+  }
+  return n;
+}
+
+// ── 機能B: 足りない業種を住民が起業する ────────────────────────────────────
+function nearestCatDist(a, cat){
+  const list=catBuildings(cat);
+  if(!list.length) return Infinity;              // 街に1軒も無い = 需要は最大
+  let best=Infinity;
+  for(const [r,c] of list){
+    const d=Math.hypot(r-a.x, c-a.y);
+    if(d<best) best=d;
+  }
+  return best;
+}
+
+// 通行可能領域 (最大連結成分) のセル数。建てる前後で比べて分断を検出する。
+function passableCount(map){
+  const comp=MW.largestComponent(MW.passableMask(map, WORLD));
+  let n=0; for(const row of comp) for(const v of row) if(v) n++;
+  return n;
+}
+// 未充足需要のヒートマップ。商売はこれがいちばん濃い所に建つ。
+function siteScoreDemand(cat, r, c){
+  const D=CITY.demand[cat];
+  if(!D) return 0;
+  let s=D[r*GRID+c]*2;
+  for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+    const nr=r+dr, nc=c+dc;
+    if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+    s+=D[nr*GRID+nc]*0.5;
+  }
+  return s;
+}
+// 住居と職場は「欲求」ではないのでヒートマップが無い。人が通る所 (踏み跡) と
+// 既存の建物の隣を好む = 街が虫食いにならず塊として広がる。
+function siteScoreGeneric(r, c){
+  let s=0;
+  for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+    const nr=r+dr, nc=c+dc;
+    if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+    s += CITY.foot[nr*GRID+nc]*0.02;
+    if(MAP[nr][nc]===BUILDING) s += 6;
+  }
+  return s;
+}
+
+const blockFree=(r,c,fp)=>{
+  for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++){
+    const nr=r+dr, nc=c+dc;
+    if(nr>=GRID||nc>=GRID||MAP[nr][nc]!==OTHER) return false;
+  }
+  return true;
+};
+// 道に面している、または既存の建物に接している区画だけに建てる。
+//   村のうちは道が中心にしか無いので、「建物の隣」も許さないと街が広がれない。
+const facesRoadOrBuilding=(r,c,fp)=>{
+  for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++)
+    for(const [ar,ac] of MW.D4){
+      const nr=r+dr+ar, nc=c+dc+ac;
+      if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+      if(MAP[nr][nc]===ROAD || MAP[nr][nc]===BUILDING) return true;
+    }
+  return false;
+};
+// fp×fp を建てても街が分断されないか。唯一の通路を塞ぐと、片側の住民が永久に
+// 経路を引けなくなって足踏みし続ける。BFS 2回 = 900セル、1日数回なので安い。
+// 「最大連結成分がちょうど fp*fp セル減った」= 誰も孤立していない。
+function canBuildFootprint(r,c,fp){
+  if(!WORLD.solidBuildings) return true;
+  const before=passableCount(MAP);
+  for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++) MAP[r+dr][c+dc]=BUILDING;
+  const after=passableCount(MAP);
+  for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++) MAP[r+dr][c+dc]=OTHER;
+  return after===before-fp*fp;
+}
+
+// 立地選定。scoreFn(r,c) が大きいほど良い立地。
+//   踏み跡機能と組み合わさると 道ができる→人が通る→店ができる→さらに人が通る が回る。
+function pickSite(day, fp, scoreFn){
+  let best=null;
+  // 1) 閉店した跡地を優先する。連結性チェックが要らず、「跡地にまた建つ」絵も強い。
+  for(const st of CITY.structs){
+    if(st.state!=='closed' || st.fp!==fp) continue;
+    if(day-(st.closedDay==null?0:st.closedDay) < 1) continue;
+    const sc=scoreFn(st.r, st.c);
+    if(!best || sc>best.score) best={reuse:st, r:st.r, c:st.c, fp, score:sc};
+  }
+  // 2) 空き区画
+  const lots=[];
+  for(let r=0;r+fp<=GRID;r++)for(let c=0;c+fp<=GRID;c++){
+    if(!blockFree(r,c,fp) || !facesRoadOrBuilding(r,c,fp)) continue;
+    lots.push({r,c,score:scoreFn(r,c)});
+  }
+  lots.sort((a,b)=>b.score-a.score);
+  for(const lot of lots.slice(0,12)){
+    if(best && best.score>=lot.score) break;     // 跡地のほうが良ければそれを使う
+    if(!canBuildFootprint(lot.r,lot.c,fp)) continue;   // 街を分断する場所は捨てる
+    return {reuse:null, r:lot.r, c:lot.c, fp, score:lot.score};
+  }
+  return best;
+}
+
+// 業種の選択: **街にいちばん少ないもの**を選ぶ。発展段階で解禁された新種は必ず0軒なので、
+// 解禁された瞬間にそれが建つ = 街が育つほど建物の種類が増えていく。
+function pickTypeFor(cat){
+  const types=foundableTypes(cat);
+  if(!types.length) return null;
+  const count={}; for(const t of types) count[t]=0;
+  for(const st of CITY.structs) if(st.state!=='gone' && (st.typeIdx in count)) count[st.typeIdx]++;
+  let min=Infinity; for(const t of types) min=Math.min(min, count[t]);
+  const pool=types.filter(t=>count[t]===min);
+  return pool[Math.floor(Math.random()*pool.length)];
+}
+
+// 起業者 = 「自分が一番困っていて、かつ性格的に動く人」。1人1軒まで。
+function pickFounder(cat){
+  let best=null, bestScore=0;
+  for(const a of agents){
+    if(a.owns) continue;
+    const sc=((a.def&&a.def.enterprise)||0) * ((a.unmetBy&&a.unmetBy[cat])||0);
+    if(sc>bestScore){ bestScore=sc; best=a; }
+  }
+  if(best) return best;
+  // 誰も不満を溜めていない場合 (強制発火や起動直後) は起業性向で重み付け抽選する。
+  // 「誰かが建てた」より「Cole が建てた」のほうがニュースとして強いので、
+  // 店主なしにはしない。
+  const pool=agents.filter(a=>!a.owns && ((a.def&&a.def.enterprise)||0)>0);
+  if(!pool.length) return null;
+  let sum=0; for(const a of pool) sum+=a.def.enterprise;
+  let r=Math.random()*sum;
+  for(const a of pool){ r-=a.def.enterprise; if(r<=0) return a; }
+  return pool[0];
+}
+
+function foundShop(cat, site, typeIdx, founder, day){
+  const fp=site.fp||1;
+  let st;
+  if(site.reuse){                     // 跡地の再利用
+    st=site.reuse;
+    st.typeIdx=typeIdx; st.born=day; st.visits=0; st.visitsToday=0; st.ema=0;
+    st.firstCustomer=null; st.closedDay=null;
+  }else{
+    for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++) MAP[site.r+dr][site.c+dc]=BUILDING;
+    st=newStruct(site.r, site.c, fp, typeIdx, day);
+    CITY.structs.push(st);
+    groundDirty=true;
+  }
+  st.state='construction';
+  st.founded=true;                    // 住民が建てた店 (創世からある建物と区別する)
+  // 工事中はゲーム内 CONSTRUCT_HOURS 時間。即座にポップさせないのは、
+  // カメラが寄る口実になり「街が育っている」ことが伝わるため。
+  st.doneAt=Date.now() + CONSTRUCT_HOURS*(DAY_MINUTES*60/24)*1000;
+  st.openedBy=founder?founder.aid:null;
+  if(founder){ founder.owns=[st.r,st.c]; founder.work=[st.r,st.c]; if(founder.unmetBy) founder.unmetBy[cat]=0; }
+  syncCity();
+  rebuildBuildings(MAP);              // 新しい建物セルを目的地候補に入れる
+  addStructMesh(scene, st);
+  // 需要を「消費」する。開店後はその一帯の人が D_OK 以内に店を持つので新たな需要は
+  // 積もらないが、**過去に積んだ熱は減衰待ちで残る**。消さないと同じ場所が数日
+  // 連続で最大スコアになり、隣に同種の店が建ち続ける (実測: 2日で薬局2軒)。
+  const D=CITY.demand[cat];
+  if(D){
+    for(let dr=-3;dr<=3;dr++)for(let dc=-3;dc<=3;dc++){
+      const nr=st.r+dr, nc=st.c+dc;
+      if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+      D[nr*GRID+nc]=0;
+    }
+    CITY.unmet[cat]*=0.4;             // 不満が解消に向かったぶんを差し引く
+  }
+  const label=BLDG_TYPES[typeIdx].label;
+  news('build', founder
+    ? `🚧 ${founder.name} が ${CAT_LABEL[cat]} の不足を見て ${label} を建てはじめた (${st.r},${st.c})`
+    : `🚧 ${CAT_LABEL[cat]} が足りなくなり ${label} の工事が始まった (${st.r},${st.c})`);
+  // 工事の箱が地面からせり上がり、その現場をカメラが映す。
+  //   以前は起業者本人にカメラを向けていたが、本人は街のどこかに居るので
+  //   肝心の工事現場が映らなかった。
+  showCityEvent(st.r, st.c, `${label} の工事が始まりました`, null, {st, kind:'rise'});
+  return st;
+}
+
+// カテゴリを1つ建てる。建てられたら struct、無理なら null。
+function foundCategory(cat, day){
+  const typeIdx=pickTypeFor(cat);
+  if(typeIdx==null) return null;
+  const fp=BLDG_TYPES[typeIdx].footprint;
+  const isNeed=CATS.includes(cat);
+  const scoreFn=isNeed ? ((r,c)=>siteScoreDemand(cat,r,c)+siteScoreGeneric(r,c)*0.2)
+                       : ((r,c)=>siteScoreGeneric(r,c));
+  const site=pickSite(day, fp, scoreFn);
+  if(!site) return null;
+  // 店主が付くのは商売だけ。住宅や職場に「店主」を付けると、その住民の勤務先が
+  // 住宅になってしまう (owns = 職場という扱いのため)。
+  const founder=isNeed ? pickFounder(cat) : null;
+  return foundShop(cat, site, typeIdx, founder, day);
+}
+
+// 1日ぶんの「1軒」を決める。優先順位は 住むところ → 働くところ → 商売。
+//   住居が足りないと人口が頭打ちになり、職場が足りないと働き口が無くなるので、
+//   生活の器のほうを先に建てる。商売は「未充足の需要が濃い場所」があるときだけ。
+function maybeFound(day){
+  const daySec=DAY_MINUTES*60;
+  const pop=agents.length;
+  const hcap=housingCapacity(), wcap=workplaceCapacity();
+  let workers=0; for(const a of agents) if(!a.owns) workers++;
+
+  if(pop >= hcap*HOME_PRESSURE && foundableTypes('home').length){
+    if(foundCategory('home', day)){
+      console.log(`[City] 住居が不足 (人口${pop}/定員${hcap}) → 住むところを建てた`);
+      return 1;
+    }
+  }
+  if(workers >= wcap*WORK_PRESSURE && foundableTypes('work').length){
+    if(foundCategory('work', day)){
+      console.log(`[City] 働き口が不足 (勤め人${workers}/定員${wcap}) → 働くところを建てた`);
+      return 1;
+    }
+  }
+  // 商売: 需要がいちばん濃い場所のスコアで発火を決める
+  let best=null;
+  const parts=[];
+  for(const cat of CATS){
+    const dg=CITY.diag[cat];
+    const avg=dg.n?(dg.sum/dg.n):0;
+    const types=foundableTypes(cat);
+    const site=types.length ? pickSite(day, 1, (r,c)=>siteScoreDemand(cat,r,c)) : null;
+    const score=site?site.score/daySec:0;               // agent-day 単位
+    parts.push(`${cat}:${score.toFixed(2)}(${catCount(cat)}軒 最寄り平均${avg.toFixed(1)}c 遠い${dg.n?Math.round(dg.far/dg.n*100):0}%)`);
+    if(site && (!best || score>best.score)) best={cat, score};
+  }
+  const L=levelSpec();
+  console.log(`[City] 起業の圧 ${parts.join(' ')} | 発火 ${FOUND_SITE} agent-day`
+    + ` | 人口${pop}/定員${hcap} 勤め人${workers}/定員${wcap} | ${L.name}(高さ≤${L.maxH}${L.fp2?' 2x2可':''})`);
+  if(!best || best.score<FOUND_SITE) return 0;
+  return foundCategory(best.cat, day) ? 1 : 0;
+}
+
+// ── フィールドの拡張 ────────────────────────────────────────────────────────
+//   街は GRID×GRID の内側の正方形だけを使う。**土地が足りなくなったら1リング広げる**。
+//   最初から広い野原があると「木しか無い場所」が目立つので、必要になってから現れる形にした。
+function buildableLots(){
+  const lo=fieldLo(), hi=fieldHi();
+  let n=0;
+  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++)
+    if(MAP[r][c]===OTHER && facesRoadOrBuilding(r,c,1)) n++;
+  return n;
+}
+
+// フィールドに占める建物セルの割合
+function fieldDensity(){
+  const lo=fieldLo(), hi=fieldHi();
+  let n=0;
+  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++) if(MAP[r][c]===BUILDING) n++;
+  return n/(fieldSize()*fieldSize());
+}
+
+function maybeExpand(day){
+  if(!CITY || CITY.size>=GRID) return 0;
+  const free=buildableLots(), dens=fieldDensity();
+  if(dens<EXPAND_DENSITY && free>EXPAND_FREE) return 0;
+  const base=makeMap(GRID, CITY.seed);        // 元の地形 (種から決定的に再生成できる)
+  const oldLo=fieldLo(), oldHi=fieldHi();
+  CITY.size=Math.min(GRID, CITY.size+EXPAND_STEP);
+  const lo=fieldLo(), hi=fieldHi();
+  let trees=0;
+  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++){
+    if(r>=oldLo&&r<=oldHi&&c>=oldLo&&c<=oldHi) continue;   // 既存部分は触らない
+    // 新しい土地は草地。元の地形の木を間引いて少しだけ生やす (一面の林にしない)
+    const wantTree = base[r][c]===TREE && EXPAND_TREES>0 && ((r*7+c*13)%EXPAND_TREES===0);
+    MAP[r][c]= wantTree ? TREE : OTHER;
+    if(wantTree){ addTreeMesh(scene, r, c); trees++; }
+  }
+  groundDirty=true;
+  rebuildBuildings(MAP);
+  console.log(`[City] フィールド拡張 ${oldHi-oldLo+1} → ${CITY.size}`
+    + ` (建て込み ${(dens*100).toFixed(0)}% / 空き区画${free} / 木+${trees})`);
+  news('expand', `🌱 街の範囲が広がった (${CITY.size}×${CITY.size})`);
+  showCityEvent(Math.round((lo+hi)/2), Math.round((lo+hi)/2),
+    `街の範囲が広がりました (${CITY.size}×${CITY.size})`, 9, null, {wide:true});
+  return 1;
+}
+
+// ── 転入 ────────────────────────────────────────────────────────────────────
+//   住居の定員に空きがあるぶんだけ人が増える。**家が建つ → 人が来る → 需要が増える →
+//   店が建つ → 経済が回る → 高い建物が解禁される** の輪をここで閉じる。
+function growPopulation(day){
+  if(!scene || !CITY) return 0;
+  const cap=Math.min(NUM_AGENTS, housingCapacity());
+  const room=cap-agents.length;
+  if(room<=0) return 0;
+  const n=Math.max(1, Math.min(room, MOVEIN_MAX, Math.ceil(agents.length*POP_GROWTH)));
+  const base=agents.length;
+  for(let k=0;k<n;k++) spawnAgent(scene, base+k);
+  assignHomes();
+  for(let k=0;k<n;k++) settleAgent(agents[base+k]);
+  CITY.pop=agents.length;
+  news('pop', `🚶 ${n}人が引っ越してきた (人口 ${agents.length} / 住居の定員 ${cap})`);
+  return n;
+}
+
+// 工事の完了 (1秒ごとに確認)。落ちている間に完了予定を過ぎたぶんもここで開く。
+function finishConstruction(){
+  if(!CITY) return;
+  const now=Date.now();
+  for(const st of CITY.structs){
+    if(st.state!=='construction' || !st.doneAt || now<st.doneAt) continue;
+    st.state='open'; st.doneAt=null;
+    CITY.stats.shopsOpened++;
+    syncCity(); addStructMesh(scene, st);
+    const owner=st.openedBy?agents.find(a=>a.aid===st.openedBy):null;
+    const label=BLDG_TYPES[st.typeIdx].label;
+    news('open', `${label} が開店しました (${st.r},${st.c})`
+      + (owner?` — 店主 ${owner.name}`:''));
+    // 工事の箱と入れ替わりに、本物の建物が地面からせり上がる
+    showCityEvent(st.r, st.c, (owner?`${owner.name} の `:'') + `${label} が建ちました`,
+                  null, {st, kind:'rise'});
+  }
+}
+
+// ── 機能C: 店の盛衰 ────────────────────────────────────────────────────────
+function rolloverVisits(){
+  for(const st of CITY.structs){
+    if(st.state==='open') st.ema = st.ema*0.7 + st.visitsToday*0.3;
+    st.visitsToday=0;
+  }
+}
+const catOfType = t => CATS.find(c => (CAT_IDX[c]||[]).includes(t));
+
+function closeShop(st, day){
+  st.state='closed'; st.closedDay=day; st.ema=0;
+  CITY.stats.shopsClosed++;
+  syncCity(); addStructMesh(scene, st);
+  const label=BLDG_TYPES[st.typeIdx].label;
+  for(const a of agents){
+    if(a.owns && a.owns[0]===st.r && a.owns[1]===st.c){
+      a.owns=null;                                  // 店主は職を失い、また勤め人に戻る
+      const works=buildingsOfTypes(WORK_IDX);
+      a.work = works.length ? [...works[Math.floor(Math.random()*works.length)]] : null;
+      news('close', `🚪 ${a.name} の ${label} が閉店しました (${st.r},${st.c})`);
+      showCityEvent(st.r, st.c, `${a.name} の ${label} が閉店しました`, 7);
+      return;
+    }
+  }
+  news('close', `🚪 ${label} (${st.r},${st.c}) が閉店しました`);
+  showCityEvent(st.r, st.c, `${label} が閉店しました`, 7);
+}
+
+// 閉店の判定は「同業の平均と比べて客が来ていない店」。絶対値だとエージェント数で
+// 意味が変わって調整不能になる (踏み跡を日次ランキングにしたのと同じ理由)。
+//   中央値ではなく平均を使う: 店数がエージェント数に対して多いと半数以上が来客ゼロで
+//   中央値が 0 になり、`ema < 中央値×0.25` が永久に成立しなくなる (= 一軒も潰れない)。
+//   平均なら「誰かが来ている限り」死に店を拾える。逆に来客が均等に散っていれば
+//   平均の 25% を下回る店が無くなり、閉店は自然に止まる。
+function maybeClose(day){
+  const open=CITY.structs.filter(st=>st.state==='open' && isClosable(st.typeIdx));
+  const cands=open.filter(st=>(day-st.born)>=GRACE_DAYS && catCount(catOfType(st.typeIdx))>MIN_PER_CAT);
+  if(!cands.length) return 0;
+  cands.sort((a,b)=>a.ema-b.ema);
+  let closed=0;
+  for(const st of cands){
+    if(closed>=CLOSE_PER_DAY) break;
+    const cat=catOfType(st.typeIdx);
+    const peers=open.filter(o=>catOfType(o.typeIdx)===cat).map(o=>o.ema);
+    const mean=peers.length?peers.reduce((x,y)=>x+y,0)/peers.length:0;
+    if(mean<=0 || st.ema>=mean*CLOSE_FRAC) continue;
+    closeShop(st, day); closed++;
+  }
+  return closed;
+}
+
+// 閉店したまま DEMOLISH_DAYS 経った建物は取り壊して空き地に戻す。
+// また誰かが建てられる = 建物のレベルで生死が回る。
+// 取り壊しは「沈みきってから」地面と一覧を書き換える。先に空き地にしてしまうと
+// 建物がまだ立っているのに人がすり抜けて見える。
+function finishDemolish(st){
+  for(let dr=0;dr<st.fp;dr++)for(let dc=0;dc<st.fp;dc++){
+    if(st.r+dr<GRID && st.c+dc<GRID) MAP[st.r+dr][st.c+dc]=OTHER;
+  }
+  removeStructMesh(scene, st);
+  st.state='gone';
+  CITY.structs=CITY.structs.filter(x=>x.state!=='gone');
+  syncCity(); rebuildBuildings(MAP); groundDirty=true;
+}
+
+function maybeDemolish(day){
+  let n=0;
+  for(const st of CITY.structs){
+    if(st.state!=='closed' || st.closedDay==null) continue;
+    if(day-st.closedDay < DEMOLISH_DAYS) continue;
+    const label=BLDG_TYPES[st.typeIdx].label;
+    st.state='demolishing';        // 目的地には選ばれない / まだ通行不可のまま
+    n++; CITY.stats.demolished++;
+    news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`);
+    showCityEvent(st.r, st.c, `${label} がなくなりました`, null,
+                  {st, kind:'sink', onDone:()=>finishDemolish(st)});
+  }
+  return n;
+}
+
+// ── 機能D: 初回性 ──────────────────────────────────────────────────────────
+// 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
+function onArrive(a, dest){
+  a.trips++;
+  if(!CITY_EVOLVE || !CITY || !dest) return;
+  const st=structAt(dest[0], dest[1]);
+  if(!st) return;
+  if(st.state==='open'){
+    st.visits++; st.visitsToday++;
+    // 経済活動 = 店/施設への来店の累計。これが溜まると発展段階が上がる
+    if(CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(st.typeIdx))) CITY.econ++;
+    if(!st.firstCustomer){
+      st.firstCustomer=a.aid;
+      // 「最初の客」は店/施設だけ。住宅や職場に客は来ない (「住宅の最初の客」になってしまう)
+      if(st.founded && CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(st.typeIdx)))
+        news('first', `🎉 ${a.name} が新しい ${BLDG_TYPES[st.typeIdx].label} の最初の客になった`);
+    }
+  }
+  const bit=1<<st.typeIdx;                       // typeIdx < 25 なのでビット演算で足りる
+  if(!((a.seenMask||0)&bit)){
+    a.seenMask=(a.seenMask||0)|bit;
+    if(st.state==='open' && Date.now()-_lastFirstNews>FIRST_NEWS_COOLDOWN_MS){
+      _lastFirstNews=Date.now();
+      news('first', `${a.name} が初めて ${BLDG_TYPES[st.typeIdx].label} に入った`);
+    }
+  }
+}
+
+// ── 日次のまとめ ───────────────────────────────────────────────────────────
+function dailyRollover(day){
+  if(!CITY || !CITY_EVOLVE) return;
+  const t0=Date.now();
+  rolloverVisits();                       // 先に EMA を更新してから閉店判定する
+  const roads=promoteFootpaths(day);
+  const grown=maybeExpand(day);           // 土地が足りなければ先にフィールドを広げる
+  const closed=maybeClose(day);
+  const gone=maybeDemolish(day);
+  // 1日に建てられる軒数は人口に比例させる。人が増えるほど街が速く育つ (複利)。
+  const budget=Math.max(1, Math.min(6, 1+Math.floor(agents.length/FOUND_PER_POP)));
+  let opened=0;
+  while(opened<budget && maybeFound(day)) opened++;
+  const moved=growPopulation(day);              // 住居に空きがあれば人が引っ越してくる
+  // 発展段階が上がったか (経済活動の累計で決まる)
+  const lv=cityLevel();
+  if(lv>(CITY.level||0)){
+    CITY.level=lv;
+    const L=CITY_LEVELS[lv];
+    news('level', `🏙 この街は「${L.name}」になった (経済活動 ${Math.round(CITY.econ)})`);
+    let sr=0, sc=0, n=0;
+    for(const st of CITY.structs) if(st.state==='open'){ sr+=st.r; sc+=st.c; n++; }
+    showCityEvent(n?Math.round(sr/n):GRID/2, n?Math.round(sc/n):GRID/2,
+      `この街は ${L.name} になりました`, 10, null, {wide:true});
+  }
+  // 需要の減衰。昨日の不満をいつまでも持ち越すと、供給が足りた後も起業が続く。
+  for(const cat of CATS){
+    CITY.unmet[cat]*=DEMAND_DECAY;
+    const D=CITY.demand[cat];
+    for(let i=0;i<D.length;i++) D[i]*=DEMAND_DECAY;
+  }
+  for(const a of agents) if(a.unmetBy) for(const k in a.unmetBy) a.unmetBy[k]*=DEMAND_DECAY;
+  CITY.diag=freshDiag();
+  const open=CITY.structs.filter(s=>s.state==='open').length;
+  console.log(`[City] ═══ Day ${day+1} ═══ 道+${roads} 建設+${opened} 閉店+${closed} 取壊+${gone} 転入+${moved}`
+    + `${grown?` 拡張→${CITY.size}`:''}`
+    + ` | 人口${agents.length} 建物${CITY.structs.length}軒(営業${open}) ${levelSpec().name}(経済${Math.round(CITY.econ)})`
+    + ` 累計 道${CITY.stats.roadsBorn}/開業${CITY.stats.shopsOpened}/閉店${CITY.stats.shopsClosed}`
+    + ` (${Date.now()-t0}ms)`);
+  saveCity();
+}
+
+// 1秒ごと: 日付の切り替わりを検出して日次処理を1回だけ走らせる + 工事の完了確認
+function cityTick(){
+  if(!CITY) return;
+  const d=gameDay();
+  if(_lastDay===null) _lastDay=d;
+  else if(d!==_lastDay){ _lastDay=d; dailyRollover(d); }
+  finishConstruction();
+}
 
 // ═══ 行動モード A/B ══════════════════════════════════════════════════════════
 // ポリシー本体は A/B で共通。違いは「compass が指す (gx,gy) と z を誰が決めるか」だけ。
@@ -1615,8 +2890,11 @@ function planPath(sr, sc, gr, gc){
 // そのタイプの建物を「近い方から k 軒」の中からランダムに選ぶ。現在地の隣は除外。
 function pickBuildingOfType(a, T, k=NAV_PICK_K){
   const ar=Math.floor(a.x), ac=Math.floor(a.y);
-  const cands=BUILDINGS.filter(b=>(BUILDING_TYPES[b[0]+'_'+b[1]]||0)===T
-    && (Math.abs(b[0]-ar)>1 || Math.abs(b[1]-ac)>1));
+  const cands=BUILDINGS.filter(b=>{
+    const st=structAt(b[0],b[1]);
+    return st && st.state==='open' && st.typeIdx===T
+      && (Math.abs(b[0]-ar)>1 || Math.abs(b[1]-ac)>1);
+  });
   if(!cands.length) return null;
   cands.sort((p,q)=>((p[0]+0.5-a.x)**2+(p[1]+0.5-a.y)**2)-((q[0]+0.5-a.x)**2+(q[1]+0.5-a.y)**2));
   const pool=cands.slice(0, Math.min(k, cands.length));
@@ -1691,10 +2969,17 @@ function stepNavigate(a){
   // 学習側の「z-set = 目標追従レジーム(探索報酬を止め接近報酬を優先)」に一致させ、
   // compass の先読み点を確実に追わせる。道中で z=0 に落とすと徘徊レジームに戻り目的地へ向かわない。
   applyGoalZ(a);
-  // 到着判定は「最後のウェイポイント」でだけ行う (途中の点では trips を数えない)
+  // 到着判定は「最後のウェイポイント」でだけ行う (途中の点では trips を数えない)。
+  //   ALIGNED では建物セルに立てないので、玄関 (4近傍) に着いた時点で到着とする。
+  //   従来の「建物中心まで 0.8」判定のままだと、玄関で止まった人は中心まで 1.0 の
+  //   ところで前進を拒否され、永久に到着しないまま足踏みする (実測: 60秒で到着1回)。
+  //   world.js に MW.hasArrived が用意されていたのに呼ばれていなかった。
   const last=a.path[a.path.length-1];
   const dlast=Math.hypot(a.x-(last[0]+0.5), a.y-(last[1]+0.5));
-  if(a.pathIdx>=a.path.length-1 && dlast<0.8) return true;
+  const atGoal = (WORLD.solidBuildings && MAP[last[0]][last[1]]===BUILDING)
+    ? MW.hasArrived(WORLD, Math.floor(a.x), Math.floor(a.y), last[0], last[1])
+    : dlast<0.8;
+  if(a.pathIdx>=a.path.length-2 && atGoal) return true;
   // 詰まったら引き直す (反応型ポリシーは経路から外れることがある)
   if(a.stall>=REPLAN_STALL){
     const p=planPath(Math.floor(a.x), Math.floor(a.y), last[0], last[1]);
@@ -1719,44 +3004,80 @@ function disposeMesh(m){
   });
 }
 
+// 表示名。ペルソナを使い回すので、同じ名前の住民には通し番号を振る。
+function agentDisplayName(i, def){
+  return (NUM_AGENTS>PERSONA_DEFS.length)
+    ? `${def.name} #${Math.floor(i/PERSONA_DEFS.length)+1}` : def.name;
+}
+
+// 住民を1人ぶん作る (転入でも使う)。i は通し番号で、aid と表示名を決める。
+function spawnAgent(S, i){
+  const def=PERSONA_DEFS[i % PERSONA_DEFS.length];
+  const b=randB(null), g=randB(b);
+  const a={aid:`${def.id}#${i}`, name:agentDisplayName(i,def),
+    x:b[0]+0.5, y:b[1]+0.5, th:Math.random()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
+    trips:0, viols:0, steps:0, stall:0, def, trail:[], active:true,
+    visited:new Set(), explored:0, visMem:new Map(),
+    // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
+    mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
+    personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
+    // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
+    home:null, work:null, needIcon:null,
+    // 街の進化: 訪問済み建物タイプのビット / 自分の店 / カテゴリ別の不満寄与
+    seenMask:0, owns:null, unmetBy:null,
+    // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
+    indoors:null,
+    hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
+    supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0};
+  agents.push(a);
+  agentMeshes.push(createAgentMesh(S, def.color));
+  return a;
+}
+
+// 住民をその家に入れて一日を始めさせる。
+function settleAgent(a){
+  if(!a.home){
+    // 住むところが無い (住居ゼロなど異常時)。建物セルの中に置くと二度と動けないので、
+    // 通れるセルへ逃がす。
+    const b=BUILDINGS.length?MW.doorCell(MAP, WORLD, BUILDINGS[0][0], BUILDINGS[0][1]):null;
+    if(b){ a.x=b[0]+0.5; a.y=b[1]+0.5; enterWander(a); }
+    return;
+  }
+  a.fatigue=Math.random()*0.15;
+  if(WORLD.solidBuildings){
+    MW.enterBuilding(a, a.home[0], a.home[1]);
+  }else{
+    a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
+    a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
+    enterWander(a);
+  }
+}
+
 function initAgents(S){
   // 既存エージェント/トレイルのメッシュを scene から外し GPU リソースを解放
   agentMeshes.forEach(m=>{S.remove(m);disposeMesh(m);});
   agents.forEach(a=>{a.trail.forEach(m=>S.remove(m));});  // trail geo/mat は共有なので dispose しない
   agents=[];agentMeshes=[];
-  // NUM_AGENTS 体を生成。ペルソナ数を超える場合は一覧を巡回して割り当て、aid で個体を一意化する。
-  for(let i=0;i<NUM_AGENTS;i++){
-    const def=PERSONA_DEFS[i % PERSONA_DEFS.length];
-    const b=randB(null),g=randB(b);
-    // solidBuildings では建物セルに立てないが、直後の initAgents で
-    // enterBuilding により屋内へ移すので、ここは仮置きで良い。
-    agents.push({aid:`${def.id}#${i}`,x:b[0]+0.5,y:b[1]+0.5,th:Math.random()*Math.PI*2,gx:g[0]+0.5,gy:g[1]+0.5,trips:0,viols:0,steps:0,stall:0,def,trail:[],active:true,visited:new Set(),explored:0,visMem:new Map(),
-      // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
-      mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
-      personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
-      // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
-      home:null, work:null, needIcon:null,
-      // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
-      // 屋内は物理と方策の外: 推論・移動・obstacle をスキップし描画も隠す。
-      indoors:null,
-      hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
-      supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0});
-    agentMeshes.push(createAgentMesh(S,def.color));
-  }
-  assignHomes();         // 拠点(自宅/職場)を決定的に割当 (再起動しても同じ住所)
-  // 自宅から一日を始める。夜間起動でも「家に居るのに眠くて彷徨う」不自然さを避ける。
-  //   自宅セル中心だと同居人が完全に重なるので、わずかにばらけさせる。
-  for(const a of agents){
-    if(!a.home) continue;
-    a.fatigue=Math.random()*0.15;          // 起床直後 = 疲労は低い
-    if(WORLD.solidBuildings){
-      MW.enterBuilding(a, a.home[0], a.home[1]);   // 自宅の中から一日を始める
-    }else{
-      a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
-      a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
-      enterWander(a);                       // 行き先を決めて A* 経路を引く
+  // 最初の人口。村から始める場合は START_POP から、以降は住居が建つたびに増える。
+  // 保存された街を復元するときはその人口から再開する。
+  const startPop=Math.max(1, Math.min(NUM_AGENTS,
+    (CITY && CITY.pop) ? CITY.pop : (START_VILLAGE ? START_POP : NUM_AGENTS)));
+  for(let i=0;i<startPop;i++) spawnAgent(S, i);
+  // 保存されていた「訪問済みタイプ」と「自分の店」を先に復元する。
+  // assignHomes は owns を見て職場を決めるので、順序を逆にすると店主が職を失う。
+  if(CITY && CITY.savedAgents){
+    let restored=0;
+    for(const a of agents){
+      const sv=CITY.savedAgents[a.aid]; if(!sv) continue;
+      a.seenMask=sv.m||0;
+      if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
     }
+    if(restored) console.log(`[City] 店主 ${restored}人の職場を復元`);
   }
+  assignHomes();         // 空きのある住居/職場へ割り当てる
+  // 自宅から一日を始める。夜間起動でも「家に居るのに眠くて彷徨う」不自然さを避ける。
+  for(const a of agents) settleAgent(a);
+  if(CITY) CITY.pop=agents.length;
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
 }
@@ -1870,6 +3191,9 @@ async function stepAll(){
       if(passable){
         a.x=nx;a.y=ny;
         const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
+        // 踏み跡: 空き地を踏んだ回数を数える。よく踏まれた空き地は日次で道になる。
+        // 道路の上の足跡は数えない (既に道なので情報が無い)。
+        if(CITY_EVOLVE && CITY && MAP[r][c]===OTHER) CITY.foot[r*GRID+c]++;
         addTrail(scene,a);
       }else a.viols++;
     }
@@ -1884,7 +3208,7 @@ async function stepAll(){
     if(a.mode==='navigate'){
       // B: 経路上の先読み点を追う。最終目的地に着いたら A(自由) に戻す。
       if(stepNavigate(a)){
-        a.trips++;
+        onArrive(a, a.navDest);
         // 到着 = 玄関に着いた。建物の中へ入る (滞在は屋内状態が担う)。
         if(WORLD.solidBuildings && a.navDest) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
         if(a.rally) a.mode='hold';   // rally: 集合点に到着したら静止 (解除は /rally?off=1)
@@ -1895,12 +3219,12 @@ async function stepAll(){
       a.goalZ=null;
       if(a.path){
         if(stepNavigate(a)){
-          a.trips++;
+          onArrive(a, a.navDest);
           if(WORLD.solidBuildings && a.navDest) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
           if(!MW.isIndoors(a)) enterWander(a);   // 到着 → 次の行き先を選び直す
         }
       }else{
-        if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){ a.trips++; enterWander(a); }  // 経路なし=直線fallback
+        if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){ onArrive(a, null); enterWander(a); }  // 経路なし=直線fallback
       }
     }
   }
@@ -1914,7 +3238,7 @@ function handleCommand(msg){
     case 'newmap': {
       const oldScene=scene;
       MAP=makeMap(GRID,Math.floor(Math.random()*100000));
-      rebuildBuildings(MAP);
+      resetCity(true);           // 新しい街 = 蓄積もゼロから (buildScene は CITY を読む)
       scene=buildScene(MAP);
       // 古いシーン (建物/道路/エージェント/トレイル) の GPU リソースを解放
       disposeScene(oldScene);
@@ -2097,10 +3421,15 @@ function shutdownYt(sig, done){
   setTimeout(()=>{ try { child.kill('SIGKILL'); } catch(_){}; if (done) done(); }, 5000);
 }
 
-if (YT_ENABLED) {
-  process.on('SIGTERM', ()=>shutdownYt('SIGTERM', ()=>process.exit(0)));
-  process.on('SIGINT',  ()=>shutdownYt('SIGINT',  ()=>process.exit(0)));
+// 終了シグナルでは街の状態を必ず保存してから落ちる (再デプロイで蓄積を失わないため)。
+// 以前は YT_ENABLED のときだけハンドラを張っていたので、WebSocket 運用では
+// 何も後始末されずに落ちていた。
+function shutdownAll(sig){
+  try{ saveCity(); console.log(`[City] ${sig}: 街の状態を保存しました`); }catch(e){ console.warn(e.message); }
+  shutdownYt(sig, ()=>process.exit(0));
 }
+process.on('SIGTERM', ()=>shutdownAll('SIGTERM'));
+process.on('SIGINT',  ()=>shutdownAll('SIGINT'));
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
@@ -2156,11 +3485,29 @@ function pickCameraTarget() {
 }
 
 function updateTrackingCamera(cam) {
+  // 街のイベント (着工/完成/閉店/取り壊し) の最中は、人ではなくその場所を映す。
+  const ev = stepCamEvents();
+  if (ev) {
+    const tx = ev.c*CELL + CELL*.5, ty = ev.r*CELL + CELL*.5;
+    const t  = (Date.now()-ev.t0)/(ev.secs*1000);           // 0→1
+    const ang = (t-0.5)*0.8;                                 // ゆっくり回り込む
+    // 寄りの画。建物がフレームに大きく入るよう、低め・近めに構える。
+    // wide のときは街全体が入るところまで引く (発展段階が上がった瞬間など)。
+    const dist = ev.wide ? fieldSize()*CELL*0.55 : CELL*4.2;
+    const hgt  = ev.wide ? fieldSize()*CELL*0.50 : CELL*2.6;
+    cam.up.set(0, 0, 1);
+    cam.position.set(tx + Math.sin(ang)*dist, ty - Math.cos(ang)*dist, hgt);
+    cam.lookAt(tx, ty, ev.wide ? CELL*2 : CELL*0.7);
+    camSwitchTimer = Date.now();     // イベント明けに即切り替わらないように
+    camFPV = false;
+    return;
+  }
   pickCameraTarget();
   if (camTargetIdx === 0 || agents.length === 0) {
+    const fx=fieldCenterW(), fs=fieldSize()*CELL;
     cam.up.set(0, 1, 0);
-    cam.position.set(W*.5, W*.5, W*0.75);
-    cam.lookAt(W*.5, W*.5 + 1, 0);
+    cam.position.set(fx, fx, fs*0.75);
+    cam.lookAt(fx, fx + 1, 0);
   } else {
     const a = agents[camTargetIdx - 1];
     if (!a) return;
@@ -2387,6 +3734,104 @@ tick(); setInterval(tick, ${ms});
   }
 
   // ── 生活状態の可視化: 時刻 / 各エージェントの拠点・空腹・疲労・いまの欲求 ──
+  // ── /city : 街の蓄積 (経過日数 / 道 / 開業・閉店 / 需要 / ニュース) ──
+  //   /city            いまの街の状態
+  //   /city?reset=1    蓄積を捨てて街を作り直す (マップはそのまま)
+  if(urlPath==='/city'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!CITY){ res.writeHead(503); res.end(JSON.stringify({ok:false,error:'city not ready'})); return; }
+    if(q.get('reset')==='1'){
+      resetCity(false);
+      if(scene){
+        const old=scene;
+        scene=buildScene(MAP);
+        disposeScene(old);
+        PERSONA_DEFS.forEach(p=>{trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});});
+        initAgents(scene);
+      }
+      res.writeHead(200); res.end(JSON.stringify({ok:true, reset:true, day:gameDay()+1})); return;
+    }
+    // 演出の確認用: 日付が変わるのを待たずに1件だけ起こす。
+    //   /city?force=found     … いま需要が最大の場所に着工させる
+    //   /city?force=close     … 来客が最少の店を閉店させる
+    //   /city?force=demolish  … 閉店中の店を1軒その場で取り壊す (沈むアニメ)
+    const force=q.get('force');
+    if(force){
+      const day=gameDay();
+      let done=null;
+      if(force==='found'){
+        // 閾値を無視して1軒建てる。カテゴリ指定も可 (/city?force=found&cat=home)
+        const want=q.get('cat');
+        const cats=want?[want]:BUILD_CATS;
+        for(const cat of cats){
+          const st=foundCategory(cat, day);
+          if(st){ done=`found ${BLDG_TYPES[st.typeIdx].name} at ${st.r},${st.c}`; break; }
+        }
+      }else if(force==='close'){
+        const cands=CITY.structs.filter(x=>x.state==='open' && isClosable(x.typeIdx))
+                                .sort((a,b)=>a.ema-b.ema);
+        if(cands[0]){ closeShop(cands[0], day); done=`closed ${cands[0].r},${cands[0].c}`; }
+      }else if(force==='demolish'){
+        const st=CITY.structs.find(x=>x.state==='closed');
+        if(st){
+          st.state='demolishing'; CITY.stats.demolished++;
+          const label=BLDG_TYPES[st.typeIdx].label;
+          news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`);
+          showCityEvent(st.r, st.c, `${label} がなくなりました`, null,
+                        {st, kind:'sink', onDone:()=>finishDemolish(st)});
+          done=`demolishing ${st.r},${st.c}`;
+        }
+      }
+      res.writeHead(done?200:409);
+      res.end(JSON.stringify({ok:!!done, force, result:done||'対象が見つからない'}));
+      return;
+    }
+    const fmt=st=>({type:BLDG_TYPES[st.typeIdx].name, label:BLDG_TYPES[st.typeIdx].label,
+      cell:[st.r,st.c], state:st.state, born:st.born+1, visits:st.visits,
+      ema:+st.ema.toFixed(1), owner:st.openedBy});
+    const open=CITY.structs.filter(s=>s.state==='open');
+    const foot=[];
+    for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
+      if(MAP[r][c]===OTHER && CITY.foot[r*GRID+c]>0) foot.push({cell:[r,c], foot:CITY.foot[r*GRID+c]});
+    foot.sort((a,b)=>b.foot-a.foot);
+    const h=gameHour();
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, evolve:CITY_EVOLVE,
+      day:gameDay()+1, time:`${String(Math.floor(h)).padStart(2,'0')}:${String(Math.floor(h%1*60)).padStart(2,'0')}`,
+      ageHours:+((Date.now()-CITY.bornAt)/3600000).toFixed(1),
+      stats:CITY.stats,
+      buildings:{total:CITY.structs.length, open:open.length,
+        construction:CITY.structs.filter(s=>s.state==='construction').length,
+        closed:CITY.structs.filter(s=>s.state==='closed').length},
+      field:{size:CITY.size, max:GRID, freeLots:buildableLots(),
+        density:+fieldDensity().toFixed(3), expandAt:{density:EXPAND_DENSITY, freeLots:EXPAND_FREE}},
+      level:{index:cityLevel(), name:levelSpec().name, econ:Math.round(CITY.econ),
+        maxHeight:levelSpec().maxH, fp2:levelSpec().fp2,
+        next:CITY_LEVELS[cityLevel()+1]?{name:CITY_LEVELS[cityLevel()+1].name,
+          econ:CITY_LEVELS[cityLevel()+1].econ}:null},
+      population:{now:agents.length, cap:housingCapacity(), max:NUM_AGENTS,
+        workCap:workplaceCapacity(),
+        homeless:agents.reduce((n,a)=>n+(a.home?0:1),0),
+        homes:openStructsOf(HOME_IDX).map(st=>({label:BLDG_TYPES[st.typeIdx].label, cell:[st.r,st.c],
+          cap:homeCapOf(st.typeIdx),
+          residents:agents.reduce((n,a)=>n+((a.home&&a.home[0]===st.r&&a.home[1]===st.c)?1:0),0)}))},
+      demand:Object.fromEntries(CATS.map(c=>{
+        const dg=CITY.diag[c];
+        return [c,{unmet:+CITY.unmet[c].toFixed(1), supply:catCount(c),
+          avgDist:dg.n?+(dg.sum/dg.n).toFixed(1):null, farPct:dg.n?Math.round(dg.far/dg.n*100):0,
+          foundable:foundableTypes(c).map(t=>BLDG_TYPES[t].name)}];
+      })),
+      buildable:Object.fromEntries(BUILD_CATS.map(c=>[c, foundableTypes(c).map(t=>BLDG_TYPES[t].name)])),
+      foundThreshold:FOUND_SITE,
+      newest:CITY.structs.filter(s=>s.founded).sort((a,b)=>b.born-a.born).slice(0,10).map(fmt),
+      busiest:open.slice().sort((a,b)=>b.visits-a.visits).slice(0,10).map(fmt),
+      atRisk:open.filter(s=>isClosable(s.typeIdx)).sort((a,b)=>a.ema-b.ema).slice(0,5).map(fmt),
+      footTop:foot.slice(0,10), roadThreshold:FOOT_MIN,
+      news:latestNews(30).reverse()}));
+    return;
+  }
+
   if(urlPath==='/life'){
     res.setHeader('Content-Type','application/json');
     const h=gameHour();
@@ -2416,7 +3861,7 @@ tick(); setInterval(tick, ${ms});
       residents:agents.map(a=>{
         const need=needOf(a);
         return {
-          id:a.aid, name:a.def.name, personaType:a.def.id, personaDesc:a.def.desc, color:a.def.hex,
+          id:a.aid, name:a.name||a.def.name, personaType:a.def.id, personaDesc:a.def.desc, color:a.def.hex,
           need, needEmoji:NEED_EMOJI[need]||null, needLabel:need?(NEED_LABEL_JA[need]||need):'元気',
           activity: describeActivity(a),
           pos:[+a.x.toFixed(1),+a.y.toFixed(1)]
@@ -2574,7 +4019,7 @@ async function simLoop(){
 }
 
 // render + JPEG 配信ループ
-let frameCount=0, encoding=false;
+let frameCount=0, encoding=false, _groundAt=0;
 async function renderLoop(){
   if(!scene) return;          // ★ scene null ガード (二重保険)
   if(encoding) return;
@@ -2599,11 +4044,22 @@ async function renderLoop(){
       m.rotation.z+=dr*Math.min(1,dt*14);
     });
 
+    stepStructAnims();            // 建物のせり上がり / 沈み込み
+    // 地面の板 (道路 / 摩耗) を作り直す。道が増えたとき (groundDirty) は即、
+    // 踏み跡の濃淡は上位%で決まるので 20 秒ごとにゆっくり追従させる。
+    if((groundDirty || Date.now()-_groundAt>20000) && Date.now()-_groundAt>3000){
+      groundDirty=false; _groundAt=Date.now(); rebuildGround(scene);
+    }
     updateTrackingCamera(mainCam);
     updateOcclusionFade();
     updateDayNight(scene);        // 時刻で空と光を変える
     updateNeedIcons(mainCam);     // 欲求アイコン (空腹/眠気/勤務) を頭上に
+    // 3D を描いてから HUD (Day/ティッカー) を正射影で重ねる。
+    // autoClear を切るので、色バッファは自分で clear する必要がある。
+    renderer.autoClear=false;
+    renderer.clear();
     renderer.render(scene, mainCam);
+    if(hudScene){ updateHud(dt); renderer.clearDepth(); renderer.render(hudScene, hudCam); }
     frameCount++;
 
     // WebSocket 視聴者も YouTube 配信も無ければ読み出し/エンコード自体を省略
@@ -2632,8 +4088,13 @@ async function renderLoop(){
 // stats ブロードキャスト
 function statsLoop(){
   if(clients.size===0) return;
-  const camName = camTargetIdx === 0 ? 'overview' : (agents[camTargetIdx-1]?.def.name || '-');
-  const msg=JSON.stringify({type:'stats', camName, agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
+  // 街のできごとを映している間は、その一言をカメラ名として出す (人を追っていないため)
+  const camName = camEventCur ? camEventCur.banner
+                : camTargetIdx === 0 ? 'overview'
+                : (agents[camTargetIdx-1]?.name || '-');
+  const msg=JSON.stringify({type:'stats', camName,
+    day:gameDay()+1, news:latestNews(5).reverse().map(n=>({day:n.day+1, kind:n.kind, text:n.text})),
+    agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
   for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}
 }
 
@@ -2648,6 +4109,10 @@ function startLoops(){
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
   setInterval(()=>{ stepNeeds(1); retargetOnNeedChange(); }, 1000);   // 空腹/疲労の進行と行き先の見直し
+  if(CITY_EVOLVE){
+    setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
+    setInterval(saveCity, Math.max(10,CITY_SAVE_SEC)*1000);           // 街の状態を定期保存
+  }
   if(YT_ENABLED){
     // 固定レートで ffmpeg へ送出 (renderLoop の出来に依存させない)
     setInterval(ytPumpTick,  Math.max(1, Math.round(1000/FPS)));
@@ -2670,8 +4135,11 @@ function startLoops(){
   await loadRaycastTextures();   // エージェント観測(FPV)用の64×64テクスチャ
   await buildNeedIcons();        // 頭上の欲求アイコン(絵文字)をテクスチャ化
 
+  console.log('[Init] restoring city state...');
+  initCity();                    // 保存された街を復元 (無ければ生成)。MAP を差し替えることがある
   console.log('[Init] building scene...');
   scene = buildScene(MAP);
+  await initHud();               // 配信画面の Day カウンタ / ニュースティッカー
 
   PERSONA_DEFS.forEach(p=>{
     trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
