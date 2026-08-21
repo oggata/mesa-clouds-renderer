@@ -239,6 +239,9 @@ data/
 | `WORLD_ALIGNED` | 1 | 空き地を通行可能・建物を通行不可にする。`0` で従来の LEGACY |
 | `CITY_EVOLVE` | 1 | 街の進化（踏み跡→道 / 起業 / 閉店）。`0` で無効 |
 | `HUD` | 1 | 配信画面の Day カウンタとニュースティッカー。`0` で無効 |
+| `NEED_ICONS` | 0 | 頭上の欲求アイコン（絵文字）。分かりにくいので既定は非表示。`1` で復活 |
+| `CHAT_CMD` | 1 | 配信チャットからの指示（`!focus <名前>` でカメラ指名）。`0` で無効 |
+| `YT_CHAT` | 0 | `1` で YouTube ライブチャットを取り込む（`YT_API_KEY` / `YT_VIDEO_ID` が必要） |
 
 街の進化まわりの設定は数が多いので **[docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §8** にまとめてあります。
 
@@ -307,6 +310,13 @@ webrtc-version/      WebRTC 配信版（別実装）
   - 配信画面に `DAY 47 12:34` / `POP 34 TOWN SUNNY` とニュースティッカーを描画
     （焼き込む文字は ASCII のみ。Linux に日本語フォントが無くても豆腐にならない。
     ログと `/city` は日本語のまま）
+  - ティッカーは「街のできごと」と「住民のいまの様子」を交互に流す
+    （`Lily #2 is sleepy and heading home` / `Rex #3 fell ill and is heading to a Pharmacy`）
+- **配信チャットからカメラ指名**：視聴者が `!focus rex` と書くと10秒そのキャラを追い、
+  画面に `Camera: Explorer Rex #1 (by 視聴者名)` と出る。入口は `/chat` に統一してあり、
+  YouTube 直取り込み（`YT_CHAT=1`、Data API のクォータ上 45秒間隔が上限）でも、
+  別のボットから叩く形でも動く。詳細は
+  [docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §13
 - **天気**：晴れ／曇り／雨。空の色と光の強さが変わり、雨は雨粒が降って「屋外に居ると疲れる」。
   `/city?weather=rain` で切り替えて確認できる
 - **通行可否の既定を ALIGNED に**：見えるもの（建物/木）＝通れない、見えないもの（道路/空き地）＝通れる。

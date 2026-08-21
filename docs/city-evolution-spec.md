@@ -481,6 +481,30 @@ renderer.render(hudScene, hudCam);   // OrthographicCamera(-W/2, W/2, H/2, -H/2)
 天気はティッカーに流さない (日付板に常時出ているうえ、変化が多くて街のできごとを
 押し出してしまう)。`TICKER_SKIP` で除外している。
 
+### 6.1 ティッカーの中身 — できごと と 住民の様子
+
+開店/閉店だけだと事件の連続で、人が住んでいる感じが出ない。そこで
+`LIFE_NEWS_SEC`(既定25秒) ごとにランダムな住民を1人選び、いまの様子を流す。
+
+```
+D5  Ramen Shop opened - run by Cole #11   *   Lily #2 is sleepy and heading home
+    *   D5 Footpaths turned into 2 new roads   *   Rex #3 fell ill and is heading to a Pharmacy
+```
+
+- **街のできごとと住民の様子は別の枠**に貯めて、ティッカーで**交互に**並べる。
+  同じ列に入れると、1日数件しかない開店/閉店が、数十秒ごとに出る住民の様子に
+  押し出されてしまう。住民の様子は保存もしない (街の記録ではなく、その瞬間の景色)
+- 抽選は状態で重み付けする (病気6 / 空腹3 / 退屈2 / 買い物2 / 睡眠1 / 勤務1)。
+  一様抽選だと夜は「寝ている」ばかりになる
+- 直近に出した住民は避け、さらに**名前と数字を伏せた「文の形」**が直近3件と
+  重ならないよう数回引き直す。小さな村では全員が同じ状態 (勤務時間帯など) になり、
+  名前だけ違う同じ文が並んでしまうため
+- 言い回しは各状態に2〜3種類。勤務中は空腹/眠気を一言添える
+  (`is on the way to work (already getting hungry)`)
+- 3回に1回ほどは状態ではなく**来歴**を流す
+  (`has been to 7 different kinds of places in town` / `runs the Ramen Shop in this town`)
+- `/city` の `residents` で日本語と英語の両方を確認できる
+
 ティッカーは幅2048pxのテクスチャを持つ板を毎フレーム左へ流す。ortho カメラの視錐台の外は
 そのまま切られるのでクリッピング処理は不要。
 
@@ -543,6 +567,7 @@ client.html 側に二重表示しない。ただし他の用途 (OBS のオー�
 | `FIRST_NEWS_COOLDOWN` | 90 | 「初めて◯◯に入った」を流す最短間隔 (秒) |
 | `HUD` | 1 | 配信画面の Day / ティッカー表示。`0` で無効 |
 | `HUD_SPEED` | 90 | ティッカーの流れる速さ (px/秒) |
+| `LIFE_NEWS_SEC` | 25 | 住民のいまの様子を流す間隔 (秒) |
 
 `personas.json` の各ペルソナに `enterprise` (起業性向 0〜1、既定 0.3) を追加した。
 Businessman Cole 0.9 / Freelancer Noah 0.75 が高く、Homebody Lily 0.05 /
@@ -835,3 +860,83 @@ curl -s "localhost:8080/city?weather=rain"     # sunny | cloudy | rain
 | `WEATHER_HOURS` | 6 | 天気を抽選し直す間隔 (ゲーム内時間) |
 | `RAIN_COUNT` | 1100 | 雨粒の数 |
 | `RAIN_SPEED` | 26 | 雨の落下速度 |
+
+---
+
+## 13. 配信チャットからの指示
+
+視聴者が「このキャラを映して」と書くと、数秒だけそのキャラを追う。
+
+```
+!focus rex          → Explorer Rex #1 を 10秒追う
+focus Lily #2       → 表示名で指定
+focus B             → ペルソナ id で指定
+focus 3             → 3人目
+focus overview      → 俯瞰
+focus random        → ランダム
+```
+
+画面には `Camera: Explorer Rex #1 (by <視聴者名>)` と数秒出る。
+**自分の名前が配信に出る**のが、この機能のいちばんの価値だと思う。
+
+カメラの優先順位は **チャットの指名 > 街のできごと > 自動切替**。
+指名は数秒なので、その間に起きた着工/取り壊しは待ち行列で待ち、明けてから再生される
+(アニメもカメラ到着に合わせて始まるので、見逃しにはならない)。
+
+### 13.1 入口は1つ (`/chat`)
+
+チャットの取り込み方は環境によって変わるので、**サーバ側の入口は1本に統一**した。
+
+```bash
+curl "localhost:8080/chat?text=focus%20rex&user=someone&token=..."
+```
+
+YouTube / Twitch / Discord / 手元の curl、どこからでも同じ形で渡せる。
+`CHAT_TOKEN` を設定すると合言葉が要る (公開サーバでは必ず設定すること)。
+
+### 13.2 YouTube から直接取り込む (`YT_CHAT=1`)
+
+公式の YouTube Data API v3 を使う:
+
+1. `videos.list(part=liveStreamingDetails)` で `activeLiveChatId` を得る (1 unit)
+2. `liveChatMessages.list` で新着を取る (**5 units/回**)
+
+**この機能の設計を決めているのはクォータ。** 既定の割当は 1日 10,000 units なので、
+
+```
+10,000 / 5 = 2,000 回/日  →  43秒に1回が上限
+```
+
+API が返す `pollingIntervalMillis` (だいたい5秒) に素直に従うと、1日の枠を
+**2.8時間**で使い切る。そこで既定は **45秒間隔**にしてある = 指示から反映まで最大45秒。
+起動時に推定使用量を出し、10,000 を超える設定なら警告する。
+
+速くしたいなら:
+- Google にクォータ増を申請する
+- 別プロセスのチャットボット (quota の無い方法) から `/chat` に流す
+
+`liveChatMessages.list` は OAuth が要る場合があるので、API キーに加えて
+アクセストークン (`YT_CHAT_TOKEN`) も送れるようにしてある。
+403/401 が返ったら `liveChatId` を捨てて取り直す。
+
+| 名前 | 既定 | 意味 |
+|---|---|---|
+| `CHAT_CMD` | 1 | チャット指示の受付。`0` で無効 |
+| `CHAT_FOCUS_SEC` | 10 | 1回の指名で映す秒数 |
+| `CHAT_COOLDOWN_SEC` | 12 | 次の指名を受け付けるまでの間隔 |
+| `CHAT_TOKEN` | (なし) | `/chat` の合言葉。公開サーバでは設定する |
+| `YT_CHAT` | 0 | `1` で YouTube ライブチャットの取り込みを有効化 |
+| `YT_API_KEY` / `YT_CHAT_TOKEN` | (なし) | APIキー / OAuth アクセストークン |
+| `YT_VIDEO_ID` | (なし) | 配信中の動画ID |
+| `YT_CHAT_POLL_SEC` | 45 | 取得間隔 (クォータと直結) |
+
+### 13.3 安全について
+
+**チャットの本文はデータであって命令文ではない。** 受け付けるのは
+`/^!?(focus|cam|camera|watch)\s+(.{1,40})$/` に一致する形だけで、本文をそのまま
+実行系に渡すことは一切しない。効果もカメラを向けることに限定してある
+(街を作り直す・天気を変える・建物を建てる等はチャットからは触らせない)。
+画面に出す視聴者名は `_ascii()` で ASCII に落として18文字で切る。
+連投は `CHAT_COOLDOWN_SEC` で抑える。
+
+許可する命令を増やしたいときは `handleChatCommand` の正規表現と分岐だけを足す。

@@ -1147,6 +1147,11 @@ function updateDayNight(S){
 // ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
 //   絵文字は sharp で SVG→PNG にラスタライズしてテクスチャ化する (canvas 依存を増やさない)。
 //   フォントが無い環境では描画が空になるので、その場合は色板にフォールバックする。
+//
+//   ★ 2026-08-21: 「何のアイコンか分かりにくい」ため**一旦すべて非表示**にしている。
+//     実装は丸ごと残してあるので、復活させるときは NEED_ICONS を true にするか
+//     環境変数 NEED_ICONS=1 で起動するだけでよい (呼び出し側の2か所がこれを見ている)。
+const NEED_ICONS = process.env.NEED_ICONS === '1';
 const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱'};
 const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈'};
 const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
@@ -1290,11 +1295,19 @@ async function refreshHudDay(){
 
 async function refreshHudTicker(){
   if(!hudScene) return;
-  // en を持たないニュース (英語化する前に保存された街の記録) は**流さない**。
-  // 日本語のまま描くとフォントの無い環境で豆腐になるため。
-  const items=latestNews(12, true).filter(n=>n.en).slice(-6).map(n=>`D${n.day+1}  ${_ascii(n.en)}`);
-  const txt=items.length ? items.reverse().join('   *   ')
-                         : 'No records yet in this town';
+  // 街のできごと と 住民の様子 を**交互に**並べる。できごとは1日数件しか無いので、
+  // 数十秒ごとに出る住民の様子と同じ列に入れると押し出されてしまう。
+  //   en を持たないニュース (英語化する前に保存された街の記録) は流さない。
+  //   日本語のまま描くとフォントの無い環境で豆腐になるため。
+  const city=latestNews(12, true).filter(n=>n.en).slice(-4).reverse()
+                                 .map(n=>`D${n.day+1}  ${_ascii(n.en)}`);
+  const life=lifeNews.slice(-3).reverse().map(n=>_ascii(n.en));
+  const items=[];
+  while(city.length || life.length){
+    if(city.length) items.push(city.shift());
+    if(life.length) items.push(life.shift());
+  }
+  const txt=items.length ? items.join('   *   ') : 'No records yet in this town';
   // 文字幅の見積り (ASCII のみ)。板の幅がズレると途中で切れる。
   const w=Math.min(6000, Math.max(WIDTH, Math.ceil(40 + txt.length*8.6)));
   const {tex}=await svgTexture(
@@ -2816,6 +2829,117 @@ function maybeDemolish(day){
   return n;
 }
 
+// ── 住民のいまの様子 (ティッカーの箸休め) ──────────────────────────────────
+//   「開店した」「閉店した」だけだと事件の連続で、住んでいる感じが出ない。
+//   一定間隔でランダムに1人を選び、いま何をしているかを流す。
+//   街のできごと (CITY.news) とは**別の枠**に貯める。混ぜてしまうと、
+//   1日数件しかない開店/閉店が、数十秒ごとに出るこちらに押し出されてしまうため。
+//   保存もしない (街の記録ではなく、その瞬間の景色なので)。
+const LIFE_NEWS_SEC = envNum('LIFE_NEWS_SEC', 25);
+let lifeNews=[], _recentLifeAids=[];
+
+const _pick = arr => arr[Math.floor(Math.random()*arr.length)];
+const _typeAt = cell => (cell ? BUILDING_TYPES[cell[0]+'_'+cell[1]] : null);
+const _popcount = n => { let c=0; while(n){ n&=n-1; c++; } return c; };
+
+// 来歴の一言。勤務時間帯は全員 need='work' になって状態の文が単調になるので、
+// ときどきこちらを混ぜる (その人が誰なのかが分かる情報)。
+function lifeProfileEn(a){
+  const N=a.name, opts=[];
+  const kinds=_popcount(a.seenMask||0);
+  const homeT=_typeAt(a.home), workT=_typeAt(a.work);
+  if(a.owns){
+    const t=_typeAt(a.owns);
+    if(t!=null) opts.push(`${N} runs the ${enOf(t)} in this town`);
+  }
+  if(kinds>=3) opts.push(`${N} has been to ${kinds} different kinds of places in town`);
+  if(homeT!=null && workT!=null && !a.owns)
+    opts.push(`${N} lives in a ${enOf(homeT)} and works at the ${enOf(workT)}`);
+  if(a.trips>=8) opts.push(`${N} has made ${a.trips} trips across town so far`);
+  if((a.explored||0)>40) opts.push(`${N} has walked ${a.explored} corners of this town`);
+  return opts.length ? _pick(opts) : null;
+}
+
+// 言い回しは複数から抽選する。勤務時間帯は全員 need='work' になるので、
+// 1種類だと「is on the way to work」ばかりが並んでしまう。
+function lifeLineEn(a){
+  const N=a.name;
+  const dest = a.goalType!=null ? enOf(a.goalType) : null;
+  const workT=_typeAt(a.work), workN=(workT!=null)?enOf(workT):null;
+  if(MW.isIndoors(a)){
+    const t=_typeAt(a.indoors), at=(t!=null)?enOf(t):'a building';
+    if(a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1])
+      return _pick([`${N} is resting at home`, `${N} is fast asleep at home`, `${N} is home for the night`]);
+    if(a.work && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1])
+      return _pick([`${N} is working at the ${at}`, `${N} is on shift at the ${at}`]);
+    if(t!=null && FOOD_IDX.includes(t)) return _pick([`${N} is having a meal at a ${at}`, `${N} is eating at a ${at}`]);
+    if(t!=null && BUY_IDX.includes(t))  return _pick([`${N} is shopping at a ${at}`, `${N} is picking up supplies at a ${at}`]);
+    if(t!=null && FUN_IDX.includes(t))  return _pick([`${N} is spending time at the ${at}`, `${N} is killing time at the ${at}`]);
+    if(t!=null && CARE_IDX.includes(t)) return _pick([`${N} is getting treatment at the ${at}`, `${N} is seeing a doctor at the ${at}`]);
+    return `${N} stepped inside a ${at}`;
+  }
+  const to = dest ? `a ${dest}` : null;
+  switch(needOf(a)){
+    case 'sick':  return _pick([`${N} fell ill and is heading to ${to||'get treatment'}`,
+                                `${N} is not feeling well and is looking for ${to||'a clinic'}`,
+                                `${N} caught something and is on the way to ${to||'get help'}`]);
+    case 'sleep': return _pick([`${N} is sleepy and heading home`,
+                                `${N} is worn out and walking home`,
+                                `${N} has had a long day and is going home`]);
+    case 'eat':   return _pick([`${N} is hungry and heading to ${to||'find something to eat'}`,
+                                `${N} is looking for ${to||'a place to eat'}`,
+                                `${N} skipped a meal and is on the way to ${to||'get food'}`]);
+    case 'work':  {
+      // 勤務中でも空腹や眠気は溜まっている。一言添えるだけで人に見える。
+      const rider=(a.hunger>0.55)?' (already getting hungry)'
+                 :(a.fatigue>0.6)?' (still half asleep)':'';
+      return _pick([`${N} is on the way to work`,
+                    workN?`${N} is heading to the ${workN} for work`:`${N} is heading to work`,
+                    `${N} is commuting to work`]) + rider;
+    }
+    case 'shop':  return _pick([`${N} ran out of supplies and is heading to ${to||'the shops'}`,
+                                `${N} needs to restock and is walking to ${to||'a shop'}`]);
+    case 'bored': return _pick([`${N} is bored and heading to ${dest?`the ${dest}`:'find something to do'}`,
+                                `${N} has nothing to do and is wandering toward ${dest?`the ${dest}`:'somewhere'}`]);
+  }
+  return dest ? _pick([`${N} is walking toward a ${dest}`, `${N} is out and about near a ${dest}`])
+              : `${N} is wandering around town`;
+}
+
+// 面白い状態の人を選びやすくする。一様抽選だと夜は「寝ている」ばかりになる。
+const LIFE_W = { sick:6, eat:3, bored:2, shop:2, sleep:1, work:1, none:1 };
+function pushLifeNews(){
+  if(!CITY || !agents.length) return;
+  // 直近に出した人は避ける (人数が少ないうちは全員除外にならないよう上限を掛ける)
+  const skip=new Set(_recentLifeAids.slice(-Math.max(1, Math.min(4, Math.floor(agents.length/2)))));
+  let total=0; const pool=[];
+  for(const a of agents){
+    if(skip.has(a.aid)) continue;
+    const w=LIFE_W[needOf(a)||'none']||1;
+    pool.push([a,w]); total+=w;
+  }
+  if(!pool.length) return;
+  let r=Math.random()*total, pick=pool[0][0];
+  for(const [a,w] of pool){ r-=w; if(r<=0){ pick=a; break; } }
+  _recentLifeAids.push(pick.aid);
+  while(_recentLifeAids.length>8) _recentLifeAids.shift();
+  // 3回に1回くらいは「いまの様子」ではなく「その人の来歴」を流す。
+  // 名前と数字を伏せた「文の形」で直近と重複しないよう数回引き直す。小さな村だと
+  // 全員が同じ状態 (勤務時間帯など) になり、名前だけ違う同じ文が並んでしまうため。
+  const shapeOf=(t,name)=>t.split(name).join('').replace(/\d+/g,'#');
+  const recent=lifeNews.slice(-3).map(x=>x.shape);
+  let en=null, shape=null;
+  for(let i=0;i<5;i++){
+    const t=(Math.random()<0.35 ? lifeProfileEn(pick) : null) || lifeLineEn(pick);
+    const sh=shapeOf(t, pick.name);
+    if(!en){ en=t; shape=sh; }
+    if(!recent.includes(sh)){ en=t; shape=sh; break; }
+  }
+  lifeNews.push({day:gameDay(), en, shape, ja:`${pick.name} は ${describeActivity(pick)}`});
+  while(lifeNews.length>12) lifeNews.shift();
+  hudNewsDirty=true;
+}
+
 // ── 機能D: 初回性 ──────────────────────────────────────────────────────────
 // 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
 function onArrive(a, dest){
@@ -3562,6 +3686,143 @@ let camFPV = false;
 
 // ターゲット切替が起きた瞬間に呼び、たまに一人称視点ショットにする。
 // FPV はエージェント対象のときのみ (俯瞰では無効)。
+// ═══ 配信チャットからの指示 ══════════════════════════════════════════════════
+//   視聴者が「このキャラを映して」と書いたら数秒だけそのキャラを追う。
+//
+//   【安全について】チャットの本文は**データであって命令文ではない**。
+//   ここで受け付けるのは下の正規表現に一致する許可済みの形だけで、本文を
+//   そのまま実行系に渡すことは一切しない。効果もカメラを向けるだけに限る
+//   (街を作り直す・天気を変える等はチャットからは触らせない)。
+//   画面に出す名前も _ascii() で ASCII に落とし、長さを詰めてから描く。
+const CHAT_CMD        = process.env.CHAT_CMD !== '0';
+const CHAT_FOCUS_SEC  = envNum('CHAT_FOCUS_SEC', 10);    // 1回の指名で映す秒数
+const CHAT_COOLDOWN   = envNum('CHAT_COOLDOWN_SEC', 12); // 次の指名を受け付けるまで
+const CHAT_TOKEN      = process.env.CHAT_TOKEN || '';    // /chat に付ける合言葉 (任意)
+let camHold=null;            // {idx, until, by}
+let _lastChatAt=0, chatLog=[];
+
+// 「rex」「Explorer Rex #2」「B」「3」「overview」などから住民を1人選ぶ。
+function findAgentByQuery(q){
+  const s0=String(q||'').trim();
+  if(!s0) return null;
+  const low=s0.toLowerCase();
+  if(low==='overview'||low==='city'||low==='town') return {overview:true};
+  if(low==='random') return {idx:Math.floor(Math.random()*agents.length)};
+  let i=agents.findIndex(a=>a.aid.toLowerCase()===low);                       // aid 完全一致
+  if(i<0) i=agents.findIndex(a=>(a.name||'').toLowerCase()===low);            // 表示名 完全一致
+  if(i<0) i=agents.findIndex(a=>(a.name||'').toLowerCase().includes(low));    // 表示名 部分一致
+  if(i<0 && /^\d+$/.test(low)) i=Math.min(agents.length-1, Math.max(0, parseInt(low)-1));
+  if(i<0 && /^[a-z]$/.test(low)) i=agents.findIndex(a=>a.def.id.toLowerCase()===low);  // ペルソナid
+  return i>=0 ? {idx:i} : null;
+}
+
+// 戻り値: {ok, msg} / null (命令ではなかった)
+function handleChatCommand(text, author){
+  if(!CHAT_CMD) return null;
+  const m=String(text||'').trim().match(/^!?(?:focus|cam|camera|watch)\s+(.{1,40})$/i);
+  if(!m) return null;
+  const who=_ascii(String(author||'viewer')).slice(0,18) || 'viewer';
+  const now=Date.now();
+  if(now-_lastChatAt < CHAT_COOLDOWN*1000)
+    return {ok:false, msg:`cooldown (${Math.ceil((CHAT_COOLDOWN*1000-(now-_lastChatAt))/1000)}s)`};
+  const hit=findAgentByQuery(m[1]);
+  if(!hit) return {ok:false, msg:`no match: ${_ascii(m[1]).slice(0,24)}`};
+  _lastChatAt=now;
+  if(hit.overview){
+    camHold={idx:-1, until:now+CHAT_FOCUS_SEC*1000, by:who};
+    showBanner(`Camera: overview (by ${who})`, Math.min(6, CHAT_FOCUS_SEC));
+  }else{
+    const a=agents[hit.idx];
+    if(!a) return {ok:false, msg:'no match'};
+    camHold={idx:hit.idx, until:now+CHAT_FOCUS_SEC*1000, by:who};
+    showBanner(`Camera: ${a.name} (by ${who})`, Math.min(6, CHAT_FOCUS_SEC));
+  }
+  const target=camHold.idx<0?'overview':agents[camHold.idx].name;
+  chatLog.push({t:now, by:who, text:_ascii(String(text)).slice(0,60), target});
+  while(chatLog.length>30) chatLog.shift();
+  console.log(`[Chat] ${who}: focus -> ${target} (${CHAT_FOCUS_SEC}s)`);
+  return {ok:true, msg:`focus ${target} for ${CHAT_FOCUS_SEC}s`};
+}
+
+// チャットの指名が有効な間は true (その間カメラの自動切替と街イベントを止める)
+function holdCamera(){
+  if(!camHold) return false;
+  if(Date.now()>=camHold.until || (camHold.idx>=0 && !agents[camHold.idx])){ camHold=null; return false; }
+  camTargetIdx = camHold.idx<0 ? 0 : camHold.idx+1;
+  camFPV=false;
+  camSwitchTimer=Date.now();     // 指名が切れた直後に即切り替わらないように
+  return true;
+}
+
+// ═══ YouTube ライブチャットの取り込み (任意) ════════════════════════════════
+//   公式の YouTube Data API v3 を使う:
+//     1) videos.list(part=liveStreamingDetails) で activeLiveChatId を得る (1 unit)
+//     2) liveChatMessages.list で新着を取る (5 units/回)
+//
+//   【クォータがこの機能の設計を決める】既定の割当は 1日 10,000 units。
+//   liveChatMessages.list が 1回 5 units なので、24時間回すと
+//     10,000 / 5 = 2,000 回/日 → **43秒に1回**が上限。
+//   API が返す pollingIntervalMillis (だいたい5秒) に素直に従うと1日の枠を
+//   3時間弱で使い切る。そこで既定は45秒間隔にしてある = 指示から反映まで最大45秒。
+//   もっと速くしたいなら (a) Google にクォータ増を申請する
+//   (b) 別プロセスのチャットボットから /chat に流す、のどちらか。
+//   liveChatMessages.list は OAuth が要る場合があるので、APIキーに加えて
+//   アクセストークン (YT_CHAT_TOKEN) も送れるようにしてある。
+const YTC = {
+  enabled: process.env.YT_CHAT === '1',
+  key:     process.env.YT_API_KEY || '',
+  token:   process.env.YT_CHAT_TOKEN || '',        // OAuth アクセストークン (任意)
+  video:   process.env.YT_VIDEO_ID || '',
+  base:    process.env.YT_CHAT_API_BASE || 'https://www.googleapis.com/youtube/v3',
+  pollSec: envNum('YT_CHAT_POLL_SEC', 45),
+  chatId:null, pageToken:null, polls:0, seen:0, cmds:0, lastError:null, startedAt:0,
+  get quotaPerDay(){ return Math.round(86400/Math.max(5,this.pollSec))*5; },
+};
+
+async function ytcFetch(path, params){
+  const u=new URL(`${YTC.base}/${path}`);
+  for(const [k,v] of Object.entries(params)) if(v!=null && v!=='') u.searchParams.set(k,v);
+  if(YTC.key) u.searchParams.set('key', YTC.key);
+  const r=await fetch(u, {headers: YTC.token ? {Authorization:`Bearer ${YTC.token}`} : {}});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(`${r.status} ${(j.error && j.error.message) || ''}`.trim());
+  return j;
+}
+
+async function ytcResolveChatId(){
+  const j=await ytcFetch('videos', {part:'liveStreamingDetails', id:YTC.video});
+  const it=(j.items||[])[0];
+  const id=it && it.liveStreamingDetails && it.liveStreamingDetails.activeLiveChatId;
+  if(!id) throw new Error('activeLiveChatId が取れない (配信中でない / 動画IDが違う / 権限不足)');
+  YTC.chatId=id; YTC.pageToken=null;
+  console.log(`[YTChat] liveChatId 取得 (${String(id).slice(0,16)}…)`);
+}
+
+async function ytcPoll(){
+  if(!YTC.enabled) return;
+  try{
+    if(!YTC.chatId) await ytcResolveChatId();
+    const j=await ytcFetch('liveChatMessages', {
+      liveChatId:YTC.chatId, part:'snippet,authorDetails',
+      maxResults:200, pageToken:YTC.pageToken});
+    YTC.polls++;
+    YTC.pageToken=j.nextPageToken||null;
+    for(const m of (j.items||[])){
+      const sn=m.snippet||{}, au=m.authorDetails||{};
+      const t=Date.parse(sn.publishedAt||'')||0;
+      if(t && t<YTC.startedAt) continue;              // 起動前のチャットは流さない
+      YTC.seen++;
+      const r=handleChatCommand(sn.displayMessage||'', au.displayName||'viewer');
+      if(r && r.ok) YTC.cmds++;
+    }
+    YTC.lastError=null;
+  }catch(e){
+    YTC.lastError=e.message;
+    console.warn('[YTChat] 取得失敗:', e.message);
+    if(/^(401|403|404)/.test(e.message)) YTC.chatId=null;   // 期限切れ等は取り直す
+  }
+}
+
 function rollFPV() {
   camFPV = (camTargetIdx > 0) && (Math.random() < FPV_CHANCE);
 }
@@ -3602,8 +3863,10 @@ function pickCameraTarget() {
 }
 
 function updateTrackingCamera(cam) {
-  // 街のイベント (着工/完成/閉店/取り壊し) の最中は、人ではなくその場所を映す。
-  const ev = stepCamEvents();
+  // 優先順位: チャットの指名 > 街のイベント > 自動切替。
+  // 指名は数秒なので、その間イベントは待ち行列で待つ (アニメも開始しない)。
+  const held = holdCamera();
+  const ev = held ? null : stepCamEvents();
   if (ev) {
     const tx = ev.c*CELL + CELL*.5, ty = ev.r*CELL + CELL*.5;
     const t  = (Date.now()-ev.t0)/(ev.secs*1000);           // 0→1
@@ -3619,7 +3882,7 @@ function updateTrackingCamera(cam) {
     camFPV = false;
     return;
   }
-  pickCameraTarget();
+  if (!held) pickCameraTarget();
   if (camTargetIdx === 0 || agents.length === 0) {
     const fx=fieldCenterW(), fs=fieldSize()*CELL;
     cam.up.set(0, 1, 0);
@@ -3851,6 +4114,24 @@ tick(); setInterval(tick, ${ms});
   }
 
   // ── 生活状態の可視化: 時刻 / 各エージェントの拠点・空腹・疲労・いまの欲求 ──
+  // ── /chat : 配信チャットからの指示を流し込む共通の入口 ──
+  //   /chat?text=focus%20rex&user=someone[&token=...]
+  //   YouTube / Twitch / 手元の curl / 自作ボット、どこからでも同じ形で渡せる。
+  //   CHAT_TOKEN を設定すると合言葉が要る (公開サーバではまず設定すること)。
+  if(urlPath==='/chat'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(CHAT_TOKEN && q.get('token')!==CHAT_TOKEN){
+      res.writeHead(403); res.end(JSON.stringify({ok:false,error:'bad token'})); return;
+    }
+    const r=handleChatCommand(q.get('text')||'', q.get('user')||'viewer');
+    res.writeHead(200);
+    res.end(JSON.stringify(r ? {...r, recognized:true}
+                             : {ok:false, recognized:false,
+                                usage:'focus <name|persona|number|overview|random>'}));
+    return;
+  }
+
   // ── /city : 街の蓄積 (経過日数 / 道 / 開業・閉店 / 需要 / ニュース) ──
   //   /city            いまの街の状態
   //   /city?reset=1    蓄積を捨てて街を作り直す (マップはそのまま)
@@ -3963,7 +4244,15 @@ tick(); setInterval(tick, ${ms});
       busiest:open.slice().sort((a,b)=>b.visits-a.visits).slice(0,10).map(fmt),
       atRisk:open.filter(s=>isClosable(s.typeIdx)).sort((a,b)=>a.ema-b.ema).slice(0,5).map(fmt),
       footTop:foot.slice(0,10), roadThreshold:FOOT_MIN,
-      news:latestNews(30).reverse()}));
+      news:latestNews(30).reverse(),
+      residents:lifeNews.slice(-8).reverse().map(n=>({day:n.day+1, ja:n.ja, en:n.en})),
+      chat:{enabled:CHAT_CMD, focusSec:CHAT_FOCUS_SEC, cooldownSec:CHAT_COOLDOWN,
+        holding: camHold ? {target:camHold.idx<0?'overview':(agents[camHold.idx]||{}).name,
+                            by:camHold.by, leftSec:Math.max(0,Math.round((camHold.until-Date.now())/1000))} : null,
+        recent:chatLog.slice(-10).reverse()},
+      youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
+        polls:YTC.polls, seen:YTC.seen, commands:YTC.cmds,
+        quotaPerDay:YTC.quotaPerDay, lastError:YTC.lastError} : null}));
     return;
   }
 
@@ -4189,7 +4478,8 @@ async function renderLoop(){
     updateTrackingCamera(mainCam);
     updateOcclusionFade();
     updateDayNight(scene);        // 時刻で空と光を変える
-    updateNeedIcons(mainCam);     // 欲求アイコン (空腹/眠気/勤務) を頭上に
+    // 欲求アイコン (空腹/眠気/勤務) を頭上に — 一旦非表示 (NEED_ICONS=1 で復活)
+    if(NEED_ICONS) updateNeedIcons(mainCam);
     // 3D を描いてから HUD (Day/ティッカー) を正射影で重ねる。
     // autoClear を切るので、色バッファは自分で clear する必要がある。
     renderer.autoClear=false;
@@ -4247,7 +4537,23 @@ function startLoops(){
   setInterval(()=>{ stepNeeds(1); retargetOnNeedChange(); }, 1000);   // 空腹/疲労の進行と行き先の見直し
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
+    setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子
     setInterval(saveCity, Math.max(10,CITY_SAVE_SEC)*1000);           // 街の状態を定期保存
+  }
+  if(YTC.enabled){
+    if(!YTC.video || (!YTC.key && !YTC.token)){
+      console.warn('[YTChat] YT_VIDEO_ID と YT_API_KEY (または YT_CHAT_TOKEN) が要る → 無効化');
+      YTC.enabled=false;
+    }else{
+      YTC.startedAt=Date.now();
+      console.log(`[YTChat] ${YTC.pollSec}秒ごとに取得 (推定 ${YTC.quotaPerDay} units/日 / 既定枠 10,000)`);
+      if(YTC.quotaPerDay>10000)
+        console.warn(`[YTChat] ⚠ 1日のクォータ (10,000 units) を超える設定。24時間回すなら`
+          + ` YT_CHAT_POLL_SEC=45 以上に。いまの間隔だと約`
+          + ` ${(10000/(YTC.quotaPerDay/24)).toFixed(1)} 時間で枠を使い切る`);
+      setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
+      ytcPoll();
+    }
   }
   if(YT_ENABLED){
     // 固定レートで ffmpeg へ送出 (renderLoop の出来に依存させない)
@@ -4269,7 +4575,8 @@ function startLoops(){
   console.log('[Init] preloading textures...');
   await preloadTextures();
   await loadRaycastTextures();   // エージェント観測(FPV)用の64×64テクスチャ
-  await buildNeedIcons();        // 頭上の欲求アイコン(絵文字)をテクスチャ化
+  // 頭上の欲求アイコン(絵文字)のテクスチャ化 — 一旦非表示 (NEED_ICONS=1 で復活)
+  if(NEED_ICONS) await buildNeedIcons();
 
   console.log('[Init] restoring city state...');
   initCity();                    // 保存された街を復元 (無ければ生成)。MAP を差し替えることがある
