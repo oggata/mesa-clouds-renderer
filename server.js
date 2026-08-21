@@ -3844,6 +3844,7 @@ const YTC = {
   mode: (['grpc','stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
   units:0, calls:{}, unitDay:'',            // 消費ユニットの自前カウント (太平洋時間の日付で区切る)
   primed:false, bytes:0, lastDataAt:0,      // 履歴を捨てたか / 受信バイト / 最後にデータが来た時刻
+  reconnects:0,                             // gRPC の張り直し回数 (正常終了ぶん)
   chatId:null, pageToken:null, polls:0, pushes:0, seen:0, cmds:0, lastError:null, startedAt:0,
   streamOk:false, _abort:null,
   pausedUntil:0,           // クォータ切れで打ち止めになった時刻 (太平洋時間の深夜まで)
@@ -3965,7 +3966,14 @@ function ytcGrpcClient(){
     ? grpcLib.credentials.createInsecure()
     : grpcLib.credentials.createSsl();
   if(process.env.YT_GRPC_INSECURE==='1') console.warn('[YTChat] ⚠ gRPC を TLS 無しで接続 (検証用)');
-  _grpcClient=new Svc(GRPC_TARGET, creds);
+  // 長時間つなぎっぱなしにするので keepalive を明示する。既定では ping を打たないため、
+  // 経路上の機器やサーバ側のアイドル判定で切られやすい。
+  _grpcClient=new Svc(GRPC_TARGET, creds, {
+    'grpc.keepalive_time_ms': 30000,            // 30秒ごとに ping
+    'grpc.keepalive_timeout_ms': 10000,
+    'grpc.keepalive_permit_without_calls': 1,
+    'grpc.max_receive_message_length': 16*1024*1024,
+  });
   return _grpcClient;
 }
 
@@ -3999,8 +4007,17 @@ function ytcGrpcOnce(){
         // REST と同じ形 (items[].snippet.displayMessage / authorDetails.displayName) で扱える
         ytcConsume(res);
       });
-      call.on('error', e=>{ YTC._call=null; reject(new Error(`gRPC ${e.code||''} ${e.details||e.message}`)); });
-      call.on('end',   ()=>{ YTC._call=null; reject(new Error('gRPC stream ended')); });
+      call.on('error', e=>{
+        YTC._call=null;
+        reject(new Error(`gRPC ${e.code||''} ${e.details||e.message}`));
+      });
+      call.on('end', ()=>{
+        YTC._call=null;
+        // サーバ側が普通に閉じた場合。**これは失敗ではない**。
+        // 実測では 1接続あたり10秒ほどで閉じられるので、pageToken を持って
+        // すぐ張り直すのが正しい (失敗扱いするとバックオフが伸びて落ちてしまう)。
+        const e=new Error('gRPC stream ended'); e.clean=true; reject(e);
+      });
       YTC._call=call;
     }catch(e){ reject(e); }
   });
@@ -4014,12 +4031,25 @@ async function ytcGrpcLoop(){
     try{
       await ytcGrpcOnce();
     }catch(e){
-      if(Date.now()-t0>30000 && YTC.streamOk) fails=0;   // 長く保っていたなら失敗ではない
+      const held=Date.now()-t0;
+      // 「データが届いた」または「5秒以上保った」なら接続自体は成功している。
+      // YouTube は1接続を短時間で閉じてくるので、30秒を基準にすると
+      // 健全な接続でも失敗が積み上がってポーリングに落ちてしまう。
+      if(YTC.streamOk && (e.clean || held>5000)) fails=0;
       YTC.lastError=e.message;
       if(/quotaExceeded|dailyLimitExceeded|RESOURCE_EXHAUSTED/i.test(e.message)){
         YTC.pausedUntil=nextQuotaResetMs();
         console.warn('[YTChat] クォータ切れ → 太平洋時間の深夜まで停止');
         await new Promise(r=>setTimeout(r, 60000));
+        continue;
+      }
+      // サーバが普通に閉じただけなら、予算に見合う間隔ですぐ張り直す
+      if(YTC.streamOk && e.clean){
+        const wait=Math.max(2, Math.round(ytcNextInterval()));
+        YTC.reconnects++;
+        if(YTC.reconnects<=3 || YTC.reconnects%20===0)
+          console.log(`[YTChat] gRPC 再接続 #${YTC.reconnects} (前回 ${(held/1000).toFixed(1)}秒 保持 / ${wait}秒後)`);
+        await new Promise(r=>setTimeout(r, wait*1000));
         continue;
       }
       fails++;
@@ -4670,7 +4700,7 @@ tick(); setInterval(tick, ${ms});
         recent:chatLog.slice(-10).reverse(),
         received:chatSeen.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
-        mode:YTC.mode, intervalSec:YTC.curSec,
+        mode:YTC.mode, intervalSec:YTC.curSec, reconnects:YTC.reconnects,
         chatActive: !!(YTC.lastMsgAt && Date.now()-YTC.lastMsgAt < YTC.activeSec*1000),
         polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
         bytes:YTC.bytes, lastDataSecAgo:YTC.lastDataAt?Math.round((Date.now()-YTC.lastDataAt)/1000):null,
