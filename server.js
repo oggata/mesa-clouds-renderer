@@ -3722,8 +3722,9 @@ const CHAT_CMD        = process.env.CHAT_CMD !== '0';
 const CHAT_FOCUS_SEC  = envNum('CHAT_FOCUS_SEC', 10);    // 1回の指名で映す秒数
 const CHAT_COOLDOWN   = envNum('CHAT_COOLDOWN_SEC', 12); // 次の指名を受け付けるまで
 const CHAT_TOKEN      = process.env.CHAT_TOKEN || '';    // /chat に付ける合言葉 (任意)
+const CHAT_LOG        = process.env.CHAT_LOG !== '0';    // 届いたチャットを全部ログに出す
 let camHold=null;            // {idx, until, by}
-let _lastChatAt=0, chatLog=[];
+let _lastChatAt=0, _lastPingAt=0, chatLog=[], chatSeen=[];
 
 // 「rex」「Explorer Rex #2」「B」「3」「overview」などから住民を1人選ぶ。
 function findAgentByQuery(q){
@@ -3743,10 +3744,28 @@ function findAgentByQuery(q){
 // 戻り値: {ok, msg} / null (命令ではなかった)
 function handleChatCommand(text, author){
   if(!CHAT_CMD) return null;
-  const m=String(text||'').trim().match(/^!?(?:focus|cam|camera|watch)\s+(.{1,40})$/i);
-  if(!m) return null;
+  const raw=String(text||'').trim();
   const who=_ascii(String(author||'viewer')).slice(0,18) || 'viewer';
   const now=Date.now();
+
+  // 疎通確認。「チャットが届いているか」を配信画面だけで確かめられるようにする。
+  //   カメラを動かさないので、focus とは別の短いクールダウンにしてある。
+  if(/^!?(test|ping|hello)\b/i.test(raw)){
+    if(now-_lastPingAt < 4000) return {ok:false, msg:'ping cooldown'};
+    _lastPingAt=now;
+    showBanner(`chat OK - ${who}`, 6);
+    lifeNews.push({day:gameDay(), en:`chat received from ${who}`, shape:'ping',
+                   ja:`${who} からのチャットが届いた`});
+    while(lifeNews.length>12) lifeNews.shift();
+    hudNewsDirty=true;
+    chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(ping)'});
+    while(chatLog.length>30) chatLog.shift();
+    console.log(`[Chat] ${who}: ping → 画面に "chat OK" を表示`);
+    return {ok:true, msg:`pong to ${who}`};
+  }
+
+  const m=raw.match(/^!?(?:focus|cam|camera|watch)\s+(.{1,40})$/i);
+  if(!m) return null;
   if(now-_lastChatAt < CHAT_COOLDOWN*1000)
     return {ok:false, msg:`cooldown (${Math.ceil((CHAT_COOLDOWN*1000-(now-_lastChatAt))/1000)}s)`};
   const hit=findAgentByQuery(m[1]);
@@ -3931,7 +3950,12 @@ function ytcConsume(j){
     const t=Date.parse(sn.publishedAt||'')||0;
     if(t && t<YTC.startedAt) continue;              // 起動前のチャットは流さない
     YTC.seen++;
-    const r=handleChatCommand(sn.displayMessage||'', au.displayName||'viewer');
+    const text=sn.displayMessage||'', who=au.displayName||'viewer';
+    // 命令でないチャットも記録する。「そもそも届いているのか」を切り分けるため。
+    chatSeen.push({t:Date.now(), by:String(who).slice(0,24), text:String(text).slice(0,80)});
+    while(chatSeen.length>20) chatSeen.shift();
+    if(CHAT_LOG) console.log(`[Chat<-] ${String(who).slice(0,24)}: ${String(text).slice(0,80)}`);
+    const r=handleChatCommand(text, who);
     if(r && r.ok) YTC.cmds++;
   }
 }
@@ -4461,7 +4485,8 @@ tick(); setInterval(tick, ${ms});
       chat:{enabled:CHAT_CMD, focusSec:CHAT_FOCUS_SEC, cooldownSec:CHAT_COOLDOWN,
         holding: camHold ? {target:camHold.idx<0?'overview':(agents[camHold.idx]||{}).name,
                             by:camHold.by, leftSec:Math.max(0,Math.round((camHold.until-Date.now())/1000))} : null,
-        recent:chatLog.slice(-10).reverse()},
+        recent:chatLog.slice(-10).reverse(),
+        received:chatSeen.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
         mode:YTC.mode, polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
         unitCost:YTC.unitCost, quotaPerDay:YTC.quotaPerDay, quotaFree:10000,
