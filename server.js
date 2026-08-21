@@ -4001,7 +4001,11 @@ function ytcGrpcOnce(){
       const req={ liveChatId:YTC.chatId, part:['snippet','authorDetails'], maxResults:200 };
       if(YTC.pageToken) req.pageToken=YTC.pageToken;
       const call=client.StreamList(req, md);
-      YTC.primed=false;
+      // **履歴を捨てるのは pageToken を持っていない最初の接続だけ。**
+      //   張り直しのときはサーバが「そのトークン以降 = 新着」を返すので、
+      //   毎回捨てていると新着を拾えない (10秒ごとに切れる本番でこれをやると
+      //   ほとんどのコメントが消える。実際にそうなっていた)。
+      YTC.primed = !!YTC.pageToken;
       // streamOk は **実際にデータが届いてから** 立てる。呼び出しオブジェクトは
       // 接続前でも作れるので、ここで立てると「一度も繋がっていない」判定が働かず、
       // 繋がらないままバックオフだけが伸びてポーリングに落ちない。
@@ -4059,6 +4063,12 @@ async function ytcGrpcLoop(){
         if(YTC.reconnects<=3 || YTC.reconnects%20===0)
           console.log(`[YTChat] gRPC 再接続 #${YTC.reconnects} (前回 ${(held/1000).toFixed(1)}秒 保持 / ${wait}秒後)`);
         await new Promise(r=>setTimeout(r, wait*1000));
+        continue;
+      }
+      if(/pageTokenInvalid|INVALID_ARGUMENT|invalid.*token/i.test(e.message) && YTC.pageToken){
+        console.warn('[YTChat] pageToken が無効 → 捨てて繋ぎ直す');
+        YTC.pageToken=null;
+        await new Promise(r=>setTimeout(r, 2000));
         continue;
       }
       fails++;
@@ -4126,7 +4136,7 @@ function ytcConsume(j){
   //   新着まで捨ててしまい、しかもログに何も出ないので原因が分からない**。
   if(!YTC.primed){
     YTC.primed=true;
-    if(items.length) console.log(`[YTChat] 接続時の履歴 ${items.length} 件は流さない (以降の新着だけ拾う)`);
+    if(items.length) console.log(`[YTChat] 初回接続の履歴 ${items.length} 件は流さない (以降の新着だけ拾う)`);
     return;
   }
   if(!items.length) return;                        // 空応答 (接続維持の合図) は無視
@@ -4165,7 +4175,7 @@ async function ytcStreamOnce(){
     throw e;
   }
   YTC.streamOk=true;
-  YTC.primed=false;                                // 張り直すたびに履歴を1回ぶん捨てる
+  YTC.primed = !!YTC.pageToken;                    // トークンがあるなら次は新着 (捨てない)
   console.log('[YTChat] streamList に接続 (push 方式・ポーリング無し)');
   const feed=makeJsonSplitter(j=>ytcConsume(j));
   const dec=new TextDecoder();
