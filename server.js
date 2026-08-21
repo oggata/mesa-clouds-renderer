@@ -3857,13 +3857,14 @@ const YTC = {
 //   あちらは反映に遅れがあるので「いま何を何回叩いたか」をこちらでも数えておく。
 //   太平洋時間の日付が変わったらリセットする (Google の集計と同じ区切り)。
 const ptDayKey = () => new Date().toLocaleDateString('en-CA', {timeZone:'America/Los_Angeles'});
-function ytcCharge(path){
+function ytcCharge(path, override){
   const d=ptDayKey();
   if(d!==YTC.unitDay){                       // 日付が変わった → リセット
     if(YTC.units) console.log(`[YTChat] ${YTC.unitDay} の消費: 約${YTC.units} units`);
     YTC.unitDay=d; YTC.units=0; YTC.calls={}; YTC.pausedUntil=0;
   }
-  const cost = path==='videos' ? 1 : path==='search' ? 100 : YTC.unitCost;
+  const cost = (override!=null) ? override
+             : path==='videos' ? 1 : path==='search' ? 100 : YTC.unitCost;
   YTC.units += cost;
   YTC.calls[path] = (YTC.calls[path]||0)+1;
 }
@@ -3947,6 +3948,13 @@ try{
   protoLoader=require('@grpc/proto-loader');
 }catch(e){ /* npm install していなければ gRPC モードは使えない */ }
 
+// YouTube は 1接続を10秒ほどで普通に閉じてくる (実測)。pageToken を持って
+// すぐ張り直せば取りこぼしは無いので、**張り直しは速いほど「常時つながっている」に近づく**。
+//   ただし1接続あたりのユニット単価が非公開なので、既定では list と同じ 5 と仮定して
+//   予算の歯止めを効かせる。Console を1時間見て消費が伸びないようなら
+//   YT_GRPC_UNIT_COST=0 にすると歯止めが外れ、2秒間隔で張り直し続ける。
+const GRPC_RECONNECT_SEC = envNum('YT_GRPC_RECONNECT_SEC', 2);
+const GRPC_UNIT_COST     = envNum('YT_GRPC_UNIT_COST', 5);
 const GRPC_PROTO = process.env.YT_GRPC_PROTO || path.join(__dirname,'tools','stream_list.proto');
 const GRPC_TARGET= process.env.YT_GRPC_TARGET || 'youtube.googleapis.com:443';
 let _grpcClient=null;
@@ -3989,7 +3997,7 @@ function ytcGrpcOnce(){
       else if(YTC.key) md.set('x-goog-api-key', YTC.key);
       else return reject(new Error('APIキーもトークンも無い'));
 
-      ytcCharge('grpc/StreamList');            // 接続1本ぶん (単価は非公開なので推定)
+      ytcCharge('grpc/StreamList', GRPC_UNIT_COST);   // 接続1本ぶん (単価は非公開なので推定)
       const req={ liveChatId:YTC.chatId, part:['snippet','authorDetails'], maxResults:200 };
       if(YTC.pageToken) req.pageToken=YTC.pageToken;
       const call=client.StreamList(req, md);
@@ -4045,7 +4053,8 @@ async function ytcGrpcLoop(){
       }
       // サーバが普通に閉じただけなら、予算に見合う間隔ですぐ張り直す
       if(YTC.streamOk && e.clean){
-        const wait=Math.max(2, Math.round(ytcNextInterval()));
+        // 張り直しは「速く」が基本。予算の歯止めだけを上限として掛ける。
+        const wait=Math.max(GRPC_RECONNECT_SEC, Math.round(ytcBudgetSec(GRPC_UNIT_COST)));
         YTC.reconnects++;
         if(YTC.reconnects<=3 || YTC.reconnects%20===0)
           console.log(`[YTChat] gRPC 再接続 #${YTC.reconnects} (前回 ${(held/1000).toFixed(1)}秒 保持 / ${wait}秒後)`);
@@ -4220,12 +4229,15 @@ async function ytcStreamLoop(){
 //   ・その日の残り枠で最後まで持たない → さらに遅く (打ち止めより遅いほうがマシ)
 function ytcNextInterval(){
   const active = YTC.lastMsgAt && (Date.now()-YTC.lastMsgAt) < YTC.activeSec*1000;
-  let sec = active ? YTC.pollFastSec : YTC.pollSec;
+  return Math.max(5, active ? YTC.pollFastSec : YTC.pollSec, ytcBudgetSec(YTC.unitCost));
+}
+// 残り枠を残り時間で割った「このペースなら最後まで持つ」間隔。単価0なら歯止め無し。
+function ytcBudgetSec(cost){
+  if(!cost) return 0;
   const leftUnits = 10000 - YTC.units;
   const leftSec   = Math.max(60, (nextQuotaResetMs()-Date.now())/1000);
   if(leftUnits <= 0) return leftSec;                       // 使い切った → リセットまで待つ
-  const needSec = leftSec / (leftUnits / YTC.unitCost);    // 残り枠で最後まで持つ間隔
-  return Math.max(5, sec, needSec);
+  return leftSec / (leftUnits / cost);
 }
 
 // 間隔が変わったらタイマーを張り直す (setInterval 固定だと適応できない)
