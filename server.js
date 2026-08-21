@@ -1629,7 +1629,7 @@ function daylight(){
 //     CITY_TEMPO=2  … 現在の既定。1日に数軒動く
 //     CITY_TEMPO=4  … かなり慌ただしい
 //   個別のパラメータを env で指定した場合も、この倍率が掛かる。
-const CITY_TEMPO   = Math.max(0.2, envNum('CITY_TEMPO', 2));
+const CITY_TEMPO   = Math.max(0.2, envNum('CITY_TEMPO', 4));
 const tempoUp      = v => v*CITY_TEMPO;      // 大きいほど活発になる値
 const tempoDown    = v => v/CITY_TEMPO;      // 小さいほど活発になる値
 const CITY_EVOLVE  = process.env.CITY_EVOLVE !== '0';
