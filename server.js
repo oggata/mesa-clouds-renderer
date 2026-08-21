@@ -1287,6 +1287,7 @@ async function initHud(){
   // 焼き込む文字は ASCII のみなので、日本語フォントの有無に依存しない。
   // (以前は日本語を描いていて、フォントの無い環境で全部豆腐になっていた)
   await refreshHudDay();
+  await refreshHudCam();
   await refreshHudTicker();
   console.log('[HUD] Day カウンタ / ニュースティッカーを配信画面に描画');
 }
@@ -1346,6 +1347,63 @@ async function refreshHudTicker(){
   hudNewsDirty=false;
 }
 
+// ── いま何を映しているか (右上に常時表示) ──────────────────────────────────
+//   誰を追っているのか分からないまま眺めることになるのを避ける。
+//   チャットで指名された場合は誰の指名かも出す。
+const HUD_CAM_W = 300, HUD_CAM_H = 46;
+let hudCam2=null, hudCamText='', hudCamBusy=false, hudCamAt=0;
+
+// 追跡中の住民の「いま何をしているか」を短く (ASCII)。
+function camStateShort(a){
+  if(!a) return '';
+  if(MW.isIndoors(a)){
+    const t=_typeAt(a.indoors);
+    if(a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1]) return 'at home';
+    if(a.work && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1]) return 'at work';
+    return t!=null ? `inside ${enOf(t)}` : 'indoors';
+  }
+  const dest=a.goalType!=null ? enOf(a.goalType) : null;
+  const n=needOf(a);
+  const NEED_EN={eat:'hungry', sleep:'sleepy', work:'commuting', shop:'shopping',
+                 bored:'bored', sick:'unwell'};
+  const st=NEED_EN[n]||'walking';
+  return dest ? `${st} - ${dest}` : st;
+}
+
+function hudCamLines(){
+  const ev=camEventCur;
+  if(ev) return ['CAM  city event', _ascii(ev.banner||'').slice(0,34)];
+  if(camHold){
+    const a=camHold.idx<0?null:agents[camHold.idx];
+    return [`CAM  ${a?a.name:'overview'}`, `requested by ${camHold.by}`];
+  }
+  if(camTargetIdx===0 || !agents.length) return ['CAM  overview', 'the whole town'];
+  const a=agents[camTargetIdx-1];
+  if(!a) return ['CAM  overview',''];
+  const tag=(a.viewer?'[viewer] ':'')+(a.cheers>=3?`[${a.cheers} cheers] `:'');
+  return [`CAM  ${a.name}`, _ascii(tag+(camFPV?'eye view - ':'')+camStateShort(a)).slice(0,36)];
+}
+
+async function refreshHudCam(){
+  if(!hudScene) return;
+  const [l1,l2]=hudCamLines();
+  const txt=l1+'|'+l2;
+  if(txt===hudCamText) return;
+  hudCamText=txt;
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_CAM_W}" height="${HUD_CAM_H}">`
+    +`<rect width="${HUD_CAM_W}" height="${HUD_CAM_H}" rx="6" fill="#050b10" fill-opacity="0.58"/>`
+    +`<rect x="${HUD_CAM_W-3}" y="0" width="3" height="${HUD_CAM_H}" fill="#00d2a0"/>`
+    +`<text x="${HUD_CAM_W-14}" y="20" font-size="14" font-weight="bold" fill="#00d2a0"`
+    +` text-anchor="end" font-family="${HUD_MONO}">${_esc(_ascii(l1))}</text>`
+    +`<text x="${HUD_CAM_W-14}" y="37" font-size="12" fill="#9fd8c8"`
+    +` text-anchor="end" font-family="${HUD_FONT}">${_esc(_ascii(l2))}</text></svg>`);
+  if(hudCam2){ hudScene.remove(hudCam2); hudCam2.material.map.dispose(); hudCam2.material.dispose(); hudCam2.geometry.dispose(); }
+  hudCam2=hudPlane(HUD_CAM_W, HUD_CAM_H, tex);
+  hudCam2.position.set(WIDTH/2-HUD_CAM_W/2-12, HEIGHT/2-HUD_CAM_H/2-10, 1);
+  hudScene.add(hudCam2);
+}
+
 // ── イベントの一言バナー ────────────────────────────────────────────────────
 //   「〇〇が建ちました」「〇〇がなくなりました」を数秒だけ大きく出す。
 //   ティッカーは一周に時間がかかるので、その瞬間に見せたいものは別枠にする。
@@ -1399,6 +1457,11 @@ function updateHud(dt){
       hudDayBusy=true; hudDayAt=now;
       refreshHudDay().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudDayBusy=false;});
     }
+  }
+  // いま何を映しているか (最短1秒に1回だけ作り直す)
+  if(!hudCamBusy && now-hudCamAt>1000){
+    hudCamBusy=true; hudCamAt=now;
+    refreshHudCam().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudCamBusy=false;});
   }
   if(hudTicker){
     hudTicker.position.x -= HUD_SPEED*dt;
@@ -1558,14 +1621,25 @@ function daylight(){
 //   変化はすべて「日次のまとめ」で起こす (dailyRollover)。理由は2つ:
 //     1. 変化量が agent 数や TICK に依存しなくなる (絶対閾値だと調整不能)
 //     2. 「朝起きたら道が伸びている」という配信のリズムになる
+// ═══ 街の変化の速さ (調整弁) ════════════════════════════════════════════════
+//   「配信を見ている人が退屈しない」ためには、建つ/なくなるが**目に見える頻度**で
+//   起きる必要がある。関係するパラメータは道・起業・閉店・取り壊しに散らばっているので、
+//   まとめて効く倍率を1つ用意する。
+//     CITY_TEMPO=1  … 落ち着いた街 (以前の既定)
+//     CITY_TEMPO=2  … 現在の既定。1日に数軒動く
+//     CITY_TEMPO=4  … かなり慌ただしい
+//   個別のパラメータを env で指定した場合も、この倍率が掛かる。
+const CITY_TEMPO   = Math.max(0.2, envNum('CITY_TEMPO', 2));
+const tempoUp      = v => v*CITY_TEMPO;      // 大きいほど活発になる値
+const tempoDown    = v => v/CITY_TEMPO;      // 小さいほど活発になる値
 const CITY_EVOLVE  = process.env.CITY_EVOLVE !== '0';
 const CITY_SEED    = envNum('CITY_SEED', 42);
 const CITY_FILE    = process.env.CITY_STATE_FILE || path.join(__dirname,'data','city_state.json');
 const CITY_SAVE_SEC= envNum('CITY_SAVE_SEC', 60);
 const DAY_ROLL_H   = envNum('DAY_ROLL_H', 5);       // 日付が変わる時刻 (朝5時)
 // 踏み跡 → 道
-const ROAD_PER_DAY = envNum('ROAD_PER_DAY', 2);     // 1日に昇格する空き地の本数
-const FOOT_MIN     = envNum('FOOT_MIN', 300);       // 昇格に必要な最低踏み跡数
+const ROAD_PER_DAY = Math.max(1, Math.round(tempoUp(envNum('ROAD_PER_DAY', 2))));
+const FOOT_MIN     = Math.max(20, tempoDown(envNum('FOOT_MIN', 300)));
 const FOOT_DECAY   = envNum('FOOT_DECAY', 0.9);     // 昇格しなかったセルの日次減衰
 // 地面の摩耗表現。踏み跡の絶対数だけで塗ると、人数が多い街では空き地が全部
 // 茶色になってしまう (300体で1分で 500 踏み)。**上位何%か**で塗り、
@@ -1575,14 +1649,14 @@ const WEAR_2       = envNum('WEAR_2', 160);         // 土が露出する下限
 const WEAR_TOP1    = envNum('WEAR_TOP1', 0.20);     // 踏み跡のある空き地の上位20%まで踏み固め
 const WEAR_TOP2    = envNum('WEAR_TOP2', 0.05);     // 上位5%は土が露出
 // 起業
-const FOUND_PER_POP   = envNum('FOUND_PER_POP', 40);    // 何人につき1日1軒 建てられるか
+const FOUND_PER_POP   = Math.max(5, tempoDown(envNum('FOUND_PER_POP', 40)));  // 何人につき1日1軒
 // 発火は「その場所を通った未充足需要の濃さ」で決める。単位は agent-day
 // (= 何人日ぶんの『遠くて満たせない欲求』がそこを通ったか)。
 //   不満の合計を供給軒数で割る形も試したが、この街は 900セルに 139軒と密で
 //   「最寄りが遠い」人がほとんど居らず、合計は常にゼロに潰れた。場所ごとに見れば
 //   「この一帯にだけ飲食店が無い」が拾える。開店すればその一帯の人は D_OK 以内に
 //   店を持つので需要が止まり、飽和も自動的に収まる。
-const FOUND_SITE      = envNum('FOUND_SITE', 0.5);
+const FOUND_SITE      = tempoDown(envNum('FOUND_SITE', 0.5));
 const CONSTRUCT_HOURS = envNum('CONSTRUCTION_HOURS', 2);// 工事中の長さ (ゲーム内時間)
 // 「遠い」の基準。街が密なので既定は小さめ。実測値 (平均最寄り距離) は毎日ログに出る。
 const DEMAND_D_OK     = envNum('DEMAND_D_OK', 3);       // これより近ければ需要ゼロ
@@ -1594,11 +1668,14 @@ const ANIM_RISE_SEC  = envNum('ANIM_RISE_SEC', 3.5);
 const ANIM_SINK_SEC  = envNum('ANIM_SINK_SEC', 3.0);
 const EVENT_CAM_SEC  = envNum('EVENT_CAM_SEC', 9);      // 1イベントを映す秒数
 // 閉店
-const CLOSE_PER_DAY   = envNum('CLOSE_PER_DAY', 1);
-const GRACE_DAYS      = envNum('GRACE_DAYS', 3);        // 開業直後は閉店判定を免除
-const CLOSE_FRAC      = envNum('CLOSE_FRAC', 0.25);     // 同業の来客平均のこの割合を下回ると閉店
-const MIN_PER_CAT     = envNum('MIN_PER_CAT', 2);       // カテゴリごとに残す最低軒数
-const DEMOLISH_DAYS   = envNum('DEMOLISH_DAYS', 5);     // 閉店から取り壊しまで
+const CLOSE_PER_DAY   = Math.max(1, Math.round(tempoUp(envNum('CLOSE_PER_DAY', 1))));
+const GRACE_DAYS      = Math.max(1, Math.round(tempoDown(envNum('GRACE_DAYS', 3))));
+const CLOSE_FRAC      = Math.min(0.9, tempoUp(envNum('CLOSE_FRAC', 0.25)));
+const MIN_PER_CAT     = envNum('MIN_PER_CAT', 2);       // ここは倍率を掛けない (最低限の安全弁)
+const DEMOLISH_DAYS   = Math.max(1, Math.round(tempoDown(envNum('DEMOLISH_DAYS', 5))));
+// 人流が店の生死に効く強さ。来客数(ema)に「周囲の踏み跡」を足して健全度とする。
+//   0 にすると従来どおり「来た客の数」だけで決まる。
+const FOOT_HEALTH     = envNum('FOOT_HEALTH', 0.01);
 // ═══ 村から始めて育てる ══════════════════════════════════════════════════════
 //   makeMap は学習側 (mesa_env) と bit-identical でなければならないので触らない。
 //   生成された「完成した街」から間引いて村に戻す後処理として実装する。
@@ -1983,7 +2060,10 @@ function gameDay(){ return (CITY?CITY.dayBase:0) + daysSinceBoot(); }
 function cityToJSON(){
   const own={};
   for(const a of agents){
-    if(a.seenMask || a.owns) own[a.aid]={m:a.seenMask||0, o:a.owns||null};
+    if(a.seenMask || a.owns || a.viewer || a.cheers)
+      own[a.aid]={m:a.seenMask||0, o:a.owns||null,
+                  n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
+                  b:a.viewer?a.by:undefined, c:a.cheers||undefined};
   }
   return {
     version:1, seed:CITY.seed, grid:GRID, savedAt:Date.now(),
@@ -1994,6 +2074,7 @@ function cityToJSON(){
     foot:Array.from(CITY.foot),
     demand:Object.fromEntries(CATS.map(c=>[c, Array.from(CITY.demand[c], v=>+v.toFixed(2))])),
     unmet:CITY.unmet, stats:CITY.stats, news:CITY.news.slice(-200), agents:own,
+    waiting:CITY.waiting||[],
   };
 }
 function saveCity(){
@@ -2090,6 +2171,7 @@ function freshCity(){
     unmet:Object.fromEntries(CATS.map(c=>[c,0])),
     stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0},
     news:[], savedAgents:{}, diag:freshDiag(),
+    waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
   };
 }
 
@@ -2119,6 +2201,7 @@ function initCity(){
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
       stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0}, j.stats||{}),
       news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
+      waiting:j.waiting||[],
     };
     if(CITY.foot.length!==GRID*GRID) CITY.foot=new Int32Array(GRID*GRID);
     for(const c of CATS) if(CITY.demand[c].length!==GRID*GRID) CITY.demand[c]=new Float32Array(GRID*GRID);
@@ -2741,12 +2824,25 @@ function growPopulation(day){
   if(room<=0) return 0;
   const n=Math.max(1, Math.min(room, MOVEIN_MAX, Math.ceil(agents.length*POP_GROWTH)));
   const base=agents.length;
-  for(let k=0;k<n;k++) spawnAgent(scene, base+k);
+  const moved=[];
+  for(let k=0;k<n;k++){
+    const a=spawnAgent(scene, base+k);
+    // 入居待ちの視聴者がいれば先に迎える (家が建つのを待っていた人が優先)
+    const w=(CITY.waiting||[]).shift();
+    if(w){ a.name=w.name; a.viewer=true; a.by=w.by; moved.push(w.name); }
+  }
   assignHomes();
   for(let k=0;k<n;k++) settleAgent(agents[base+k]);
   CITY.pop=agents.length;
-  news('pop', `🚶 ${n}人が引っ越してきた (人口 ${agents.length} / 住居の定員 ${cap})`,
-       `${n} resident${n>1?'s':''} moved in (pop ${agents.length})`);
+  if(moved.length){
+    news('pop', `🏠 入居待ちだった ${moved.join(', ')} が引っ越してきた (人口 ${agents.length})`,
+         `${moved.join(', ')} finally moved in (pop ${agents.length})`);
+    showBanner(`${moved[0]} moved in`, 6);
+  }
+  const others=n-moved.length;
+  if(others>0)
+    news('pop', `🚶 ${others}人が引っ越してきた (人口 ${agents.length} / 住居の定員 ${cap})`,
+         `${others} resident${others>1?'s':''} moved in (pop ${agents.length})`);
   return n;
 }
 
@@ -2772,9 +2868,25 @@ function finishConstruction(){
 }
 
 // ── 機能C: 店の盛衰 ────────────────────────────────────────────────────────
+// 建物の周り (3x3) の踏み跡。人通りの多い場所かどうか。
+function footNear(st){
+  let n=0;
+  for(let dr=-1;dr<=st.fp;dr++)for(let dc=-1;dc<=st.fp;dc++){
+    const r=st.r+dr, c=st.c+dc;
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    n+=CITY.foot[r*GRID+c];
+  }
+  return n;
+}
+// 店の健全度 = 来た客 + 前を通る人。**人通りの無い場所の店は先に潰れる**。
+const shopHealth = st => st.ema + FOOT_HEALTH*(st.footNear||0);
+
 function rolloverVisits(){
   for(const st of CITY.structs){
-    if(st.state==='open') st.ema = st.ema*0.7 + st.visitsToday*0.3;
+    if(st.state==='open'){
+      st.ema = st.ema*0.7 + st.visitsToday*0.3;
+      st.footNear = footNear(st);
+    }
     st.visitsToday=0;
   }
 }
@@ -2810,14 +2922,14 @@ function maybeClose(day){
   const open=CITY.structs.filter(st=>st.state==='open' && isClosable(st.typeIdx));
   const cands=open.filter(st=>(day-st.born)>=GRACE_DAYS && catCount(catOfType(st.typeIdx))>MIN_PER_CAT);
   if(!cands.length) return 0;
-  cands.sort((a,b)=>a.ema-b.ema);
+  cands.sort((a,b)=>shopHealth(a)-shopHealth(b));
   let closed=0;
   for(const st of cands){
     if(closed>=CLOSE_PER_DAY) break;
     const cat=catOfType(st.typeIdx);
-    const peers=open.filter(o=>catOfType(o.typeIdx)===cat).map(o=>o.ema);
+    const peers=open.filter(o=>catOfType(o.typeIdx)===cat).map(shopHealth);
     const mean=peers.length?peers.reduce((x,y)=>x+y,0)/peers.length:0;
-    if(mean<=0 || st.ema>=mean*CLOSE_FRAC) continue;
+    if(mean<=0 || shopHealth(st)>=mean*CLOSE_FRAC) continue;
     closeShop(st, day); closed++;
   }
   return closed;
@@ -2879,6 +2991,8 @@ function lifeProfileEn(a){
   if(kinds>=3) opts.push(`${N} has been to ${kinds} different kinds of places in town`);
   if(homeT!=null && workT!=null && !a.owns)
     opts.push(`${N} lives in a ${enOf(homeT)} and works at the ${enOf(workT)}`);
+  if(a.cheers>=3) opts.push(`${N} has been cheered ${a.cheers} times by viewers`);
+  if(a.viewer)    opts.push(`${N} is a viewer who moved into this town`);
   if(a.trips>=8) opts.push(`${N} has made ${a.trips} trips across town so far`);
   if((a.explored||0)>40) opts.push(`${N} has walked ${a.explored} corners of this town`);
   return opts.length ? _pick(opts) : null;
@@ -3290,6 +3404,7 @@ function spawnAgent(S, i){
     home:null, work:null, needIcon:null,
     // 街の進化: 訪問済み建物タイプのビット / 自分の店 / カテゴリ別の不満寄与
     seenMask:0, owns:null, unmetBy:null,
+    viewer:false, by:null, cheers:0, // 視聴者住民か / どの視聴者か / 応援された回数
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
     hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
@@ -3332,12 +3447,16 @@ function initAgents(S){
   // assignHomes は owns を見て職場を決めるので、順序を逆にすると店主が職を失う。
   if(CITY && CITY.savedAgents){
     let restored=0;
+    let viewers=0;
     for(const a of agents){
       const sv=CITY.savedAgents[a.aid]; if(!sv) continue;
       a.seenMask=sv.m||0;
+      a.cheers=sv.c||0;
+      if(sv.v && sv.n){ a.viewer=true; a.name=sv.n; a.by=sv.b||null; viewers++; }   // 視聴者住民を戻す
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
     }
     if(restored) console.log(`[City] 店主 ${restored}人の職場を復元`);
+    if(viewers)  console.log(`[City] 視聴者住民 ${viewers}人を復元`);
   }
   assignHomes();         // 空きのある住居/職場へ割り当てる
   // 自宅から一日を始める。夜間起動でも「家に居るのに眠くて彷徨う」不自然さを避ける。
@@ -3723,6 +3842,14 @@ const CHAT_FOCUS_SEC  = envNum('CHAT_FOCUS_SEC', 10);    // 1回の指名で映�
 const CHAT_COOLDOWN   = envNum('CHAT_COOLDOWN_SEC', 12); // 次の指名を受け付けるまで
 const CHAT_TOKEN      = process.env.CHAT_TOKEN || '';    // /chat に付ける合言葉 (任意)
 const CHAT_LOG        = process.env.CHAT_LOG !== '0';    // 届いたチャットを全部ログに出す
+// 視聴者が住民になる (!join) / 住民を応援する (!cheer)
+const VIEWER_JOIN     = process.env.VIEWER_JOIN !== '0';
+const VIEWER_MAX_FRAC = envNum('VIEWER_MAX_FRAC', 0.3);  // 視聴者住民は人口のこの割合まで
+const CHEER_RELIEF    = envNum('CHEER_RELIEF', 0.35);    // 応援で退屈がどれだけ晴れるか
+const CHEER_COOLDOWN  = envNum('CHEER_COOLDOWN_SEC', 3);
+// 名前に使わせない語 (カンマ区切り)。配信に出るので運営側で足せるようにしておく。
+const NG_WORDS = (process.env.CHAT_NG_WORDS||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
+let _lastCheerAt=0, _lastCheerBannerAt=0;
 let camHold=null;            // {idx, until, by}
 let _lastChatAt=0, _lastPingAt=0, chatLog=[], chatSeen=[];
 
@@ -3764,6 +3891,25 @@ function handleChatCommand(text, author){
     return {ok:true, msg:`pong to ${who}`};
   }
 
+  // 視聴者が住民になる
+  const mj=raw.match(/^!?join\b\s*(.{0,20})$/i);
+  if(mj){
+    const r=viewerJoin(who, (mj[1]||'').trim());
+    chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(join)'});
+    while(chatLog.length>30) chatLog.shift();
+    return r;
+  }
+  // 住民を応援する
+  const mc=raw.match(/^!?cheer\s+(.{1,40})$/i);
+  if(mc){
+    const r=viewerCheer(mc[1], who);
+    if(r.ok){
+      chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(cheer)'});
+      while(chatLog.length>30) chatLog.shift();
+    }
+    return r;
+  }
+
   const m=raw.match(/^!?(?:focus|cam|camera|watch)\s+(.{1,40})$/i);
   if(!m) return null;
   if(now-_lastChatAt < CHAT_COOLDOWN*1000)
@@ -3785,6 +3931,91 @@ function handleChatCommand(text, author){
   while(chatLog.length>30) chatLog.shift();
   console.log(`[Chat] ${who}: focus -> ${target} (${CHAT_FOCUS_SEC}s)`);
   return {ok:true, msg:`focus ${target} for ${CHAT_FOCUS_SEC}s`};
+}
+
+// 視聴者名を住民の表示名にできる形に整える。ASCII のみ・長さ制限・重複回避。
+function viewerNameFor(who){
+  let base=_ascii(who).replace(/[^A-Za-z0-9 _.#-]/g,'').trim().slice(0,16);
+  if(base.length<2) return null;
+  if(NG_WORDS.some(w=>base.toLowerCase().includes(w))) return null;
+  let name=base, n=2;
+  while(agents.some(a=>a.name===name)) name=`${base} #${n++}`;
+  return name;
+}
+
+// !join: 視聴者を住民として迎える。**家が空いていなければ待機列**に入れる
+// (家が無い人は生まれない、という街の決まりを視聴者にも適用する)。
+//   arg があればそれを住民の名前にする。**配信画面は ASCII しか描けない**ので、
+//   日本語だけの表示名だと名前が空になってしまう。`!join Hikari` のように
+//   ローマ字を自分で指定できる逃げ道を用意しておく。
+function viewerJoin(who, arg){
+  if(!VIEWER_JOIN || !CITY) return {ok:false, msg:'join disabled'};
+  const mine=a=>a.viewer && (a.by===who || a.name===_ascii(who).slice(0,16));
+  const exist=agents.find(mine);
+  if(exist){                                   // もう住んでいる → その人を映す
+    const idx=agents.indexOf(exist);
+    camHold={idx, until:Date.now()+CHAT_FOCUS_SEC*1000, by:who};
+    showBanner(`${exist.name} already lives here`, 5);
+    return {ok:true, msg:`already a resident: ${exist.name}`};
+  }
+  const name=viewerNameFor(arg||who);
+  if(!name) return {ok:false,
+    msg:'name needs 2+ letters/numbers (try: !join YourName)'};
+  if(CITY.waiting.some(w=>w.name===name)) return {ok:false, msg:'already waiting'};
+  const viewers=agents.reduce((n,a)=>n+(a.viewer?1:0),0);
+  const limit=Math.max(5, Math.round(NUM_AGENTS*VIEWER_MAX_FRAC));
+  if(viewers+CITY.waiting.length>=limit) return {ok:false, msg:`viewer residents are full (${limit})`};
+
+  const cap=Math.min(NUM_AGENTS, housingCapacity());
+  if(agents.length<cap && scene){              // 空き家がある → すぐ引っ越してくる
+    const a=spawnAgent(scene, agents.length);
+    a.name=name; a.viewer=true; a.by=who;
+    assignHomes(); settleAgent(a);
+    CITY.pop=agents.length;
+    news('pop', `🏠 ${name} がこの街に引っ越してきた (視聴者)`,
+         `${name} moved into this town`);
+    showBanner(`${name} moved in`, 6);
+    if(a.home) showCityEvent(a.home[0], a.home[1], `${name} moved into this town`, 8);
+    console.log(`[Chat] ${who}: join → 住民 ${name} が誕生 (人口 ${agents.length})`);
+    return {ok:true, msg:`welcome, ${name}`};
+  }
+  CITY.waiting.push({name, by:who, t:Date.now()});   // 家が無い → 建つまで待つ
+  news('pop', `🧳 ${name} が入居待ち (住居の空き待ち ${CITY.waiting.length}人)`,
+       `${name} is waiting for a home (${CITY.waiting.length} in queue)`);
+  showBanner(`${name} is waiting for a home`, 6);
+  return {ok:true, msg:`${name} queued (no housing yet)`};
+}
+
+// !cheer: 住民を応援する。退屈が晴れる = 「人と関わった」のと同じ扱いなので、
+// 街の理屈を壊さない。応援された回数は住民に貯まり、保存される。
+function viewerCheer(query, who){
+  const now=Date.now();
+  if(now-_lastCheerAt < CHEER_COOLDOWN*1000) return {ok:false, msg:'cheer cooldown'};
+  const hit=findAgentByQuery(query);
+  if(!hit || hit.overview) return {ok:false, msg:`no match: ${_ascii(query).slice(0,24)}`};
+  const a=agents[hit.idx];
+  if(!a) return {ok:false, msg:'no match'};
+  _lastCheerAt=now;
+  a.cheers=(a.cheers||0)+1;
+  a.bored=Math.max(0, (a.bored||0)-CHEER_RELIEF);
+  lifeNews.push({day:gameDay(), shape:'cheer',
+    en:`${a.name} was cheered by ${who} (${a.cheers} total)`,
+    ja:`${a.name} が ${who} に応援された (通算${a.cheers})`});
+  while(lifeNews.length>12) lifeNews.shift();
+  hudNewsDirty=true;
+  if(now-_lastCheerBannerAt > 20000){           // バナーは出しすぎない
+    _lastCheerBannerAt=now;
+    showBanner(`${a.name} cheered by ${who}`, 5);
+  }
+  console.log(`[Chat] ${who}: cheer → ${a.name} (通算${a.cheers})`);
+  return {ok:true, msg:`cheered ${a.name} (${a.cheers})`};
+}
+
+// 応援がいちばん多い住民
+function townFavorite(){
+  let best=null;
+  for(const a of agents) if((a.cheers||0)>((best&&best.cheers)||0)) best=a;
+  return best;
 }
 
 // チャットの指名が有効な間は true (その間カメラの自動切替と街イベントを止める)
@@ -4712,10 +4943,21 @@ tick(); setInterval(tick, ${ms});
       foundThreshold:FOUND_SITE,
       newest:CITY.structs.filter(s=>s.founded).sort((a,b)=>b.born-a.born).slice(0,10).map(fmt),
       busiest:open.slice().sort((a,b)=>b.visits-a.visits).slice(0,10).map(fmt),
-      atRisk:open.filter(s=>isClosable(s.typeIdx)).sort((a,b)=>a.ema-b.ema).slice(0,5).map(fmt),
+      tempo:{cityTempo:CITY_TEMPO, roadPerDay:ROAD_PER_DAY, footMin:Math.round(FOOT_MIN),
+        foundSite:+FOUND_SITE.toFixed(3), foundPerPop:Math.round(FOUND_PER_POP),
+        closePerDay:CLOSE_PER_DAY, graceDays:GRACE_DAYS, closeFrac:+CLOSE_FRAC.toFixed(2),
+        demolishDays:DEMOLISH_DAYS, footHealth:FOOT_HEALTH},
+      atRisk:open.filter(s=>isClosable(s.typeIdx))
+        .sort((a,b)=>shopHealth(a)-shopHealth(b)).slice(0,5)
+        .map(s=>({...fmt(s), health:+shopHealth(s).toFixed(1), footNear:s.footNear||0})),
       footTop:foot.slice(0,10), roadThreshold:FOOT_MIN,
       news:latestNews(30).reverse(),
       residents:lifeNews.slice(-8).reverse().map(n=>({day:n.day+1, ja:n.ja, en:n.en})),
+      viewers:{residents:agents.filter(a=>a.viewer).map(a=>({name:a.name, cheers:a.cheers||0,
+                 home:a.home, owns:a.owns})),
+        waiting:(CITY.waiting||[]).map(w=>w.name),
+        limit:Math.max(5, Math.round(NUM_AGENTS*VIEWER_MAX_FRAC)),
+        favorite:(()=>{ const f=townFavorite(); return f?{name:f.name, cheers:f.cheers||0}:null; })()},
       chat:{enabled:CHAT_CMD, focusSec:CHAT_FOCUS_SEC, cooldownSec:CHAT_COOLDOWN,
         holding: camHold ? {target:camHold.idx<0?'overview':(agents[camHold.idx]||{}).name,
                             by:camHold.by, leftSec:Math.max(0,Math.round((camHold.until-Date.now())/1000))} : null,
