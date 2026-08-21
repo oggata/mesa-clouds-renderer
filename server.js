@@ -3835,6 +3835,7 @@ const YTC = {
   // 取り込み方式: 'auto' はまず streamList を試し、駄目ならポーリングへ落ちる
   mode: (['stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
   units:0, calls:{}, unitDay:'',            // 消費ユニットの自前カウント (太平洋時間の日付で区切る)
+  primed:false, bytes:0, lastDataAt:0,      // 履歴を捨てたか / 受信バイト / 最後にデータが来た時刻
   chatId:null, pageToken:null, polls:0, pushes:0, seen:0, cmds:0, lastError:null, startedAt:0,
   streamOk:false, _abort:null,
   pausedUntil:0,           // クォータ切れで打ち止めになった時刻 (太平洋時間の深夜まで)
@@ -3963,10 +3964,20 @@ function makeJsonSplitter(onObject){
 
 function ytcConsume(j){
   if(j && j.nextPageToken) YTC.pageToken=j.nextPageToken;
-  for(const m of ((j&&j.items)||[])){
+  const items=((j&&j.items)||[]);
+  YTC.pushes++;
+  // 最初の応答には「これまでのチャット履歴」が入っている。ここだけ捨てて、
+  // 以降は時刻を見ずに全部流す。
+  //   以前は publishedAt < 起動時刻 で捨てていたが、**サーバの時計がズレていると
+  //   新着まで捨ててしまい、しかもログに何も出ないので原因が分からない**。
+  if(!YTC.primed){
+    YTC.primed=true;
+    if(items.length) console.log(`[YTChat] 接続時の履歴 ${items.length} 件は流さない (以降の新着だけ拾う)`);
+    return;
+  }
+  if(!items.length) return;                        // 空応答 (接続維持の合図) は無視
+  for(const m of items){
     const sn=m.snippet||{}, au=m.authorDetails||{};
-    const t=Date.parse(sn.publishedAt||'')||0;
-    if(t && t<YTC.startedAt) continue;              // 起動前のチャットは流さない
     YTC.seen++;
     const text=sn.displayMessage||'', who=au.displayName||'viewer';
     // 命令でないチャットも記録する。「そもそも届いているのか」を切り分けるため。
@@ -3999,11 +4010,20 @@ async function ytcStreamOnce(){
     throw e;
   }
   YTC.streamOk=true;
+  YTC.primed=false;                                // 張り直すたびに履歴を1回ぶん捨てる
   console.log('[YTChat] streamList に接続 (push 方式・ポーリング無し)');
-  const feed=makeJsonSplitter(j=>{ YTC.pushes++; ytcConsume(j); });
+  const feed=makeJsonSplitter(j=>ytcConsume(j));
   const dec=new TextDecoder();
-  for await (const chunk of res.body) feed(dec.decode(chunk, {stream:true}));
-  throw new Error('stream closed');                // 正常終了しても張り直す
+  let nChunk=0;
+  for await (const chunk of res.body){
+    YTC.bytes+=chunk.length; YTC.lastDataAt=Date.now(); nChunk++;
+    // 最初の数回と、その後は時々だけ出す。「繋がっているが無言」なのか
+    // 「そもそも何も来ていない」のかを切り分けるため。
+    if(nChunk<=3 || nChunk%50===0)
+      console.log(`[YTChat] 受信 ${chunk.length}B (計${YTC.bytes}B / 応答${YTC.pushes}件 / メッセージ${YTC.seen}件)`);
+    feed(dec.decode(chunk, {stream:true}));
+  }
+  throw new Error(`stream closed (受信 ${nChunk} chunk / ${YTC.bytes}B)`);
 }
 
 // 接続が切れたら張り直す。何度やっても駄目ならポーリングへ落とす。
@@ -4011,10 +4031,14 @@ async function ytcStreamLoop(){
   let fails=0;
   for(;;){
     if(!YTC.enabled || YTC.mode!=='stream') return;
+    const t0=Date.now();
     try{
       await ytcStreamOnce();
-      fails=0;                                     // 一度でも繋がれば回復扱い
     }catch(e){
+      // 30秒以上つながっていたなら「正常に張られていて切れただけ」= 失敗ではない。
+      // ytcStreamOnce は必ず throw で終わるので、この判定が無いと健全な接続でも
+      // fails が溜まってポーリングに落ちてしまう。
+      if(Date.now()-t0 > 30000 && YTC.streamOk) fails=0;
       YTC.lastError=e.message;
       if(/quotaExceeded|dailyLimitExceeded/i.test(e.reason||e.message)){
         YTC.pausedUntil=nextQuotaResetMs();
@@ -4508,6 +4532,7 @@ tick(); setInterval(tick, ${ms});
         received:chatSeen.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
         mode:YTC.mode, polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
+        bytes:YTC.bytes, lastDataSecAgo:YTC.lastDataAt?Math.round((Date.now()-YTC.lastDataAt)/1000):null,
         usage:{ptDay:YTC.unitDay, unitsUsed:YTC.units, freeQuota:10000,
           calls:YTC.calls, unitCost:YTC.unitCost,
           note:'自前の見積り。正は Cloud Console の「割り当て」。liveChat 系の単価は非公開のため YT_CHAT_UNIT_COST の値で計算している'},
