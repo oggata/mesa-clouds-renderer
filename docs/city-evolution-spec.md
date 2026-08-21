@@ -868,6 +868,7 @@ curl -s "localhost:8080/city?weather=rain"     # sunny | cloudy | rain
 視聴者が「このキャラを映して」と書くと、数秒だけそのキャラを追う。
 
 ```
+test / ping         → 画面に「chat OK - <視聴者名>」と数秒出る (疎通確認)
 !focus rex          → Explorer Rex #1 を 10秒追う
 focus Lily #2       → 表示名で指定
 focus B             → ペルソナ id で指定
@@ -882,6 +883,20 @@ focus random        → ランダム
 カメラの優先順位は **チャットの指名 > 街のできごと > 自動切替**。
 指名は数秒なので、その間に起きた着工/取り壊しは待ち行列で待ち、明けてから再生される
 (アニメもカメラ到着に合わせて始まるので、見逃しにはならない)。
+
+### 13.0b 届いているかの確認
+
+チャットが**そもそも届いているのか**、届いたが**命令として解釈されなかった**のかは
+別の話なので、3か所で見られるようにしてある。
+
+| 見る場所 | 内容 |
+|---|---|
+| 配信画面 | `test` と書くと「chat OK - 名前」が数秒出る (カメラは動かさない) |
+| サーバのログ | `[Chat<-] 名前: 本文` … **命令でないチャットも全部**出る (`CHAT_LOG=0` で止まる) |
+| `/city` の `chat` | `received` = 生のチャット直近10件 / `recent` = 命令として通ったもの |
+
+視聴者名は ASCII に落として描く。日本語だけの名前は落ちて `viewer` になる
+(配信画面に日本語フォントが無いため。ログと `/city` には元の名前が残る)。
 
 ### 13.1 入口は1つ (`/chat`)
 
@@ -969,6 +984,28 @@ server.js 側が期限を見て自動で取り直す (`ytcAccessToken`)。
 `quotaExceeded` を受け取ったら、**太平洋時間の深夜まで自動で停止**する
 (叩き続けても復帰しないうえ、ログが埋まるため)。街の進行と配信は止まらない。
 
+### 13.2d 消費量の見方
+
+正は **Google Cloud Console → APIとサービス → YouTube Data API v3 → 割り当て**
+(「Queries per day」が 10,000 の枠)。ただし反映に遅れがあるので、
+サーバ側でも自前で数えている。
+
+```bash
+curl -s localhost:8080/city | python3 -c "import json,sys;print(json.load(sys.stdin)['youtube']['usage'])"
+# {'ptDay':'2026-08-20', 'unitsUsed':6, 'freeQuota':10000,
+#  'calls':{'videos':1,'liveChat/messages/stream':1}, ...}
+```
+
+1時間ごとにログにも出る。太平洋時間の日付が変わったらリセットする (Google と同じ区切り)。
+
+実測 (モック): **stream 方式は繋いだ時点の 6 units から増えない**
+(videos.list=1 + 接続1本ぶんの推定5)。ポーリング5秒間隔だと12秒で 16 units まで伸びた。
+
+注意:
+- `liveChat` 系の単価は非公開なので `YT_CHAT_UNIT_COST`(既定5) で計算した**推定**
+- 失敗した呼び出しも数えている (Google 側も課金されうるため)
+- `search.list` は 100 units。しかも **search 専用に「1日100クエリ」の別枠**がある
+
 ### 13.2c streamList (push 方式) を優先し、駄目ならポーリングへ落ちる
 
 公式が「ライブチャットを消費する最も効率的な方法」としているのが
@@ -1010,6 +1047,7 @@ YT_CHAT_MODE=poll    # ポーリングのみ (従来どおり)
 | `CHAT_FOCUS_SEC` | 10 | 1回の指名で映す秒数 |
 | `CHAT_COOLDOWN_SEC` | 12 | 次の指名を受け付けるまでの間隔 |
 | `CHAT_TOKEN` | (なし) | `/chat` の合言葉。公開サーバでは設定する |
+| `CHAT_LOG` | 1 | 届いたチャットを全部ログに出す。`0` で命令だけ |
 | `YT_CHAT` | 0 | `1` で YouTube ライブチャットの取り込みを有効化 |
 | `YT_API_KEY` | (なし) | APIキー |
 | `YT_OAUTH_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | (なし) | OAuth が要る場合。期限は自動更新 |

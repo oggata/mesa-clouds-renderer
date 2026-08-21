@@ -3834,12 +3834,29 @@ const YTC = {
   unitCost: envNum('YT_CHAT_UNIT_COST', 5),
   // 取り込み方式: 'auto' はまず streamList を試し、駄目ならポーリングへ落ちる
   mode: (['stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
+  units:0, calls:{}, unitDay:'',            // 消費ユニットの自前カウント (太平洋時間の日付で区切る)
   chatId:null, pageToken:null, polls:0, pushes:0, seen:0, cmds:0, lastError:null, startedAt:0,
   streamOk:false, _abort:null,
   pausedUntil:0,           // クォータ切れで打ち止めになった時刻 (太平洋時間の深夜まで)
   _access:'', _accessExp:0, _lastSearch:0,
   get quotaPerDay(){ return Math.round(86400/Math.max(5,this.pollSec))*this.unitCost; },
 };
+
+// ── 消費ユニットの自前カウント ──────────────────────────────────────────────
+//   正は Google Cloud Console (APIとサービス → YouTube Data API v3 → 割り当て) だが、
+//   あちらは反映に遅れがあるので「いま何を何回叩いたか」をこちらでも数えておく。
+//   太平洋時間の日付が変わったらリセットする (Google の集計と同じ区切り)。
+const ptDayKey = () => new Date().toLocaleDateString('en-CA', {timeZone:'America/Los_Angeles'});
+function ytcCharge(path){
+  const d=ptDayKey();
+  if(d!==YTC.unitDay){                       // 日付が変わった → リセット
+    if(YTC.units) console.log(`[YTChat] ${YTC.unitDay} の消費: 約${YTC.units} units`);
+    YTC.unitDay=d; YTC.units=0; YTC.calls={}; YTC.pausedUntil=0;
+  }
+  const cost = path==='videos' ? 1 : path==='search' ? 100 : YTC.unitCost;
+  YTC.units += cost;
+  YTC.calls[path] = (YTC.calls[path]||0)+1;
+}
 
 // クォータは**太平洋時間の深夜**に戻る (繰り越し無し)。次のリセットまでの時刻を返す。
 function nextQuotaResetMs(){
@@ -3868,6 +3885,7 @@ async function ytcAccessToken(){
 }
 
 async function ytcFetch(path, params){
+  ytcCharge(path);                           // 失敗しても課金されうるので、投げる前に数える
   const u=new URL(`${YTC.base}/${path}`);
   for(const [k,v] of Object.entries(params)) if(v!=null && v!=='') u.searchParams.set(k,v);
   if(YTC.key) u.searchParams.set('key', YTC.key);
@@ -3971,6 +3989,7 @@ async function ytcStreamOnce(){
   const tok=await ytcAccessToken();
   const ac=new AbortController();
   YTC._abort=ac;
+  ytcCharge('liveChat/messages/stream');     // 接続1本ぶん (単価は非公開なので推定)
   const res=await fetch(u, {headers: tok?{Authorization:`Bearer ${tok}`}:{}, signal:ac.signal});
   if(!res.ok){
     const j=await res.json().catch(()=>({}));
@@ -4489,7 +4508,10 @@ tick(); setInterval(tick, ${ms});
         received:chatSeen.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
         mode:YTC.mode, polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
-        unitCost:YTC.unitCost, quotaPerDay:YTC.quotaPerDay, quotaFree:10000,
+        usage:{ptDay:YTC.unitDay, unitsUsed:YTC.units, freeQuota:10000,
+          calls:YTC.calls, unitCost:YTC.unitCost,
+          note:'自前の見積り。正は Cloud Console の「割り当て」。liveChat 系の単価は非公開のため YT_CHAT_UNIT_COST の値で計算している'},
+        quotaPerDay:YTC.quotaPerDay, quotaFree:10000,
         pausedForSec:YTC.pausedUntil>Date.now()?Math.round((YTC.pausedUntil-Date.now())/1000):0,
         lastError:YTC.lastError} : null}));
     return;
@@ -4789,6 +4811,11 @@ function startLoops(){
     }else{
       YTC.startedAt=Date.now();
       if(YTC.mode==='auto') YTC.mode='stream';        // まず push 方式を試す
+      YTC.unitDay=ptDayKey();
+      setInterval(()=>{
+        if(YTC.units) console.log(`[YTChat] 本日 (${YTC.unitDay} PT) の消費: 約${YTC.units} units / 10,000`
+          + ` — ${Object.entries(YTC.calls).map(([k,v])=>`${k}×${v}`).join(' ')}`);
+      }, 3600*1000);
       if(YTC.mode==='stream'){
         console.log('[YTChat] streamList (push) で取り込む。失敗したらポーリングに落ちる');
         ytcStreamLoop();
