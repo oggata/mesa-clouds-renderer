@@ -22,6 +22,30 @@ const fs    = require('fs');
 const path  = require('path');
 const { spawn } = require('child_process');
 
+// ─── .env の読み込み (依存パッケージ無し) ─────────────────────────────────────
+//   設定項目が増えたので、毎回コマンドラインに並べるのは現実的でない。
+//   リポジトリ直下の .env を読む (.gitignore 済み)。ENV_FILE で場所を変えられる。
+//   **既に設定されている環境変数は上書きしない** ので、Render 等のダッシュボードで
+//   入れた値や `FOO=1 node server.js` のほうが常に優先される。
+//   ここは他のどの const よりも先に走らせること (下の設定群が process.env を読むため)。
+(function loadDotEnv(){
+  const fp = process.env.ENV_FILE || path.join(__dirname, '.env');
+  try{
+    if(!fs.existsSync(fp)) return;
+    let n=0;
+    for(let line of fs.readFileSync(fp,'utf8').split(/\r?\n/)){
+      line=line.replace(/^\s*export\s+/, '');
+      const m=line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if(!m) continue;                                  // 空行・コメント行は飛ばす
+      let v=m[2].trim();
+      if((v.startsWith('"')&&v.endsWith('"'))||(v.startsWith("'")&&v.endsWith("'"))) v=v.slice(1,-1);
+      else v=v.replace(/\s+#.*$/,'').trim();            // 行末コメントを落とす
+      if(process.env[m[1]]===undefined){ process.env[m[1]]=v; n++; }
+    }
+    if(n) console.log(`[Env] ${path.basename(fp)} から ${n} 件読み込み`);
+  }catch(e){ console.warn('[Env] .env の読み込みに失敗:', e.message); }
+})();
+
 // JPEG エンコードに sharp を使う（なければ簡易RGB返し）
 let sharp = null;
 try { sharp = require('sharp'); console.log('[Sharp] loaded'); }
@@ -3759,6 +3783,10 @@ function holdCamera(){
 //     1) videos.list(part=liveStreamingDetails) で activeLiveChatId を得る (1 unit)
 //     2) liveChatMessages.list で新着を取る (5 units/回)
 //
+//   ★ REST のパスはメソッド名と違う。`liveChatMessages` ではなく
+//     **`/youtube/v3/liveChat/messages`**。前者を叩くと本文の無い 404 が返ってきて
+//     原因が分かりにくい (実際に一度踏んだ)。
+//
 //   【クォータがこの機能の設計を決める】既定の割当は 1日 10,000 units。
 //   liveChatMessages.list が 1回 5 units なので、24時間回すと
 //     10,000 / 5 = 2,000 回/日 → **43秒に1回**が上限。
@@ -3771,53 +3799,237 @@ function holdCamera(){
 const YTC = {
   enabled: process.env.YT_CHAT === '1',
   key:     process.env.YT_API_KEY || '',
-  token:   process.env.YT_CHAT_TOKEN || '',        // OAuth アクセストークン (任意)
+  token:   process.env.YT_CHAT_TOKEN || '',        // 手で入れた短命アクセストークン (検証用)
+  // 24時間動かすならリフレッシュトークン。アクセストークンは1時間で切れるので、
+  // YT_CHAT_TOKEN を直接入れる運用は動作確認のときだけにすること。
+  clientId:     process.env.YT_OAUTH_CLIENT_ID || '',
+  clientSecret: process.env.YT_OAUTH_CLIENT_SECRET || '',
+  refresh:      process.env.YT_OAUTH_REFRESH_TOKEN || '',
   video:   process.env.YT_VIDEO_ID || '',
+  channel: process.env.YT_CHANNEL_ID || '',        // 動画IDの代わりにチャンネルから自動発見
   base:    process.env.YT_CHAT_API_BASE || 'https://www.googleapis.com/youtube/v3',
   pollSec: envNum('YT_CHAT_POLL_SEC', 45),
-  chatId:null, pageToken:null, polls:0, seen:0, cmds:0, lastError:null, startedAt:0,
-  get quotaPerDay(){ return Math.round(86400/Math.max(5,this.pollSec))*5; },
+  // liveChatMessages.list の単価は公式のクォータ表で確認できなかった。多くの list は
+  // 1 unit だが、ライブチャットは 5 unit という記述も見かける。**安全側の 5 を既定**にし、
+  // 実測できたら YT_CHAT_UNIT_COST で直せるようにしておく (見積りログに効く)。
+  unitCost: envNum('YT_CHAT_UNIT_COST', 5),
+  // 取り込み方式: 'auto' はまず streamList を試し、駄目ならポーリングへ落ちる
+  mode: (['stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
+  chatId:null, pageToken:null, polls:0, pushes:0, seen:0, cmds:0, lastError:null, startedAt:0,
+  streamOk:false, _abort:null,
+  pausedUntil:0,           // クォータ切れで打ち止めになった時刻 (太平洋時間の深夜まで)
+  _access:'', _accessExp:0, _lastSearch:0,
+  get quotaPerDay(){ return Math.round(86400/Math.max(5,this.pollSec))*this.unitCost; },
 };
+
+// クォータは**太平洋時間の深夜**に戻る (繰り越し無し)。次のリセットまでの時刻を返す。
+function nextQuotaResetMs(){
+  const now=new Date();
+  const pt=new Date(now.toLocaleString('en-US',{timeZone:'America/Los_Angeles'}));
+  const next=new Date(pt); next.setHours(24,0,0,0);
+  return now.getTime() + (next.getTime()-pt.getTime());
+}
+
+// アクセストークンは1時間で切れる。リフレッシュトークンがあれば自動で取り直す。
+async function ytcAccessToken(){
+  if(YTC.token) return YTC.token;
+  if(!YTC.refresh || !YTC.clientId || !YTC.clientSecret) return '';
+  if(YTC._access && Date.now() < YTC._accessExp-60000) return YTC._access;
+  const body=new URLSearchParams({client_id:YTC.clientId, client_secret:YTC.clientSecret,
+                                  refresh_token:YTC.refresh, grant_type:'refresh_token'});
+  const r=await fetch('https://oauth2.googleapis.com/token',
+    {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok || !j.access_token)
+    throw new Error(`アクセストークンの更新に失敗: ${r.status} ${j.error_description||j.error||''}`);
+  YTC._access=j.access_token;
+  YTC._accessExp=Date.now()+((j.expires_in||3600)*1000);
+  console.log(`[YTChat] アクセストークンを更新 (${Math.round((j.expires_in||3600)/60)}分有効)`);
+  return YTC._access;
+}
 
 async function ytcFetch(path, params){
   const u=new URL(`${YTC.base}/${path}`);
   for(const [k,v] of Object.entries(params)) if(v!=null && v!=='') u.searchParams.set(k,v);
   if(YTC.key) u.searchParams.set('key', YTC.key);
-  const r=await fetch(u, {headers: YTC.token ? {Authorization:`Bearer ${YTC.token}`} : {}});
+  const tok=await ytcAccessToken();
+  const r=await fetch(u, {headers: tok ? {Authorization:`Bearer ${tok}`} : {}});
   const j=await r.json().catch(()=>({}));
-  if(!r.ok) throw new Error(`${r.status} ${(j.error && j.error.message) || ''}`.trim());
+  if(!r.ok){
+    const reason=((((j.error||{}).errors||[])[0])||{}).reason || '';
+    const e=new Error(`${r.status} ${reason} ${(j.error && j.error.message) || ''}`.trim());
+    e.reason=reason; e.status=r.status;
+    throw e;
+  }
   return j;
 }
 
+// 配信中の動画IDをチャンネルから探す。search.list は **100 units** と高いので、
+// 動画IDが分からないときだけ、かつ5分に1回までに絞る。
+async function ytcFindLiveVideo(){
+  if(!YTC.channel) return null;
+  if(Date.now()-YTC._lastSearch < 5*60*1000) return null;
+  YTC._lastSearch=Date.now();
+  const j=await ytcFetch('search', {part:'id', channelId:YTC.channel,
+                                    eventType:'live', type:'video', maxResults:1});
+  const id=((j.items||[])[0]||{}).id && j.items[0].id.videoId;
+  if(id){ YTC.video=id; console.log(`[YTChat] 配信中の動画を発見: ${id} (search.list = 100 units)`); }
+  return id||null;
+}
+
 async function ytcResolveChatId(){
+  if(!YTC.video) await ytcFindLiveVideo();
+  if(!YTC.video) throw new Error('動画IDが無い (YT_VIDEO_ID か YT_CHANNEL_ID を設定する)');
   const j=await ytcFetch('videos', {part:'liveStreamingDetails', id:YTC.video});
   const it=(j.items||[])[0];
   const id=it && it.liveStreamingDetails && it.liveStreamingDetails.activeLiveChatId;
-  if(!id) throw new Error('activeLiveChatId が取れない (配信中でない / 動画IDが違う / 権限不足)');
+  if(!id){ YTC.video=YTC.channel?'':YTC.video;   // チャンネル指定なら次回探し直す
+    throw new Error('activeLiveChatId が取れない (配信中でない / 動画IDが違う / 権限不足)'); }
   YTC.chatId=id; YTC.pageToken=null;
   console.log(`[YTChat] liveChatId 取得 (${String(id).slice(0,16)}…)`);
 }
 
+// ── streamList (長時間つなぎっぱなしで新着を push してもらう) ────────────────
+//   公式は「ライブチャットを消費する最も効率的な方法」としている。本体は gRPC
+//   (protobuf) だが、REST のクエリ仕様も公開されているので **まず REST の
+//   streaming エンドポイントを試し、駄目ならポーリングに落ちる**形にした。
+//   gRPC を使うには @grpc/grpc-js と .proto が要る = 依存が増えるので、
+//   REST で足りるならそのほうが安い。
+//
+//   応答は「JSON オブジェクトが少しずつ流れてくる」形なので、括弧の深さを数えて
+//   完成したオブジェクトから順に取り出す (改行区切りとは限らないため)。
+function makeJsonSplitter(onObject){
+  let buf='', depth=0, start=-1, inStr=false, esc=false;
+  return chunk=>{
+    buf+=chunk;
+    for(let i=0;i<buf.length;i++){
+      const ch=buf[i];
+      if(inStr){
+        if(esc) esc=false;
+        else if(ch==='\\') esc=true;
+        else if(ch==='"') inStr=false;
+        continue;
+      }
+      if(ch==='"'){ inStr=true; continue; }
+      if(ch==='{'){ if(depth===0) start=i; depth++; }
+      else if(ch==='}'){
+        depth--;
+        if(depth===0 && start>=0){
+          try{ onObject(JSON.parse(buf.slice(start,i+1))); }catch(_){}
+          buf=buf.slice(i+1); i=-1; start=-1;
+        }
+      }
+    }
+    if(depth===0 && buf.length>1000000) buf='';     // 壊れた応答で膨らませない
+  };
+}
+
+function ytcConsume(j){
+  if(j && j.nextPageToken) YTC.pageToken=j.nextPageToken;
+  for(const m of ((j&&j.items)||[])){
+    const sn=m.snippet||{}, au=m.authorDetails||{};
+    const t=Date.parse(sn.publishedAt||'')||0;
+    if(t && t<YTC.startedAt) continue;              // 起動前のチャットは流さない
+    YTC.seen++;
+    const r=handleChatCommand(sn.displayMessage||'', au.displayName||'viewer');
+    if(r && r.ok) YTC.cmds++;
+  }
+}
+
+async function ytcStreamOnce(){
+  if(!YTC.chatId) await ytcResolveChatId();
+  const u=new URL(`${YTC.base}/liveChat/messages/stream`);
+  u.searchParams.set('liveChatId', YTC.chatId);
+  u.searchParams.set('part', 'snippet,authorDetails');
+  u.searchParams.set('maxResults', '500');
+  if(YTC.pageToken) u.searchParams.set('pageToken', YTC.pageToken);
+  if(YTC.key) u.searchParams.set('key', YTC.key);
+  const tok=await ytcAccessToken();
+  const ac=new AbortController();
+  YTC._abort=ac;
+  const res=await fetch(u, {headers: tok?{Authorization:`Bearer ${tok}`}:{}, signal:ac.signal});
+  if(!res.ok){
+    const j=await res.json().catch(()=>({}));
+    const reason=((((j.error||{}).errors||[])[0])||{}).reason||'';
+    const e=new Error(`${res.status} ${reason} ${(j.error&&j.error.message)||''}`.trim());
+    e.status=res.status; e.reason=reason;
+    throw e;
+  }
+  YTC.streamOk=true;
+  console.log('[YTChat] streamList に接続 (push 方式・ポーリング無し)');
+  const feed=makeJsonSplitter(j=>{ YTC.pushes++; ytcConsume(j); });
+  const dec=new TextDecoder();
+  for await (const chunk of res.body) feed(dec.decode(chunk, {stream:true}));
+  throw new Error('stream closed');                // 正常終了しても張り直す
+}
+
+// 接続が切れたら張り直す。何度やっても駄目ならポーリングへ落とす。
+async function ytcStreamLoop(){
+  let fails=0;
+  for(;;){
+    if(!YTC.enabled || YTC.mode!=='stream') return;
+    try{
+      await ytcStreamOnce();
+      fails=0;                                     // 一度でも繋がれば回復扱い
+    }catch(e){
+      YTC.lastError=e.message;
+      if(/quotaExceeded|dailyLimitExceeded/i.test(e.reason||e.message)){
+        YTC.pausedUntil=nextQuotaResetMs();
+        console.warn('[YTChat] 1日のクォータを使い切った → 太平洋時間の深夜まで停止');
+        await new Promise(r=>setTimeout(r, 60000));
+        continue;
+      }
+      // 一度も繋がったことが無く 4xx なら、この環境では streamList を使えない
+      if(!YTC.streamOk && e.status>=400 && e.status<500){
+        console.warn(`[YTChat] streamList が使えない (${e.message}) → ポーリングに切り替え`);
+        YTC.mode='poll';
+        YTC.pageToken=null;
+        setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
+        ytcPoll();
+        return;
+      }
+      fails++;
+      const wait=Math.min(60, 2**Math.min(fails,5));
+      console.warn(`[YTChat] stream 切断 (${e.message}) → ${wait}秒後に張り直す`);
+      await new Promise(r=>setTimeout(r, wait*1000));
+      if(fails>=8){
+        console.warn('[YTChat] 張り直しが続くのでポーリングに切り替え');
+        YTC.mode='poll';
+        setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
+        ytcPoll();
+        return;
+      }
+    }
+  }
+}
+
 async function ytcPoll(){
   if(!YTC.enabled) return;
+  if(YTC.pausedUntil && Date.now()<YTC.pausedUntil) return;   // クォータ切れ中は叩かない
   try{
     if(!YTC.chatId) await ytcResolveChatId();
-    const j=await ytcFetch('liveChatMessages', {
+    const j=await ytcFetch('liveChat/messages', {
       liveChatId:YTC.chatId, part:'snippet,authorDetails',
-      maxResults:200, pageToken:YTC.pageToken});
+      maxResults:2000, pageToken:YTC.pageToken});
     YTC.polls++;
-    YTC.pageToken=j.nextPageToken||null;
-    for(const m of (j.items||[])){
-      const sn=m.snippet||{}, au=m.authorDetails||{};
-      const t=Date.parse(sn.publishedAt||'')||0;
-      if(t && t<YTC.startedAt) continue;              // 起動前のチャットは流さない
-      YTC.seen++;
-      const r=handleChatCommand(sn.displayMessage||'', au.displayName||'viewer');
-      if(r && r.ok) YTC.cmds++;
-    }
+    ytcConsume(j);
     YTC.lastError=null;
   }catch(e){
     YTC.lastError=e.message;
+    // quotaExceeded は「その日はもう打ち止め」。叩き続けても意味が無いので
+    // 太平洋時間の深夜まで止める。rateLimitExceeded は一時的なので数回休むだけ。
+    if(/quotaExceeded|dailyLimitExceeded/i.test(e.reason||e.message)){
+      YTC.pausedUntil=nextQuotaResetMs();
+      const h=((YTC.pausedUntil-Date.now())/3600000).toFixed(1);
+      console.warn(`[YTChat] 1日のクォータを使い切った → 約${h}時間後 (太平洋時間の深夜) まで停止。`
+        + ` YT_CHAT_POLL_SEC を伸ばすか、別プロセスのボットから /chat に流す形に変える`);
+      return;
+    }
+    if(/rateLimitExceeded|userRateLimitExceeded/i.test(e.reason||e.message)){
+      YTC.pausedUntil=Date.now()+Math.max(60, YTC.pollSec*4)*1000;
+      console.warn('[YTChat] レート超過 → 少し休む');
+      return;
+    }
     console.warn('[YTChat] 取得失敗:', e.message);
     if(/^(401|403|404)/.test(e.message)) YTC.chatId=null;   // 期限切れ等は取り直す
   }
@@ -4251,8 +4463,10 @@ tick(); setInterval(tick, ${ms});
                             by:camHold.by, leftSec:Math.max(0,Math.round((camHold.until-Date.now())/1000))} : null,
         recent:chatLog.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
-        polls:YTC.polls, seen:YTC.seen, commands:YTC.cmds,
-        quotaPerDay:YTC.quotaPerDay, lastError:YTC.lastError} : null}));
+        mode:YTC.mode, polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
+        unitCost:YTC.unitCost, quotaPerDay:YTC.quotaPerDay, quotaFree:10000,
+        pausedForSec:YTC.pausedUntil>Date.now()?Math.round((YTC.pausedUntil-Date.now())/1000):0,
+        lastError:YTC.lastError} : null}));
     return;
   }
 
@@ -4541,18 +4755,29 @@ function startLoops(){
     setInterval(saveCity, Math.max(10,CITY_SAVE_SEC)*1000);           // 街の状態を定期保存
   }
   if(YTC.enabled){
-    if(!YTC.video || (!YTC.key && !YTC.token)){
-      console.warn('[YTChat] YT_VIDEO_ID と YT_API_KEY (または YT_CHAT_TOKEN) が要る → 無効化');
+    const hasAuth = YTC.key || YTC.token || (YTC.refresh && YTC.clientId && YTC.clientSecret);
+    if((!YTC.video && !YTC.channel) || !hasAuth){
+      console.warn('[YTChat] 設定不足 → 無効化 '
+        + '(YT_VIDEO_ID か YT_CHANNEL_ID、および YT_API_KEY か OAuth 一式が要る。'
+        + ' 手順は docs/city-evolution-spec.md §13.2 / tools/yt-chat-setup.js)');
       YTC.enabled=false;
     }else{
       YTC.startedAt=Date.now();
-      console.log(`[YTChat] ${YTC.pollSec}秒ごとに取得 (推定 ${YTC.quotaPerDay} units/日 / 既定枠 10,000)`);
-      if(YTC.quotaPerDay>10000)
-        console.warn(`[YTChat] ⚠ 1日のクォータ (10,000 units) を超える設定。24時間回すなら`
-          + ` YT_CHAT_POLL_SEC=45 以上に。いまの間隔だと約`
-          + ` ${(10000/(YTC.quotaPerDay/24)).toFixed(1)} 時間で枠を使い切る`);
-      setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
-      ytcPoll();
+      if(YTC.mode==='auto') YTC.mode='stream';        // まず push 方式を試す
+      if(YTC.mode==='stream'){
+        console.log('[YTChat] streamList (push) で取り込む。失敗したらポーリングに落ちる');
+        ytcStreamLoop();
+      }else{
+        console.log(`[YTChat] ${YTC.pollSec}秒ごとに取得`
+          + ` (推定 ${YTC.quotaPerDay} units/日 = ${YTC.unitCost}units×${Math.round(86400/YTC.pollSec)}回`
+          + ` / 無料枠は 1日 10,000・太平洋時間の深夜にリセット)`);
+        if(YTC.quotaPerDay>10000)
+          console.warn(`[YTChat] ⚠ 1日のクォータ (10,000 units) を超える設定。24時間回すなら`
+            + ` YT_CHAT_POLL_SEC=45 以上に。いまの間隔だと約`
+            + ` ${(10000/(YTC.quotaPerDay/24)).toFixed(1)} 時間で枠を使い切る`);
+        setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
+        ytcPoll();
+      }
     }
   }
   if(YT_ENABLED){

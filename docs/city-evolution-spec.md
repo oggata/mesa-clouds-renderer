@@ -894,26 +894,111 @@ curl "localhost:8080/chat?text=focus%20rex&user=someone&token=..."
 YouTube / Twitch / Discord / 手元の curl、どこからでも同じ形で渡せる。
 `CHAT_TOKEN` を設定すると合言葉が要る (公開サーバでは必ず設定すること)。
 
-### 13.2 YouTube から直接取り込む (`YT_CHAT=1`)
+### 13.2 YouTube に繋ぐ手順
+
+設定は **リポジトリ直下の `.env`** に書く (`.env.example` をコピーする)。
+server.js が起動時に自分で読む (依存パッケージ無し / `.gitignore` 済み)。
+**既に設定されている環境変数は上書きしない**ので、Render 等のダッシュボードで
+入れた値や `FOO=1 node server.js` のほうが常に優先される。
+
+```
+YT_CHAT=1
+YT_API_KEY=…
+YT_VIDEO_ID=…
+YT_CHAT_POLL_SEC=45
+```
+
+読めていれば起動ログに `[Env] .env から N 件読み込み` と出る。
+
+```bash
+# 1) APIキーだけで読めるか試す (配信を始めてから)
+node tools/yt-chat-setup.js check --key=APIキー --video=動画ID
+
+# 2) 「APIキーだけでは足りない」と出たら OAuth のトークンを取る
+node tools/yt-chat-setup.js auth --client-id=… --client-secret=…
+
+# 3) 取れたトークンでもう一度確認
+node tools/yt-chat-setup.js check --video=動画ID \
+     --client-id=… --client-secret=… --refresh=…
+```
+
+Google Cloud 側の準備は「プロジェクトを作る → **YouTube Data API v3** を有効化 →
+APIキーを作る」まで。OAuth が要る場合だけ、OAuth クライアント (種類は
+**テレビとリミット入力デバイス**) を追加で作る。
+
+`tools/yt-chat-setup.js` は依存パッケージ無しで動き、受け取った値を**この端末の
+標準出力にしか出さない** (送信もファイル書き込みもしない)。
+
+**アクセストークンは1時間で切れる**ので、24時間配信ではリフレッシュトークンを使う。
+server.js 側が期限を見て自動で取り直す (`ytcAccessToken`)。
+`YT_CHAT_TOKEN` に直接アクセストークンを入れる形は動作確認のときだけ。
+
+`YT_VIDEO_ID` の代わりに `YT_CHANNEL_ID` を渡すと、配信中の動画を自動で探す。
+ただし `search.list` は **100 units** と高いので、動画IDが分からないときだけ、
+かつ5分に1回までに絞ってある。
+
+### 13.2b 取り込みの仕組みとクォータ
 
 公式の YouTube Data API v3 を使う:
 
 1. `videos.list(part=liveStreamingDetails)` で `activeLiveChatId` を得る (1 unit)
 2. `liveChatMessages.list` で新着を取る (**5 units/回**)
 
-**この機能の設計を決めているのはクォータ。** 既定の割当は 1日 10,000 units なので、
+**この機能の設計を決めているのはクォータ。**
+
+- 無料枠は **Google Cloud プロジェクトごとに 1日 10,000 units**
+- リセットは**太平洋時間の深夜**。繰り越しは無い
+- 使い切ると以後は `403 quotaExceeded` が返り、その日は読めない
+  (`rateLimitExceeded` は別物で、こちらは短く待てば復帰する)
+- 増枠は監査フォームの申請が要る (数週間〜数ヶ月・却下も多い)
+
+単価は `videos.list` = 1、`search.list` = **100**。
+`liveChatMessages.list` は公式のクォータ表で確認できなかった。多くの list は 1 unit
+だが、ライブチャットは 5 unit という記述も見かけるので、**安全側の 5 を既定**にしてある
+(`YT_CHAT_UNIT_COST` で直せる。見積りログにのみ効く)。5 と仮定すると:
 
 ```
 10,000 / 5 = 2,000 回/日  →  43秒に1回が上限
 ```
 
-API が返す `pollingIntervalMillis` (だいたい5秒) に素直に従うと、1日の枠を
-**2.8時間**で使い切る。そこで既定は **45秒間隔**にしてある = 指示から反映まで最大45秒。
-起動時に推定使用量を出し、10,000 を超える設定なら警告する。
+そこで既定は **45秒間隔** = 指示から反映まで最大45秒。起動時に推定使用量を出し、
+10,000 を超える設定なら警告する。実際の消費は Google Cloud Console の
+「APIとサービス → 割り当て」で見られるので、1日回してから `YT_CHAT_UNIT_COST` と
+`YT_CHAT_POLL_SEC` を詰めるとよい。
 
-速くしたいなら:
-- Google にクォータ増を申請する
-- 別プロセスのチャットボット (quota の無い方法) から `/chat` に流す
+`quotaExceeded` を受け取ったら、**太平洋時間の深夜まで自動で停止**する
+(叩き続けても復帰しないうえ、ログが埋まるため)。街の進行と配信は止まらない。
+
+### 13.2c streamList (push 方式) を優先し、駄目ならポーリングへ落ちる
+
+公式が「ライブチャットを消費する最も効率的な方法」としているのが
+`liveChatMessages.streamList`。長時間つなぎっぱなしの接続に新着が push されるので、
+**ポーリングが要らない = 45秒の遅延もクォータの心配も消える**。
+
+ただし本体は **gRPC** (protobuf / `stream_list.proto`) で、素直にやると
+`@grpc/grpc-js` と `.proto` が要る = 依存が増える。一方 REST 側にもクエリ仕様が
+公開されているので、**まず REST の streaming エンドポイントを試し、
+使えなければポーリングに自動で落ちる**形にした (依存ゼロ)。
+
+```
+YT_CHAT_MODE=auto    # 既定。stream を試して駄目ならポーリング
+YT_CHAT_MODE=stream  # stream のみ
+YT_CHAT_MODE=poll    # ポーリングのみ (従来どおり)
+```
+
+- 応答は「JSON オブジェクトが少しずつ流れてくる」形。改行区切りとは限らないので、
+  括弧の深さを数えて完成したオブジェクトから取り出す (`makeJsonSplitter`)
+- 切断されたら `nextPageToken` を持ったまま張り直す (2,4,8…最大60秒のバックオフ)
+- **一度も繋がらないまま 4xx** なら、その環境では使えないと判断してポーリングへ切替
+- 張り直しが8回続いた場合もポーリングへ切替
+- `/city` の `youtube.mode` / `pushes` / `polls` で、いまどちらで動いているか分かる
+
+`tools/yt-chat-setup.js check` の `[4/4]` で、繋ぐ前に判定できる。
+
+速くしたい/枠を空けたい場合の他の手:
+- Google にクォータ増を申請する (監査フォーム・数週間〜数ヶ月)
+- 別プロセスのチャットボットから `/chat` に流す
+- gRPC 版の streamList を使う (依存を足してよければ)
 
 `liveChatMessages.list` は OAuth が要る場合があるので、API キーに加えて
 アクセストークン (`YT_CHAT_TOKEN`) も送れるようにしてある。
@@ -926,9 +1011,14 @@ API が返す `pollingIntervalMillis` (だいたい5秒) に素直に従うと�
 | `CHAT_COOLDOWN_SEC` | 12 | 次の指名を受け付けるまでの間隔 |
 | `CHAT_TOKEN` | (なし) | `/chat` の合言葉。公開サーバでは設定する |
 | `YT_CHAT` | 0 | `1` で YouTube ライブチャットの取り込みを有効化 |
-| `YT_API_KEY` / `YT_CHAT_TOKEN` | (なし) | APIキー / OAuth アクセストークン |
+| `YT_API_KEY` | (なし) | APIキー |
+| `YT_OAUTH_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | (なし) | OAuth が要る場合。期限は自動更新 |
+| `YT_CHAT_TOKEN` | (なし) | 短命アクセストークン (動作確認用) |
 | `YT_VIDEO_ID` | (なし) | 配信中の動画ID |
-| `YT_CHAT_POLL_SEC` | 45 | 取得間隔 (クォータと直結) |
+| `YT_CHANNEL_ID` | (なし) | 動画IDの代わり。配信中の動画を自動発見 (search.list=100 units) |
+| `YT_CHAT_MODE` | auto | `stream`(push) を試して駄目なら `poll` に落ちる |
+| `YT_CHAT_POLL_SEC` | 45 | ポーリング時の取得間隔 (クォータと直結) |
+| `YT_CHAT_UNIT_COST` | 5 | 見積り用の単価。実測できたら直す |
 
 ### 13.3 安全について
 
