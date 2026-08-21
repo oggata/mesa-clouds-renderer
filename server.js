@@ -1583,7 +1583,8 @@ const HUNGER_RATE   = 1/(9*60);    // 1秒あたりの空腹上昇 (約9分で�
 const FATIGUE_RATE  = 1/(14*60);   // 1秒あたりの疲労上昇
 const EAT_RECOVER   = 0.75;        // 飲食店に着いたときの空腹回復量
 const SLEEP_RECOVER = 0.55;        // 自宅に着いたときの疲労回復量
-const NEED_HI       = 0.62;        // これを超えると「その欲求で目的地を選ぶ」
+// これを超えると「その欲求で目的地を選ぶ」。小さいほど住民が用事で動きやすくなる。
+const NEED_HI       = envNum('NEED_HI', 0.62);
 const SUPPLY_RATE   = 1/(16*60);   // 日用品の消費 (買い物欲)
 const BORED_RATE    = 1/(11*60);   // 退屈の蓄積 (人と会う/娯楽で解消)
 const SICK_PROB     = 1/(60*90);   // 1秒あたりの発症確率 (平均90分に1回)
@@ -2060,10 +2061,15 @@ function gameDay(){ return (CITY?CITY.dayBase:0) + daysSinceBoot(); }
 function cityToJSON(){
   const own={};
   for(const a of agents){
-    if(a.seenMask || a.owns || a.viewer || a.cheers)
+    if(a.seenMask || a.owns || a.viewer || a.cheers || (a.pref && Object.keys(a.pref).length)){
+      // 好みは上位6件だけ保存する (1000人ぶん全部持つと保存ファイルが膨らむ)
+      const top=Object.entries(a.pref||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,6);
       own[a.aid]={m:a.seenMask||0, o:a.owns||null,
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
-                  b:a.viewer?a.by:undefined, c:a.cheers||undefined};
+                  b:a.viewer?a.by:undefined, c:a.cheers||undefined,
+                  p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
+                  t:a.taught||undefined};
+    }
   }
   return {
     version:1, seed:CITY.seed, grid:GRID, savedAt:Date.now(),
@@ -2074,7 +2080,7 @@ function cityToJSON(){
     foot:Array.from(CITY.foot),
     demand:Object.fromEntries(CATS.map(c=>[c, Array.from(CITY.demand[c], v=>+v.toFixed(2))])),
     unmet:CITY.unmet, stats:CITY.stats, news:CITY.news.slice(-200), agents:own,
-    waiting:CITY.waiting||[],
+    waiting:CITY.waiting||[], recs:CITY.recs||[],
   };
 }
 function saveCity(){
@@ -2172,6 +2178,7 @@ function freshCity(){
     stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0},
     news:[], savedAgents:{}, diag:freshDiag(),
     waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
+    recs:[],                         // 視聴者のおすすめ (どこまで広まったか)
   };
 }
 
@@ -2201,7 +2208,7 @@ function initCity(){
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
       stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0}, j.stats||{}),
       news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
-      waiting:j.waiting||[],
+      waiting:j.waiting||[], recs:j.recs||[],
     };
     if(CITY.foot.length!==GRID*GRID) CITY.foot=new Int32Array(GRID*GRID);
     for(const c of CATS) if(CITY.demand[c].length!==GRID*GRID) CITY.demand[c]=new Float32Array(GRID*GRID);
@@ -2314,7 +2321,12 @@ function stepNeeds(dtSec){
     // 退屈は「一人でいる時間」で溜まる → 近くに人が居れば溜まらない (社交と連動)
     let alone=true;
     for(const o of agents){ if(o===a) continue;
-      if(Math.abs(o.x-a.x)<3 && Math.abs(o.y-a.y)<3){ alone=false; break; } }
+      if(Math.abs(o.x-a.x)<3 && Math.abs(o.y-a.y)<3){
+        alone=false;
+        // すれ違いざまに「行きつけ」の話をする (低確率)
+        if(CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec) gossip(a, o);
+        break;
+      } }
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
     // 病気: 低確率で発症。疲労が高いほどかかりやすい (内部状態同士の因果)
     if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
@@ -2454,9 +2466,28 @@ function pickLifeGoal(a, ex){
   if(CAT){
     const f=buildingsOfTypes(CAT);
     if(f.length){
-      f.sort((p,q)=>((p[0]-a.x)**2+(p[1]-a.y)**2)-((q[0]-a.x)**2+(q[1]-a.y)**2));
-      const k = n==='sick' ? 2 : 4;                // 病気のときは近い所へ
-      return [...f[Math.floor(Math.random()*Math.min(k,f.length))]];
+      // 距離だけでなく **その住民の好み** で選ぶ。行きつけができると
+      // 少し遠くても通うようになる (病気のときは好みより近さを優先)。
+      // 勧められた店をまだ試していないなら、**まずそこへ行く**。
+      // 上位からランダムに選ぶ形だと、せっかくの推薦が引かれずに終わってしまう。
+      if(a.taught && !a.taught.tried){
+        const tSt=cellStruct[a.taught.key];
+        if(tSt && tSt.state==='open' && CAT.includes(tSt.typeIdx)){
+          if(CHAT_LOG) console.log(`[Learn] ${a.name} は勧められた ${BLDG_TYPES[tSt.typeIdx].name} (${tSt.r},${tSt.c}) へ向かう`);
+          return [tSt.r, tSt.c];
+        }
+      }
+      const w = n==='sick' ? PREF_WEIGHT*0.3 : PREF_WEIGHT;
+      const scored=f.map(b=>{
+        const st=structAt(b[0],b[1]);
+        const key=prefKey(st);
+        let sc = -Math.hypot(b[0]-a.x, b[1]-a.y) + w*prefOf(a,key);
+        if(a.taught && a.taught.key===key && !a.taught.tried) sc += w*TEACH_BONUS;  // 勧められた店は一度試す
+        return {b, sc};
+      });
+      scored.sort((p,q)=>q.sc-p.sc);
+      const k = n==='sick' ? 2 : 3;                // 上位から少しばらけさせる
+      return [...scored[Math.floor(Math.random()*Math.min(k,scored.length))].b];
     }
   }
   return randB(ex);
@@ -3078,6 +3109,82 @@ function pushLifeNews(){
   hudNewsDirty=true;
 }
 
+// ═══ 住民が「行きつけ」を覚える ══════════════════════════════════════════════
+//   目的地の抽選を距離だけで決めていたのを、**その住民自身の経験**で重み付けする。
+//   行ってみて近くて空いていれば好みが上がり、遠かった/混んでいたら下がる。
+//   数日で「Rex はいつもあのカフェ」という習慣ができ、店の盛衰が経路依存になる。
+//
+//   これは勾配学習ではなく、場所ごとの評価をオンラインで更新する仕組み。
+//   方策(ONNX)には触れないので再学習は不要。
+const PREF_LEARN   = envNum('PREF_LEARN', 0.35);   // 1回の経験でどれだけ更新するか
+const PREF_WEIGHT  = envNum('PREF_WEIGHT', 6);     // 目的地選びで好みをどれだけ効かせるか
+const PREF_DECAY   = envNum('PREF_DECAY', 0.97);   // 好みの日次減衰 (古い習慣は薄れる)
+const PREF_FAR     = envNum('PREF_FAR', 14);       // これだけ歩かされたら「遠い」
+const TEACH_BONUS  = envNum('TEACH_BONUS', 1.2);   // 勧められた店を一度は試す強さ
+const TEACH_DAYS   = envNum('TEACH_DAYS', 3);      // 定着したか判定するまでの日数
+const GOSSIP_P     = envNum('GOSSIP_P', 0.02);     // 近くの人と好みを交換する確率/秒
+const GOSSIP_GAIN  = envNum('GOSSIP_GAIN', 0.25);  // 口コミで伝わる強さ
+
+const prefKey = st => st ? st.r+'_'+st.c : null;
+function prefOf(a, key){ return (a.pref && a.pref[key]) ? a.pref[key].s : 0; }
+function prefBump(a, key, target, rate){
+  if(!a.pref) a.pref={};
+  const e=a.pref[key] || (a.pref[key]={s:0, n:0});
+  e.s += (rate||PREF_LEARN)*(target - e.s);
+  return e;
+}
+// その住民の「いちばんの行きつけ」(カテゴリ内)
+function prefBest(a, idxs){
+  let best=null, bs=-Infinity;
+  for(const k in (a.pref||{})){
+    const st=cellStruct[k];
+    if(!st || st.state!=='open') continue;
+    if(idxs && !idxs.includes(st.typeIdx)) continue;
+    const v=a.pref[k].s;
+    if(v>bs){ bs=v; best={key:k, st, s:v, n:a.pref[k].n}; }
+  }
+  return best;
+}
+
+// 到着したときに「良い経験だったか」を採点して覚える。
+//   近い = 良い / 遠い = 悪い、混んでいる店は少し敬遠する。
+const CHOOSABLE = t => CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(t));
+function learnFromVisit(a, st, pathLen){
+  if(!st) return;
+  // 自宅と職場は「割り当てられた場所」であって選んだ場所ではないので覚えない。
+  // これを外すと `likes House x4` のような無意味な行きつけができる。
+  if(!CHOOSABLE(st.typeIdx)) return;
+  const key=prefKey(st);
+  if(CHAT_LOG && a.taught && a.taught.key===key)
+    console.log(`[Learn] ${a.name} が勧められた店に到着 (${key})`);
+  const dist=pathLen || 8;
+  const crowd=Math.min(0.4, (st.visitsToday||0)/40);          // 混雑の軽い減点
+  const reward=Math.max(0, Math.min(1, 1 - dist/PREF_FAR)) - crowd;
+  const e=prefBump(a, key, reward);
+  e.n=(e.n||0)+1;
+  // 勧められて来たのなら、その結果を記録する (定着したかの判定に使う)
+  if(a.taught && a.taught.key===key) a.taught.tried=true;
+}
+
+// 口コミ: 近くに居る人と「行きつけ」を少しだけ共有する。
+//   stepNeeds の孤独判定 (既に近くの人を走査している) に相乗りする。
+function gossip(a, other){
+  const b=prefBest(other, null);
+  if(!b || b.s<=0.2) return;
+  const before=prefOf(a, b.key);
+  prefBump(a, b.key, b.s, GOSSIP_GAIN);
+  // 誰かの推薦が広まったら数える
+  const rec=CITY && (CITY.recs||[]).find(r=>r.key===b.key);
+  if(rec && before<0.3 && prefOf(a,b.key)>=0.3){
+    rec.spread=(rec.spread||0)+1;
+    if([3,10,25,50].includes(rec.spread)){
+      const st=cellStruct[b.key];
+      news('teach', `🗣 ${rec.by} のおすすめの ${st?BLDG_TYPES[st.typeIdx].label:'店'} が ${rec.spread}人に広まった`,
+           `${rec.by}'s recommendation has spread to ${rec.spread} residents`);
+    }
+  }
+}
+
 // ── 機能D: 初回性 ──────────────────────────────────────────────────────────
 // 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
 function onArrive(a, dest){
@@ -3085,6 +3192,7 @@ function onArrive(a, dest){
   if(!CITY_EVOLVE || !CITY || !dest) return;
   const st=structAt(dest[0], dest[1]);
   if(!st) return;
+  learnFromVisit(a, st, a.path?a.path.length:null);   // 行きつけを覚える
   if(st.state==='open'){
     st.visits++; st.visitsToday++;
     // 経済活動 = 店/施設への来店の累計。これが溜まると発展段階が上がる
@@ -3142,6 +3250,27 @@ function dailyRollover(day){
   }
   for(const a of agents) if(a.unmetBy) for(const k in a.unmetBy) a.unmetBy[k]*=DEMAND_DECAY;
   CITY.diag=freshDiag();
+  // 好みは少しずつ薄れる (古い習慣がいつまでも残らないように)
+  for(const a of agents){
+    for(const k in (a.pref||{})){
+      a.pref[k].s*=PREF_DECAY;
+      if(Math.abs(a.pref[k].s)<0.02 && a.pref[k].n<2) delete a.pref[k];
+    }
+    // 勧められた店が「行きつけ」になったか
+    if(a.taught && a.taught.tried && !a.taught.judged && day-a.taught.day>=TEACH_DAYS){
+      a.taught.judged=true;
+      const best=prefBest(a, null);
+      const st=cellStruct[a.taught.key];
+      if(best && best.key===a.taught.key){
+        news('teach', `⭐ ${a.taught.by} のおすすめが ${a.name} の行きつけになった`
+          + (st?` (${BLDG_TYPES[st.typeIdx].label})`:''),
+          `${a.taught.by}'s recommendation became ${a.name}'s usual spot`);
+      }else{
+        news('teach', `${a.name} は結局いつもの店に戻った (${a.taught.by} のおすすめは定着せず)`,
+          `${a.name} went back to their old favourite (${a.taught.by}'s tip did not stick)`);
+      }
+    }
+  }
   const open=CITY.structs.filter(s=>s.state==='open').length;
   console.log(`[City] ═══ Day ${day+1} ═══ 道+${roads} 建設+${opened} 閉店+${closed} 取壊+${gone} 転入+${moved}`
     + `${grown?` 拡張→${CITY.size}`:''}`
@@ -3405,6 +3534,7 @@ function spawnAgent(S, i){
     // 街の進化: 訪問済み建物タイプのビット / 自分の店 / カテゴリ別の不満寄与
     seenMask:0, owns:null, unmetBy:null,
     viewer:false, by:null, cheers:0, // 視聴者住民か / どの視聴者か / 応援された回数
+    pref:{}, taught:null,            // 場所ごとの好み (経験で更新) / 勧められた店
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
     hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
@@ -3452,6 +3582,8 @@ function initAgents(S){
       const sv=CITY.savedAgents[a.aid]; if(!sv) continue;
       a.seenMask=sv.m||0;
       a.cheers=sv.c||0;
+      if(sv.p){ a.pref={}; for(const k in sv.p) a.pref[k]={s:sv.p[k][0], n:sv.p[k][1]}; }
+      if(sv.t) a.taught=sv.t;
       if(sv.v && sv.n){ a.viewer=true; a.name=sv.n; a.by=sv.b||null; viewers++; }   // 視聴者住民を戻す
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
     }
@@ -3899,6 +4031,17 @@ function handleChatCommand(text, author){
     while(chatLog.length>30) chatLog.shift();
     return r;
   }
+  // 店を勧める / 何を覚えたか聞く
+  const mt=raw.match(/^!?teach\s+(\S{1,24})\s+(.{1,24})$/i);
+  if(mt){
+    const r=viewerTeach(who, mt[1], mt[2]);
+    if(r.ok){ chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(teach)'});
+              while(chatLog.length>30) chatLog.shift(); }
+    return r;
+  }
+  const ma=raw.match(/^!?ask\s+(.{1,40})$/i);
+  if(ma) return viewerAsk(ma[1]);
+
   // 住民を応援する
   const mc=raw.match(/^!?cheer\s+(.{1,40})$/i);
   if(mc){
@@ -4009,6 +4152,67 @@ function viewerCheer(query, who){
   }
   console.log(`[Chat] ${who}: cheer → ${a.name} (通算${a.cheers})`);
   return {ok:true, msg:`cheered ${a.name} (${a.cheers})`};
+}
+
+// !teach <住民> <業種>: 店を勧める。**命令ではない**ので、定着するかは本人の経験しだい。
+function viewerTeach(who, targetQ, placeQ){
+  if(!CITY) return {ok:false, msg:'not ready'};
+  const hit=findAgentByQuery(targetQ);
+  if(!hit || hit.overview) return {ok:false, msg:`no resident: ${_ascii(targetQ).slice(0,20)}`};
+  const a=agents[hit.idx];
+  if(!a) return {ok:false, msg:'no resident'};
+  // 業種名 (ramen / cafe …) か英語表示名から探す。その住民に**いちばん近い**同業を勧める。
+  const q=String(placeQ||'').trim().toLowerCase();
+  let ti=BLDG_TYPES.findIndex(b=>b.name.toLowerCase()===q);
+  if(ti<0) ti=BLDG_TYPES.findIndex(b=>(BLDG_EN[b.name]||'').toLowerCase().includes(q));
+  if(ti<0) ti=BLDG_TYPES.findIndex(b=>b.name.toLowerCase().includes(q));
+  if(ti<0) return {ok:false, msg:`unknown place: ${_ascii(q).slice(0,20)}`};
+  const cands=CITY.structs.filter(st=>st.state==='open' && st.typeIdx===ti);
+  if(!cands.length) return {ok:false, msg:`no open ${enOf(ti)} in town`};
+  cands.sort((p,qq)=>((p.r-a.x)**2+(p.c-a.y)**2)-((qq.r-a.x)**2+(qq.c-a.y)**2));
+  const st=cands[0], key=prefKey(st);
+  a.taught={key, by:who, day:gameDay(), tried:false};
+  prefBump(a, key, 0.5, 0.4);                       // 「一度は行ってみる」ぶんの下駄
+  CITY.recs=CITY.recs||[];
+  if(!CITY.recs.some(r=>r.key===key && r.by===who))
+    CITY.recs.push({key, by:who, day:gameDay(), spread:0});
+  while(CITY.recs.length>50) CITY.recs.shift();
+  news('teach', `💡 ${who} が ${a.name} に ${BLDG_TYPES[ti].label} (${st.r},${st.c}) を勧めた`,
+       `${who} recommended a ${enOf(ti)} to ${a.name}`);
+  showBanner(`${who} told ${a.name} about a ${enOf(ti)}`, 6);
+  console.log(`[Chat] ${who}: teach → ${a.name} に ${BLDG_TYPES[ti].name}`);
+  return {ok:true, msg:`told ${a.name} about a ${enOf(ti)} (they will decide for themselves)`};
+}
+
+// !ask <住民>: その住民が何を覚えたかを見せる。学習は見えないと意味がない。
+function viewerAsk(targetQ){
+  const hit=findAgentByQuery(targetQ);
+  if(!hit || hit.overview) return {ok:false, msg:'no resident'};
+  const a=agents[hit.idx];
+  if(!a) return {ok:false, msg:'no resident'};
+  const list=Object.entries(a.pref||{})
+    .map(([k,v])=>({k, ...v, st:cellStruct[k]}))
+    .filter(x=>x.st && x.st.state==='open')
+    .sort((p,q)=>q.s-p.s);
+  // まだ行っていない店を「行きつけ」と言わない。勧められただけの店は別扱い。
+  const visited=list.filter(x=>x.n>0);
+  const top=visited.slice(0,2).map(x=>`${enOf(x.st.typeIdx)} x${x.n}`);
+  const worst=visited.length>2 ? visited[visited.length-1] : null;
+  const tSt=a.taught ? cellStruct[a.taught.key] : null;
+  const tip=(a.taught && tSt)
+    ? (a.taught.tried ? ` - ${a.taught.by} told them about that ${enOf(tSt.typeIdx)}`
+                      : ` - has not yet tried the ${enOf(tSt.typeIdx)} ${a.taught.by} suggested`)
+    : '';
+  const en=top.length
+    ? `${a.name} likes ${top.join(' / ')}`
+      + (worst && worst.s<0 ? ` - avoids that ${enOf(worst.st.typeIdx)}` : '') + tip
+    : `${a.name} has no favourite place yet` + tip;
+  lifeNews.push({day:gameDay(), shape:'ask', en,
+    ja:`${a.name} の行きつけ: ${list.slice(0,2).map(x=>`${BLDG_TYPES[x.st.typeIdx].label}(${x.n}回)`).join(' / ')||'まだ無し'}`});
+  while(lifeNews.length>12) lifeNews.shift();
+  hudNewsDirty=true;
+  showBanner(en, 7);
+  return {ok:true, msg:en};
 }
 
 // 応援がいちばん多い住民

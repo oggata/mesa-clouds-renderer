@@ -317,6 +317,9 @@ webrtc-version/      WebRTC 配信版（別実装）
     ログと `/city` は日本語のまま）
   - ティッカーは「街のできごと」と「住民のいまの様子」を交互に流す
     （`Lily #2 is sleepy and heading home` / `Rex #3 fell ill and is heading to a Pharmacy`）
+- **視聴者が街に参加する**：`!join` で自分の名前を持った住民が引っ越してくる（家が空くまで入居待ち）。
+  `!cheer <名前>` で応援、`!teach <名前> <業種>` で店を勧める、`!ask <名前>` で何を覚えたか聞ける。
+  住民は行った結果で「行きつけ」を学習し、推薦が定着するかは本人の経験しだい。
 - **配信チャットからカメラ指名**：視聴者が `!focus rex` と書くと10秒そのキャラを追い、
   画面に `Camera: Explorer Rex #1 (by 視聴者名)` と出る。入口は `/chat` に統一してあり、
   YouTube 直取り込み（`YT_CHAT=1`、Data API のクォータ上 45秒間隔が上限）でも、
