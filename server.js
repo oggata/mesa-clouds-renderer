@@ -1127,17 +1127,21 @@ function updateOcclusionFade(){
 const _cDay=new THREE.Color(0xeaf2f7), _cNight=new THREE.Color(0x0b1a33);
 const _sDay=new THREE.Color(0xfff4e0), _sDusk =new THREE.Color(0xff9a5c), _sNight=new THREE.Color(0x2a4a8a);
 const _gDay=new THREE.Color(0xbcd0e0), _gNight=new THREE.Color(0x24304a);
+const _cWeather=new THREE.Color();
 function updateDayNight(S){
   const L=S&&S.userData&&S.userData.lights; if(!L) return;
   const d=daylight();
+  const w=weatherNow();
   // 朝夕(d が中間)のときだけ夕焼け色を強く混ぜる
   const dusk=Math.max(0,1-Math.abs(d-0.5)*4);
   S.background.copy(_cNight).lerp(_cDay,d);
-  L.sun.color.copy(_sNight).lerp(_sDay,d).lerp(_sDusk,dusk*0.55);
-  L.sun.intensity  = 0.15+1.55*d;
+  // 曇り/雨は空を鈍色へ寄せ、光を落とす (昼ほど効きが分かりやすい)
+  if(w.sky!=null) S.background.lerp(_cWeather.setHex(w.sky), 0.25+0.5*d);
+  L.sun.color.copy(_sNight).lerp(_sDay,d).lerp(_sDusk,dusk*0.55*w.light);
+  L.sun.intensity  = (0.15+1.55*d)*w.light;
   L.amb.color.copy(_gNight).lerp(_gDay,d);
-  L.amb.intensity  = 0.45+0.85*d;
-  L.hemi.intensity = 0.25+0.85*d;
+  L.amb.intensity  = (0.45+0.85*d)*(0.65+0.35*w.light);
+  L.hemi.intensity = (0.25+0.85*d)*(0.65+0.35*w.light);
 }
 
 // ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
@@ -1205,17 +1209,17 @@ function updateNeedIcons(cam){
 // そこで描画を2パスにし、正射影カメラで板を重ねる。文字のラスタライズは
 // SVG→sharp→DataTexture (上の欲求アイコンと同じ手。canvas 依存を増やさない)。
 const HUD_ON        = process.env.HUD !== '0';
-const HUD_DAY_W     = 400, HUD_DAY_H = 86;
-const HUD_TICKER_H  = 44;
+// 配信画面に焼き込む文字は **ASCII だけ**。本番 (Linux) に日本語フォントが無いと
+// 豆腐になるため。表示領域も控えめにして街を隠さないようにする。
+const HUD_DAY_W     = 250, HUD_DAY_H = 54;
+const HUD_TICKER_H  = 30;
 const HUD_SPEED     = envNum('HUD_SPEED', 90);      // ティッカーの流れる速さ (px/秒)
 // 絵文字フォントを最後に足しておかないと 💊 や 🏛 が豆腐になる (欲求アイコンと同じ理由)。
-// ティッカーは絵文字を落として描く。sharp(librsvg) はカラー絵文字 (sbix/CBDT) を
-// 確実には描けず、フォント指定の順序を変えても豆腐が残った。文字だけで意味は通るので、
-// 表示の安定を優先する。ニュース本文 (ログ / /city / WebSocket) には絵文字を残す。
-const HUD_FONT      = 'Hiragino Sans, Noto Sans CJK JP, Noto Sans JP, sans-serif';
-const _stripEmoji = t => String(t)
-  .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '')
-  .replace(/\s{2,}/g, ' ').trim();
+// 配信画面には ASCII だけを描く (_ascii)。絵文字も日本語も落ちる。
+//   sharp(librsvg) はカラー絵文字を確実には描けず、日本語は本番 (Linux) に
+//   フォントが無いと豆腐になる。ニュース本文 (ログ / /city / WebSocket) は日本語のまま。
+const HUD_FONT      = 'Helvetica Neue, Helvetica, DejaVu Sans, Arial, sans-serif';
+const HUD_MONO      = 'Menlo, DejaVu Sans Mono, monospace';
 let hudScene=null, hudCam=null, hudDay=null, hudTicker=null, hudBar=null;
 // 日付板とティッカーは別々の busy フラグで管理する。1つにまとめていたら、
 // ゲーム内時刻が速い設定 (DAY_MINUTES が小さい) で日付板が毎フレーム作り直され、
@@ -1223,6 +1227,9 @@ let hudScene=null, hudCam=null, hudDay=null, hudTicker=null, hudBar=null;
 let hudDayText='', hudDayBusy=false, hudTickerBusy=false, hudTickerW=0, hudDayAt=0;
 
 const _esc = t => String(t).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// 配信画面に焼き込む文字は **ASCII だけ**に落とす。日本語フォントが無い環境では
+// 非 ASCII が全部豆腐になるので、混ざったら描く前に落としてしまう (最後の砦)。
+const _ascii = t => String(t).replace(/[^\x20-\x7E]/g,'').replace(/\s{2,}/g,' ').trim();
 
 async function svgTexture(svg){
   const png=await sharp(Buffer.from(svg)).png().toBuffer();
@@ -1246,27 +1253,22 @@ async function initHud(){
   // ティッカーの下敷き (文字板は透過。スクロールしても帯は動かない)
   hudBar=new THREE.Mesh(new THREE.PlaneGeometry(WIDTH, HUD_TICKER_H),
     new THREE.MeshBasicMaterial({color:0x050b10, transparent:true, opacity:0.55, depthTest:false}));
-  hudBar.position.set(0, -HEIGHT/2+HUD_TICKER_H/2+8, 0);
+  hudBar.position.set(0, -HEIGHT/2+HUD_TICKER_H/2+6, 0);
   hudScene.add(hudBar);
-  // 日本語が出るフォントがあるか (Linux では fonts-noto-cjk が無いと豆腐になる)
-  try{
-    const probe=await svgTexture(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="40">`
-      +`<text x="2" y="30" font-size="28" fill="#fff" font-family="${HUD_FONT}">街</text></svg>`);
-    probe.tex.dispose();
-    if(probe.opaque<20) console.warn('[HUD] 日本語フォントが見つからない → ティッカーが豆腐になる。'
-      + ' Ubuntu なら: sudo apt-get install -y fonts-noto-cjk');
-  }catch(e){ console.warn('[HUD] フォント確認に失敗:', e.message); }
+  // 焼き込む文字は ASCII のみなので、日本語フォントの有無に依存しない。
+  // (以前は日本語を描いていて、フォントの無い環境で全部豆腐になっていた)
   await refreshHudDay();
   await refreshHudTicker();
   console.log('[HUD] Day カウンタ / ニュースティッカーを配信画面に描画');
 }
 
-// 表示は「DAY 12  08:30 / 人口 34 · 村」の2行。人口と段階が上がっていくのが
-// 見えること自体が、この街を見続ける理由になる。
+// 「DAY 12  08:30 / POP 34  TOWN  SUNNY」の2行。人口と発展段階と天気が
+// 上がったり変わったりするのが見えること自体が、この街を見続ける理由になる。
 function hudDayLines(){
   const h=gameHour();
-  return [`DAY ${gameDay()+1}  ${String(Math.floor(h)).padStart(2,'0')}:${String(Math.floor(h%1*60)).padStart(2,'0')}`,
-          CITY ? `人口 ${agents.length} · ${levelSpec().name}` : ''];
+  const hh=String(Math.floor(h)).padStart(2,'0'), mm=String(Math.floor(h%1*60)).padStart(2,'0');
+  return [`DAY ${gameDay()+1}  ${hh}:${mm}`,
+          CITY ? `POP ${agents.length}  ${levelSpec().en}  ${weatherNow().en}` : ''];
 }
 async function refreshHudDay(){
   const [l1,l2]=hudDayLines();
@@ -1275,34 +1277,34 @@ async function refreshHudDay(){
   hudDayText=txt;
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_DAY_W}" height="${HUD_DAY_H}">`
-    +`<rect width="${HUD_DAY_W}" height="${HUD_DAY_H}" rx="8" fill="#050b10" fill-opacity="0.62"/>`
-    +`<text x="18" y="38" font-size="26" font-weight="bold" fill="#00d2a0"`
-    +` font-family="Menlo, DejaVu Sans Mono, monospace">${_esc(l1)}</text>`
-    +`<text x="18" y="70" font-size="22" fill="#9fd8c8"`
-    +` font-family="${HUD_FONT}">${_esc(l2)}</text></svg>`);
+    +`<rect width="${HUD_DAY_W}" height="${HUD_DAY_H}" rx="6" fill="#050b10" fill-opacity="0.58"/>`
+    +`<text x="12" y="24" font-size="17" font-weight="bold" fill="#00d2a0"`
+    +` font-family="${HUD_MONO}">${_esc(_ascii(l1))}</text>`
+    +`<text x="12" y="43" font-size="13" fill="#9fd8c8"`
+    +` font-family="${HUD_MONO}">${_esc(_ascii(l2))}</text></svg>`);
   if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
   hudDay=hudPlane(HUD_DAY_W, HUD_DAY_H, tex);
-  hudDay.position.set(-WIDTH/2+HUD_DAY_W/2+16, HEIGHT/2-HUD_DAY_H/2-14, 1);
+  hudDay.position.set(-WIDTH/2+HUD_DAY_W/2+12, HEIGHT/2-HUD_DAY_H/2-10, 1);
   hudScene.add(hudDay);
 }
 
 async function refreshHudTicker(){
   if(!hudScene) return;
-  const items=latestNews(6).map(n=>`Day${n.day+1} ${_stripEmoji(n.text)}`);
-  const txt=items.length ? items.reverse().join('　　◆　　')
-                         : 'この街の記録はまだありません';
-  // 文字幅の見積り (全角=font-size, 半角=その半分強)。板の幅がズレると途中で切れる。
-  let px=40;
-  for(const ch of txt) px += (ch.charCodeAt(0)<0x100 ? 13 : 25);
-  const w=Math.min(6000, Math.max(WIDTH, Math.ceil(px)));
+  // en を持たないニュース (英語化する前に保存された街の記録) は**流さない**。
+  // 日本語のまま描くとフォントの無い環境で豆腐になるため。
+  const items=latestNews(12, true).filter(n=>n.en).slice(-6).map(n=>`D${n.day+1}  ${_ascii(n.en)}`);
+  const txt=items.length ? items.reverse().join('   *   ')
+                         : 'No records yet in this town';
+  // 文字幅の見積り (ASCII のみ)。板の幅がズレると途中で切れる。
+  const w=Math.min(6000, Math.max(WIDTH, Math.ceil(40 + txt.length*8.6)));
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${HUD_TICKER_H}">`
-    +`<text x="20" y="30" font-size="24" fill="#dfeee9"`
-    +` font-family="${HUD_FONT}">${_esc(txt)}</text></svg>`);
+    +`<text x="16" y="21" font-size="16" fill="#dfeee9"`
+    +` font-family="${HUD_FONT}">${_esc(_ascii(txt))}</text></svg>`);
   if(hudTicker){ hudScene.remove(hudTicker); hudTicker.material.map.dispose(); hudTicker.material.dispose(); hudTicker.geometry.dispose(); }
   hudTickerW=w;
   hudTicker=hudPlane(w, HUD_TICKER_H, tex);
-  hudTicker.position.set(WIDTH/2+w/2, -HEIGHT/2+HUD_TICKER_H/2+8, 1);
+  hudTicker.position.set(WIDTH/2+w/2, -HEIGHT/2+HUD_TICKER_H/2+6, 1);
   hudScene.add(hudTicker);
   hudNewsDirty=false;
 }
@@ -1314,26 +1316,24 @@ let hudBanner=null, hudBannerT0=0, hudBannerUntil=0, hudBannerBusy=false;
 
 async function setBanner(text, secs){
   if(!hudScene) return;
-  let px=80;
-  for(const ch of text) px += (ch.charCodeAt(0)<0x100 ? 20 : 38);
-  const w=Math.min(WIDTH-40, Math.max(320, Math.ceil(px))), h=76;
+  const w=Math.min(WIDTH-40, Math.max(240, Math.ceil(44 + text.length*11.5))), h=48;
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">`
-    +`<rect width="${w}" height="${h}" rx="10" fill="#050b10" fill-opacity="0.78"/>`
-    +`<rect x="0" y="0" width="4" height="${h}" fill="#00d2a0"/>`
-    +`<text x="26" y="50" font-size="34" fill="#eaf6f2"`
-    +` font-family="${HUD_FONT}">${_esc(text)}</text></svg>`);
+    +`<rect width="${w}" height="${h}" rx="6" fill="#050b10" fill-opacity="0.74"/>`
+    +`<rect x="0" y="0" width="3" height="${h}" fill="#00d2a0"/>`
+    +`<text x="18" y="31" font-size="21" fill="#eaf6f2"`
+    +` font-family="${HUD_FONT}">${_esc(_ascii(text))}</text></svg>`);
   if(hudBanner){ hudScene.remove(hudBanner); hudBanner.material.map.dispose(); hudBanner.material.dispose(); hudBanner.geometry.dispose(); }
   hudBanner=hudPlane(w, h, tex);
   hudBanner.material.opacity=0;
-  hudBanner.position.set(0, HEIGHT/2-h/2-96, 2);
+  hudBanner.position.set(0, HEIGHT/2-h/2-74, 2);
   hudScene.add(hudBanner);
   hudBannerT0=Date.now(); hudBannerUntil=hudBannerT0+secs*1000;
 }
 function showBanner(text, secs){
   if(!hudScene || hudBannerBusy) return;
   hudBannerBusy=true;
-  setBanner(_stripEmoji(text), secs||6)
+  setBanner(_ascii(text), secs||6)
     .catch(e=>console.warn('[HUD]',e.message))
     .finally(()=>{ hudBannerBusy=false; });
 }
@@ -1591,12 +1591,36 @@ const WORK_PRESSURE   = envNum('WORK_PRESSURE', 0.9);    // 同上 (職場)
 //   ECON_SCALE で発展の速さをまとめて調整できる (小さいほど早く育つ)。
 const ECON_SCALE = envNum('ECON_SCALE', 1);
 const CITY_LEVELS = [
-  { name:'集落', maxH:1.4, fp2:false, econ:0     },
-  { name:'村',   maxH:1.7, fp2:false, econ:400   },
-  { name:'町',   maxH:2.1, fp2:true,  econ:2000  },
-  { name:'市',   maxH:2.6, fp2:true,  econ:8000  },
-  { name:'都市', maxH:3.3, fp2:true,  econ:25000 },
+  { name:'集落', en:'HAMLET',     maxH:1.4, fp2:false, econ:0     },
+  { name:'村',   en:'VILLAGE',    maxH:1.7, fp2:false, econ:400   },
+  { name:'町',   en:'TOWN',       maxH:2.1, fp2:true,  econ:2000  },
+  { name:'市',   en:'CITY',       maxH:2.6, fp2:true,  econ:8000  },
+  { name:'都市', en:'METROPOLIS', maxH:3.3, fp2:true,  econ:25000 },
 ].map(L=>({...L, econ:L.econ*ECON_SCALE}));
+
+// ═══ 天気 ══════════════════════════════════════════════════════════════════
+//   晴れ / 曇り / 雨。空の色と光の強さ、雨粒、HUD 表示、そして「雨の日は外を歩くと
+//   疲れる」という小さな効果まで。WEATHER_HOURS ゲーム時間ごとに抽選し直す。
+const WEATHER_HOURS = envNum('WEATHER_HOURS', 6);   // 何ゲーム時間ごとに抽選し直すか
+const WEATHERS = {
+  sunny : { ja:'晴れ', en:'SUNNY',  p:0.55, light:1.00, sky:null,     fatigue:1.0  },
+  cloudy: { ja:'曇り', en:'CLOUDY', p:0.30, light:0.74, sky:0x9aa6b2, fatigue:1.0  },
+  rain  : { ja:'雨',   en:'RAIN',   p:0.15, light:0.52, sky:0x6d7782, fatigue:1.35 },
+};
+const WEATHER_KEYS = Object.keys(WEATHERS);
+const weatherNow = () => WEATHERS[(CITY && CITY.weather) || 'sunny'] || WEATHERS.sunny;
+
+function stepWeather(){
+  if(!CITY) return;
+  const now=Date.now();
+  if(CITY.weatherUntil && now < CITY.weatherUntil) return;
+  let r=Math.random(), pick=WEATHER_KEYS[0];
+  for(const k of WEATHER_KEYS){ r-=WEATHERS[k].p; if(r<=0){ pick=k; break; } }
+  const changed = pick!==CITY.weather;
+  CITY.weather=pick;
+  CITY.weatherUntil = now + WEATHER_HOURS*(DAY_MINUTES*60/24)*1000;
+  if(changed) news('weather', `天気が ${WEATHERS[pick].ja} になった`, `Weather: ${WEATHERS[pick].en}`);
+}
 
 // 需要カテゴリ (欲求 → 建物カテゴリ)
 const CATS      = ['eat','shop','fun','care'];
@@ -1606,6 +1630,20 @@ const CAT_IDX   = { eat:FOOD_IDX, shop:BUY_IDX, fun:FUN_IDX, care:CARE_IDX,
                     home:HOME_IDX, work:WORK_IDX };
 const CAT_LABEL = { eat:'飲食店', shop:'買い物する場所', fun:'遊ぶ場所', care:'医療',
                     home:'住むところ', work:'働くところ' };
+
+// 配信画面 (HUD) は英語で描く。Linux に日本語フォントが無いと豆腐になるため、
+// 焼き込む文字は ASCII に統一する。ログ / /city / WebSocket は日本語のまま。
+const BLDG_EN = {
+  kiosk:'Food Stall', conbini:'Convenience Store', pharmacy:'Pharmacy', cafe:'Cafe',
+  gyudon:'Beef Bowl Shop', ramen:'Ramen Shop', bento:'Bento Shop', shop:'Shop',
+  house:'House', post:'Post Office', bank:'Bank', apartment:'Apartment', hotel:'Hotel',
+  office:'Office', tower:'Tower', supermarket:'Supermarket', temple:'Shrine',
+  school:'School', station:'Station', library:'Library', hospital:'Hospital',
+  cityhall:'City Hall', museum:'Museum', stadium:'Stadium', mall:'Mall',
+};
+const enOf = t => BLDG_EN[BLDG_TYPES[t].name] || BLDG_TYPES[t].name;
+const CAT_EN = { eat:'food', shop:'shops', fun:'leisure', care:'healthcare',
+                 home:'housing', work:'workplaces' };
 
 // いまの発展段階で建てられるか。方策の goal は BLDG_TYPES(25) の one-hot なので、
 // **新種を作らない限り再学習は不要**。増えるのは「いつ建つか」だけ。
@@ -1715,6 +1753,59 @@ function addStructMesh(S, st){
   mesh.position.set(cx,cy,h/2);
   S.add(mesh);
   occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
+}
+
+// ── 雨粒 ────────────────────────────────────────────────────────────────────
+//   カメラの周りだけに降らせる (街全体に撒くと、寄りの画では粒がまばらに見える)。
+//   点の集合を1メッシュで持ち、落ちきったら上へ戻して使い回す。
+const RAIN_N     = envNum('RAIN_COUNT', 1100);
+const RAIN_SPAN  = CELL*9;      // カメラ周りに降る範囲 (半径)
+const RAIN_TOP   = CELL*7;      // 降り始めの高さ
+const RAIN_SPEED = envNum('RAIN_SPEED', 26);
+
+// 粒 (THREE.Points) はソフトウェア GL だと gl_PointSize がほぼ効かず見えなかったので、
+// 1滴 = 短い線分 (LineSegments) にする。雨脚らしく見えるし確実に描かれる。
+const RAIN_LEN  = CELL*0.75;     // 1滴の長さ
+const RAIN_SLANT= CELL*0.18;     // 斜めに降らせる量 (風)
+function ensureRain(S){
+  if(!S) return null;
+  if(S.userData.rain) return S.userData.rain;
+  const pos=new Float32Array(RAIN_N*2*3);     // 2頂点/滴
+  for(let i=0;i<RAIN_N;i++){
+    const x=(Math.random()*2-1)*RAIN_SPAN, y=(Math.random()*2-1)*RAIN_SPAN, z=Math.random()*RAIN_TOP;
+    pos[i*6  ]=x;             pos[i*6+1]=y; pos[i*6+2]=z;
+    pos[i*6+3]=x+RAIN_SLANT;  pos[i*6+4]=y; pos[i*6+5]=z+RAIN_LEN;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  const m=new THREE.LineBasicMaterial({color:0xf2f8ff, transparent:true,
+                                       opacity:0.8, depthWrite:false});
+  const p=new THREE.LineSegments(g,m);
+  p.visible=false;
+  S.add(p);
+  S.userData.rain=p;
+  return p;
+}
+
+function stepRain(dt, cam){
+  if(!scene) return;
+  const p=ensureRain(scene);
+  if(!p) return;
+  const raining = !!(CITY && CITY.weather==='rain');
+  p.visible=raining;
+  if(!raining) return;
+  p.position.set(cam.position.x, cam.position.y, 0);   // カメラの足元に雨の箱を追従
+  const arr=p.geometry.attributes.position.array, drop=RAIN_SPEED*dt;
+  for(let i=0;i<RAIN_N;i++){
+    const b=i*6;
+    arr[b+2]-=drop; arr[b+5]-=drop;
+    if(arr[b+2]<0){
+      const x=(Math.random()*2-1)*RAIN_SPAN, y=(Math.random()*2-1)*RAIN_SPAN;
+      arr[b  ]=x;            arr[b+1]=y; arr[b+2]=RAIN_TOP;
+      arr[b+3]=x+RAIN_SLANT; arr[b+4]=y; arr[b+5]=RAIN_TOP+RAIN_LEN;
+    }
+  }
+  p.geometry.attributes.position.needsUpdate=true;
 }
 
 function addTreeMesh(S, r, c){
@@ -1860,7 +1951,7 @@ function cityToJSON(){
   return {
     version:1, seed:CITY.seed, grid:GRID, savedAt:Date.now(),
     day:gameDay(), bornAt:CITY.bornAt,
-    econ:CITY.econ, level:CITY.level, pop:agents.length, size:CITY.size,
+    econ:CITY.econ, level:CITY.level, pop:agents.length, size:CITY.size, weather:CITY.weather,
     map:MAP.map(row=>row.join('')),
     structs:CITY.structs.map(st=>({...st})),
     foot:Array.from(CITY.foot),
@@ -1955,6 +2046,7 @@ function freshCity(){
   return {
     seed:CITY_SEED, dayBase:-daysSinceBoot(), bornAt:Date.now(),
     econ:0, level:0, pop:0, size,    // 経済活動の累計 / 発展段階 / 人口 / フィールドの一辺
+    weather:'sunny', weatherUntil:0,
     structs,
     foot:new Int32Array(GRID*GRID),
     demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
@@ -1983,6 +2075,7 @@ function initCity(){
     CITY = {
       seed:CITY_SEED, dayBase:j.day||0, bornAt:j.bornAt||Date.now(),
       econ:j.econ||0, level:j.level||0, pop:j.pop||0, size:j.size||GRID,
+      weather:j.weather||'sunny', weatherUntil:0,
       structs:j.structs.map(st=>({...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st})),
       foot:Int32Array.from(j.foot||[]),
       demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
@@ -2094,7 +2187,9 @@ function stepNeeds(dtSec){
   for(const a of agents){
     a.hunger  = Math.min(1, (a.hunger ||0) + HUNGER_RATE *dtSec);
     // 夜は疲れやすい / 自宅に居るときは休息
-    a.fatigue = Math.min(1, (a.fatigue||0) + FATIGUE_RATE*dtSec*(night?1.6:1.0));
+    // 雨の日は外を歩くと疲れる (屋内は影響しない)
+    a.fatigue = Math.min(1, (a.fatigue||0) + FATIGUE_RATE*dtSec*(night?1.6:1.0)
+                            *(MW.isIndoors(a)?1:weatherNow().fatigue));
     a.supply  = Math.min(1, (a.supply ||0) + SUPPLY_RATE *dtSec);
     // 退屈は「一人でいる時間」で溜まる → 近くに人が居れば溜まらない (社交と連動)
     let alone=true;
@@ -2259,14 +2354,22 @@ let _lastFirstNews = 0;
 let _lastDay = null;
 let hudNewsDirty = false;
 
-function news(kind, text){
+// text = 日本語 (ログ / API)、en = 配信画面のティッカー用の英語。
+function news(kind, text, en){
   if(!CITY) return;
-  CITY.news.push({t:Date.now(), day:gameDay(), kind, text});
+  CITY.news.push({t:Date.now(), day:gameDay(), kind, text, en:en||null});
   while(CITY.news.length>NEWS_MAX) CITY.news.shift();
   hudNewsDirty = true;
   console.log(`[News] Day${gameDay()+1} ${text}`);
 }
-const latestNews = n => CITY ? CITY.news.slice(-n) : [];
+// 天気はティッカーに流さない。日付板に常時出ているうえ、変化が多いので
+// 街のできごと (開店/閉店/道/転入) を押し出してしまう。
+const TICKER_SKIP = new Set(['weather']);
+const latestNews = (n, forTicker) => {
+  if(!CITY) return [];
+  const src = forTicker ? CITY.news.filter(x=>!TICKER_SKIP.has(x.kind)) : CITY.news;
+  return src.slice(-n);
+};
 
 // ── 機能A: 踏み跡が道になる ────────────────────────────────────────────────
 // 絶対閾値ではなく「今日いちばん踏まれた空き地を N 本だけ道にする」日次ランキング。
@@ -2303,7 +2406,8 @@ function promoteFootpaths(day){
     groundDirty=true;
     // 道が増えると、それまで空き地の奥で孤立していた建物が到達可能になることがある
     rebuildBuildings(MAP);
-    news('road', `🛣 よく踏まれた空き地が道になった (${n}本)`);
+    news('road', `🛣 よく踏まれた空き地が道になった (${n}本)`,
+         `Footpaths turned into ${n} new road${n>1?'s':''}`);
   }
   return n;
 }
@@ -2475,13 +2579,16 @@ function foundShop(cat, site, typeIdx, founder, day){
     CITY.unmet[cat]*=0.4;             // 不満が解消に向かったぶんを差し引く
   }
   const label=BLDG_TYPES[typeIdx].label;
+  const enLabel=enOf(typeIdx);
   news('build', founder
     ? `🚧 ${founder.name} が ${CAT_LABEL[cat]} の不足を見て ${label} を建てはじめた (${st.r},${st.c})`
-    : `🚧 ${CAT_LABEL[cat]} が足りなくなり ${label} の工事が始まった (${st.r},${st.c})`);
+    : `🚧 ${CAT_LABEL[cat]} が足りなくなり ${label} の工事が始まった (${st.r},${st.c})`,
+    founder ? `${founder.name} started building a ${enLabel} (short of ${CAT_EN[cat]})`
+            : `New ${enLabel} under construction (short of ${CAT_EN[cat]})`);
   // 工事の箱が地面からせり上がり、その現場をカメラが映す。
   //   以前は起業者本人にカメラを向けていたが、本人は街のどこかに居るので
   //   肝心の工事現場が映らなかった。
-  showCityEvent(st.r, st.c, `${label} の工事が始まりました`, null, {st, kind:'rise'});
+  showCityEvent(st.r, st.c, `${enLabel} - construction started`, null, {st, kind:'rise'});
   return st;
 }
 
@@ -2580,9 +2687,10 @@ function maybeExpand(day){
   rebuildBuildings(MAP);
   console.log(`[City] フィールド拡張 ${oldHi-oldLo+1} → ${CITY.size}`
     + ` (建て込み ${(dens*100).toFixed(0)}% / 空き区画${free} / 木+${trees})`);
-  news('expand', `🌱 街の範囲が広がった (${CITY.size}×${CITY.size})`);
+  news('expand', `🌱 街の範囲が広がった (${CITY.size}×${CITY.size})`,
+       `The land expanded to ${CITY.size}x${CITY.size}`);
   showCityEvent(Math.round((lo+hi)/2), Math.round((lo+hi)/2),
-    `街の範囲が広がりました (${CITY.size}×${CITY.size})`, 9, null, {wide:true});
+    `The land expanded to ${CITY.size}x${CITY.size}`, 9, null, {wide:true});
   return 1;
 }
 
@@ -2600,7 +2708,8 @@ function growPopulation(day){
   assignHomes();
   for(let k=0;k<n;k++) settleAgent(agents[base+k]);
   CITY.pop=agents.length;
-  news('pop', `🚶 ${n}人が引っ越してきた (人口 ${agents.length} / 住居の定員 ${cap})`);
+  news('pop', `🚶 ${n}人が引っ越してきた (人口 ${agents.length} / 住居の定員 ${cap})`,
+       `${n} resident${n>1?'s':''} moved in (pop ${agents.length})`);
   return n;
 }
 
@@ -2615,10 +2724,12 @@ function finishConstruction(){
     syncCity(); addStructMesh(scene, st);
     const owner=st.openedBy?agents.find(a=>a.aid===st.openedBy):null;
     const label=BLDG_TYPES[st.typeIdx].label;
+    const enLabel=enOf(st.typeIdx);
     news('open', `${label} が開店しました (${st.r},${st.c})`
-      + (owner?` — 店主 ${owner.name}`:''));
+      + (owner?` — 店主 ${owner.name}`:''),
+      `${enLabel} opened` + (owner?` - run by ${owner.name}`:''));
     // 工事の箱と入れ替わりに、本物の建物が地面からせり上がる
-    showCityEvent(st.r, st.c, (owner?`${owner.name} の `:'') + `${label} が建ちました`,
+    showCityEvent(st.r, st.c, `${enLabel} was built` + (owner?` by ${owner.name}`:''),
                   null, {st, kind:'rise'});
   }
 }
@@ -2642,13 +2753,14 @@ function closeShop(st, day){
       a.owns=null;                                  // 店主は職を失い、また勤め人に戻る
       const works=buildingsOfTypes(WORK_IDX);
       a.work = works.length ? [...works[Math.floor(Math.random()*works.length)]] : null;
-      news('close', `🚪 ${a.name} の ${label} が閉店しました (${st.r},${st.c})`);
-      showCityEvent(st.r, st.c, `${a.name} の ${label} が閉店しました`, 7);
+      news('close', `🚪 ${a.name} の ${label} が閉店しました (${st.r},${st.c})`,
+           `${a.name}'s ${enOf(st.typeIdx)} closed down`);
+      showCityEvent(st.r, st.c, `${a.name}'s ${enOf(st.typeIdx)} closed down`, 7);
       return;
     }
   }
-  news('close', `🚪 ${label} (${st.r},${st.c}) が閉店しました`);
-  showCityEvent(st.r, st.c, `${label} が閉店しました`, 7);
+  news('close', `🚪 ${label} (${st.r},${st.c}) が閉店しました`, `${enOf(st.typeIdx)} closed down`);
+  showCityEvent(st.r, st.c, `${enOf(st.typeIdx)} closed down`, 7);
 }
 
 // 閉店の判定は「同業の平均と比べて客が来ていない店」。絶対値だとエージェント数で
@@ -2696,8 +2808,9 @@ function maybeDemolish(day){
     const label=BLDG_TYPES[st.typeIdx].label;
     st.state='demolishing';        // 目的地には選ばれない / まだ通行不可のまま
     n++; CITY.stats.demolished++;
-    news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`);
-    showCityEvent(st.r, st.c, `${label} がなくなりました`, null,
+    news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`,
+         `${enOf(st.typeIdx)} was demolished`);
+    showCityEvent(st.r, st.c, `${enOf(st.typeIdx)} is gone`, null,
                   {st, kind:'sink', onDone:()=>finishDemolish(st)});
   }
   return n;
@@ -2718,7 +2831,8 @@ function onArrive(a, dest){
       st.firstCustomer=a.aid;
       // 「最初の客」は店/施設だけ。住宅や職場に客は来ない (「住宅の最初の客」になってしまう)
       if(st.founded && CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(st.typeIdx)))
-        news('first', `🎉 ${a.name} が新しい ${BLDG_TYPES[st.typeIdx].label} の最初の客になった`);
+        news('first', `🎉 ${a.name} が新しい ${BLDG_TYPES[st.typeIdx].label} の最初の客になった`,
+             `${a.name} is the first customer of the new ${enOf(st.typeIdx)}`);
     }
   }
   const bit=1<<st.typeIdx;                       // typeIdx < 25 なのでビット演算で足りる
@@ -2726,7 +2840,8 @@ function onArrive(a, dest){
     a.seenMask=(a.seenMask||0)|bit;
     if(st.state==='open' && Date.now()-_lastFirstNews>FIRST_NEWS_COOLDOWN_MS){
       _lastFirstNews=Date.now();
-      news('first', `${a.name} が初めて ${BLDG_TYPES[st.typeIdx].label} に入った`);
+      news('first', `${a.name} が初めて ${BLDG_TYPES[st.typeIdx].label} に入った`,
+           `${a.name} visited a ${enOf(st.typeIdx)} for the first time`);
     }
   }
 }
@@ -2750,11 +2865,12 @@ function dailyRollover(day){
   if(lv>(CITY.level||0)){
     CITY.level=lv;
     const L=CITY_LEVELS[lv];
-    news('level', `🏙 この街は「${L.name}」になった (経済活動 ${Math.round(CITY.econ)})`);
+    news('level', `🏙 この街は「${L.name}」になった (経済活動 ${Math.round(CITY.econ)})`,
+         `This place is now a ${L.en} (economy ${Math.round(CITY.econ)})`);
     let sr=0, sc=0, n=0;
     for(const st of CITY.structs) if(st.state==='open'){ sr+=st.r; sc+=st.c; n++; }
     showCityEvent(n?Math.round(sr/n):GRID/2, n?Math.round(sc/n):GRID/2,
-      `この街は ${L.name} になりました`, 10, null, {wide:true});
+      `This place is now a ${L.en}`, 10, null, {wide:true});
   }
   // 需要の減衰。昨日の不満をいつまでも持ち越すと、供給が足りた後も起業が続く。
   for(const cat of CATS){
@@ -2776,6 +2892,7 @@ function dailyRollover(day){
 // 1秒ごと: 日付の切り替わりを検出して日次処理を1回だけ走らせる + 工事の完了確認
 function cityTick(){
   if(!CITY) return;
+  stepWeather();
   const d=gameDay();
   if(_lastDay===null) _lastDay=d;
   else if(d!==_lastDay){ _lastDay=d; dailyRollover(d); }
@@ -3752,6 +3869,21 @@ tick(); setInterval(tick, ${ms});
       }
       res.writeHead(200); res.end(JSON.stringify({ok:true, reset:true, day:gameDay()+1})); return;
     }
+    // 天気の切替 (見た目の確認用): /city?weather=sunny|cloudy|rain
+    const wx=q.get('weather');
+    if(wx){
+      if(!WEATHERS[wx]){
+        res.writeHead(400);
+        res.end(JSON.stringify({ok:false, error:`unknown weather: ${wx}`, weathers:WEATHER_KEYS}));
+        return;
+      }
+      CITY.weather=wx;
+      CITY.weatherUntil=Date.now()+WEATHER_HOURS*(DAY_MINUTES*60/24)*1000;
+      news('weather', `天気が ${WEATHERS[wx].ja} になった`, `Weather: ${WEATHERS[wx].en}`);
+      res.writeHead(200); res.end(JSON.stringify({ok:true, weather:wx}));
+      return;
+    }
+
     // 演出の確認用: 日付が変わるのを待たずに1件だけ起こす。
     //   /city?force=found     … いま需要が最大の場所に着工させる
     //   /city?force=close     … 来客が最少の店を閉店させる
@@ -3777,8 +3909,9 @@ tick(); setInterval(tick, ${ms});
         if(st){
           st.state='demolishing'; CITY.stats.demolished++;
           const label=BLDG_TYPES[st.typeIdx].label;
-          news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`);
-          showCityEvent(st.r, st.c, `${label} がなくなりました`, null,
+          news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`,
+               `${enOf(st.typeIdx)} was demolished`);
+          showCityEvent(st.r, st.c, `${enOf(st.typeIdx)} is gone`, null,
                         {st, kind:'sink', onDone:()=>finishDemolish(st)});
           done=`demolishing ${st.r},${st.c}`;
         }
@@ -3804,6 +3937,8 @@ tick(); setInterval(tick, ${ms});
       buildings:{total:CITY.structs.length, open:open.length,
         construction:CITY.structs.filter(s=>s.state==='construction').length,
         closed:CITY.structs.filter(s=>s.state==='closed').length},
+      weather:{now:CITY.weather||'sunny', label:weatherNow().ja, en:weatherNow().en,
+        untilSec:Math.max(0, Math.round(((CITY.weatherUntil||0)-Date.now())/1000))},
       field:{size:CITY.size, max:GRID, freeLots:buildableLots(),
         density:+fieldDensity().toFixed(3), expandAt:{density:EXPAND_DENSITY, freeLots:EXPAND_FREE}},
       level:{index:cityLevel(), name:levelSpec().name, econ:Math.round(CITY.econ),
@@ -4045,6 +4180,7 @@ async function renderLoop(){
     });
 
     stepStructAnims();            // 建物のせり上がり / 沈み込み
+    stepRain(dt, mainCam);        // 雨 (天気が rain のときだけ)
     // 地面の板 (道路 / 摩耗) を作り直す。道が増えたとき (groundDirty) は即、
     // 踏み跡の濃淡は上位%で決まるので 20 秒ごとにゆっくり追従させる。
     if((groundDirty || Date.now()-_groundAt>20000) && Date.now()-_groundAt>3000){
