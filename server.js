@@ -3005,6 +3005,25 @@ function maybeDemolish(day){
 const LIFE_NEWS_SEC = envNum('LIFE_NEWS_SEC', 25);
 let lifeNews=[], _recentLifeAids=[];
 
+// 使い方をときどきティッカーに混ぜる。概要欄を読まない視聴者にも届かせるため。
+//   HINT_EVERY 回に1回、住民の様子の代わりにこれを流す。0 で無効。
+const HINT_EVERY = envNum('CHAT_HINT_EVERY', 6);
+let _hintN=0, _lifeN=0;
+const CHAT_HINTS = [
+  'TYPE IN CHAT:  test  - check your message reaches the town',
+  'TYPE IN CHAT:  !focus rex  - the camera follows that resident for 10s',
+  'TYPE IN CHAT:  !join  - move into this town as a resident',
+  'TYPE IN CHAT:  !join YourName  - pick the name you live under',
+  'TYPE IN CHAT:  !cheer <name>  - cheer a resident, it lifts their mood',
+  'TYPE IN CHAT:  !teach <name> ramen  - recommend a shop (they decide for themselves)',
+  'TYPE IN CHAT:  !ask <name>  - hear what that resident has learned',
+  'TYPE IN CHAT:  !focus overview  - pull the camera back over the whole town',
+];
+function nextHint(){
+  const t=CHAT_HINTS[_hintN % CHAT_HINTS.length]; _hintN++;
+  return t;
+}
+
 const _pick = arr => arr[Math.floor(Math.random()*arr.length)];
 const _typeAt = cell => (cell ? BUILDING_TYPES[cell[0]+'_'+cell[1]] : null);
 const _popcount = n => { let c=0; while(n){ n&=n-1; c++; } return c; };
@@ -3079,6 +3098,14 @@ function lifeLineEn(a){
 const LIFE_W = { sick:6, eat:3, bored:2, shop:2, sleep:1, work:1, none:1 };
 function pushLifeNews(){
   if(!CITY || !agents.length) return;
+  // HINT_EVERY 回に1回は「使い方」を流す (住民の様子の代わりに)
+  _lifeN++;
+  if(HINT_EVERY>0 && CHAT_CMD && _lifeN % HINT_EVERY === 0){
+    lifeNews.push({day:gameDay(), shape:'hint', en:nextHint(), ja:'(操作ヒント)'});
+    while(lifeNews.length>12) lifeNews.shift();
+    hudNewsDirty=true;
+    return;
+  }
   // 直近に出した人は避ける (人数が少ないうちは全員除外にならないよう上限を掛ける)
   const skip=new Set(_recentLifeAids.slice(-Math.max(1, Math.min(4, Math.floor(agents.length/2)))));
   let total=0; const pool=[];

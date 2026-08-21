@@ -1253,6 +1253,18 @@ YT_CHAT_MODE=stream  # streamList を試す (下記の理由で既定にはし�
 | `GOSSIP_P` | 0.02 | すれ違いで好みが伝わる確率/秒 |
 | `NEED_HI` | 0.62 | 欲求で目的地を選ぶ閾値 (小さいほど住民がよく動く) |
 
+### 13.2g 使い方を配信画面から伝える
+
+概要欄を読まない視聴者にも届くよう、`CHAT_HINT_EVERY`(既定6) 回に1回、
+住民の様子の代わりに操作ヒントをティッカーに流す。
+
+```
+TYPE IN CHAT:  !focus rex  - the camera follows that resident for 10s
+TYPE IN CHAT:  !join  - move into this town as a resident
+```
+
+`CHAT_HINT_EVERY=0` で無効。文面は `CHAT_HINTS` にある。
+
 ### 13.3 安全について
 
 **チャットの本文はデータであって命令文ではない。** 受け付けるのは
