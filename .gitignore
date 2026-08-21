@@ -10,6 +10,13 @@ lerna-debug.log*
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
+# エディタのスワップ/バックアップ。**.env を編集すると .env.swp に中身が丸ごと残る**ので、
+# これを追跡していると API キーごとコミットされてしまう (実際に一度やってしまった)。
+*.swp
+*.swo
+*~
+.*.sw?
+
 # 街の恒久状態 (実行時に生成される。環境ごとに違うのでコミットしない)
 data/city_state.json
 data/city_state.json.tmp
