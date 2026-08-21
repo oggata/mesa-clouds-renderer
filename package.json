@@ -8,11 +8,15 @@
     "start:local": "node server.js"
   },
   "dependencies": {
-    "three": "0.132.2",
+    "@grpc/grpc-js": "^1.10.0",
+    "@grpc/proto-loader": "^0.7.0",
     "gl": "9.0.0-rc.9",
-    "ws": "^8.20.0",
+    "onnxruntime-node": "^1.17.0",
     "sharp": "^0.33.0",
-    "onnxruntime-node": "^1.17.0"
+    "three": "0.132.2",
+    "ws": "^8.20.0"
   },
-  "engines": { "node": ">=18.0.0" }
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }

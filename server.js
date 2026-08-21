@@ -3827,13 +3827,21 @@ const YTC = {
   video:   process.env.YT_VIDEO_ID || '',
   channel: process.env.YT_CHANNEL_ID || '',        // 動画IDの代わりにチャンネルから自動発見
   base:    process.env.YT_CHAT_API_BASE || 'https://www.googleapis.com/youtube/v3',
-  pollSec: envNum('YT_CHAT_POLL_SEC', 45),
+  // 静かなときの間隔 / 会話中の間隔 / 「会話中」とみなす無音の長さ
+  pollSec:     envNum('YT_CHAT_POLL_SEC', 45),
+  pollFastSec: envNum('YT_CHAT_POLL_FAST', 8),
+  activeSec:   envNum('YT_CHAT_ACTIVE_SEC', 120),
+  lastMsgAt:0, curSec:0, _timer:null,
   // liveChatMessages.list の単価は公式のクォータ表で確認できなかった。多くの list は
   // 1 unit だが、ライブチャットは 5 unit という記述も見かける。**安全側の 5 を既定**にし、
   // 実測できたら YT_CHAT_UNIT_COST で直せるようにしておく (見積りログに効く)。
   unitCost: envNum('YT_CHAT_UNIT_COST', 5),
-  // 取り込み方式: 'auto' はまず streamList を試し、駄目ならポーリングへ落ちる
-  mode: (['stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
+  // 取り込み方式。**既定は poll**。
+  //   REST の streamList は本番で試したところ、接続 → 履歴を返す → すぐ切断 を
+  //   繰り返すだけだった (真のストリーミングは gRPC 版のほう)。張り直しのたびに
+  //   ユニットを食うので、素直にポーリングしたほうが安くて速い。
+  //   YT_CHAT_MODE=stream で明示的に試すことはできる。
+  mode: (['grpc','stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
   units:0, calls:{}, unitDay:'',            // 消費ユニットの自前カウント (太平洋時間の日付で区切る)
   primed:false, bytes:0, lastDataAt:0,      // 履歴を捨てたか / 受信バイト / 最後にデータが来た時刻
   chatId:null, pageToken:null, polls:0, pushes:0, seen:0, cmds:0, lastError:null, startedAt:0,
@@ -3927,7 +3935,114 @@ async function ytcResolveChatId(){
   console.log(`[YTChat] liveChatId 取得 (${String(id).slice(0,16)}…)`);
 }
 
-// ── streamList (長時間つなぎっぱなしで新着を push してもらう) ────────────────
+// ── streamList (gRPC): 長時間つなぎっぱなしで新着を push してもらう ──────────
+//   これが公式の本命。REST 版は「接続 → 履歴 → 即切断」を繰り返すだけで使い物に
+//   ならなかった (本番で確認済み)。gRPC なら本当に張りっぱなしになる。
+//   proto は tools/stream_list.proto (公式から必要な部分だけ抜粋・フィールド番号は一致)。
+//   依存は任意ロード: 入っていなければポーリングに落ちるだけでサーバは動く。
+let grpcLib=null, protoLoader=null;
+try{
+  grpcLib=require('@grpc/grpc-js');
+  protoLoader=require('@grpc/proto-loader');
+}catch(e){ /* npm install していなければ gRPC モードは使えない */ }
+
+const GRPC_PROTO = process.env.YT_GRPC_PROTO || path.join(__dirname,'tools','stream_list.proto');
+const GRPC_TARGET= process.env.YT_GRPC_TARGET || 'youtube.googleapis.com:443';
+let _grpcClient=null;
+
+function ytcGrpcClient(){
+  if(_grpcClient) return _grpcClient;
+  if(!grpcLib || !protoLoader) throw new Error('@grpc/grpc-js と @grpc/proto-loader が入っていない (npm install)');
+  if(!fs.existsSync(GRPC_PROTO)) throw new Error(`proto が無い: ${GRPC_PROTO}`);
+  const def=protoLoader.loadSync(GRPC_PROTO,
+    {keepCase:false, longs:String, enums:String, defaults:false, oneofs:true});
+  const pkg=grpcLib.loadPackageDefinition(def);
+  const Svc=pkg.youtube && pkg.youtube.api && pkg.youtube.api.v3
+            && pkg.youtube.api.v3.V3DataLiveChatMessageService;
+  if(!Svc) throw new Error('proto に V3DataLiveChatMessageService が無い');
+  // 既定は TLS。YT_GRPC_INSECURE=1 はローカルの検証用 (本番では使わないこと)
+  const creds = process.env.YT_GRPC_INSECURE==='1'
+    ? grpcLib.credentials.createInsecure()
+    : grpcLib.credentials.createSsl();
+  if(process.env.YT_GRPC_INSECURE==='1') console.warn('[YTChat] ⚠ gRPC を TLS 無しで接続 (検証用)');
+  _grpcClient=new Svc(GRPC_TARGET, creds);
+  return _grpcClient;
+}
+
+// 1回ぶんの接続。切れるまで待って、切れたら reject する (呼び出し側が張り直す)。
+function ytcGrpcOnce(){
+  return new Promise(async (resolve, reject)=>{
+    try{
+      if(!YTC.chatId) await ytcResolveChatId();
+      const client=ytcGrpcClient();
+      const md=new grpcLib.Metadata();
+      const tok=await ytcAccessToken();
+      if(tok) md.set('authorization', `Bearer ${tok}`);
+      else if(YTC.key) md.set('x-goog-api-key', YTC.key);
+      else return reject(new Error('APIキーもトークンも無い'));
+
+      ytcCharge('grpc/StreamList');            // 接続1本ぶん (単価は非公開なので推定)
+      const req={ liveChatId:YTC.chatId, part:['snippet','authorDetails'], maxResults:200 };
+      if(YTC.pageToken) req.pageToken=YTC.pageToken;
+      const call=client.StreamList(req, md);
+      YTC.primed=false;
+      // streamOk は **実際にデータが届いてから** 立てる。呼び出しオブジェクトは
+      // 接続前でも作れるので、ここで立てると「一度も繋がっていない」判定が働かず、
+      // 繋がらないままバックオフだけが伸びてポーリングに落ちない。
+      console.log('[YTChat] gRPC streamList へ接続中…');
+
+      call.on('data', res=>{
+        if(!YTC.streamOk){ YTC.streamOk=true; console.log('[YTChat] gRPC 接続確立 (push 方式・ポーリング無し)'); }
+        YTC.lastDataAt=Date.now();
+        if(res && res.offlineAt) console.log(`[YTChat] 配信が終了した合図 (offlineAt=${res.offlineAt})`);
+        // proto-loader が snake_case を camelCase にしてくれるので、
+        // REST と同じ形 (items[].snippet.displayMessage / authorDetails.displayName) で扱える
+        ytcConsume(res);
+      });
+      call.on('error', e=>{ YTC._call=null; reject(new Error(`gRPC ${e.code||''} ${e.details||e.message}`)); });
+      call.on('end',   ()=>{ YTC._call=null; reject(new Error('gRPC stream ended')); });
+      YTC._call=call;
+    }catch(e){ reject(e); }
+  });
+}
+
+async function ytcGrpcLoop(){
+  let fails=0;
+  for(;;){
+    if(!YTC.enabled || YTC.mode!=='grpc') return;
+    const t0=Date.now();
+    try{
+      await ytcGrpcOnce();
+    }catch(e){
+      if(Date.now()-t0>30000 && YTC.streamOk) fails=0;   // 長く保っていたなら失敗ではない
+      YTC.lastError=e.message;
+      if(/quotaExceeded|dailyLimitExceeded|RESOURCE_EXHAUSTED/i.test(e.message)){
+        YTC.pausedUntil=nextQuotaResetMs();
+        console.warn('[YTChat] クォータ切れ → 太平洋時間の深夜まで停止');
+        await new Promise(r=>setTimeout(r, 60000));
+        continue;
+      }
+      fails++;
+      if(!YTC.streamOk && fails>=3){
+        console.warn(`[YTChat] gRPC が使えない (${e.message}) → ポーリングに切り替え`);
+        YTC.mode='poll'; YTC.pageToken=null;
+        ytcPoll().finally(ytcSchedule);
+        return;
+      }
+      const wait=Math.min(60, 2**Math.min(fails,5));
+      console.warn(`[YTChat] gRPC 切断 (${e.message}) → ${wait}秒後に張り直す`);
+      await new Promise(r=>setTimeout(r, wait*1000));
+      if(fails>=10){
+        console.warn('[YTChat] 張り直しが続くのでポーリングに切り替え');
+        YTC.mode='poll';
+        ytcPoll().finally(ytcSchedule);
+        return;
+      }
+    }
+  }
+}
+
+// ── streamList (REST版): 参考実装。本番では即切断されるので既定では使わない ──────
 //   公式は「ライブチャットを消費する最も効率的な方法」としている。本体は gRPC
 //   (protobuf) だが、REST のクエリ仕様も公開されているので **まず REST の
 //   streaming エンドポイントを試し、駄目ならポーリングに落ちる**形にした。
@@ -3980,6 +4095,7 @@ function ytcConsume(j){
     const sn=m.snippet||{}, au=m.authorDetails||{};
     YTC.seen++;
     const text=sn.displayMessage||'', who=au.displayName||'viewer';
+    YTC.lastMsgAt=Date.now();                    // 会話中とみなして取得間隔を詰める
     // 命令でないチャットも記録する。「そもそも届いているのか」を切り分けるため。
     chatSeen.push({t:Date.now(), by:String(who).slice(0,24), text:String(text).slice(0,80)});
     while(chatSeen.length>20) chatSeen.shift();
@@ -4051,8 +4167,7 @@ async function ytcStreamLoop(){
         console.warn(`[YTChat] streamList が使えない (${e.message}) → ポーリングに切り替え`);
         YTC.mode='poll';
         YTC.pageToken=null;
-        setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
-        ytcPoll();
+        ytcPoll().finally(ytcSchedule);
         return;
       }
       fails++;
@@ -4062,12 +4177,36 @@ async function ytcStreamLoop(){
       if(fails>=8){
         console.warn('[YTChat] 張り直しが続くのでポーリングに切り替え');
         YTC.mode='poll';
-        setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
-        ytcPoll();
+        ytcPoll().finally(ytcSchedule);
         return;
       }
     }
   }
+}
+
+// 次に叩くまでの秒数を決める。
+//   ・直近にチャットがあった → 速く (会話中は数秒で反応してほしい)
+//   ・静か → 遅く (誰も喋っていないのに叩いても意味がない)
+//   ・その日の残り枠で最後まで持たない → さらに遅く (打ち止めより遅いほうがマシ)
+function ytcNextInterval(){
+  const active = YTC.lastMsgAt && (Date.now()-YTC.lastMsgAt) < YTC.activeSec*1000;
+  let sec = active ? YTC.pollFastSec : YTC.pollSec;
+  const leftUnits = 10000 - YTC.units;
+  const leftSec   = Math.max(60, (nextQuotaResetMs()-Date.now())/1000);
+  if(leftUnits <= 0) return leftSec;                       // 使い切った → リセットまで待つ
+  const needSec = leftSec / (leftUnits / YTC.unitCost);    // 残り枠で最後まで持つ間隔
+  return Math.max(5, sec, needSec);
+}
+
+// 間隔が変わったらタイマーを張り直す (setInterval 固定だと適応できない)
+function ytcSchedule(){
+  const sec=Math.round(ytcNextInterval());
+  if(sec!==YTC.curSec){
+    YTC.curSec=sec;
+    console.log(`[YTChat] 取得間隔を ${sec}秒に (本日の消費 約${YTC.units}/10,000 units)`);
+  }
+  clearTimeout(YTC._timer);
+  YTC._timer=setTimeout(()=>{ ytcPoll().finally(ytcSchedule); }, sec*1000);
 }
 
 async function ytcPoll(){
@@ -4531,7 +4670,9 @@ tick(); setInterval(tick, ${ms});
         recent:chatLog.slice(-10).reverse(),
         received:chatSeen.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
-        mode:YTC.mode, polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
+        mode:YTC.mode, intervalSec:YTC.curSec,
+        chatActive: !!(YTC.lastMsgAt && Date.now()-YTC.lastMsgAt < YTC.activeSec*1000),
+        polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
         bytes:YTC.bytes, lastDataSecAgo:YTC.lastDataAt?Math.round((Date.now()-YTC.lastDataAt)/1000):null,
         usage:{ptDay:YTC.unitDay, unitsUsed:YTC.units, freeQuota:10000,
           calls:YTC.calls, unitCost:YTC.unitCost,
@@ -4835,25 +4976,24 @@ function startLoops(){
       YTC.enabled=false;
     }else{
       YTC.startedAt=Date.now();
-      if(YTC.mode==='auto') YTC.mode='stream';        // まず push 方式を試す
       YTC.unitDay=ptDayKey();
       setInterval(()=>{
         if(YTC.units) console.log(`[YTChat] 本日 (${YTC.unitDay} PT) の消費: 約${YTC.units} units / 10,000`
           + ` — ${Object.entries(YTC.calls).map(([k,v])=>`${k}×${v}`).join(' ')}`);
       }, 3600*1000);
-      if(YTC.mode==='stream'){
-        console.log('[YTChat] streamList (push) で取り込む。失敗したらポーリングに落ちる');
+      // auto: gRPC が使えるなら gRPC、駄目ならポーリング
+      if(YTC.mode==='auto') YTC.mode=(grpcLib && protoLoader && fs.existsSync(GRPC_PROTO)) ? 'grpc' : 'poll';
+      if(YTC.mode==='grpc'){
+        console.log(`[YTChat] gRPC streamList で取り込む (${GRPC_TARGET})。失敗したらポーリングに落ちる`);
+        ytcGrpcLoop();
+      }else if(YTC.mode==='stream'){
+        console.log('[YTChat] streamList (REST) で取り込む。失敗したらポーリングに落ちる');
         ytcStreamLoop();
       }else{
-        console.log(`[YTChat] ${YTC.pollSec}秒ごとに取得`
-          + ` (推定 ${YTC.quotaPerDay} units/日 = ${YTC.unitCost}units×${Math.round(86400/YTC.pollSec)}回`
-          + ` / 無料枠は 1日 10,000・太平洋時間の深夜にリセット)`);
-        if(YTC.quotaPerDay>10000)
-          console.warn(`[YTChat] ⚠ 1日のクォータ (10,000 units) を超える設定。24時間回すなら`
-            + ` YT_CHAT_POLL_SEC=45 以上に。いまの間隔だと約`
-            + ` ${(10000/(YTC.quotaPerDay/24)).toFixed(1)} 時間で枠を使い切る`);
-        setInterval(ytcPoll, Math.max(5,YTC.pollSec)*1000);
-        ytcPoll();
+        console.log(`[YTChat] ポーリング: 会話中 ${YTC.pollFastSec}秒 / 静かなとき ${YTC.pollSec}秒`
+          + ` (無料枠 1日 10,000 units・太平洋時間の深夜にリセット。`
+          + ` 残り枠で足りなくなれば自動でさらに広げる)`);
+        ytcPoll().finally(ytcSchedule);
       }
     }
   }

@@ -1006,7 +1006,63 @@ curl -s localhost:8080/city | python3 -c "import json,sys;print(json.load(sys.st
 - 失敗した呼び出しも数えている (Google 側も課金されうるため)
 - `search.list` は 100 units。しかも **search 専用に「1日100クエリ」の別枠**がある
 
-### 13.2c streamList (push 方式) を優先し、駄目ならポーリングへ落ちる
+### 13.2c gRPC streamList (既定)
+
+公式の本命。`youtube.googleapis.com:443` へ gRPC で繋ぎっぱなしにし、新着が push される。
+**ポーリングしないので遅延はほぼゼロ、消費ユニットも接続1本ぶんだけ。**
+
+- proto は `tools/stream_list.proto`。公式ページ掲載の `stream_list.proto` から
+  **必要な部分だけ**を抜き出したもの。protobuf は知らないフィールドを読み飛ばすので
+  全部書く必要はないが、**フィールド番号は公式と一致していること**
+  (`display_message = 16`, `published_at = 4`, `display_name = 103`, `items = 1007`,
+  `next_page_token = 100602` など。番号がズレると値が壊れる)
+- サービスは `youtube.api.v3.V3DataLiveChatMessageService.StreamList`
+- 認証はメタデータ。APIキーなら `x-goog-api-key`、OAuth なら `authorization: Bearer …`
+- `@grpc/grpc-js` と `@grpc/proto-loader` が要る (`npm install`)。
+  **入っていなければポーリングに落ちるだけ**でサーバは動く (任意ロード)
+- proto-loader が snake_case を camelCase に変換するので、REST と同じ形
+  (`items[].snippet.displayMessage`) で扱える = 取り込み後の処理は共通
+
+```
+YT_CHAT_MODE=auto    # 既定。gRPC が使えれば gRPC、駄目ならポーリング
+YT_CHAT_MODE=grpc    # gRPC のみ
+YT_CHAT_MODE=poll    # 適応ポーリングのみ
+YT_CHAT_MODE=stream  # REST 版 streamList (即切断されるので実質使えない)
+```
+
+落ち方:
+- **データが一度も届かないまま3回失敗** → ポーリングへ切替。
+  `streamOk` は「呼び出しを作った時点」ではなく **実際にデータが届いた時点**で立てる。
+  接続前に立てると、繋がらないままバックオフだけが伸びて永久に落ちてこない
+- 30秒以上保っていた接続の切断は失敗として数えない (張り直すだけ)
+- 10回失敗が続いたらポーリングへ
+
+### 13.2c-2 適応ポーリング (gRPC が使えないとき)
+
+固定間隔は無駄が多い。**誰も喋っていないときに叩いても意味がない**し、
+会話中に45秒待たせるのも遅い。そこで間隔を状況で決める:
+
+```
+間隔 = max( 直近に発言あり ? YT_CHAT_POLL_FAST(8秒) : YT_CHAT_POLL_SEC(45秒),
+            その日の残り枠を残り時間で割った「持たせるのに必要な間隔」 )
+```
+
+3つ目の項が予算の歯止め。太平洋時間の深夜までの残り時間と残りユニットから
+「このペースなら最後まで持つ」間隔を計算し、それより速くはしない。
+枠を使い切って打ち止めになるより、遅くても動き続けるほうがよい。
+
+実測 (モック / 残り5時間・単価5と仮定):
+
+```
+[YTChat] 取得間隔を 20秒に (本日の消費 約6/10,000 units)     ← 静か
+[Chat<-] Synthe-Reels: test
+[YTChat] 取得間隔を 9秒に (本日の消費 約16/10,000 units)     ← 会話中 (予算の歯止めが 9秒)
+```
+
+単価が実際は 1 だった場合は `YT_CHAT_UNIT_COST=1` にすると歯止めが緩み、
+会話中は指定どおり 8秒 (さらに詰めれば 2秒) まで速くなる。
+
+### 13.2d streamList を試した結果 (既定では使わない)
 
 公式が「ライブチャットを消費する最も効率的な方法」としているのが
 `liveChatMessages.streamList`。長時間つなぎっぱなしの接続に新着が push されるので、
@@ -1018,10 +1074,14 @@ curl -s localhost:8080/city | python3 -c "import json,sys;print(json.load(sys.st
 使えなければポーリングに自動で落ちる**形にした (依存ゼロ)。
 
 ```
-YT_CHAT_MODE=auto    # 既定。stream を試して駄目ならポーリング
-YT_CHAT_MODE=stream  # stream のみ
-YT_CHAT_MODE=poll    # ポーリングのみ (従来どおり)
+YT_CHAT_MODE=poll    # 既定。適応ポーリング
+YT_CHAT_MODE=stream  # streamList を試す (下記の理由で既定にはしていない)
 ```
+
+**本番で試したところ、REST の streamList は「接続 → 履歴を返す → すぐ切断」を
+繰り返すだけだった。** 30秒も持たず、8回で見切りをつけてポーリングに落ちた。
+真のストリーミングは gRPC 版のほうで、REST 側は実質 `list` を1回叩くのと同じ挙動に見える。
+張り直しのたびにユニットも食うので、**素直にポーリングしたほうが安くて速い**。
 
 - 応答は「JSON オブジェクトが少しずつ流れてくる」形。改行区切りとは限らないので、
   括弧の深さを数えて完成したオブジェクトから取り出す (`makeJsonSplitter`)

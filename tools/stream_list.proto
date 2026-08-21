@@ -1,0 +1,62 @@
+// YouTube ライブチャットの gRPC ストリーミング (liveChatMessages.streamList) 用。
+//
+// 公式の stream_list.proto から **このアプリが必要とする部分だけ**を抜き出したもの。
+// 出典: https://developers.google.com/youtube/v3/live/streaming-live-chat
+//   (ページ内に proto 全文が掲載されている。ダウンロードリンクは提供されていない)
+//
+// protobuf は知らないフィールドを読み飛ばすので、全部を書く必要はない。
+// **フィールド番号だけは公式と一致していること** (番号がズレると値が壊れる)。
+// スーパーチャットやメンバーシップの詳細 (oneof displayed_content) は使わないので省略。
+syntax = "proto2";
+
+package youtube.api.v3;
+
+message LiveChatMessageListRequest {
+  optional string live_chat_id = 1;
+  optional string hl = 2;
+  optional uint32 profile_image_size = 3;
+  optional uint32 max_results = 98;
+  optional string page_token = 99;
+  repeated string part = 100;
+}
+
+message LiveChatMessageAuthorDetails {
+  optional string channel_id = 10101;
+  optional string channel_url = 102;
+  optional string display_name = 103;
+  optional string profile_image_url = 104;
+  optional bool is_verified = 4;
+  optional bool is_chat_owner = 5;
+  optional bool is_chat_sponsor = 6;
+  optional bool is_chat_moderator = 7;
+}
+
+message LiveChatMessageSnippet {
+  optional int32  type = 1;                 // enum は値だけ分かればよいので int32 で受ける
+  optional string live_chat_id = 201;
+  optional string author_channel_id = 301;
+  optional string published_at = 4;
+  optional bool   has_display_content = 17;
+  optional string display_message = 16;
+}
+
+message LiveChatMessage {
+  optional string kind = 200;
+  optional string etag = 201;
+  optional string id = 101;
+  optional LiveChatMessageSnippet snippet = 2;
+  optional LiveChatMessageAuthorDetails author_details = 3;
+}
+
+message LiveChatMessageListResponse {
+  optional string kind = 200;
+  optional string etag = 201;
+  optional string offline_at = 2;
+  optional string next_page_token = 100602;
+  repeated LiveChatMessage items = 1007;
+}
+
+service V3DataLiveChatMessageService {
+  rpc StreamList(LiveChatMessageListRequest)
+      returns (stream LiveChatMessageListResponse) {}
+}

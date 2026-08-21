@@ -246,6 +246,7 @@ data/
 | `NEED_ICONS` | 0 | 頭上の欲求アイコン（絵文字）。分かりにくいので既定は非表示。`1` で復活 |
 | `CHAT_CMD` | 1 | 配信チャットからの指示（`!focus <名前>` でカメラ指名）。`0` で無効 |
 | `YT_CHAT` | 0 | `1` で YouTube ライブチャットを取り込む（`YT_API_KEY` / `YT_VIDEO_ID` が必要） |
+| `YT_CHAT_MODE` | auto | `grpc`(push・遅延ほぼゼロ) を試し、駄目なら適応ポーリングに落ちる |
 
 街の進化まわりの設定は数が多いので **[docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §8** にまとめてあります。
 
