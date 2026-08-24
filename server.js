@@ -904,6 +904,10 @@ async function loadTextureFile(filePath) {
     tex.generateMipmaps = false;
     tex.flipY = true;
     tex.needsUpdate = true;
+    // 画像は1ファイル1枚だけ。面ごとの clone をやめて全建物で共有するので、
+    // disposeScene で破棄されないよう印を付ける (壊すと以後の建物が真っ白になる)。
+    tex.userData = tex.userData || {};
+    tex.userData.shared = true;
     texCache[filePath] = tex;
   } catch(e) {
     console.warn(`[Tex] failed ${filePath}:`, e.message);
@@ -919,33 +923,55 @@ async function preloadTextures() {
 //   0: +X, 1: -X → UV横がZ軸方向なので90°補正
 //   2: +Y, 3: -Y → 正常
 //   4: +Z 上面(屋上), 5: -Z 底面
+// 面ごとの向き補正を **ジオメトリの UV に焼き込む**。
+//   以前は面ごとにテクスチャを clone して rotation/repeat を設定していた。
+//   clone した Texture は three.js から見て別物なので、**同じ画像が4回GPUに載る**
+//   (実測: 24種の建物に対しテクスチャ実体96個)。UVに焼けば1種1枚で済む。
+//   さらに側面4面を1グループにまとめ、底面(地面に接していて見えない)は描かない。
+//   → 建物1軒あたりのドローコールが 6 → 2 に減る。
+function bakeBoxUV(geo){
+  if(geo.userData.uvBaked) return geo;
+  const uv=geo.attributes.uv, idx=geo.index.array, M=new THREE.Matrix3();
+  const apply=(gi, flipU, flipV, rotDeg)=>{
+    const g=geo.groups[gi]; if(!g) return;
+    const rot=rotDeg*Math.PI/180, ctr=rotDeg!==0?0.5:0;   // 旧実装は回転時のみ center=0.5
+    M.identity().setUvTransform(flipU?1:0, flipV?1:0, flipU?-1:1, flipV?-1:1, rot, ctr, ctr);
+    const seen=new Set(), v=new THREE.Vector3();
+    for(let k=g.start;k<g.start+g.count;k++){
+      const vi=idx[k];
+      if(seen.has(vi)) continue; seen.add(vi);
+      v.set(uv.getX(vi), uv.getY(vi), 1).applyMatrix3(M);
+      uv.setXY(vi, v.x, v.y);
+    }
+  };
+  apply(0,false,false, 90);   // +X 右側面
+  apply(1,false,false,-90);   // -X 左側面
+  apply(2,true, true,   0);   // +Y 正面
+  apply(3,false,false,  0);   // -Y 背面
+  uv.needsUpdate=true;
+  // 側面(0..3)は index buffer 上で連続しているので1グループにまとめられる
+  const sides=[0,1,2,3].map(i=>geo.groups[i]);
+  const start=Math.min(...sides.map(g=>g.start));
+  const end  =Math.max(...sides.map(g=>g.start+g.count));
+  const roof =geo.groups[4];
+  geo.clearGroups();
+  geo.addGroup(start, end-start, 0);        // 側面 (テクスチャ)
+  geo.addGroup(roof.start, roof.count, 1);  // 屋上 (単色)
+  // 底面(5)はグループを作らない = 描画されない
+  geo.userData.uvBaked=true;
+  return geo;
+}
+
 function getBuildingMaterial(typeIdx) {
   const cacheKey = typeIdx % BLDG_TYPES.length;
   if (buildingMatCache[cacheKey]) return buildingMatCache[cacheKey];
-
   const bt = BLDG_TYPES[cacheKey];
   const sideTex = texCache[bt.textureFile];
-
-  function makeMat(flipU = false, flipV = false, rotateDeg = 0) {
-    if (!sideTex) return new THREE.MeshLambertMaterial({ color: bt.fallbackColor });
-    const t = sideTex.clone();
-    t.needsUpdate = true;
-    if (rotateDeg !== 0) {
-      t.rotation = rotateDeg * (Math.PI / 180);
-      t.center.set(0.5, 0.5);
-    }
-    t.repeat.set(flipU ? -1 : 1, flipV ? -1 : 1);
-    t.offset.set(flipU ?  1 : 0, flipV ?  1 : 0);
-    return new THREE.MeshLambertMaterial({ map: t });
-  }
-
   const mats = [
-    makeMat(false, false,  90), // 0: +X 右側面
-    makeMat(false, false,   -90), // 1: -X 左側面
-    makeMat(true,  true,    0), // 2: +Y 正面 (BoxGeometry の +Y UV は 180°回転なので flipU+flipV で補正)
-    makeMat(false, false,   0), // 3: -Y 背面 (無変換で正立)
-    new THREE.MeshLambertMaterial({ color: 0xb0b4ac }), // 4: 屋上
-    new THREE.MeshLambertMaterial({ color: 0x666666 }), // 5: 底面
+    // clone しない。全建物・全側面で1枚のテクスチャを共有する
+    sideTex ? new THREE.MeshLambertMaterial({ map: sideTex })
+            : new THREE.MeshLambertMaterial({ color: bt.fallbackColor }),
+    new THREE.MeshLambertMaterial({ color: 0xb0b4ac }),   // 屋上
   ];
   buildingMatCache[cacheKey] = mats;
   return mats;
@@ -987,9 +1013,10 @@ function disposeScene(S){
       else mats.add(obj.material);
     }
   });
-  geos.forEach(g=>{ if(g!==TRAIL_GEO) g.dispose(); });
+  geos.forEach(g=>{ if(!SHARED_GEO.has(g)) g.dispose(); });
   mats.forEach(m=>{
-    if(m.map) m.map.dispose();
+    if(m.map && !(m.map.userData && m.map.userData.shared)) m.map.dispose();
+    if(m.userData && m.userData.shared) return;     // 全住民/全建物で共有しているので残す
     m.dispose();
   });
 }
@@ -1124,14 +1151,40 @@ function buildScene(map){
 
 // ─── 近接フェード: キャラクターが建物/木のそばに来たら半透明にして視認性を保つ ──
 const FADE_DIST = CELL*2.3, FADE_OPACITY = 0.8;
+// 建物/木をセル単位のバケツに入れておく。総当たりだと住民×オブジェクトになり、
+// 1000人 × 600個 = 毎フレーム60万回で、描画より重くなる (実測 300人で4.7ms)。
+let _occGrid=null, _occStamp=-1;
+function occluderGrid(){
+  const keys=Object.keys(occluders);
+  if(_occGrid && _occStamp===keys.length) return _occGrid;   // 数が変わらなければ使い回す
+  _occGrid=new Map();
+  for(const key of keys){
+    const o=occluders[key];
+    const cr=Math.floor(o.cy/CELL), cc=Math.floor(o.cx/CELL);
+    const k=cr*GRID+cc;
+    let arr=_occGrid.get(k); if(!arr) _occGrid.set(k, arr=[]);
+    arr.push(key);
+  }
+  _occStamp=keys.length;
+  return _occGrid;
+}
+
 function updateOcclusionFade(){
   const near=new Set();
+  const grid=occluderGrid();
+  const R=Math.ceil(FADE_DIST/CELL);
   for(const a of agents){
     const ax=a.y*CELL+CELL*.5, ay=a.x*CELL+CELL*.5;
-    for(const key in occluders){
-      const o=occluders[key];
-      const dx=o.cx-ax, dy=o.cy-ay;
-      if(dx*dx+dy*dy<FADE_DIST*FADE_DIST) near.add(key);
+    const cr=Math.floor(a.x), cc=Math.floor(a.y);
+    // 自分の周り R セルぶんのバケツだけ見る
+    for(let dr=-R;dr<=R;dr++)for(let dc=-R;dc<=R;dc++){
+      const arr=grid.get((cr+dr)*GRID+(cc+dc));
+      if(!arr) continue;
+      for(const key of arr){
+        const o=occluders[key];
+        const dx=o.cx-ax, dy=o.cy-ay;
+        if(dx*dx+dy*dy<FADE_DIST*FADE_DIST) near.add(key);
+      }
     }
   }
   for(const key in occluders){
@@ -1476,60 +1529,90 @@ function updateHud(dt){
   }
 }
 
-function createAgentMesh(S,color){
-  const g=new THREE.Group();
-  const base=-CELL*.26;                                   // 地面 (足元)
-  const skin=0xf1c9a5, hair=0x4a3b2f, pants=0x2b303a;
-  const bodyMat =new THREE.MeshLambertMaterial({color});
-  const skinMat =new THREE.MeshLambertMaterial({color:skin});
-  const hairMat =new THREE.MeshLambertMaterial({color:hair});
-  const pantsMat=new THREE.MeshLambertMaterial({color:pants});
-  const upZ=geo=>{geo.rotateX(Math.PI/2);return geo;};    // Y軸ジオメトリを Z 上向きに
+// 住民の見た目。以前は1人ぶんで8個のMeshを作り、しかも **ジオメトリとマテリアルを
+// 人数分だけ新規生成** していた (300人なら2400ジオメトリ)。部位は一切アニメーション
+// せず、常に一体で動くだけなので、
+//   ・ジオメトリを1個にマージして全住民で共有
+//   ・色の違う「体」以外 (肌/髪/ズボン) は頂点カラーに焼き込んで1マテリアルに
+// することで、1人 = 1Mesh / 2ドローコール、ジオメトリは街全体で1個になる。
+const SHARED_GEO = new Set();          // dispose 対象外にする共有ジオメトリ
+let _agentGeo = null;                  // 全住民で共有する体のジオメトリ
+const _bodyMats = new Map();           // 体の色ごとのマテリアル (ペルソナ数ぶんだけ作られる)
+const _partsMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+_partsMat.userData.shared = true;
 
-  // 脚 (細身・左右)
-  const legGeo=upZ(new THREE.CylinderGeometry(CELL*.032,CELL*.028,CELL*.22,8));
-  for(const sx of [-1,1]){
-    const leg=new THREE.Mesh(legGeo,pantsMat);
-    leg.position.set(sx*CELL*.05,0,base+CELL*.11);
-    g.add(leg);
+// 複数の BufferGeometry を1本に連結する。色は頂点カラーとして書き込む。
+// (three の BufferGeometryUtils は Node ビルドに含まれないので最小限を自前で持つ)
+function mergeGeos(list){
+  const cnt = g => g.index ? g.index.count : g.attributes.position.count;
+  let vc=0, ic=0;
+  for(const it of list){ vc+=it.geo.attributes.position.count; ic+=cnt(it.geo); }
+  const pos=new Float32Array(vc*3), nor=new Float32Array(vc*3), col=new Float32Array(vc*3);
+  const idx=new Uint16Array(ic);
+  let vo=0, io=0;
+  for(const it of list){
+    const p=it.geo.attributes.position, n=it.geo.attributes.normal;
+    const c=it.color || new THREE.Color(1,1,1);
+    pos.set(p.array, vo*3); nor.set(n.array, vo*3);
+    for(let i=0;i<p.count;i++){ col[(vo+i)*3]=c.r; col[(vo+i)*3+1]=c.g; col[(vo+i)*3+2]=c.b; }
+    if(it.geo.index){ const a=it.geo.index.array; for(let i=0;i<a.length;i++) idx[io+i]=a[i]+vo; io+=a.length; }
+    else { for(let i=0;i<p.count;i++) idx[io+i]=vo+i; io+=p.count; }
+    vo+=p.count;
+    it.geo.dispose();                  // 型紙はもう要らない
   }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  g.setAttribute('normal',   new THREE.BufferAttribute(nor,3));
+  g.setAttribute('color',    new THREE.BufferAttribute(col,3));
+  g.setIndex(new THREE.BufferAttribute(idx,1));
+  return g;
+}
 
-  // 胴体: 裾に向かってわずかに広がるテーパー (コート/ワンピース風シルエット)
-  const torso=new THREE.Mesh(
-    upZ(new THREE.CylinderGeometry(CELL*.095,CELL*.135,CELL*.30,16)),bodyMat);
-  torso.position.set(0,0,base+CELL*.35);
-  g.add(torso);
+function agentGeometry(){
+  if(_agentGeo) return _agentGeo;
+  const base=-CELL*.26;                                  // 地面 (足元)
+  const skin=new THREE.Color(0xf1c9a5), hair=new THREE.Color(0x4a3b2f), pants=new THREE.Color(0x2b303a);
+  const upZ=g=>{ g.rotateX(Math.PI/2); return g; };       // Y軸ジオメトリを Z 上向きに
+  const put=(g,x,y,z,sx=1,sy=1,sz=1)=>{
+    g.applyMatrix4(new THREE.Matrix4().compose(
+      new THREE.Vector3(x,y,z), new THREE.Quaternion(), new THREE.Vector3(sx,sy,sz)));
+    return g;
+  };
+  // ── グループ0: 体 (住民ごとに色が変わるのでマテリアル側で塗る) ──
+  const body=[
+    // 胴体: 裾に向かってわずかに広がるテーパー (コート/ワンピース風シルエット)
+    { geo: put(upZ(new THREE.CylinderGeometry(CELL*.095,CELL*.135,CELL*.30,16)), 0,0,base+CELL*.35) },
+    // 丸い肩
+    { geo: put(new THREE.SphereGeometry(CELL*.12,16,10), 0,0,base+CELL*.49, 1.05,.8,.7) },
+  ];
+  // ── グループ1: 肌・髪・ズボン (色が固定なので頂点カラーに焼く) ──
+  const legGeo=()=>upZ(new THREE.CylinderGeometry(CELL*.032,CELL*.028,CELL*.22,8));
+  const parts=[
+    { geo: put(legGeo(), -CELL*.05,0,base+CELL*.11), color: pants },   // 脚 (細身・左右)
+    { geo: put(legGeo(),  CELL*.05,0,base+CELL*.11), color: pants },
+    { geo: put(upZ(new THREE.CylinderGeometry(CELL*.04,CELL*.045,CELL*.06,8)), 0,0,base+CELL*.55), color: skin }, // 首
+    { geo: put(new THREE.SphereGeometry(CELL*.115,18,14), 0,0,base+CELL*.66, 1,.95,1.05), color: skin },          // 頭
+    // 髪 (頭頂のドーム)
+    { geo: put(upZ(new THREE.SphereGeometry(CELL*.122,18,12,0,Math.PI*2,0,Math.PI*.62)), 0,-CELL*.012,base+CELL*.665), color: hair },
+    // 正面マーカー (鼻) — 進行方向の判別用に控えめに残す。Cone は既定で +Y を向く。
+    { geo: put(new THREE.ConeGeometry(CELL*.03,CELL*.06,8), 0,CELL*.11,base+CELL*.655), color: skin },
+  ];
+  const nBody=body.reduce((n,it)=>n+(it.geo.index?it.geo.index.count:it.geo.attributes.position.count),0);
+  const all=body.concat(parts);
+  const nAll=all.reduce((n,it)=>n+(it.geo.index?it.geo.index.count:it.geo.attributes.position.count),0);
+  const g=mergeGeos(all);
+  g.addGroup(0, nBody, 0);
+  g.addGroup(nBody, nAll-nBody, 1);
+  SHARED_GEO.add(g);
+  _agentGeo=g; return g;
+}
 
-  // 丸い肩
-  const shoulders=new THREE.Mesh(new THREE.SphereGeometry(CELL*.12,16,10),bodyMat);
-  shoulders.scale.set(1.05,.8,.7);
-  shoulders.position.set(0,0,base+CELL*.49);
-  g.add(shoulders);
-
-  // 首
-  const neck=new THREE.Mesh(upZ(new THREE.CylinderGeometry(CELL*.04,CELL*.045,CELL*.06,8)),skinMat);
-  neck.position.set(0,0,base+CELL*.55);
-  g.add(neck);
-
-  // 頭
-  const head=new THREE.Mesh(new THREE.SphereGeometry(CELL*.115,18,14),skinMat);
-  head.scale.set(1,.95,1.05);
-  head.position.set(0,0,base+CELL*.66);
-  g.add(head);
-
-  // 髪 (頭頂のドーム)
-  const hairGeo=upZ(new THREE.SphereGeometry(CELL*.122,18,12,0,Math.PI*2,0,Math.PI*.62));
-  const hairMesh=new THREE.Mesh(hairGeo,hairMat);
-  hairMesh.position.set(0,-CELL*.012,base+CELL*.665);
-  g.add(hairMesh);
-
-  // 正面マーカー (鼻) — 進行方向の判別用に控えめに残す。Cone は既定で +Y を向く。
-  const nose=new THREE.Mesh(new THREE.ConeGeometry(CELL*.03,CELL*.06,8),skinMat);
-  nose.position.set(0,CELL*.11,base+CELL*.655);
-  g.add(nose);
-
-  g.scale.setScalar(CHAR_SCALE);   // 街に対する大きさ調整 (足元は renderLoop 側で接地補正)
-  S.add(g);return g;
+function createAgentMesh(S,color){
+  let bodyMat=_bodyMats.get(color);
+  if(!bodyMat){ bodyMat=new THREE.MeshLambertMaterial({color}); bodyMat.userData.shared=true; _bodyMats.set(color, bodyMat); }
+  const m=new THREE.Mesh(agentGeometry(), [bodyMat, _partsMat]);
+  m.scale.setScalar(CHAR_SCALE);   // 街に対する大きさ調整 (足元は renderLoop 側で接地補正)
+  S.add(m); return m;
 }
 
 // ─── RGBA → JPEG ─────────────────────────────────────────────────────────────
@@ -1792,7 +1875,8 @@ function newStruct(r,c,fp,typeIdx,born){
     born: born||0,           // 建った日 (0 = 創世時からある)
     openedBy: null,          // 起業した住民の aid
     visits: 0, visitsToday: 0, ema: 0,
-    firstCustomer: null, doneAt: null, closedDay: null };
+    firstCustomer: null, doneAt: null, closedDay: null,
+    vacantSince: null };            // 誰も使わなくなった日 (住宅/職場の撤去判定)
 }
 
 function structAt(r,c){ return cellStruct[r+'_'+c] || null; }
@@ -1856,6 +1940,7 @@ function removeStructMesh(S, st){
   const arr=Array.isArray(o.mesh.material)?o.mesh.material:[o.mesh.material];
   arr.forEach(m=>m.dispose());
   delete occluders[key];
+  _occStamp=-1;                       // バケツを作り直す
 }
 function addStructMesh(S, st){
   if(!S || st.state==='gone') return;
@@ -1863,11 +1948,12 @@ function addStructMesh(S, st){
   const span=st.fp, bw=span*CELL*0.8, h=structHeight(st);
   const cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
   const gkey=span+'_'+h.toFixed(3);
-  if(!boxGeoByH[gkey]) boxGeoByH[gkey]=new THREE.BoxGeometry(bw,bw,h);
+  if(!boxGeoByH[gkey]) boxGeoByH[gkey]=bakeBoxUV(new THREE.BoxGeometry(bw,bw,h));
   const mesh=new THREE.Mesh(boxGeoByH[gkey], structMats(st));
   mesh.position.set(cx,cy,h/2);
   S.add(mesh);
   occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
+  _occStamp=-1;                       // バケツを作り直す
 }
 
 // ── 雨粒 ────────────────────────────────────────────────────────────────────
@@ -2596,14 +2682,81 @@ function siteScoreDemand(cat, r, c){
 // 住居と職場は「欲求」ではないのでヒートマップが無い。人が通る所 (踏み跡) と
 // 既存の建物の隣を好む = 街が虫食いにならず塊として広がる。
 function siteScoreGeneric(r, c){
-  let s=0;
+  let s=0, nb=0;
   for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
     const nr=r+dr, nc=c+dc;
     if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
     s += CITY.foot[nr*GRID+nc]*0.02;
-    if(MAP[nr][nc]===BUILDING) s += 6;
+    if(MAP[nr][nc]===BUILDING) nb++;
   }
+  // 建物に接していると寄せる力は残すが弱める (虫食い防止)。ただし**囲まれるほど減点**して
+  // 塊になるのを止める。以前は隣接1つにつき +6 で、密集する一方だった。
+  s += Math.min(nb,2)*2 - Math.max(0, nb-3)*4;
+  s += (openRatio(r,c)-0.5)*10;          // 周りが開けている場所を好む
   return s;
+}
+
+// ═══ 通行性 (walkability) ══════════════════════════════════════════════════
+//   40日ほど回した本番で「建物が密集して人が動けない」状態になった。原因は3つ:
+//     1. 立地スコアが建物への隣接に +6 を与えていた (虫食い防止のつもりが塊を作る)
+//     2. 住宅と職場は**閉店も取り壊しもされない**ので単調に増え続ける
+//     3. 建設に密度の上限が無く、フィールドが最大 (30x30) に達した後も建て続ける
+//   連結性 (canBuildFootprint) は「分断されないこと」しか見ておらず、
+//   幅1の通路だらけでも通ってしまう。通れる**広さ**を別に見る必要がある。
+const WALK_MIN        = envNum('WALK_MIN', 0.55);        // これを下回ると建設を止め、取り壊しを始める
+const BUILD_MAX_DENS  = envNum('BUILD_MAX_DENSITY', 0.42); // 建物セルの割合の上限
+const MIN_OPEN_RATIO  = envNum('MIN_OPEN_RATIO', 0.35);  // 5x5 窓に残すべき通行可能セルの割合
+const VACANT_DAYS     = envNum('VACANT_DAYS', 4);        // 空き家/空き職場を取り壊すまでの日数
+
+// 通行可能セルの平均「開け具合」(4近傍のうち通れる数 / 4)。1 に近いほど広々。
+function walkability(){
+  const lo=fieldLo(), hi=fieldHi();
+  let cells=0, sum=0;
+  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++){
+    if(!PASSABLE.has(MAP[r][c])) continue;
+    let n=0;
+    for(const [dr,dc] of MW.D4){
+      const nr=r+dr, nc=c+dc;
+      if(nr<lo||nr>hi||nc<lo||nc>hi) continue;
+      if(PASSABLE.has(MAP[nr][nc])) n++;
+    }
+    sum+=n; cells++;
+  }
+  return cells ? sum/(cells*4) : 1;
+}
+
+// (r,c) 周辺の通行可能セルの割合 (半径2の5x5窓)
+function openRatio(r,c){
+  const lo=fieldLo(), hi=fieldHi();
+  let tot=0, ok=0;
+  for(let dr=-2;dr<=2;dr++)for(let dc=-2;dc<=2;dc++){
+    const nr=r+dr, nc=c+dc;
+    if(nr<lo||nr>hi||nc<lo||nc>hi) continue;
+    tot++; if(PASSABLE.has(MAP[nr][nc])) ok++;
+  }
+  return tot ? ok/tot : 1;
+}
+
+// 置いた後に「行き止まり」ができないか。通れる隣が1以下のセルを作らない。
+//   これが幅1の迷路化を防ぐ本体。連結性チェックだけでは通ってしまう。
+function wouldChoke(r,c,fp){
+  const lo=fieldLo(), hi=fieldHi();
+  for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++) MAP[r+dr][c+dc]=BUILDING;
+  let bad=false;
+  for(let dr=-1;dr<=fp && !bad;dr++)for(let dc=-1;dc<=fp && !bad;dc++){
+    const nr=r+dr, nc=c+dc;
+    if(nr<lo||nr>hi||nc<lo||nc>hi) continue;
+    if(!PASSABLE.has(MAP[nr][nc])) continue;
+    let n=0;
+    for(const [ar,ac] of MW.D4){
+      const rr=nr+ar, cc=nc+ac;
+      if(rr<lo||rr>hi||cc<lo||cc>hi) continue;
+      if(PASSABLE.has(MAP[rr][cc])) n++;
+    }
+    if(n<=1) bad=true;
+  }
+  for(let dr=0;dr<fp;dr++)for(let dc=0;dc<fp;dc++) MAP[r+dr][c+dc]=OTHER;
+  return bad;
 }
 
 const blockFree=(r,c,fp)=>{
@@ -2654,9 +2807,11 @@ function pickSite(day, fp, scoreFn){
     lots.push({r,c,score:scoreFn(r,c)});
   }
   lots.sort((a,b)=>b.score-a.score);
-  for(const lot of lots.slice(0,12)){
+  for(const lot of lots.slice(0,24)){
     if(best && best.score>=lot.score) break;     // 跡地のほうが良ければそれを使う
     if(!canBuildFootprint(lot.r,lot.c,fp)) continue;   // 街を分断する場所は捨てる
+    if(wouldChoke(lot.r,lot.c,fp)) continue;           // 行き止まり/幅1の通路を作らない
+    if(openRatio(lot.r,lot.c) < MIN_OPEN_RATIO) continue;  // すでに詰まっている一帯には建てない
     return {reuse:null, r:lot.r, c:lot.c, fp, score:lot.score};
   }
   return best;
@@ -2764,6 +2919,14 @@ function foundCategory(cat, day){
 //   生活の器のほうを先に建てる。商売は「未充足の需要が濃い場所」があるときだけ。
 function maybeFound(day){
   const daySec=DAY_MINUTES*60;
+  // 詰まってきたら建てない。フィールドが最大 (30x30) に達すると拡張で逃げられなくなるので、
+  // ここで止めないと単調に密集し続ける (本番で40日目に発生)。
+  const dens=fieldDensity(), walk=walkability();
+  if(dens>=BUILD_MAX_DENS || walk<WALK_MIN){
+    console.log(`[City] 建設を見送り: 建て込み ${(dens*100).toFixed(0)}% (上限${(BUILD_MAX_DENS*100)|0}%)`
+      + ` / 通行性 ${walk.toFixed(2)} (下限${WALK_MIN})`);
+    return 0;
+  }
   const pop=agents.length;
   const hcap=housingCapacity(), wcap=workplaceCapacity();
   let workers=0; for(const a of agents) if(!a.owns) workers++;
@@ -2923,11 +3086,16 @@ function rolloverVisits(){
 }
 const catOfType = t => CATS.find(c => (CAT_IDX[c]||[]).includes(t));
 
-function closeShop(st, day){
+function closeShop(st, day, vacant){
   st.state='closed'; st.closedDay=day; st.ema=0;
   CITY.stats.shopsClosed++;
   syncCity(); addStructMesh(scene, st);
   const label=BLDG_TYPES[st.typeIdx].label;
+  if(vacant){                                  // 空き家/空き職場は「閉店」ではない
+    news('close', `🏚 誰も使わなくなった ${label} (${st.r},${st.c}) が閉じられた`,
+         `${enOf(st.typeIdx)} stood empty and was closed up`);
+    return;
+  }
   for(const a of agents){
     if(a.owns && a.owns[0]===st.r && a.owns[1]===st.c){
       a.owns=null;                                  // 店主は職を失い、また勤め人に戻る
@@ -2964,6 +3132,102 @@ function maybeClose(day){
     closeShop(st, day); closed++;
   }
   return closed;
+}
+
+// 誰も住んでいない住宅 / 誰も働いていない職場を畳む。
+//   住宅と職場は「閉店」の対象外なので、これまで**増える一方**だった。
+//   人口が増えるほど建物が増え、取り壊しの道が無いので街が埋まっていく。
+//   使われていないものにだけ撤去の道を作る (住んでいる家は絶対に壊さない)。
+function markVacant(day){
+  let n=0;
+  const homeCount={}, workCount={};
+  for(const a of agents){
+    if(a.home) homeCount[cellKey(a.home)]=(homeCount[cellKey(a.home)]||0)+1;
+    if(a.work) workCount[cellKey(a.work)]=(workCount[cellKey(a.work)]||0)+1;
+  }
+  for(const st of CITY.structs){
+    if(st.state!=='open') continue;
+    const isHome=HOME_IDX.includes(st.typeIdx), isWork=WORK_IDX.includes(st.typeIdx);
+    if(!isHome && !isWork) continue;
+    const used=(isHome?homeCount[st.r+'_'+st.c]:workCount[st.r+'_'+st.c])||0;
+    if(used>0){ st.vacantSince=null; continue; }
+    if(st.vacantSince==null){ st.vacantSince=day; continue; }
+    if(day-st.vacantSince < VACANT_DAYS) continue;
+    // 最低限は残す (全部畳むと住むところ/働くところが消える)
+    const same=CITY.structs.filter(x=>x.state==='open' &&
+      (isHome?HOME_IDX:WORK_IDX).includes(x.typeIdx)).length;
+    if(same<=2) continue;
+    closeShop(st, day, true);                 // 閉鎖 → 通常の取り壊し待ち行列に乗る
+    n++;
+    if(n>=CLOSE_PER_DAY) break;
+  }
+  return n;
+}
+
+// 通行性が落ちているとき、いちばん道を塞いでいる建物を1つ畳む。
+//   密集した街が自力で息を吹き返すための弁。
+function relieveCongestion(day){
+  if(walkability()>=WALK_MIN) return 0;
+  return relieveCongestionForce(day, true);    // 1日1軒なのでカメラで見せる
+}
+
+// 道をいちばん塞いでいる建物を1つ選ぶ。使われている住居/職場は対象外。
+//   `_picked` は一括整理のときに「もう選んだ」印 (MAP を仮に空けて次を選ぶため)。
+function bestCongestionTarget(){
+  let best=null, bs=-1;
+  for(const st of CITY.structs){
+    if(st.state!=='open' || st.fp!==1 || st._picked) continue;
+    if(HOME_IDX.includes(st.typeIdx) || WORK_IDX.includes(st.typeIdx)){
+      const used=agents.some(a=>(a.home&&a.home[0]===st.r&&a.home[1]===st.c)
+                             || (a.work&&a.work[0]===st.r&&a.work[1]===st.c));
+      if(used) continue;                     // 住んでいる家・働いている職場は壊さない
+    }
+    // そこを空けたとき、周囲がどれだけ開けるか
+    MAP[st.r][st.c]=OTHER;
+    const gain=openRatio(st.r, st.c);
+    MAP[st.r][st.c]=BUILDING;
+    if(gain>bs){ bs=gain; best=st; }
+  }
+  return best;
+}
+
+function demolishForStreets(st, showCam){
+  const label=BLDG_TYPES[st.typeIdx].label;
+  news('demolish', `🚧 道が狭くなったため ${label} (${st.r},${st.c}) が取り壊された`,
+       `${enOf(st.typeIdx)} was cleared to open up the streets`);
+  st.state='demolishing'; CITY.stats.demolished++;
+  if(showCam){
+    showCityEvent(st.r, st.c, `${enOf(st.typeIdx)} cleared for the streets`, null,
+                  {st, kind:'sink', onDone:()=>finishDemolish(st)});
+  }else{
+    animateStruct(st, 'sink', ()=>finishDemolish(st));   // カメラは動かさず沈める
+  }
+}
+
+// showCam=false は手動の一括整理用。20軒ぶんのカメライベントを積むと
+// 配信が3分間ジャックされるので、まとめて壊すときは黙って壊す。
+function relieveCongestionForce(day, showCam){
+  const st=bestCongestionTarget();
+  if(!st) return 0;
+  demolishForStreets(st, showCam);
+  return 1;
+}
+
+// 一括整理: 先に n 軒ぶんの対象を選んでから、まとめて沈める。
+//   沈むアニメが終わるまで MAP は建物のままなので、選びながら壊すと
+//   2軒目以降が「まだ塞がっている」前提で選ばれてしまう。
+function declutter(day, n){
+  const chosen=[];
+  for(let i=0;i<n;i++){
+    const st=bestCongestionTarget();
+    if(!st) break;
+    chosen.push(st);
+    st._picked=true;
+    MAP[st.r][st.c]=OTHER;                   // 次の選択のために仮に空ける
+  }
+  for(const st of chosen){ MAP[st.r][st.c]=BUILDING; delete st._picked; }  // 戻す
+  for(const st of chosen) demolishForStreets(st, false);
+  return chosen.length;
 }
 
 // 閉店したまま DEMOLISH_DAYS 経った建物は取り壊して空き地に戻す。
@@ -3250,8 +3514,8 @@ function dailyRollover(day){
   rolloverVisits();                       // 先に EMA を更新してから閉店判定する
   const roads=promoteFootpaths(day);
   const grown=maybeExpand(day);           // 土地が足りなければ先にフィールドを広げる
-  const closed=maybeClose(day);
-  const gone=maybeDemolish(day);
+  const closed=maybeClose(day) + markVacant(day);   // 空き家/空き職場も畳む
+  const gone=maybeDemolish(day) + relieveCongestion(day);
   // 1日に建てられる軒数は人口に比例させる。人が増えるほど街が速く育つ (複利)。
   const budget=Math.max(1, Math.min(6, 1+Math.floor(agents.length/FOUND_PER_POP)));
   let opened=0;
@@ -3524,17 +3788,20 @@ function stepNavigate(a){
   return false;
 }
 
-let agents=[], agentMeshes=[], trailMats={};
+let agents=[], agentMeshes=[];
 let scene=null;   // ★ async init 完了まで null のまま
 let paused=false, speedMul=1;
 
 function disposeMesh(m){
   if(!m) return;
   m.traverse(o=>{
-    if(o.geometry && o.geometry!==TRAIL_GEO) o.geometry.dispose();
+    if(o.geometry && !SHARED_GEO.has(o.geometry)) o.geometry.dispose();
     if(o.material){
       const arr=Array.isArray(o.material)?o.material:[o.material];
-      arr.forEach(mat=>{ if(mat.map) mat.map.dispose(); mat.dispose(); });
+      arr.forEach(mat=>{
+        if(mat.userData && mat.userData.shared) return;     // 全住民で共有しているので残す
+        if(mat.map) mat.map.dispose(); mat.dispose();
+      });
     }
   });
 }
@@ -3551,7 +3818,7 @@ function spawnAgent(S, i){
   const b=randB(null), g=randB(b);
   const a={aid:`${def.id}#${i}`, name:agentDisplayName(i,def),
     x:b[0]+0.5, y:b[1]+0.5, th:Math.random()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
-    trips:0, viols:0, steps:0, stall:0, def, trail:[], active:true,
+    trips:0, viols:0, steps:0, stall:0, def, ti:agents.length, active:true,
     visited:new Set(), explored:0, visMem:new Map(),
     // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
     mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
@@ -3593,7 +3860,7 @@ function settleAgent(a){
 function initAgents(S){
   // 既存エージェント/トレイルのメッシュを scene から外し GPU リソースを解放
   agentMeshes.forEach(m=>{S.remove(m);disposeMesh(m);});
-  agents.forEach(a=>{a.trail.forEach(m=>S.remove(m));});  // trail geo/mat は共有なので dispose しない
+  clearTrails();
   agents=[];agentMeshes=[];
   // 最初の人口。村から始める場合は START_POP から、以降は住居が建つたびに増える。
   // 保存された街を復元するときはその人口から再開する。
@@ -3625,21 +3892,65 @@ function initAgents(S){
   console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
 }
 
-// トレイルは毎ステップ生成されるため、geometry を全トレイルで共有する。
-// 以前は毎回 new PlaneGeometry していて、50個超で remove するだけ (dispose なし)
-// だったため GPU バッファがリークし続けていた。共有 geometry なら 1個で済み、
-// disposeScene では破棄しない (TRAIL_GEO で除外)。
-const TRAIL_GEO = new THREE.PlaneGeometry(CELL*.2*TRAIL_SCALE, CELL*.2*TRAIL_SCALE);
+// ── 足跡 (トレイル) ─────────────────────────────────────────────────────────
+// 以前は足跡1個 = 1Mesh だった。ジオメトリとマテリアルは共有できていたが、
+// ドローコールは共有できない。住民300人 × MAX_TRAIL=10 で **3000 ドローコール**が
+// 常時フィールドに乗っており、街が育つほど効く固定費になっていた。
+// そこで全住民の足跡を **1メッシュの中の板の集まり** として持つ。住民ごとに
+// MAX_TRAIL 枚のスロットを固定で割り当て、リングバッファとして上書きする。
+// 色はペルソナごとに違うので頂点カラーで持つ。未使用スロットは4頂点を同じ点に
+// 潰しておく (縮退三角形 = 描画されない)。
+const TRAIL_HALF = CELL*.2*TRAIL_SCALE/2;
+const TRAIL_CAP  = (NUM_AGENTS+8) * MAX_TRAIL;   // 板の総数
+const Trail = { mesh:null, pos:null, col:null, cursor:new Uint16Array(NUM_AGENTS+8) };
+const _tcol = new THREE.Color();
+
+function initTrailField(S){
+  if(!S) return;
+  const pos=new Float32Array(TRAIL_CAP*4*3), col=new Float32Array(TRAIL_CAP*4*3);
+  const idx=new Uint32Array(TRAIL_CAP*6);
+  for(let q=0;q<TRAIL_CAP;q++){
+    const v=q*4, o=q*6;
+    idx[o]=v; idx[o+1]=v+1; idx[o+2]=v+2;
+    idx[o+3]=v; idx[o+4]=v+2; idx[o+5]=v+3;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  g.setAttribute('color',    new THREE.BufferAttribute(col,3));
+  g.setIndex(new THREE.BufferAttribute(idx,1));
+  const mesh=new THREE.Mesh(g, new THREE.MeshBasicMaterial(
+    {vertexColors:true, transparent:true, opacity:0.28, depthWrite:false}));
+  mesh.frustumCulled=false;         // 全頂点が原点に潰れている初期状態で消えないように
+  S.add(mesh);
+  Trail.mesh=mesh; Trail.pos=pos; Trail.col=col;
+  Trail.cursor.fill(0);
+}
+
+// 全住民の足跡を消す (シーン作り直し / リセット時)
+function clearTrails(){
+  if(!Trail.pos) return;
+  Trail.pos.fill(0); Trail.cursor.fill(0);
+  Trail.mesh.geometry.attributes.position.needsUpdate=true;
+}
 
 function addTrail(S,agent){
+  if(!Trail.mesh) return;
   if(MW.isIndoors(agent)) return;   // 建物の中に点が溜まるのを防ぐ
-  const m=new THREE.Mesh(TRAIL_GEO,trailMats[agent.def.id]);
-  m.position.set(agent.y*CELL+CELL*.5,agent.x*CELL+CELL*.5,.04);
-  S.add(m);agent.trail.push(m);
-  while(agent.trail.length>MAX_TRAIL){
-    const old=agent.trail.shift();
-    S.remove(old);   // geometry は共有・material はパーソナ共有なので dispose 不要
-  }
+  const i=agent.ti;
+  if(i==null || i>=Trail.cursor.length) return;
+  const k=Trail.cursor[i];
+  Trail.cursor[i]=(k+1)%MAX_TRAIL;
+  const q=i*MAX_TRAIL+k, v=q*4, h=TRAIL_HALF, z=.04;
+  const cx=agent.y*CELL+CELL*.5, cy=agent.x*CELL+CELL*.5;
+  const p=Trail.pos, c=Trail.col;
+  p[v*3   ]=cx-h; p[v*3+1 ]=cy-h; p[v*3+2 ]=z;
+  p[v*3+3 ]=cx+h; p[v*3+4 ]=cy-h; p[v*3+5 ]=z;
+  p[v*3+6 ]=cx+h; p[v*3+7 ]=cy+h; p[v*3+8 ]=z;
+  p[v*3+9 ]=cx-h; p[v*3+10]=cy+h; p[v*3+11]=z;
+  _tcol.set(agent.def.color);
+  for(let j=0;j<4;j++){ c[(v+j)*3]=_tcol.r; c[(v+j)*3+1]=_tcol.g; c[(v+j)*3+2]=_tcol.b; }
+  Trail.mesh.geometry.attributes.position.needsUpdate=true;
+  Trail.mesh.geometry.attributes.color.needsUpdate=true;
 }
 
 // (x,y) から角度 th へ move 進んだ先のセルが通行可能か
@@ -3785,7 +4096,7 @@ function handleCommand(msg){
       scene=buildScene(MAP);
       // 古いシーン (建物/道路/エージェント/トレイル) の GPU リソースを解放
       disposeScene(oldScene);
-      PERSONA_DEFS.forEach(p=>{trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});});
+      initTrailField(scene);       // 足跡メッシュは旧シーンと一緒に破棄されている
       if(scene) initAgents(scene);
       break;
     }
@@ -5077,7 +5388,7 @@ tick(); setInterval(tick, ${ms});
         const old=scene;
         scene=buildScene(MAP);
         disposeScene(old);
-        PERSONA_DEFS.forEach(p=>{trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});});
+        initTrailField(scene);     // 足跡メッシュは旧シーンと一緒に破棄されている
         initAgents(scene);
       }
       res.writeHead(200); res.end(JSON.stringify({ok:true, reset:true, day:gameDay()+1})); return;
@@ -5113,6 +5424,17 @@ tick(); setInterval(tick, ${ms});
           const st=foundCategory(cat, day);
           if(st){ done=`found ${BLDG_TYPES[st.typeIdx].name} at ${st.r},${st.c}`; break; }
         }
+      }else if(force==='declutter'){
+        // すでに詰まってしまった街を手当てする。道をいちばん塞いでいる建物から
+        // 順に畳む。使われている住居/職場は対象外。
+        // 指定された軒数ぶん、道をいちばん塞いでいる建物から畳む。
+        // 沈むアニメの完了を待たずに次を選べるよう、MAP は即座に更新する。
+        const n=Math.max(1, Math.min(40, parseInt(q.get('n'))||5));
+        const w0=walkability(), d0=fieldDensity();
+        const done2=declutter(day, n);
+        // 実際に MAP が空くのは沈みきってから (数秒後)
+        done=`decluttering ${done2} building(s) — before: walkability ${w0.toFixed(3)}`
+           + ` density ${d0.toFixed(3)} (再度 /city で結果を確認してください)`;
       }else if(force==='close'){
         const cands=CITY.structs.filter(x=>x.state==='open' && isClosable(x.typeIdx))
                                 .sort((a,b)=>a.ema-b.ema);
@@ -5153,7 +5475,10 @@ tick(); setInterval(tick, ${ms});
       weather:{now:CITY.weather||'sunny', label:weatherNow().ja, en:weatherNow().en,
         untilSec:Math.max(0, Math.round(((CITY.weatherUntil||0)-Date.now())/1000))},
       field:{size:CITY.size, max:GRID, freeLots:buildableLots(),
-        density:+fieldDensity().toFixed(3), expandAt:{density:EXPAND_DENSITY, freeLots:EXPAND_FREE}},
+        density:+fieldDensity().toFixed(3), walkability:+walkability().toFixed(3),
+        limits:{maxDensity:BUILD_MAX_DENS, minWalkability:WALK_MIN},
+        buildingPaused: fieldDensity()>=BUILD_MAX_DENS || walkability()<WALK_MIN,
+        expandAt:{density:EXPAND_DENSITY, freeLots:EXPAND_FREE}},
       level:{index:cityLevel(), name:levelSpec().name, econ:Math.round(CITY.econ),
         maxHeight:levelSpec().maxH, fp2:levelSpec().fp2,
         next:CITY_LEVELS[cityLevel()+1]?{name:CITY_LEVELS[cityLevel()+1].name,
@@ -5396,12 +5721,32 @@ async function simLoop(){
 
 // render + JPEG 配信ループ
 let frameCount=0, encoding=false, _groundAt=0;
+// 描画のどこに時間が消えているかの計測 (PERF_LOG=1 で有効)。
+//   フィールドが広がると重くなる、という話を数字で切り分けるため。
+const PERF_LOG = process.env.PERF_LOG === '1';
+const _perf = {agents:0, fade:0, render:0, pixels:0, jpeg:0, n:0};
+function perfReport(){
+  if(!_perf.n) return;
+  let meshes=0, tex=new Set();
+  scene && scene.traverse(o=>{
+    if(o.isMesh || o.isPoints || o.isLineSegments) meshes++;
+    const mats=Array.isArray(o.material)?o.material:(o.material?[o.material]:[]);
+    for(const m of mats) if(m && m.map) tex.add(m.map.uuid);
+  });
+  const p=k=>(_perf[k]/_perf.n).toFixed(1);
+  console.log(`[Perf] 1フレーム平均: agent更新${p('agents')}ms フェード${p('fade')}ms `
+    + `描画${p('render')}ms 読出${p('pixels')}ms JPEG${p('jpeg')}ms `
+    + `| メッシュ${meshes} テクスチャ実体${tex.size} 住民${agents.length} `
+    + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}`);
+  for(const k in _perf) _perf[k]=0;
+}
 async function renderLoop(){
   if(!scene) return;          // ★ scene null ガード (二重保険)
   if(encoding) return;
   encoding=true;
 
   try{
+    const _t0=PERF_LOG?Date.now():0;
     // エージェントメッシュ更新
     const dt=1/FPS;
     agents.forEach((a,i)=>{
@@ -5420,6 +5765,7 @@ async function renderLoop(){
       m.rotation.z+=dr*Math.min(1,dt*14);
     });
 
+    if(PERF_LOG){ _perf.agents+=Date.now()-_t0; }
     stepStructAnims();            // 建物のせり上がり / 沈み込み
     stepRain(dt, mainCam);        // 雨 (天気が rain のときだけ)
     // 地面の板 (道路 / 摩耗) を作り直す。道が増えたとき (groundDirty) は即、
@@ -5428,27 +5774,35 @@ async function renderLoop(){
       groundDirty=false; _groundAt=Date.now(); rebuildGround(scene);
     }
     updateTrackingCamera(mainCam);
+    const _t1=PERF_LOG?Date.now():0;
     updateOcclusionFade();
+    if(PERF_LOG){ _perf.fade+=Date.now()-_t1; }
     updateDayNight(scene);        // 時刻で空と光を変える
     // 欲求アイコン (空腹/眠気/勤務) を頭上に — 一旦非表示 (NEED_ICONS=1 で復活)
     if(NEED_ICONS) updateNeedIcons(mainCam);
     // 3D を描いてから HUD (Day/ティッカー) を正射影で重ねる。
     // autoClear を切るので、色バッファは自分で clear する必要がある。
+    const _t2=PERF_LOG?Date.now():0;
     renderer.autoClear=false;
     renderer.clear();
     renderer.render(scene, mainCam);
     if(hudScene){ updateHud(dt); renderer.clearDepth(); renderer.render(hudScene, hudCam); }
+    if(PERF_LOG){ _perf.render+=Date.now()-_t2; _perf.n++; if(_perf.n>=FPS*10) perfReport(); }
     frameCount++;
 
     // WebSocket 視聴者も YouTube 配信も無ければ読み出し/エンコード自体を省略
     if(clients.size===0 && !YT.ready) return;
 
+    const _t3=PERF_LOG?Date.now():0;
     const rgba=readPixels(glCtx);
+    if(PERF_LOG) _perf.pixels+=Date.now()-_t3;
     // YouTube: 生RGBAフレームを直接 ffmpeg へ (JPEGを経由しない)
     if(YT.ready) setYtFrame(rgba);
     // ブラウザ視聴者がいる時だけ JPEG 化して送る (視聴者0なら JPEGエンコードもしない)
     if(clients.size>0){
+      const _t4=PERF_LOG?Date.now():0;
       const jpeg=await rgbaToJpeg(rgba,WIDTH,HEIGHT);
+      if(PERF_LOG) _perf.jpeg+=Date.now()-_t4;
       for(const ws of clients){
         if(ws.readyState===WebSocket.OPEN){
           ws.send(jpeg,(err)=>{if(err)clients.delete(ws);});
@@ -5551,10 +5905,7 @@ function startLoops(){
   scene = buildScene(MAP);
   await initHud();               // 配信画面の Day カウンタ / ニュースティッカー
 
-  PERSONA_DEFS.forEach(p=>{
-    trailMats[p.id]=new THREE.MeshBasicMaterial({color:p.color,transparent:true,opacity:0.28,depthWrite:false});
-  });
-
+  initTrailField(scene);
   initAgents(scene);
 
   httpServer.listen(PORT, ()=>{
