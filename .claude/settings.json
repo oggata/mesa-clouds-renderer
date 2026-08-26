@@ -68,7 +68,6 @@
       "Bash(rm -rf /*)",
       "Bash(rm -rf ~*)",
       "Bash(sudo *)",
-      "Bash(git push*)",
       "Bash(git reset --hard*)",
       "Bash(git clean -fd*)",
       "Bash(npm publish*)",

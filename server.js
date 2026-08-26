@@ -2483,10 +2483,12 @@ function retargetOnNeedChange(){
     const n=needOf(a);
     if(n===a.lastNeed) continue;
     a.lastNeed=n;
-    if(a.mode==='wander'){
-      const g=pickLifeGoal(a,[Math.floor(a.x),Math.floor(a.y)]);
-      a.gx=g[0]+0.5; a.gy=g[1]+0.5;
-    }
+    // gx/gy を差し替えるだけでは効かない。経路追従中は stepNavigate が毎tick
+    // 先読み点で gx/gy を上書きするので、住民は古い目的地へ歩き続けていた。
+    // 行き先の抽選から経路の引き直しまでを enterWander に任せる。
+    // 屋内の住民は外へ出るときに enterWander が走るので、ここでは触らない
+    // (建物セルからは経路が引けず、無駄な直線 fallback になる)。
+    if(a.mode==='wander' && !MW.isIndoors(a)) enterWander(a);
   }
 }
 
@@ -3686,9 +3688,21 @@ function cityTick(){
 //                 最終区間だけ z=onehot(T) を立てて目的建物へ。どちらも学習分布内に収まる。
 // 再学習は不要 (観測の形は一切変えていない)。
 const WP_REACH  = 0.9;   // ウェイポイント通過とみなす距離
+// 経路から外れたときに index を進め直すための射影パラメータ。
+//   従来は「先頭から順に WP_REACH 以内へ入る」ことでしか pathIdx が進まなかった。
+//   角を大回りしたり障害物を避けたりして経路を 1 セル以上外れると index が凍結し、
+//   先読み点(にんじん)が背後に取り残されたまま戻れなくなる。これが
+//   「住民が同じ建物の周りをぐるぐる周回する」の主因 (実測: 1人が約19000tick周回し続けた)。
+const SNAP_WINDOW = 6;   // 射影で見るウェイポイント数 (経路が自分の近くへ戻る場合の飛び越し防止)
+const SNAP_REACH  = 1.6; // この距離以内まで来たウェイポイントは通過済みとして index を進める
 const LOOKAHEAD = 2;     // 経路上を何マス先取りして狙うか (pure pursuit の「ニンジン」)
 const NAV_PICK_K = 3;    // 目的地は「近い方から k 軒」のランダム (最寄り固定だと往復しやすい)
 const REPLAN_STALL = 8;  // これだけ足踏みしたら経路を引き直す
+// 目的地に近づけない時間が続いたら経路を引き直し、それでも駄目なら行き先を変える。
+//   足踏み(stall)は「前に進めない」ことしか見ておらず、障害物の周りを回り続けている
+//   住民は毎tick動いているので永久に発火しない。距離が縮まっているかを別に見る。
+const NOPROG_REPLAN = parseInt(process.env.NOPROG_REPLAN)||60;  // 距離が縮まらないまま歩いた tick 数
+const MAX_REPLAN    = parseInt(process.env.MAX_REPLAN)||4;      // 引き直しの上限。超えたら行き先を変える
 // アンスティック: これだけ足踏みしたら、方策の行動を上書きして「通れる向き」へ強制回避する。
 //   反応型ポリシーが障害物に押し付けられて動けなくなるのを、決定論で救出する (再学習不要)。
 //   通常移動中(stall小)は一切介入しないので、学習した挙動は保たれる。
@@ -3808,6 +3822,15 @@ function applyGoalZ(a){
   return true;
 }
 
+// 目的地までの残り距離が縮んでいるかの監視。best を更新できない tick が
+// NOPROG_REPLAN 続いたら true (= 迂回でも周回でもなく「近づけていない」)。
+function noProgress(a, d){
+  if(a.bestD==null || d < a.bestD-0.2){ a.bestD=d; a.noProg=0; return false; }
+  return (++a.noProg) >= NOPROG_REPLAN;
+}
+// 行き先を決め直したときに監視状態をリセットする。
+function resetNavWatch(a){ a.bestD=null; a.noProg=0; a.replans=0; a.spin=0; }
+
 // A: 自由行動へ。z=0 + ランダム建物を compass の的にする (現状の既定動作)。
 function enterWander(a){
   a.mode='wander'; a.goalZ=null; a.rally=false;
@@ -3820,7 +3843,9 @@ function enterWander(a){
   // 行き先まで A* 経路を引いて「道沿いに」向かわせる (直線 compass だと途中の建物/木に突っ込んで詰まる)。
   const path=planPath(Math.floor(a.x), Math.floor(a.y), g[0], g[1]);
   if(path && path.length>1){ a.path=path; a.pathIdx=0; a.navDest=[g[0],g[1]]; }
-  else { a.path=null; a.pathIdx=0; a.gx=g[0]+0.5; a.gy=g[1]+0.5; }   // 経路が引けなければ直線
+  // 経路が引けなければ直線。行き先セルは覚えておく (到着判定と入館に要る)。
+  else { a.path=null; a.pathIdx=0; a.navDest=[g[0],g[1]]; a.gx=g[0]+0.5; a.gy=g[1]+0.5; }
+  resetNavWatch(a);
   applyGoalZ(a);   // goalType に応じて z をセット (未対応タイプなら z=0 に落ちる)
 }
 
@@ -3832,6 +3857,7 @@ function enterNavigate(a, T){
   const path=planPath(Math.floor(a.x), Math.floor(a.y), dest[0], dest[1]);
   if(!path || path.length<1){ enterWander(a); return 'unreachable'; }
   a.mode='navigate'; a.goalType=T; a.path=path; a.pathIdx=0; a.navDest=dest; a.rally=false;
+  resetNavWatch(a);
   return 'ok';
 }
 
@@ -3842,6 +3868,7 @@ function enterNavigateTo(a, dr, dc, T, hold){
   if(!path || path.length<1){ enterWander(a); return 'unreachable'; }
   a.mode='navigate'; a.goalType=(T!=null&&T>=0?T:null); a.path=path; a.pathIdx=0;
   a.navDest=[dr,dc]; a.rally=!!hold;
+  resetNavWatch(a);
   return 'ok';
 }
 
@@ -3849,7 +3876,16 @@ function enterNavigateTo(a, dr, dc, T, hold){
 // 戻り値: 最終目的地に到着したか
 function stepNavigate(a){
   if(!a.path || !a.path.length){ enterWander(a); return false; }
-  // 通過済みウェイポイントを進める
+  // 通過済みウェイポイントを進める。まず「現在地にいちばん近い先のウェイポイント」へ
+  // 射影する: 経路を外れて次の点に WP_REACH まで近づけなくても index が凍結しないように。
+  // (凍結すると先読み点が背後に残り、そこへ戻ろうとして建物の周りを周回し続ける)
+  let bi=a.pathIdx, bd=Infinity;
+  const win=Math.min(a.path.length-1, a.pathIdx+SNAP_WINDOW);
+  for(let i=a.pathIdx;i<=win;i++){
+    const d=Math.hypot(a.x-(a.path[i][0]+0.5), a.y-(a.path[i][1]+0.5));
+    if(d<bd){ bd=d; bi=i; }
+  }
+  if(bd<SNAP_REACH) a.pathIdx=bi;                       // 後戻りはしない (bi>=pathIdx)
   while(a.pathIdx < a.path.length-1){
     const [r,c]=a.path[a.pathIdx];
     if(Math.hypot(a.x-(r+0.5), a.y-(c+0.5)) < WP_REACH) a.pathIdx++; else break;
@@ -3858,7 +3894,13 @@ function stepNavigate(a){
   // 「経路を何セル先取りした点」を見ていたかと一致していないと観測がズレる。
   const _pm=personaMeta[a.def.id];
   const look=(_pm&&_pm.compassLookahead)||LOOKAHEAD;
-  const ti=Math.min(a.pathIdx+look, a.path.length-1);
+  let ti=Math.min(a.pathIdx+look, a.path.length-1);
+  // pursuit は「にんじん」へ直進しようとするので、間に壁がある先読み点を狙うと
+  // 角で引っかかって経路から外れる。見通せる範囲まで手前に寄せる。
+  // 学習方策のときは観測(compass)を学習時と変えないため切り詰めない。
+  if(MOVE_MODE==='pursuit' || !hasUsablePolicy(a)){
+    while(ti > a.pathIdx+1 && !lineOfSight(a.x, a.y, a.path[ti][0]+0.5, a.path[ti][1]+0.5)) ti--;
+  }
   const [tr,tc]=a.path[ti];
   a.gx=tr+0.5; a.gy=tc+0.5;
   // navigate 中は全区間で z(目的タイプ one-hot) を立てる。
@@ -3876,13 +3918,31 @@ function stepNavigate(a){
     ? MW.hasArrived(WORLD, Math.floor(a.x), Math.floor(a.y), last[0], last[1])
     : dlast<0.8;
   if(a.pathIdx>=a.path.length-2 && atGoal) return true;
-  // 詰まったら引き直す (反応型ポリシーは経路から外れることがある)
-  if(a.stall>=REPLAN_STALL){
+  // 詰まったら引き直す (反応型ポリシーは経路から外れることがある)。
+  // 足踏みしていなくても「目的地に近づけていない」時間が続けば同じく引き直す:
+  // 障害物の周りを回り続けている住民は毎tick動いているので stall では捕まらない。
+  if(a.stall>=REPLAN_STALL || noProgress(a, dlast)){
+    a.stall=0; a.bestD=null; a.noProg=0;   // 連続再計画(毎tick BFS)を防ぐ
+    // 引き直しても抜けられない = その行き先に固執しても堂々巡りになる。行き先ごと変える。
+    // ただし rally (集合命令) は命令が優先なので諦めず引き直し続ける。
+    if((a.replans=(a.replans||0)+1) > MAX_REPLAN && !a.rally){ enterWander(a); return false; }
     const p=planPath(Math.floor(a.x), Math.floor(a.y), last[0], last[1]);
-    if(p&&p.length){ a.path=p; a.pathIdx=0; } else { enterWander(a); }
-    a.stall=0;   // 連続再計画(毎tick BFS)を防ぐ
+    if(p&&p.length>1){ a.path=p; a.pathIdx=0; } else { enterWander(a); }
   }
   return false;
+}
+
+// (x0,y0)-(x1,y1) の間が通行可能セルだけで繋がっているか。終点セル自体は建物でもよい
+// (玄関に着く経路の最終点が建物セルのため)。
+function lineOfSight(x0, y0, x1, y1){
+  const er=Math.floor(x1), ec=Math.floor(y1);
+  const n=Math.ceil(Math.hypot(x1-x0, y1-y0)*4);
+  for(let i=1;i<=n;i++){
+    const r=Math.floor(x0+(x1-x0)*i/n), c=Math.floor(y0+(y1-y0)*i/n);
+    if(r<0||r>=GRID||c<0||c>=GRID) return false;
+    if(!PASSABLE.has(MAP[r][c]) && !(r===er&&c===ec)) return false;
+  }
+  return true;
 }
 
 let agents=[], agentMeshes=[];
@@ -3919,6 +3979,7 @@ function spawnAgent(S, i){
     visited:new Set(), explored:0, visMem:new Map(),
     // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
     mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
+    bestD:null, noProg:0, replans:0, spin:0,   // 目的地に近づけているかの監視 (周回の打ち切り)
     personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
     // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
     home:null, work:null, needIcon:null,
@@ -4156,7 +4217,16 @@ async function stepAll(){
     // stall 判定の閾値も毎tick移動量に比例させる (INFER_EVERY 非依存に)。固定0.05だと
     // 高INFER_EVERY(=毎tick量が小)のとき移動中でも stall 誤検出してしまう。
     const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>move*0.5;
-    a.stall=moved?0:Math.min(a.stall+1,10);
+    // 回頭 (action 1/2) は移動しないが「進むための準備」なので足踏みには数えない。
+    // 数えていた頃は 8tick=64° 回るだけで REPLAN_STALL が発火して経路が引き直され、
+    // 先読み点が左右に飛ぶ → また回る、を繰り返して同じ場所を周回する原因になっていた。
+    // 1周ぶん回っても抜けられないときだけ本当の詰まりとして数える。
+    if(moved){ a.stall=0; a.spin=0; }
+    else if(action!==0){
+      a.spin=(a.spin||0)+1;
+      if(a.spin*rot > Math.PI*2) a.stall=Math.min(a.stall+1,10);
+    }
+    else { a.stall=Math.min(a.stall+1,10); a.spin=0; }
     // ── 行動モード別に compass の的 (gx,gy) と z を更新 ──
     if(a.mode==='navigate'){
       // B: 経路上の先読み点を追う。最終目的地に着いたら A(自由) に戻す。
@@ -4177,7 +4247,21 @@ async function stepAll(){
           if(!MW.isIndoors(a)) enterWander(a);   // 到着 → 次の行き先を選び直す
         }
       }else{
-        if(Math.hypot(a.x-a.gx, a.y-a.gy)<0.8){ onArrive(a, null); enterWander(a); }  // 経路なし=直線fallback
+        // 経路なし = 直線 fallback。ALIGNED では建物セルに立てないので「建物中心まで 0.8」に
+        // 入れないことがあり、距離判定だけだと到着できないまま建物の周りを回り続ける。
+        // navigate と同じく玄関 (4近傍) 到着でも着いたことにする。
+        const dst=a.navDest;
+        const dg=Math.hypot(a.x-a.gx, a.y-a.gy);
+        const arrived = dg<0.8
+          || (dst && WORLD.solidBuildings && MAP[dst[0]][dst[1]]===BUILDING
+              && MW.hasArrived(WORLD, Math.floor(a.x), Math.floor(a.y), dst[0], dst[1]));
+        if(arrived){
+          onArrive(a, dst);
+          if(WORLD.solidBuildings && dst && MAP[dst[0]][dst[1]]===BUILDING) MW.enterBuilding(a, dst[0], dst[1]);
+          if(!MW.isIndoors(a)) enterWander(a);
+        }else if(noProgress(a, dg)){
+          enterWander(a);   // 近づけないまま歩き続けている → 行き先を選び直す (周回の打ち切り)
+        }
       }
     }
   }
