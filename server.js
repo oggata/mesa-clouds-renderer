@@ -144,6 +144,8 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マー�
 // (mesa_env) と同じ実装で、js/map_conformance.cjs が一致を検証する。
 // 変数名は MW (mesa world)。W は既存の const W=GRID*CELL と衝突する。
 const MW = require('./world.js');
+// 住民どうしの関係と立ち話。街の物理/経済と混ざると読めなくなるので別ファイル。
+const SOC = require('./social.js');
 const { OTHER, ROAD, BUILDING, TREE } = MW;
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
@@ -1236,12 +1238,22 @@ const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕�
 const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
                    sick:0xff5a5a, shop:0xffd23a, bored:0xb07aff};
 const ICON_PX=72;
-const _iconGeo=new THREE.PlaneGeometry(CELL*.3,CELL*.3);
+// シーンを作り直しても壊してはいけない共有ジオメトリ (disposeScene が参照する)。
+// 住民の体・頭上の板など、全住民で1個を使い回すものを入れる。
+const SHARED_GEO = new Set();
+
+// 板は住民の背丈に合わせる。CELL*0.3 のままだと一辺1.2で、住民の全高0.88より
+// 大きな白板が浮くことになる (CHAR_SCALE を掛け忘れていた)。
+const ICON_SIZE=CELL*0.42*CHAR_SCALE;
+const _iconGeo=new THREE.PlaneGeometry(ICON_SIZE, ICON_SIZE);
+SHARED_GEO.add(_iconGeo);          // disposeScene で壊さない (全住民で共有)
 const _iconMats={};
 
+// 立ち話の吹き出し。欲求アイコンと同じ板 (NEED_ICONS=0 でも出す)
+const TALK_EMOJI={talk:'💬'};
 // 起動時に全絵文字をテクスチャ化しておく (毎フレーム生成しない)
 async function buildNeedIcons(){
-  for(const [kind,emoji] of Object.entries(NEED_EMOJI)){
+  for(const [kind,emoji] of Object.entries({...NEED_EMOJI, ...TALK_EMOJI})){
     let mat=null;
     try{
       const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_PX}" height="${ICON_PX}">`
@@ -1259,15 +1271,22 @@ async function buildNeedIcons(){
     }catch(e){ /* フォント無し等 → 色板へ */ }
     if(!mat) mat=new THREE.MeshBasicMaterial(
       {color:ICON_COLORS[kind],transparent:true,opacity:0.95,depthTest:false});
+    mat.userData.shared=true;
+    if(mat.map){ mat.map.userData=mat.map.userData||{}; mat.map.userData.shared=true; }
     _iconMats[kind]=mat;
   }
+  const kinds=Object.keys(NEED_EMOJI).length+Object.keys(TALK_EMOJI).length;
   const emojiOk=Object.values(_iconMats).filter(m=>m.map).length;
-  console.log(`[Life] 欲求アイコン生成: ${emojiOk}/${Object.keys(NEED_EMOJI).length} 種が絵文字`
-            + (emojiOk<Object.keys(NEED_EMOJI).length ? ' (残りは色板フォールバック)' : ''));
+  console.log(`[Life] 頭上アイコン生成: ${emojiOk}/${kinds} 種が絵文字`
+            + (emojiOk<kinds ? ' (残りは色板フォールバック)' : ''));
 }
 function iconMat(kind){
-  if(!_iconMats[kind]) _iconMats[kind]=new THREE.MeshBasicMaterial(
-    {color:ICON_COLORS[kind]||0xffffff,transparent:true,opacity:0.95,depthTest:false});
+  if(!_iconMats[kind]){
+    const m=new THREE.MeshBasicMaterial(
+      {color:ICON_COLORS[kind]||0xffffff,transparent:true,opacity:0.95,depthTest:false});
+    m.userData.shared=true;
+    _iconMats[kind]=m;
+  }
   return _iconMats[kind];
 }
 // 頭上アイコンを現在の欲求に合わせて更新 (カメラの方を向かせる)
@@ -1286,8 +1305,27 @@ function updateNeedIcons(cam){
       ic.userData.kind=kind;
       scene.add(ic); a.needIcon=ic;
     }
-    a.needIcon.position.set(m.position.x, m.position.y, m.position.z + CELL*1.05*CHAR_SCALE);
+    a.needIcon.position.set(m.position.x, m.position.y, m.position.z + CELL*0.62*CHAR_SCALE + ICON_SIZE*0.6);
     if(cam) a.needIcon.quaternion.copy(cam.quaternion);   // 板を常にカメラへ向ける
+  }
+}
+
+// 立ち話している住民の頭上に吹き出しを出す。
+// 欲求アイコンと違い、NEED_ICONS の設定に関係なく常に出す (これが見えないと
+// 「住民が急に立ち止まった」だけの画になってしまう)。
+function updateTalkBubbles(cam){
+  const now=Date.now();
+  for(let i=0;i<agents.length;i++){
+    const a=agents[i], m=agentMeshes[i]; if(!m) continue;
+    const on = SOC.isTalking(a, now) && m.visible;
+    if(a.talkIcon && !on){ scene.remove(a.talkIcon); a.talkIcon=null; }
+    if(!on) continue;
+    if(!a.talkIcon){
+      a.talkIcon=new THREE.Mesh(_iconGeo, iconMat('talk'));
+      scene.add(a.talkIcon);
+    }
+    a.talkIcon.position.set(m.position.x, m.position.y, m.position.z + CELL*0.62*CHAR_SCALE + ICON_SIZE*0.6);
+    if(cam) a.talkIcon.quaternion.copy(cam.quaternion);
   }
 }
 
@@ -1540,7 +1578,6 @@ function updateHud(dt){
 //   ・ジオメトリを1個にマージして全住民で共有
 //   ・色の違う「体」以外 (肌/髪/ズボン) は頂点カラーに焼き込んで1マテリアルに
 // することで、1人 = 1Mesh / 2ドローコール、ジオメトリは街全体で1個になる。
-const SHARED_GEO = new Set();          // dispose 対象外にする共有ジオメトリ
 
 // 複数の BufferGeometry を1本に連結する。色は頂点カラーとして書き込む。
 // (three の BufferGeometryUtils は Node ビルドに含まれないので最小限を自前で持つ)
@@ -2246,14 +2283,15 @@ function gameDay(){ return (CITY?CITY.dayBase:0) + daysSinceBoot(); }
 function cityToJSON(){
   const own={};
   for(const a of agents){
-    if(a.seenMask || a.owns || a.viewer || a.cheers || (a.pref && Object.keys(a.pref).length)){
+    const rel=SOCIAL_ON ? SOC.serializeAgent(a, REL_SAVE) : undefined;
+    if(a.seenMask || a.owns || a.viewer || a.cheers || rel || (a.pref && Object.keys(a.pref).length)){
       // 好みは上位6件だけ保存する (1000人ぶん全部持つと保存ファイルが膨らむ)
       const top=Object.entries(a.pref||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,6);
       own[a.aid]={m:a.seenMask||0, o:a.owns||null,
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
                   b:a.viewer?a.by:undefined, c:a.cheers||undefined,
                   p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
-                  t:a.taught||undefined};
+                  t:a.taught||undefined, r:rel};
     }
   }
   return {
@@ -2360,7 +2398,7 @@ function freshCity(){
     foot:new Int32Array(GRID*GRID),
     demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
     unmet:Object.fromEntries(CATS.map(c=>[c,0])),
-    stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0},
+    stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0},
     news:[], savedAgents:{}, diag:freshDiag(),
     waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
     recs:[],                         // 視聴者のおすすめ (どこまで広まったか)
@@ -2391,7 +2429,7 @@ function initCity(){
       foot:Int32Array.from(j.foot||[]),
       demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
-      stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0}, j.stats||{}),
+      stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0}, j.stats||{}),
       news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
       waiting:j.waiting||[], recs:j.recs||[],
     };
@@ -2495,7 +2533,9 @@ function retargetOnNeedChange(){
 }
 
 // 内部状態を進める (1秒ごと)。到着していれば回復させる。
+const _nearBuf=[];
 function stepNeeds(dtSec){
+  SOC.buildGrid(SOC_STATE, agents);   // 近接判定の下ごしらえ (SOCIAL=0 でも要る)
   const h=gameHour();
   const night = (h<6 || h>=22);
   for(const a of agents){
@@ -2506,14 +2546,12 @@ function stepNeeds(dtSec){
                             *(MW.isIndoors(a)?1:weatherNow().fatigue));
     a.supply  = Math.min(1, (a.supply ||0) + SUPPLY_RATE *dtSec);
     // 退屈は「一人でいる時間」で溜まる → 近くに人が居れば溜まらない (社交と連動)
-    let alone=true;
-    for(const o of agents){ if(o===a) continue;
-      if(Math.abs(o.x-a.x)<3 && Math.abs(o.y-a.y)<3){
-        alone=false;
-        // すれ違いざまに「行きつけ」の話をする (低確率)
-        if(CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec) gossip(a, o);
-        break;
-      } }
+    // 近くの人は social.js の空間ハッシュから引く。
+    // 以前は全員を総当たりしていて、300人で9万回/tick の走査になっていた。
+    SOC.neighbors(SOC_STATE, a, _nearBuf, 1);   // 居るかどうかだけ分かればよい
+    const alone = _nearBuf.length===0;
+    if(!alone && CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec)
+      gossip(a, _nearBuf[0]);      // すれ違いざまに「行きつけ」の話をする (低確率)
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
     // 病気: 低確率で発症。疲労が高いほどかかりやすい (内部状態同士の因果)
     if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
@@ -3517,6 +3555,140 @@ const TEACH_DAYS   = envNum('TEACH_DAYS', 3);      // 定着したか判定す�
 const GOSSIP_P     = envNum('GOSSIP_P', 0.02);     // 近くの人と好みを交換する確率/秒
 const GOSSIP_GAIN  = envNum('GOSSIP_GAIN', 0.25);  // 口コミで伝わる強さ
 
+// ── 人間関係 (social.js) ────────────────────────────────────────────────────
+const SOCIAL_ON   = process.env.SOCIAL !== '0';
+const REL_SAVE    = envNum('REL_SAVE', 6);         // 1人あたり何件の関係を保存するか
+const TALK_OPEN   = envNum('TALK_OPEN', 0.45);     // ここより狭い場所では立ち止まらない
+const NEWSHOP_DAYS= envNum('NEWSHOP_DAYS', 4);     // 「最近できた店」とみなす日数
+const NEWSHOP_SEED= envNum('NEWSHOP_SEED', 0.45);  // 教わった新店をどれくらい試したくなるか
+const SOC_STATE = SOC.createState({
+  relMax:      envNum('REL_MAX', 12),
+  relGain:     envNum('REL_GAIN', 0.18),
+  relDecay:    envNum('REL_DECAY', 0.98),
+  relFriend:   envNum('REL_FRIEND', 0.50),
+  meetRadius:  envNum('MEET_RADIUS', 3),
+  meetScan:    envNum('MEET_SCAN', 8),
+  meetPerTick: envNum('MEET_PER_TICK', 2),
+  meetCoolSec: envNum('MEET_COOL_SEC', 45),
+  talkP:       envNum('TALK_P', 0.35),
+  talkSec:     envNum('TALK_SEC', 4),
+  talkMax:     envNum('TALK_MAX', 6),
+  talkCoolSec: envNum('TALK_COOL_SEC', 25),
+});
+
+// ── social.js に渡すコールバック束 ──────────────────────────────────────────
+// 話題を「決める」のは social.js、話題が街に「効く」のはこちら側。
+// 好みの機構 (pref) は既にここにあるので、二重に持たない。
+
+// そこで立ち止まってよいか。狭い道で立ち話されると通行が詰まる
+// (40日目の渋滞問題と同じ失敗をしないための制約)。
+function canTalkAt(a){
+  const r=Math.floor(a.x), c=Math.floor(a.y);
+  return openRatio(r,c) >= TALK_OPEN;
+}
+
+// a が知っていて b が知らない「最近できた店」。gossip は「一番の行きつけ」しか
+// 広めないので、できたばかりの店は誰の一番でもなく広まらない。そこを埋める。
+function freshShopFor(a, b){
+  const today=gameDay();
+  for(const k in (a.pref||{})){
+    const st=cellStruct[k];
+    if(!st || st.state!=='open' || !st.founded) continue;
+    if(today-(st.born||0) > NEWSHOP_DAYS) continue;
+    if(prefOf(b,k) > 0.05) continue;            // b はもう知っている
+    return k;
+  }
+  return null;
+}
+
+// どちらかの好みに残っている「もう無い店」。話題にすると聞いた側も忘れられる。
+function deadShopFor(a, b){
+  for(const src of [a,b]) for(const k in (src.pref||{})){
+    const st=cellStruct[k];
+    // 建物ごと消えた / 閉店・解体中 = もう無い店。開いている店を拾わないこと
+    // (条件を反転させると、健全な店の好みを会話のたびに消してしまう)。
+    if(!st || (st.state!=='open' && st.state!=='construction')) return k;
+  }
+  return null;
+}
+
+// 話題の効果
+function applyTopic(a, b, topic){
+  if(topic.kind==='newshop'){
+    // 教わった側が「行ってみたくなる」。到着すれば learnFromVisit が本採点する。
+    prefBump(b, topic.key, NEWSHOP_SEED, GOSSIP_GAIN);
+  }else if(topic.kind==='closed'){
+    // 潰れた店を二人とも忘れる。放置すると幽霊の行きつけが残り続ける。
+    if(a.pref) delete a.pref[topic.key];
+    if(b.pref) delete b.pref[topic.key];
+  }else{
+    gossip(a, b); gossip(b, a);                 // 従来の口コミ (行きつけの交換)
+  }
+}
+
+// 立ち話が始まった。吹き出しはレンダラ側 (updateTalkBubbles) が拾う。
+let _talkNewsAt=0;
+function onTalk(a, b, topic){
+  if(!TALK_NEWS) return;
+  // 立ち話は多いので、話題のあるもの (新店/閉店) を優先し、
+  // ただの世間話は間隔を空けてしか流さない。
+  const now=Date.now();
+  if(topic.kind==='place'){
+    if(now-_talkNewsAt < TALK_NEWS_COOL_SEC*1000) return;
+  }
+  _talkNewsAt=now;
+  const st=topic.key ? cellStruct[topic.key] : null;
+  const what = topic.kind==='newshop' && st ? ` about the new ${enOf(st.typeIdx)}`
+             : topic.kind==='closed'  && st ? ` about the ${enOf(st.typeIdx)} that closed`
+             : '';
+  lifeNews.push({day:gameDay(), shape:'talk',
+    en:`${_ascii(a.name)} is chatting with ${_ascii(b.name)}${what}`,
+    ja:`${a.name} と ${b.name} が立ち話している`});
+  while(lifeNews.length>12) lifeNews.shift();
+  hudNewsDirty=true;
+}
+
+// 友人になった瞬間。街に残る出来事なので CITY に積む。
+//   ただし人口1000人だと20日で280組できる。全部ティッカーに流すと開店/閉店/道の
+//   ニュースを押し出してしまうので、**数を絞って**出す。
+//   ・視聴者住民 (!join) が絡むものは必ず出す — その人にとっては自分の話なので
+//   ・それ以外は1日 FRIEND_NEWS_PER_DAY 件まで
+//   ・カメラは FRIEND_CAM_COOL_SEC に1回まで
+const TALK_NEWS  = process.env.TALK_NEWS !== '0';
+const TALK_NEWS_COOL_SEC   = envNum('TALK_NEWS_COOL_SEC', 40);
+const FRIEND_NEWS_PER_DAY  = envNum('FRIEND_NEWS_PER_DAY', 3);
+const FRIEND_CAM_COOL_SEC  = envNum('FRIEND_CAM_COOL_SEC', 180);
+let _friendNewsDay=-1, _friendNewsN=0, _friendCamAt=0;
+
+function onFriend(a, b){
+  if(!CITY) return;
+  CITY.stats.friendships=(CITY.stats.friendships||0)+1;
+  const day=gameDay();
+  if(day!==_friendNewsDay){ _friendNewsDay=day; _friendNewsN=0; }
+  const viewer = a.viewer || b.viewer;
+  if(!viewer && _friendNewsN>=FRIEND_NEWS_PER_DAY) return;
+  _friendNewsN++;
+  news('friend', `🤝 ${a.name} と ${b.name} が友達になった`,
+       `${_ascii(a.name)} and ${_ascii(b.name)} became friends`);
+  // カメラは間隔を空ける。寄りで映す (wide だと街全体が映って誰の話か分からない)
+  const now=Date.now();
+  if(now-_friendCamAt >= FRIEND_CAM_COOL_SEC*1000){
+    _friendCamAt=now;
+    showCityEvent(Math.floor(a.x), Math.floor(a.y),
+      `${_ascii(a.name)} & ${_ascii(b.name)} - new friends`, 5);
+  }
+}
+
+function stepSocial(dtSec){
+  if(!SOCIAL_ON) return;
+  SOC.step(SOC_STATE, {
+    agents, dtSec, day:gameDay(), now:Date.now(),
+    isIndoors:MW.isIndoors, canTalkAt,
+    freshShopFor, deadShopFor, applyTopic, onTalk, onFriend,
+    rng:Math.random,
+  });
+}
+
 const prefKey = st => st ? st.r+'_'+st.c : null;
 function prefOf(a, key){ return (a.pref && a.pref[key]) ? a.pref[key].s : 0; }
 function prefBump(a, key, target, rate){
@@ -3613,6 +3785,7 @@ function dailyRollover(day){
   if(!CITY || !CITY_EVOLVE) return;
   const t0=Date.now();
   rolloverVisits();                       // 先に EMA を更新してから閉店判定する
+  if(SOCIAL_ON) SOC.dailyDecay(SOC_STATE, agents);   // 会わない相手との関係は薄れる
   const roads=promoteFootpaths(day);
   const grown=maybeExpand(day);           // 土地が足りなければ先にフィールドを広げる
   const closed=maybeClose(day) + markVacant(day);   // 空き家/空き職場も畳む
@@ -3989,6 +4162,7 @@ function spawnAgent(S, i){
     seenMask:0, owns:null, unmetBy:null,
     viewer:false, by:null, cheers:0, // 視聴者住民か / どの視聴者か / 応援された回数
     pref:{}, taught:null,            // 場所ごとの好み (経験で更新) / 勧められた店
+    rel:{}, talk:null, talkIcon:null,// 人間関係 / 立ち話の状態 (social.js が管理)
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
     hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
@@ -4022,6 +4196,7 @@ function initAgents(S){
   // 既存エージェント/トレイルのメッシュを scene から外し GPU リソースを解放
   // 住民は InstancedMesh 1本で描いているので、個別に解放するものは無い
   if(AgentInst.body) AgentInst.body.count=AgentInst.parts.count=0;
+  for(const a of agents){ a.needIcon=null; a.talkIcon=null; }   // 古いシーンの板を掴んだままにしない
   clearTrails();
   agents=[];agentMeshes=[];
   // 最初の人口。村から始める場合は START_POP から、以降は住居が建つたびに増える。
@@ -4034,6 +4209,7 @@ function initAgents(S){
   if(CITY && CITY.savedAgents){
     let restored=0;
     let viewers=0;
+    let rels=0;
     for(const a of agents){
       const sv=CITY.savedAgents[a.aid]; if(!sv) continue;
       a.seenMask=sv.m||0;
@@ -4042,9 +4218,11 @@ function initAgents(S){
       if(sv.t) a.taught=sv.t;
       if(sv.v && sv.n){ a.viewer=true; a.name=sv.n; a.by=sv.b||null; viewers++; }   // 視聴者住民を戻す
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
+      if(sv.r && SOCIAL_ON){ SOC.restoreAgent(a, sv.r); rels++; }
     }
     if(restored) console.log(`[City] 店主 ${restored}人の職場を復元`);
     if(viewers)  console.log(`[City] 視聴者住民 ${viewers}人を復元`);
+    if(rels)     console.log(`[City] ${rels}人の人間関係を復元`);
   }
   assignHomes();         // 空きのある住居/職場へ割り当てる
   // 自宅から一日を始める。夜間起動でも「家に居るのに眠くて彷徨う」不自然さを避ける。
@@ -4161,6 +4339,9 @@ async function stepAll(){
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
     if(a.mode==='hold') continue;   // rally 集合後は静止 (デバッグ用)
+    // 立ち話の間は足を止めて相手を向く。歩行シェーダの振幅は「実際に進んだ距離」で
+    // 決まるので、止めるだけで脚も自動的に止まる。
+    if(a.talk && a.talk.until>Date.now()){ a.th=a.talk.th; a.stall=0; continue; }
     // ── 屋内は物理と方策の外 ──
     // 建物セルは通行不可なので、屋内エージェントに推論や移動を適用すると
     // 「壁の中で前進が常に失敗する」状態になる。欲求だけ進めて、外出条件が
@@ -5672,6 +5853,68 @@ tick(); setInterval(tick, ${ms});
   //   /chat?text=focus%20rex&user=someone[&token=...]
   //   YouTube / Twitch / 手元の curl / 自作ボット、どこからでも同じ形で渡せる。
   //   CHAT_TOKEN を設定すると合言葉が要る (公開サーバではまず設定すること)。
+  // ── /social : 人間関係の様子 ──
+  //   /social            出会い/立ち話/友人関係の累計と、顔の広い住民
+  //   /social?who=Marco  その住民が誰と知り合いか
+  if(urlPath==='/social'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!SOCIAL_ON){
+      res.writeHead(200); res.end(JSON.stringify({ok:false, enabled:false, hint:'SOCIAL=1 で有効'}));
+      return;
+    }
+    const who=q.get('who');
+    if(who){
+      const hit=findAgentByQuery(who);
+      const a=hit && hit.idx>=0 ? agents[hit.idx] : null;
+      if(!a){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:`no match: ${who}`})); return; }
+      const rel=Object.entries(a.rel||{}).sort((x,y)=>y[1].s-x[1].s).map(([id,e])=>{
+        const o=agents.find(x=>x.aid===id);
+        return {aid:id, name:o?o.name:null, closeness:+e.s.toFixed(2), met:e.n, lastDay:e.d};
+      });
+      res.writeHead(200);
+      res.end(JSON.stringify({ok:true, name:a.name, aid:a.aid,
+        sociability:a.def.sociability!=null?a.def.sociability:0.4,
+        friends:SOC.degreeOf(a), knows:rel.length, rel}));
+      return;
+    }
+    // なぜ newshop / closed の話題が出ないのか、を後から追えるようにしておく。
+    // (実装直後、開店15軒あるのに newshop が0件で、原因の切り分けに要った)
+    const today=gameDay();
+    let withPref=0, freshCand=0, deadCand=0, freshShops=0;
+    for(const st of (CITY?CITY.structs:[]))
+      if(st.founded && st.state==='open' && today-(st.born||0)<=NEWSHOP_DAYS) freshShops++;
+    for(const a of agents){
+      const keys=Object.keys(a.pref||{});
+      if(!keys.length) continue;
+      withPref++;
+      for(const k of keys){
+        const st=cellStruct[k];
+        if(!st || (st.state!=='open' && st.state!=='construction')){ deadCand++; break; }
+      }
+      for(const k of keys){
+        const st=cellStruct[k];
+        if(st && st.state==='open' && st.founded && today-(st.born||0)<=NEWSHOP_DAYS){ freshCand++; break; }
+      }
+    }
+    const top=SOC.topConnected(agents, 5).map(x=>({name:x.a.name, friends:x.deg}));
+    const talking=agents.filter(a=>SOC.isTalking(a, Date.now()))
+      .map(a=>({name:a.name, with:(agents.find(x=>x.aid===a.talk.with)||{}).name||null,
+                topic:a.talk.topic}));
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, enabled:true,
+      totals:{meets:SOC_STATE.stats.meets, talks:SOC_STATE.stats.talks,
+              friendshipsSinceBoot:SOC_STATE.stats.friends,
+              topics:SOC_STATE.stats.topics,
+              friendshipsAllTime:(CITY&&CITY.stats.friendships)||0},
+      talkingNow:talking, mostConnected:top,
+      diag:{residents:agents.length, withPref, freshShopsInTown:freshShops,
+            canTellNewShop:freshCand, canTellClosed:deadCand,
+            newShopDays:NEWSHOP_DAYS},
+      config:SOC_STATE.cfg}));
+    return;
+  }
+
   // ── /yt : 配信中の動画IDの状況確認と手動の探し直し ──
   //   /yt            いまの動画ID / チャンネルID / チャット状態
   //   /yt?refind=1   いまの動画IDを捨てて配信中の動画を探し直す (uploads経由で3 units)
@@ -6134,6 +6377,7 @@ async function renderLoop(){
     updateDayNight(scene);        // 時刻で空と光を変える
     // 欲求アイコン (空腹/眠気/勤務) を頭上に — 一旦非表示 (NEED_ICONS=1 で復活)
     if(NEED_ICONS) updateNeedIcons(mainCam);
+    if(SOCIAL_ON)  updateTalkBubbles(mainCam);   // 立ち話の吹き出し
     // 3D を描いてから HUD (Day/ティッカー) を正射影で重ねる。
     // autoClear を切るので、色バッファは自分で clear する必要がある。
     const _t2=PERF_LOG?Date.now():0;
@@ -6194,7 +6438,7 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  setInterval(()=>{ stepNeeds(1); retargetOnNeedChange(); }, 1000);   // 空腹/疲労の進行と行き先の見直し
+  setInterval(()=>{ stepSocial(1); stepNeeds(1); retargetOnNeedChange(); }, 1000);
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
     setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子
@@ -6252,7 +6496,7 @@ function startLoops(){
   await preloadTextures();
   await loadRaycastTextures();   // エージェント観測(FPV)用の64×64テクスチャ
   // 頭上の欲求アイコン(絵文字)のテクスチャ化 — 一旦非表示 (NEED_ICONS=1 で復活)
-  if(NEED_ICONS) await buildNeedIcons();
+  if(NEED_ICONS || SOCIAL_ON) await buildNeedIcons();   // 吹き出しは SOCIAL でも要る
 
   console.log('[Init] restoring city state...');
   initCity();                    // 保存された街を復元 (無ければ生成)。MAP を差し替えることがある
