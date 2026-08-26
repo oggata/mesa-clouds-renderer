@@ -1531,36 +1531,71 @@ async function refreshHudCam(){
 // チャットログのように左下へ流す。焼き込む文字は **ASCII のみ** (_ascii)。
 //   本番 (Linux) には日本語フォントも絵文字フォントも無く、非ASCIIは全部豆腐になる。
 const TALK_LOG_ON   = process.env.TALK_LOG !== '0';
-const TALK_LOG_N    = Math.max(2, Math.min(8, envNum('TALK_LOG_LINES', 5)));
-const TALK_LOG_W    = envNum('TALK_LOG_W', 505);   // 名前22 + 本文44 が収まる幅
-const TALK_LOG_LH   = 17;                      // 行の高さ
-const TALK_LOG_H    = TALK_LOG_N*TALK_LOG_LH + 14;
+const TALK_LOG_N    = Math.max(2, Math.min(12, envNum('TALK_LOG_LINES', 6)));  // 覚えておく会話の数
+const TALK_LOG_ROWS = Math.max(3, Math.min(14, envNum('TALK_LOG_ROWS', 8)));   // 表示する行数 (折り返し後)
+const TALK_LOG_W    = envNum('TALK_LOG_W', 250);   // 街を隠さないよう控えめに
+const TALK_LOG_FS   = envNum('TALK_LOG_FONT', 10);
+const TALK_LOG_LH   = Math.round(TALK_LOG_FS*1.34);   // 行の高さ
+const TALK_LOG_PAD  = 9;
+const TALK_LOG_H    = TALK_LOG_ROWS*TALK_LOG_LH + 11;
+// 等幅フォントの1文字幅は約 0.6em。幅を変えても折り返し位置がズレないよう、
+// 文字数ではなく「板の幅」から桁数を出す。
+const TALK_LOG_COLS = Math.max(12,
+  Math.floor((TALK_LOG_W - TALK_LOG_PAD - 6) / (TALK_LOG_FS*0.6)));
 let hudTalkLog=null, talkLog=[], talkLogDirty=false, talkLogBusy=false, talkLogAt=0;
 
 // 会話ログに1行足す。name は話し手、text は本文 (どちらも ASCII に落とす)。
 function pushTalkLine(name, text){
   if(!TALK_LOG_ON) return;
   // 先にコロンを付けて切ると、コロンごと落ちて名前と本文がくっつく
-  talkLog.push({name:_ascii(name).slice(0,22)+':', text:_ascii(text).slice(0,44)});
+  talkLog.push({name:_ascii(name).slice(0,24)+':', text:_ascii(text)});
   while(talkLog.length>TALK_LOG_N) talkLog.shift();
   talkLogDirty=true;
+}
+
+// 「名前: 本文」を桁数 cols で折り返して、表示行の配列にする。
+// 先頭行だけ名前を持ち、続きの行は 2 桁ぶん字下げする。
+function wrapTalkLine(l, cols){
+  const words=String(l.text).split(/\s+/).filter(Boolean);
+  const out=[];
+  let head=l.name, indent='', room=cols-l.name.length-1, cur='';
+  const flush=()=>{ out.push({name:head, text:cur, indent}); head=null; indent='  ';
+                    room=cols-2; cur=''; };
+  for(const w of words){
+    // 1語で1行に収まらないときは途中で割る (長い店名など)
+    let word=w;
+    while(word.length>room && room>2){
+      const take=room-cur.length-(cur?1:0);
+      if(take>1){ cur+=(cur?' ':'')+word.slice(0,take); word=word.slice(take); }
+      flush();
+    }
+    if(cur.length+(cur?1:0)+word.length>room) flush();
+    cur+=(cur?' ':'')+word;
+  }
+  if(cur || head) flush();
+  return out;
 }
 
 async function refreshTalkLog(){
   if(!hudScene) return;
   talkLogDirty=false;
-  const lines=talkLog.slice(-TALK_LOG_N);
+  // 新しいものから折り返して、板に入るぶんだけ拾う
+  const disp=[];
+  for(let i=talkLog.length-1; i>=0 && disp.length<TALK_LOG_ROWS; i--)
+    disp.unshift(...wrapTalkLine(talkLog[i], TALK_LOG_COLS));
+  const lines=disp.slice(-TALK_LOG_ROWS);
   const rows=lines.map((l,i)=>{
-    const y=18+i*TALK_LOG_LH;
-    // 名前だけ色を変える。等幅なので名前の幅は文字数から出せる。
-    return `<text x="10" y="${y}" font-size="12.5" font-family="${HUD_MONO}">`
-         + `<tspan fill="#00d2a0">${_esc(l.name)}</tspan>`
-         + `<tspan fill="#cfe3dc"> ${_esc(l.text)}</tspan></text>`;
+    const y=TALK_LOG_LH+i*TALK_LOG_LH-1;
+    const body=`<tspan fill="#cfe3dc">${_esc((l.name?' ':'')+l.indent+l.text)}</tspan>`;
+    return `<text x="${TALK_LOG_PAD}" y="${y}" font-size="${TALK_LOG_FS}"`
+         + ` xml:space="preserve" font-family="${HUD_MONO}">`
+         + (l.name ? `<tspan fill="#00d2a0">${_esc(l.name)}</tspan>` : '')
+         + body + `</text>`;
   }).join('');
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${TALK_LOG_W}" height="${TALK_LOG_H}">`
-    +`<rect width="${TALK_LOG_W}" height="${TALK_LOG_H}" rx="6" fill="#050b10" fill-opacity="0.72"/>`
-    +`<rect x="0" y="0" width="3" height="${TALK_LOG_H}" fill="#00d2a0" fill-opacity="0.8"/>`
+    +`<rect width="${TALK_LOG_W}" height="${TALK_LOG_H}" rx="5" fill="#050b10" fill-opacity="0.68"/>`
+    +`<rect x="0" y="0" width="2" height="${TALK_LOG_H}" fill="#00d2a0" fill-opacity="0.8"/>`
     +rows+`</svg>`);
   if(hudTalkLog){ hudScene.remove(hudTalkLog); hudTalkLog.material.map.dispose();
                   hudTalkLog.material.dispose(); hudTalkLog.geometry.dispose(); }
