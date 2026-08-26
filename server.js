@@ -1273,16 +1273,19 @@ function updateNeedIcons(cam){
   for(let i=0;i<agents.length;i++){
     const a=agents[i], m=agentMeshes[i]; if(!m) continue;
     const kind=needOf(a);
-    if(a.needIcon && a.needIcon.userData.kind!==kind){ m.remove(a.needIcon); a.needIcon=null; }
-    if(!kind){ continue; }
+    // 住民は InstancedMesh なので親子付けができない。アイコンは scene 直付けにして
+    // 毎フレーム住民の頭上へ置き直す。
+    if(a.needIcon && (a.needIcon.userData.kind!==kind || !m.visible)){
+      scene.remove(a.needIcon); a.needIcon=null;
+    }
+    if(!kind || !m.visible){ continue; }
     if(!a.needIcon){
       const ic=new THREE.Mesh(_iconGeo, iconMat(kind));
       ic.userData.kind=kind;
-      ic.position.set(0,0,CELL*1.05);      // 頭上
-      m.add(ic); a.needIcon=ic;
+      scene.add(ic); a.needIcon=ic;
     }
-    // 板を常にカメラへ向ける (親の回転を打ち消す)
-    if(cam) a.needIcon.quaternion.copy(cam.quaternion).premultiply(m.getWorldQuaternion(new THREE.Quaternion()).invert());
+    a.needIcon.position.set(m.position.x, m.position.y, m.position.z + CELL*1.05*CHAR_SCALE);
+    if(cam) a.needIcon.quaternion.copy(cam.quaternion);   // 板を常にカメラへ向ける
   }
 }
 
@@ -1536,10 +1539,6 @@ function updateHud(dt){
 //   ・色の違う「体」以外 (肌/髪/ズボン) は頂点カラーに焼き込んで1マテリアルに
 // することで、1人 = 1Mesh / 2ドローコール、ジオメトリは街全体で1個になる。
 const SHARED_GEO = new Set();          // dispose 対象外にする共有ジオメトリ
-let _agentGeo = null;                  // 全住民で共有する体のジオメトリ
-const _bodyMats = new Map();           // 体の色ごとのマテリアル (ペルソナ数ぶんだけ作られる)
-const _partsMat = new THREE.MeshLambertMaterial({ vertexColors: true });
-_partsMat.userData.shared = true;
 
 // 複数の BufferGeometry を1本に連結する。色は頂点カラーとして書き込む。
 // (three の BufferGeometryUtils は Node ビルドに含まれないので最小限を自前で持つ)
@@ -1568,9 +1567,16 @@ function mergeGeos(list){
   return g;
 }
 
-function agentGeometry(){
-  if(_agentGeo) return _agentGeo;
-  const base=-CELL*.26;                                  // 地面 (足元)
+// 住民の体を「体」と「肌・髪・ズボン」の2本のジオメトリに分けて作る。
+//   体だけ住民ごとに色が変わるので、インスタンスカラーで塗り分けられるよう別にする。
+//   残りは色が固定なので頂点カラーに焼いて1マテリアルにまとめる。
+const AGENT_BASE = -CELL*.26;                 // 足元 (ローカル原点からの高さ)
+const AGENT_HIP  = AGENT_BASE + CELL*.22;     // 脚の付け根。ここより下が「脚」
+let _agentGeoBody=null, _agentGeoParts=null;
+
+function buildAgentGeos(){
+  if(_agentGeoBody) return;
+  const base=AGENT_BASE;
   const skin=new THREE.Color(0xf1c9a5), hair=new THREE.Color(0x4a3b2f), pants=new THREE.Color(0x2b303a);
   const upZ=g=>{ g.rotateX(Math.PI/2); return g; };       // Y軸ジオメトリを Z 上向きに
   const put=(g,x,y,z,sx=1,sy=1,sz=1)=>{
@@ -1578,16 +1584,17 @@ function agentGeometry(){
       new THREE.Vector3(x,y,z), new THREE.Quaternion(), new THREE.Vector3(sx,sy,sz)));
     return g;
   };
-  // ── グループ0: 体 (住民ごとに色が変わるのでマテリアル側で塗る) ──
-  const body=[
+  // ── 体 (住民ごとに色が変わる) ──
+  _agentGeoBody = mergeGeos([
     // 胴体: 裾に向かってわずかに広がるテーパー (コート/ワンピース風シルエット)
     { geo: put(upZ(new THREE.CylinderGeometry(CELL*.095,CELL*.135,CELL*.30,16)), 0,0,base+CELL*.35) },
     // 丸い肩
     { geo: put(new THREE.SphereGeometry(CELL*.12,16,10), 0,0,base+CELL*.49, 1.05,.8,.7) },
-  ];
-  // ── グループ1: 肌・髪・ズボン (色が固定なので頂点カラーに焼く) ──
+  ]);
+  // ── 肌・髪・ズボン (色が固定なので頂点カラーに焼く) ──
+  //   この中で AGENT_HIP より下にあるのは脚だけ。歩行シェーダはそれを目印に脚を振る。
   const legGeo=()=>upZ(new THREE.CylinderGeometry(CELL*.032,CELL*.028,CELL*.22,8));
-  const parts=[
+  _agentGeoParts = mergeGeos([
     { geo: put(legGeo(), -CELL*.05,0,base+CELL*.11), color: pants },   // 脚 (細身・左右)
     { geo: put(legGeo(),  CELL*.05,0,base+CELL*.11), color: pants },
     { geo: put(upZ(new THREE.CylinderGeometry(CELL*.04,CELL*.045,CELL*.06,8)), 0,0,base+CELL*.55), color: skin }, // 首
@@ -1596,23 +1603,113 @@ function agentGeometry(){
     { geo: put(upZ(new THREE.SphereGeometry(CELL*.122,18,12,0,Math.PI*2,0,Math.PI*.62)), 0,-CELL*.012,base+CELL*.665), color: hair },
     // 正面マーカー (鼻) — 進行方向の判別用に控えめに残す。Cone は既定で +Y を向く。
     { geo: put(new THREE.ConeGeometry(CELL*.03,CELL*.06,8), 0,CELL*.11,base+CELL*.655), color: skin },
-  ];
-  const nBody=body.reduce((n,it)=>n+(it.geo.index?it.geo.index.count:it.geo.attributes.position.count),0);
-  const all=body.concat(parts);
-  const nAll=all.reduce((n,it)=>n+(it.geo.index?it.geo.index.count:it.geo.attributes.position.count),0);
-  const g=mergeGeos(all);
-  g.addGroup(0, nBody, 0);
-  g.addGroup(nBody, nAll-nBody, 1);
-  SHARED_GEO.add(g);
-  _agentGeo=g; return g;
+  ]);
+  SHARED_GEO.add(_agentGeoBody); SHARED_GEO.add(_agentGeoParts);
 }
 
+// ── シェーダ歩行 ─────────────────────────────────────────────────────────────
+// ボーン (SkinnedMesh) を使うと、住民ごとにスケルトンとボーン行列の更新が要るうえ
+// three.js r132 には InstancedSkinnedMesh が無いのでインスタンシングと排他になる。
+// 歩かせたいだけなら頂点シェーダで足りる。住民ごとの歩行位相と振幅を
+// インスタンス属性 aWalk = (位相, 振幅) で渡し、脚の付け根から下だけを前後に振る。
+//   位相は「実際に進んだ距離」で進めるので、歩幅と速さが自然に一致する。
+//   振幅は止まると 0 に落ちるので、立ち止まっているときは脚も止まる。
+const WALK_CYCLE = parseFloat(process.env.WALK_CYCLE) || CELL*0.30;  // 1歩行周期で進む距離
+const WALK_FULL  = parseFloat(process.env.WALK_FULL)  || CELL*0.018; // 振幅が最大になる1フレームの移動量 (実測の歩行速度に合わせた)
+const WALK_SWING = parseFloat(process.env.WALK_SWING) || 0.55;       // 脚の振れ角 (rad)
+const WALK_RATE  = Math.PI*2 / WALK_CYCLE;
+
+// マテリアルに歩行を仕込む。legs=true なら脚を振る (体側は位相を受け取るだけ)。
+function addWalkShader(mat, legs){
+  mat.onBeforeCompile = (sh)=>{
+    sh.vertexShader = 'attribute vec2 aWalk;\n' + sh.vertexShader;
+    if(legs){
+      sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
+        `#include <begin_vertex>
+        if(aWalk.y > 0.001 && transformed.z < ${AGENT_HIP.toFixed(5)}){
+          float side = transformed.x < 0.0 ? 1.0 : -1.0;      // 左右の脚は逆位相
+          float ang  = sin(aWalk.x) * ${WALK_SWING.toFixed(3)} * aWalk.y * side;
+          float dz   = transformed.z - ${AGENT_HIP.toFixed(5)};
+          float sa   = sin(ang), ca = cos(ang);
+          float y0   = transformed.y;
+          transformed.y = y0*ca - dz*sa;                      // 付け根まわりの回転
+          transformed.z = ${AGENT_HIP.toFixed(5)} + y0*sa + dz*ca;
+        }`);
+    }
+  };
+  // onBeforeCompile を付けたマテリアルは別プログラムとしてキャッシュさせる
+  mat.customProgramCacheKey = ()=> legs ? 'agentWalkLegs' : 'agentWalkBody';
+}
+
+// ── 住民のインスタンス描画 ───────────────────────────────────────────────────
+// 以前は住民1人 = 1メッシュで、300人なら 600 ドローコール (体+パーツ) だった。
+// 形はみな同じで、違うのは「位置・向き・体の色・歩行位相」だけなので、
+// InstancedMesh 2本 (体 / パーツ) にまとめて **2 ドローコール** で描く。
+const AGENT_CAP = NUM_AGENTS + 8;
+const AgentInst = { body:null, parts:null, walk:null };
+const _agentHide = new THREE.Matrix4().makeScale(0,0,0);   // 屋内の住民を隠す行列
+
+function initAgentInstances(S){
+  if(!S) return;
+  buildAgentGeos();
+  const walk=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*2), 2);
+  // 同じ属性オブジェクトを両ジオメトリで共有する (GPUバッファも1本で済む)
+  _agentGeoBody.setAttribute('aWalk', walk);
+  _agentGeoParts.setAttribute('aWalk', walk);
+
+  // three 0.132 の color_fragment は USE_COLOR / USE_COLOR_ALPHA のときしか vColor を
+  // 使わない。USE_INSTANCING_COLOR だけだと頂点側で計算した色が捨てられ、全員白になる。
+  // 体ジオメトリには mergeGeos が白の頂点カラーを入れてあるので、vertexColors を
+  // 有効にして経路を通し、その上に instanceColor を掛けさせる。
+  const bodyMat=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
+  const partsMat=new THREE.MeshLambertMaterial({vertexColors:true});
+  bodyMat.userData.shared=true; partsMat.userData.shared=true;
+  addWalkShader(bodyMat,false); addWalkShader(partsMat,true);
+
+  const body =new THREE.InstancedMesh(_agentGeoBody,  bodyMat,  AGENT_CAP);
+  const parts=new THREE.InstancedMesh(_agentGeoParts, partsMat, AGENT_CAP);
+  for(const m of [body,parts]){
+    m.count=0;
+    m.frustumCulled=false;     // 境界球はジオメトリ1体ぶんしか無く、街全体には効かない
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    S.add(m);
+  }
+  AgentInst.body=body; AgentInst.parts=parts; AgentInst.walk=walk;
+  // 既に住民が居る状態でシーンを作り直した場合に備えて色を入れ直す
+  for(let i=0;i<agents.length && i<AGENT_CAP;i++) setAgentColor(i, agents[i].def.color);
+}
+
+const _acol=new THREE.Color();
+function setAgentColor(i, hex){
+  if(!AgentInst.body || i>=AGENT_CAP) return;
+  AgentInst.body.setColorAt(i, _acol.set(hex));
+  AgentInst.body.instanceColor.needsUpdate=true;
+}
+
+// 住民1人ぶんの「置き場所」。ジオメトリもマテリアルも持たない純粋な変換だけの器で、
+// scene には入れない。renderLoop がここに補間後の位置と向きを書き、
+// syncAgentInstances がまとめてインスタンス行列へ流し込む。
 function createAgentMesh(S,color){
-  let bodyMat=_bodyMats.get(color);
-  if(!bodyMat){ bodyMat=new THREE.MeshLambertMaterial({color}); bodyMat.userData.shared=true; _bodyMats.set(color, bodyMat); }
-  const m=new THREE.Mesh(agentGeometry(), [bodyMat, _partsMat]);
-  m.scale.setScalar(CHAR_SCALE);   // 街に対する大きさ調整 (足元は renderLoop 側で接地補正)
-  S.add(m); return m;
+  const o=new THREE.Object3D();
+  o.scale.setScalar(CHAR_SCALE);   // 街に対する大きさ調整 (足元は renderLoop 側で接地補正)
+  o.matrixAutoUpdate=false;
+  return o;
+}
+
+// 補間済みの位置・向き・歩行状態を InstancedMesh へ書き出す
+function syncAgentInstances(){
+  const B=AgentInst.body, P=AgentInst.parts; if(!B) return;
+  const n=Math.min(agents.length, AGENT_CAP);
+  const w=AgentInst.walk.array;
+  for(let i=0;i<n;i++){
+    const o=agentMeshes[i]; if(!o) continue;
+    if(o.visible){ o.updateMatrix(); B.setMatrixAt(i,o.matrix); P.setMatrixAt(i,o.matrix); }
+    else { B.setMatrixAt(i,_agentHide); P.setMatrixAt(i,_agentHide); }
+    w[i*2]=o.userData.ph||0; w[i*2+1]=o.userData.amp||0;
+  }
+  B.count=P.count=n;
+  B.instanceMatrix.needsUpdate=true; P.instanceMatrix.needsUpdate=true;
+  AgentInst.walk.needsUpdate=true;
 }
 
 // ─── RGBA → JPEG ─────────────────────────────────────────────────────────────
@@ -3835,6 +3932,7 @@ function spawnAgent(S, i){
     supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0};
   agents.push(a);
   agentMeshes.push(createAgentMesh(S, def.color));
+  setAgentColor(agentMeshes.length-1, def.color);
   return a;
 }
 
@@ -3859,7 +3957,8 @@ function settleAgent(a){
 
 function initAgents(S){
   // 既存エージェント/トレイルのメッシュを scene から外し GPU リソースを解放
-  agentMeshes.forEach(m=>{S.remove(m);disposeMesh(m);});
+  // 住民は InstancedMesh 1本で描いているので、個別に解放するものは無い
+  if(AgentInst.body) AgentInst.body.count=AgentInst.parts.count=0;
   clearTrails();
   agents=[];agentMeshes=[];
   // 最初の人口。村から始める場合は START_POP から、以降は住居が建つたびに増える。
@@ -4096,7 +4195,8 @@ function handleCommand(msg){
       scene=buildScene(MAP);
       // 古いシーン (建物/道路/エージェント/トレイル) の GPU リソースを解放
       disposeScene(oldScene);
-      initTrailField(scene);       // 足跡メッシュは旧シーンと一緒に破棄されている
+      initTrailField(scene);       // 足跡/住民メッシュは旧シーンと一緒に破棄されている
+      initAgentInstances(scene);
       if(scene) initAgents(scene);
       break;
     }
@@ -5388,7 +5488,8 @@ tick(); setInterval(tick, ${ms});
         const old=scene;
         scene=buildScene(MAP);
         disposeScene(old);
-        initTrailField(scene);     // 足跡メッシュは旧シーンと一緒に破棄されている
+        initTrailField(scene);     // 足跡/住民メッシュは旧シーンと一緒に破棄されている
+        initAgentInstances(scene);
         initAgents(scene);
       }
       res.writeHead(200); res.end(JSON.stringify({ok:true, reset:true, day:gameDay()+1})); return;
@@ -5733,11 +5834,16 @@ function perfReport(){
     const mats=Array.isArray(o.material)?o.material:(o.material?[o.material]:[]);
     for(const m of mats) if(m && m.map) tex.add(m.map.uuid);
   });
+  // 歩行シェーダが実際に駆動されているか (振幅>0.2 の住民数と平均振幅)
+  let walking=0, ampSum=0;
+  for(const o of agentMeshes){ const a=(o&&o.userData.amp)||0; ampSum+=a; if(a>0.2) walking++; }
+  const walkStat=agentMeshes.length
+    ? ` 歩行${walking}/${agentMeshes.length}(平均振幅${(ampSum/agentMeshes.length).toFixed(2)})` : '';
   const p=k=>(_perf[k]/_perf.n).toFixed(1);
   console.log(`[Perf] 1フレーム平均: agent更新${p('agents')}ms フェード${p('fade')}ms `
     + `描画${p('render')}ms 読出${p('pixels')}ms JPEG${p('jpeg')}ms `
     + `| メッシュ${meshes} テクスチャ実体${tex.size} 住民${agents.length} `
-    + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}`);
+    + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}` + walkStat);
   for(const k in _perf) _perf[k]=0;
 }
 async function renderLoop(){
@@ -5755,15 +5861,22 @@ async function renderLoop(){
       // 屋内 = 建物の中に居るので見えない。位置の補間も止める (玄関から
       // 建物中心へ滑って見えるのを防ぐ)。
       m.visible = !MW.isIndoors(a);
-      if(!m.visible) return;
-      m.position.x+=(tx-m.position.x)*Math.min(1,dt*14);
-      m.position.y+=(ty-m.position.y)*Math.min(1,dt*14);
+      if(!m.visible){ m.userData.amp=0; return; }
+      const px=m.position.x, py=m.position.y;
+      m.position.x+=(tx-px)*Math.min(1,dt*14);
+      m.position.y+=(ty-py)*Math.min(1,dt*14);
       m.position.z=CELL*.26*CHAR_SCALE;   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
       const tar=-a.th+Math.PI*.5;
       let dr=tar-m.rotation.z;
       while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
       m.rotation.z+=dr*Math.min(1,dt*14);
+      // 歩行: 実際に進んだ距離で位相を進める (歩幅と速さが自然に一致する)。
+      // 立ち止まると振幅が 0 に落ちて脚も止まる。
+      const sp=Math.hypot(m.position.x-px, m.position.y-py);
+      m.userData.ph=(m.userData.ph||0)+sp*WALK_RATE;
+      m.userData.amp=(m.userData.amp||0)*0.75 + Math.min(1, sp/WALK_FULL)*0.25;
     });
+    syncAgentInstances();
 
     if(PERF_LOG){ _perf.agents+=Date.now()-_t0; }
     stepStructAnims();            // 建物のせり上がり / 沈み込み
@@ -5906,6 +6019,7 @@ function startLoops(){
   await initHud();               // 配信画面の Day カウンタ / ニュースティッカー
 
   initTrailField(scene);
+  initAgentInstances(scene);
   initAgents(scene);
 
   httpServer.listen(PORT, ()=>{
