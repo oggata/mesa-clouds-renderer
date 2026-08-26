@@ -247,6 +247,20 @@ data/
 | `CHAT_CMD` | 1 | 配信チャットからの指示（`!focus <名前>` でカメラ指名）。`0` で無効 |
 | `YT_CHAT` | 0 | `1` で YouTube ライブチャットを取り込む（`YT_API_KEY` / `YT_VIDEO_ID` が必要） |
 | `YT_CHAT_MODE` | auto | `grpc`(push・遅延ほぼゼロ) を試し、駄目なら適応ポーリングに落ちる |
+| `YT_AUTO_FIND` | 1 | 配信を立て直して動画IDが変わっても自動で追いかける。`0` で無効 |
+| `FPV_EYE` | 1.0 | 一人称カメラの目の高さの倍率（1.0 = 住民の実際の目線） |
+
+**配信の動画IDが変わったとき**：`.env` を書き換える必要はありません。
+`YT_AUTO_FIND`（既定で有効）が投稿チャンネルを学習して次の配信を探し、
+見つけたIDを `data/yt_live.json` に保存します。
+
+```bash
+curl http://localhost:8080/yt
+```
+
+状態確認は上のコマンド、いますぐ探し直させるなら `?refind=1` を付けます。
+手元で調べたいときは `node tools/yt-chat-setup.js find --key=API_KEY --video=前の動画ID`。
+仕組みと単価は [docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §17 に書いてあります。
 
 街の進化まわりの設定は数が多いので **[docs/city-evolution-spec.md](docs/city-evolution-spec.md) の §8** にまとめてあります。
 

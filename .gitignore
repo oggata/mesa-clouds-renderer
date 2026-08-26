@@ -148,3 +148,6 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# 自動で見つけたライブ動画ID (実行時の状態)
+data/yt_live.json

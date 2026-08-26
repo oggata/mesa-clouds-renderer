@@ -1540,3 +1540,90 @@ scene 直付けにして毎フレーム頭上へ置き直す形に変えた。
 - 木も同様にインスタンス化できる (現状205メッシュ)。こちらは遮蔽フェードだけが問題。
 - `MAX_TRAIL` を下げる (足跡は1メッシュになったのでメッシュ数には効かない。
   頂点数だけの問題になった)。
+
+
+---
+
+## 17. 配信の動画IDが変わっても追いかける
+
+配信を立て直すと YouTube の動画IDが変わる。以前は `.env` の `YT_VIDEO_ID` を
+手で書き換えるまでチャットが死んだままだった。
+
+- ポーリングが `liveChatEnded` を受けても `chatId` しか捨てておらず、
+  **死んだ動画IDを永久に掴み続けていた**。
+- 再探索は `YT_CHANNEL_ID` を設定している場合しか走らず、
+  設定していなければ復帰の手段が無かった。
+
+### 17.1 直したこと
+
+**(a) チャンネルIDを自分で学習する** — `YT_CHANNEL_ID` が未設定でも、いま持っている
+動画IDから `videos.list(part=snippet)` で投稿チャンネルを引く (1 unit)。
+**配信が健全なうちに**一度だけ学習しておく。配信が切れてから学習しようとすると、
+手がかりの動画IDを既に捨てていて間に合わない (実装中に一度踏んだ)。
+`ytcEnsureChannel`。
+
+**(b) 死んだ動画IDを捨てる** — ポーリングが `liveChatEnded` / `liveChatNotFound` /
+`liveChatDisabled` / 404 を返したら、`chatId` だけでなく**動画IDごと**捨てて
+次の配信を探しにいく。`ytcInvalidateVideo`。
+
+**(c) 安く探す** — `search.list` は **100 units** と高い (5分おきに叩くと1日28,800
+units で無料枠を超える)。代わりにアップロード一覧をたどる:
+
+| | 呼び出し | units |
+|---|---|---|
+| 1 | `channels.list(part=contentDetails)` → uploads プレイリストID | 1 |
+| 2 | `playlistItems.list(part=contentDetails)` → 直近5件の動画ID | 1 |
+| 3 | `videos.list(part=liveStreamingDetails, id=カンマ区切り)` | 1 |
+
+**合計 3 units**。ライブ配信もアップロード一覧に載るのでこれで拾える。
+反映が遅れて載っていない場合の保険として `search.list` を残してあるが、
+1日 `YT_SEARCH_MAX_PER_DAY` (既定10) 回までに制限している。
+
+**(d) 見つけたIDを保存する** — `data/yt_live.json` に動画IDと学習済みチャンネルIDを
+書く。再起動しても探し直さなくて済む。
+`YT_VIDEO_ID` を明示している場合はそちらを優先する (手で指定したものを勝手に
+上書きしない)。その値が死んでいれば (a)(b)(c) で数 units 使って復帰する。
+
+### 17.2 使い方
+
+```
+curl http://localhost:8080/yt              # いまの動画ID / チャンネルID / チャット状態
+curl "http://localhost:8080/yt?refind=1"   # いますぐ探し直す
+node tools/yt-chat-setup.js find --key=API_KEY --video=前の動画ID
+```
+
+`.env` でチャンネルIDを明示しておくと、学習の 1 unit すら要らない:
+
+```
+YT_CHANNEL_ID=UCxxxxxxxxxxxxxxxxxxxxxx
+```
+
+| 環境変数 | 既定 | 意味 |
+|---|---|---|
+| `YT_AUTO_FIND` | 有効 | `0` で自動追従を切る |
+| `YT_SCAN_RECENT` | 5 | アップロード一覧を何件見るか |
+| `YT_SEARCH_MIN_SEC` | 120 | 探索の最短間隔 (秒) |
+| `YT_ALLOW_SEARCH` | 有効 | `0` で search.list のフォールバックを使わない |
+| `YT_SEARCH_MAX_PER_DAY` | 10 | search.list の1日あたり上限 |
+| `YT_LIVE_FILE` | `data/yt_live.json` | 見つけた動画IDの保存先 |
+
+### 17.3 検証
+
+モックAPI (実APIのレスポンス形状に合わせたもの) で確認した:
+
+- 起動時に `YT_VIDEO_ID` が死んでいる → チャンネル学習 → 新しい動画を発見 →
+  チャット再開。`search.list` は 0 回、合計 10 units。
+- **配信中に動画IDが変わる** (`liveChatEnded`) → 約15秒で新しい動画へ乗り換え。
+  連続2回の立て直しでも追従した。
+- サーバ再起動後、保存済みの動画IDから復帰。
+
+実APIでの唯一の未確認点は「ライブ配信がアップロード一覧に**すぐ**載るか」。
+載らないチャンネル/タイミングがあれば `search.list` のフォールバックが拾う。
+一度 `node tools/yt-chat-setup.js find` を実配信に対して実行して確かめておくとよい。
+
+### 17.4 一人称カメラの目線の高さ
+
+`FPV` の目の高さが `Math.max(CELL*0.5, CELL*0.66*CHAR_SCALE)` になっていて、
+下限のほうが常に勝っていた。`CHAR_SCALE=1/3` だと住民の実際の頭の高さは
+`CELL*0.22` なので、**実際の目線の2倍以上**から見下ろす画になっていた。
+下限を外して実高をそのまま使い、`FPV_EYE` (既定 1.0) で倍率を調整できるようにした。

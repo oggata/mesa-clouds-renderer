@@ -106,10 +106,12 @@ const CAM_STALL_SWITCH = parseInt(process.env.CAM_STALL_SWITCH) || 20;
 // FPV_CHANCE: ターゲット切替時に、そのキャラの一人称視点(目線)ショットになる確率 (0..1, 既定0.25)。
 //             A/B どちらでも「たまに挟む」形で入る。0 で無効。 例: FPV_CHANCE=0.3 node server.js
 const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); return isNaN(v)?0.25:Math.max(0,Math.min(1,v)); })();
+// FPV_EYE: 一人称カメラの目の高さの倍率。1.0 = 住民の実際の目線。 例: FPV_EYE=1.3 node server.js
+const FPV_EYE          = (()=>{ const v=parseFloat(process.env.FPV_EYE); return isNaN(v)?1.0:Math.max(0.3,Math.min(4.0,v)); })();
 // CAM_DIST: 追跡カメラのプレイヤーまでの距離倍率 (1.0=従来)。小さいほど寄る。 例: CAM_DIST=0.5 node server.js
 //const CAM_DIST         = (()=>{ const v=parseFloat(process.env.CAM_DIST); return isNaN(v)?1.0:Math.max(0.2,Math.min(3.0,v)); })();
 const CAM_DIST = 0.6;
-console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY} | camMode=${CAM_MODE} fpv=${FPV_CHANCE} camDist=${CAM_DIST}`);
+console.log(`[Config] ASPECT=${ASPECT} QUALITY=${QUALITY} → ${WIDTH}x${HEIGHT} @ ${FPS}fps (jpeg ${JPEG_Q}) | onnxThreads=${ONNX_THREADS} inferEvery=${INFER_EVERY} | camMode=${CAM_MODE} fpv=${FPV_CHANCE} fpvEye=${FPV_EYE} camDist=${CAM_DIST}`);
 const PORT   = process.env.PORT || 8080;
 // 前進可否の判定方式: 既定はマップ配列(確実・学習と一致)。
 // seg_head で学習し直した場合のみ SEG_GATE=1 で seg 判定に切替。
@@ -4782,7 +4784,16 @@ const YTC = {
   clientSecret: process.env.YT_OAUTH_CLIENT_SECRET || '',
   refresh:      process.env.YT_OAUTH_REFRESH_TOKEN || '',
   video:   process.env.YT_VIDEO_ID || '',
-  channel: process.env.YT_CHANNEL_ID || '',        // 動画IDの代わりにチャンネルから自動発見
+  channel: process.env.YT_CHANNEL_ID || '',        // 未設定なら動画IDから自動で学習する
+  // 配信を立て直して動画IDが変わったとき、自動で次の配信を探すか
+  autoFind: process.env.YT_AUTO_FIND !== '0',
+  scanRecent:    envNum('YT_SCAN_RECENT', 5),      // アップロード一覧を何件見るか
+  searchMinSec:  envNum('YT_SEARCH_MIN_SEC', 120), // 探索の最短間隔 (秒)
+  // search.list は 100 units と高い。既定では uploads 経由 (3 units) を使い、
+  // それで見つからないときだけ1日数回に限って使う。
+  allowSearch:   process.env.YT_ALLOW_SEARCH !== '0',
+  searchMaxPerDay: envNum('YT_SEARCH_MAX_PER_DAY', 10),
+  _searchCalls: 0,
   base:    process.env.YT_CHAT_API_BASE || 'https://www.googleapis.com/youtube/v3',
   // 静かなときの間隔 / 会話中の間隔 / 「会話中」とみなす無音の長さ
   pollSec:     envNum('YT_CHAT_POLL_SEC', 45),
@@ -4805,7 +4816,7 @@ const YTC = {
   chatId:null, pageToken:null, polls:0, pushes:0, seen:0, cmds:0, lastError:null, startedAt:0,
   streamOk:false, _abort:null,
   pausedUntil:0,           // クォータ切れで打ち止めになった時刻 (太平洋時間の深夜まで)
-  _access:'', _accessExp:0, _lastSearch:0,
+  _access:'', _accessExp:0, _lastSearch:0, _lastVideo:'',
   get quotaPerDay(){ return Math.round(86400/Math.max(5,this.pollSec))*this.unitCost; },
 };
 
@@ -4818,10 +4829,12 @@ function ytcCharge(path, override){
   const d=ptDayKey();
   if(d!==YTC.unitDay){                       // 日付が変わった → リセット
     if(YTC.units) console.log(`[YTChat] ${YTC.unitDay} の消費: 約${YTC.units} units`);
-    YTC.unitDay=d; YTC.units=0; YTC.calls={}; YTC.pausedUntil=0;
+    YTC.unitDay=d; YTC.units=0; YTC.calls={}; YTC.pausedUntil=0; YTC._searchCalls=0;
   }
   const cost = (override!=null) ? override
-             : path==='videos' ? 1 : path==='search' ? 100 : YTC.unitCost;
+             : path==='search' ? 100
+             : (path==='videos' || path==='channels' || path==='playlistItems') ? 1
+             : YTC.unitCost;
   YTC.units += cost;
   YTC.calls[path] = (YTC.calls[path]||0)+1;
 }
@@ -4869,29 +4882,133 @@ async function ytcFetch(path, params){
   return j;
 }
 
-// 配信中の動画IDをチャンネルから探す。search.list は **100 units** と高いので、
-// 動画IDが分からないときだけ、かつ5分に1回までに絞る。
+// ── 配信中の動画IDを自動で追いかける ────────────────────────────────────────
+// 配信を立て直すと動画IDが変わる。以前は YT_VIDEO_ID を手で書き換えるまで
+// チャットが死んだままだった (チャンネルIDを設定していない限り再探索もしなかった)。
+// ここでは **チャンネルIDが未設定でも** 復帰できるようにする。
+//   1) いま持っている動画IDから channelId を学習する (videos.list = 1 unit)
+//   2) チャンネルのアップロード一覧から配信中の動画を探す (合計 3 units)
+//   3) それでも見つからなければ search.list (100 units) に落とす
+// 見つけた動画IDは data/yt_live.json に保存するので、再起動しても探し直さない。
+
+const YT_LIVE_FILE = process.env.YT_LIVE_FILE
+  || path.join(__dirname, 'data', 'yt_live.json');
+
+function ytcLoadLive(){
+  try{
+    const j=JSON.parse(fs.readFileSync(YT_LIVE_FILE,'utf8'));
+    if(j.channel && !YTC.channel) YTC.channel=j.channel;
+    // 環境変数で明示された動画IDのほうを優先する (手で指定したものを勝手に上書きしない)
+    if(j.video && !YTC.video){ YTC.video=j.video;
+      console.log(`[YTChat] 前回の動画IDを復元: ${j.video}`); }
+  }catch(e){ /* 無ければ何もしない */ }
+}
+function ytcSaveLive(){
+  try{
+    fs.mkdirSync(path.dirname(YT_LIVE_FILE), {recursive:true});
+    fs.writeFileSync(YT_LIVE_FILE, JSON.stringify(
+      {video:YTC.video||'', channel:YTC.channel||'', at:new Date().toISOString()}, null, 2));
+  }catch(e){ console.warn('[YTChat] 動画IDの保存に失敗:', e.message); }
+}
+
+// いま分かっている動画IDから、その動画の投稿チャンネルを学習する (1 unit)。
+// これができると YT_CHANNEL_ID を設定していなくても次の配信を探せる。
+async function ytcEnsureChannel(){
+  if(YTC.channel) return YTC.channel;
+  // 破棄済みの動画IDでも投稿チャンネルは引けるので、直前のIDも拾う
+  const vid=YTC.video || YTC._lastVideo;
+  if(!vid) return '';
+  try{
+    const j=await ytcFetch('videos', {part:'snippet', id:vid});
+    const ch=(((j.items||[])[0]||{}).snippet||{}).channelId;
+    if(ch){
+      YTC.channel=ch; ytcSaveLive();
+      console.log(`[YTChat] チャンネルIDを学習: ${ch} (次の配信はこれで探す)`);
+    }
+    return ch||'';
+  }catch(e){ console.warn('[YTChat] チャンネルIDの学習に失敗:', e.message); return ''; }
+}
+
+// アップロード一覧をたどって配信中の動画を探す。合計 3 units。
+//   channels.list(1) → playlistItems.list(1) → videos.list(1)
+async function ytcFindLiveViaUploads(){
+  const c=await ytcFetch('channels', {part:'contentDetails', id:YTC.channel});
+  const up=((((c.items||[])[0]||{}).contentDetails||{}).relatedPlaylists||{}).uploads;
+  if(!up) return null;
+  const pl=await ytcFetch('playlistItems',
+    {part:'contentDetails', playlistId:up, maxResults:YTC.scanRecent});
+  const ids=(pl.items||[]).map(it=>(it.contentDetails||{}).videoId).filter(Boolean);
+  if(!ids.length) return null;
+  // まとめて1回で問い合わせる (id はカンマ区切りで複数指定できる)
+  const v=await ytcFetch('videos', {part:'liveStreamingDetails', id:ids.join(',')});
+  for(const it of (v.items||[])){
+    if(it.liveStreamingDetails && it.liveStreamingDetails.activeLiveChatId){
+      YTC.chatId=it.liveStreamingDetails.activeLiveChatId; YTC.pageToken=null;
+      return it.id;
+    }
+  }
+  return null;
+}
+
+// 配信中の動画IDを探す。呼びすぎないよう最短間隔を空ける。
 async function ytcFindLiveVideo(){
-  if(!YTC.channel) return null;
-  if(Date.now()-YTC._lastSearch < 5*60*1000) return null;
+  if(!YTC.autoFind) return null;
+  if(Date.now()-YTC._lastSearch < YTC.searchMinSec*1000) return null;
   YTC._lastSearch=Date.now();
-  const j=await ytcFetch('search', {part:'id', channelId:YTC.channel,
-                                    eventType:'live', type:'video', maxResults:1});
-  const id=((j.items||[])[0]||{}).id && j.items[0].id.videoId;
-  if(id){ YTC.video=id; console.log(`[YTChat] 配信中の動画を発見: ${id} (search.list = 100 units)`); }
+  await ytcEnsureChannel();
+  if(!YTC.channel) return null;
+  let id=null;
+  try{ id=await ytcFindLiveViaUploads(); }
+  catch(e){ console.warn('[YTChat] アップロード一覧からの探索に失敗:', e.message); }
+  if(!id && YTC.allowSearch){
+    // 最後の手段。100 units と高いので既定では1日数回に制限する。
+    if(YTC._searchCalls < YTC.searchMaxPerDay){
+      YTC._searchCalls++;
+      try{
+        const j=await ytcFetch('search', {part:'id', channelId:YTC.channel,
+                                          eventType:'live', type:'video', maxResults:1});
+        id=((j.items||[])[0]||{}).id && j.items[0].id.videoId || null;
+        if(id) console.log('[YTChat] search.list で発見 (100 units)');
+      }catch(e){ console.warn('[YTChat] search.list 失敗:', e.message); }
+    }else{
+      console.warn(`[YTChat] search.list は本日の上限 ${YTC.searchMaxPerDay} 回に達している`);
+    }
+  }
+  if(id && id!==YTC.video){
+    console.log(`[YTChat] 配信中の動画を発見: ${id} (前回: ${YTC.video||'なし'})`);
+    YTC.video=id; ytcSaveLive();
+  }
   return id||null;
+}
+
+// 動画IDが死んでいると判断したときに呼ぶ。次の ytcResolveChatId で探し直させる。
+function ytcInvalidateVideo(why){
+  if(!YTC.video && !YTC.chatId) return;
+  console.warn(`[YTChat] 動画ID ${YTC.video||'(なし)'} を破棄して探し直す: ${why}`);
+  if(YTC.video) YTC._lastVideo=YTC.video;   // チャンネル学習に使うので覚えておく
+  YTC.video=''; YTC.chatId=null; YTC.pageToken=null;
+  YTC._lastSearch=0;                 // すぐ探せるように間隔制限を解除
 }
 
 async function ytcResolveChatId(){
   if(!YTC.video) await ytcFindLiveVideo();
-  if(!YTC.video) throw new Error('動画IDが無い (YT_VIDEO_ID か YT_CHANNEL_ID を設定する)');
+  if(YTC.chatId) return;             // uploads 探索の途中で取れていることがある
+  if(!YTC.video) throw new Error('配信中の動画が見つからない (配信していない / YT_VIDEO_ID か YT_CHANNEL_ID を設定する)');
   const j=await ytcFetch('videos', {part:'liveStreamingDetails', id:YTC.video});
   const it=(j.items||[])[0];
   const id=it && it.liveStreamingDetails && it.liveStreamingDetails.activeLiveChatId;
-  if(!id){ YTC.video=YTC.channel?'':YTC.video;   // チャンネル指定なら次回探し直す
-    throw new Error('activeLiveChatId が取れない (配信中でない / 動画IDが違う / 権限不足)'); }
+  if(!id){
+    // この動画のチャットはもう無い。チャンネルを学習してから次を探す。
+    await ytcEnsureChannel();
+    ytcInvalidateVideo('activeLiveChatId が取れない (配信終了 / 動画IDが違う)');
+    throw new Error('activeLiveChatId が取れない → 次の配信を探し直す');
+  }
   YTC.chatId=id; YTC.pageToken=null;
-  console.log(`[YTChat] liveChatId 取得 (${String(id).slice(0,16)}…)`);
+  ytcSaveLive();
+  console.log(`[YTChat] liveChatId 取得 (動画 ${YTC.video} / ${String(id).slice(0,16)}…)`);
+  // 配信が健全なうちにチャンネルIDを学習しておく (1 unit・一度きり)。
+  // 配信が切れてから学習しようとすると、手がかりの動画IDを既に捨てていて間に合わない。
+  if(!YTC.channel && YTC.autoFind) ytcEnsureChannel().catch(()=>{});
 }
 
 // ── streamList (gRPC): 長時間つなぎっぱなしで新着を push してもらう ──────────
@@ -5246,7 +5363,14 @@ async function ytcPoll(){
       return;
     }
     console.warn('[YTChat] 取得失敗:', e.message);
-    if(/^(401|403|404)/.test(e.message)) YTC.chatId=null;   // 期限切れ等は取り直す
+    // 配信が終わった / チャットが消えた → 動画IDごと捨てて次の配信を探す。
+    // (以前はここで chatId しか消しておらず、死んだ動画IDを永久に掴み続けていた)
+    if(/liveChatEnded|liveChatNotFound|videoNotFound|liveChatDisabled/i.test(e.reason||e.message)
+       || /^404/.test(e.message)){
+      ytcInvalidateVideo(e.reason||e.message);
+    }else if(/^(401|403)/.test(e.message)){
+      YTC.chatId=null;   // トークン期限切れ等は chatId だけ取り直す
+    }
   }
 }
 
@@ -5324,8 +5448,11 @@ function updateTrackingCamera(cam) {
       // ── 一人称視点 (キャラの目線) ──
       // world 進行方向 = (sin th, cos th) (stepAll の移動則より導出)。
       const dwx = Math.sin(a.th), dwy = Math.cos(a.th);
-      // 目の高さ: キャラの頭の高さ (接地スケール準拠) を基準に、見やすさのため下限を設ける。
-      const eyeZ = Math.max(CELL*0.5, CELL*0.66*CHAR_SCALE);
+      // 目の高さ: 住民の頭のてっぺんの実高 (接地スケール準拠) をそのまま使う。
+      //   以前は Math.max(CELL*0.5, ...) の下限が常に勝っていて、実際の目線の
+      //   2倍以上の高さから見下ろす画になっていた。
+      //   FPV_EYE で微調整できる (1.0=実際の目線 / 大きいほど高い)。
+      const eyeZ = CELL*0.66*CHAR_SCALE*FPV_EYE;
       const fwd  = CELL*0.3;   // 自分のメッシュに潜り込まないよう少し前へ出す
       cam.up.set(0, 0, 1);     // Z が上 → 水平線が水平に見える
       cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
@@ -5545,6 +5672,34 @@ tick(); setInterval(tick, ${ms});
   //   /chat?text=focus%20rex&user=someone[&token=...]
   //   YouTube / Twitch / 手元の curl / 自作ボット、どこからでも同じ形で渡せる。
   //   CHAT_TOKEN を設定すると合言葉が要る (公開サーバではまず設定すること)。
+  // ── /yt : 配信中の動画IDの状況確認と手動の探し直し ──
+  //   /yt            いまの動画ID / チャンネルID / チャット状態
+  //   /yt?refind=1   いまの動画IDを捨てて配信中の動画を探し直す (uploads経由で3 units)
+  if(urlPath==='/yt'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!YTC.enabled){
+      res.writeHead(200);
+      res.end(JSON.stringify({ok:false, enabled:false, hint:'YT_CHAT=1 で有効になる'}));
+      return;
+    }
+    const done=()=>{
+      res.writeHead(200);
+      res.end(JSON.stringify({ok:true, enabled:true,
+        video:YTC.video||null, channel:YTC.channel||null, chatId:YTC.chatId||null,
+        autoFind:YTC.autoFind, mode:YTC.mode,
+        searchCallsToday:YTC._searchCalls, unitsToday:YTC.units,
+        lastError:YTC.lastError||null,
+        watch: YTC.video ? `https://www.youtube.com/watch?v=${YTC.video}` : null}));
+    };
+    if(q.get('refind')==='1'){
+      ytcInvalidateVideo('/yt?refind=1 による手動の探し直し');
+      ytcResolveChatId().then(done).catch(e=>{ YTC.lastError=e.message; done(); });
+      return;
+    }
+    done(); return;
+  }
+
   if(urlPath==='/chat'){
     const q=new URL(req.url,'http://x').searchParams;
     res.setHeader('Content-Type','application/json');
@@ -5705,6 +5860,8 @@ tick(); setInterval(tick, ${ms});
         recent:chatLog.slice(-10).reverse(),
         received:chatSeen.slice(-10).reverse()},
       youtube:YTC.enabled ? {video:YTC.video, chatId:YTC.chatId, pollSec:YTC.pollSec,
+        channel:YTC.channel||null, autoFind:YTC.autoFind,
+        searchCallsToday:YTC._searchCalls, lastError:YTC.lastError||null,
         mode:YTC.mode, intervalSec:YTC.curSec, reconnects:YTC.reconnects,
         chatActive: !!(YTC.lastMsgAt && Date.now()-YTC.lastMsgAt < YTC.activeSec*1000),
         polls:YTC.polls, pushes:YTC.pushes, seen:YTC.seen, commands:YTC.cmds,
@@ -6044,6 +6201,7 @@ function startLoops(){
     setInterval(saveCity, Math.max(10,CITY_SAVE_SEC)*1000);           // 街の状態を定期保存
   }
   if(YTC.enabled){
+    ytcLoadLive();     // 前回見つけた動画ID / 学習済みチャンネルIDを復元
     const hasAuth = YTC.key || YTC.token || (YTC.refresh && YTC.clientId && YTC.clientSecret);
     if((!YTC.video && !YTC.channel) || !hasAuth){
       console.warn('[YTChat] 設定不足 → 無効化 '

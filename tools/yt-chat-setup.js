@@ -13,6 +13,11 @@
  *      node tools/yt-chat-setup.js check --video=VIDEO_ID \
  *           --client-id=xxx --client-secret=yyy --refresh=zzz
  *
+ *   4) いま配信中の動画IDを探す (配信を立て直してIDが変わったとき)
+ *      node tools/yt-chat-setup.js find --key=API_KEY --channel=CHANNEL_ID
+ *      node tools/yt-chat-setup.js find --key=API_KEY --video=前のVIDEO_ID
+ *        → 動画IDからチャンネルを引いてから探す。サーバ側 (YT_AUTO_FIND) と同じ手順。
+ *
  * 【秘密情報について】このスクリプトは受け取った値を**この端末の標準出力にしか出さない**。
  * どこにも送信しないし、ファイルにも書かない。表示された値は .env などに自分で控えること
  * (.gitignore で .env は除外済み)。
@@ -182,7 +187,64 @@ async function auth() {
   }
 }
 
+// ── find: いま配信中の動画IDを探す ─────────────────────────────────────────
+//   server.js の ytcFindLiveVideo と同じ手順。search.list (100 units) を避けて
+//   アップロード一覧をたどる (合計 3 units)。見つからないときだけ search に落とす。
+async function find() {
+  if (!args.key && !args.refresh) die('--key か (--client-id --client-secret --refresh) のどちらかが要る');
+  const token = await accessTokenFromRefresh();
+  let channel = args.channel || '';
+
+  if (!channel) {
+    if (!args.video) die('--channel か --video のどちらかが要る');
+    const v = await call('videos', { part: 'snippet', id: args.video }, token);
+    if (!v.ok) die(`videos.list に失敗: ${v.status} ${v.reason} ${v.error}`);
+    channel = (((v.json.items || [])[0] || {}).snippet || {}).channelId || '';
+    if (!channel) die(`動画 ${args.video} からチャンネルIDを引けなかった`);
+    console.log(`  チャンネルID: ${channel}  (動画 ${args.video} から取得 / 1 unit)`);
+  }
+
+  const c = await call('channels', { part: 'contentDetails', id: channel }, token);
+  if (!c.ok) die(`channels.list に失敗: ${c.status} ${c.reason} ${c.error}`);
+  const up = ((((c.json.items || [])[0] || {}).contentDetails || {}).relatedPlaylists || {}).uploads;
+  if (!up) die(`チャンネル ${channel} のアップロード一覧が取れない`);
+
+  const pl = await call('playlistItems', { part: 'contentDetails', playlistId: up, maxResults: 5 }, token);
+  if (!pl.ok) die(`playlistItems.list に失敗: ${pl.status} ${pl.reason} ${pl.error}`);
+  const ids = (pl.json.items || []).map(it => (it.contentDetails || {}).videoId).filter(Boolean);
+  console.log(`  直近の動画: ${ids.join(', ') || '(なし)'}`);
+
+  let live = null;
+  if (ids.length) {
+    const v = await call('videos', { part: 'liveStreamingDetails', id: ids.join(',') }, token);
+    if (!v.ok) die(`videos.list に失敗: ${v.status} ${v.reason} ${v.error}`);
+    live = (v.json.items || []).find(it => (it.liveStreamingDetails || {}).activeLiveChatId) || null;
+  }
+
+  if (!live) {
+    console.log('  アップロード一覧に配信中のものが無い → search.list を試す (100 units)');
+    const sr = await call('search', { part: 'id', channelId: channel, eventType: 'live', type: 'video', maxResults: 1 }, token);
+    if (!sr.ok) die(`search.list に失敗: ${sr.status} ${sr.reason} ${sr.error}`);
+    const id = (((sr.json.items || [])[0] || {}).id || {}).videoId;
+    if (!id) die('配信中の動画が見つからない (いま配信していない可能性)');
+    const v = await call('videos', { part: 'liveStreamingDetails', id }, token);
+    live = (v.json.items || [])[0] || null;
+    if (!live || !(live.liveStreamingDetails || {}).activeLiveChatId)
+      die(`動画 ${id} は見つかったが activeLiveChatId が無い`);
+  }
+
+  console.log('\n✓ 配信中の動画が見つかりました:\n');
+  console.log(`  YT_VIDEO_ID=${live.id}`);
+  console.log(`  YT_CHANNEL_ID=${channel}`);
+  console.log(`  liveChatId: ${mask(live.liveStreamingDetails.activeLiveChatId)}`);
+  console.log(`  https://www.youtube.com/watch?v=${live.id}`);
+  console.log('\n  ※ サーバ側は YT_AUTO_FIND (既定で有効) が同じことを自動でやるので、');
+  console.log('     .env を書き換えなくても次の配信に追従します。');
+  console.log('     いますぐ探し直させたいときは: curl "http://localhost:8080/yt?refind=1"\n');
+}
+
 (async () => {
   if (cmd === 'auth') await auth();
+  else if (cmd === 'find') await find();
   else await check();
 })().catch(e => die(e.message));
