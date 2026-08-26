@@ -1247,13 +1247,39 @@ const SHARED_GEO = new Set();
 const ICON_SIZE=CELL*0.42*CHAR_SCALE;
 const _iconGeo=new THREE.PlaneGeometry(ICON_SIZE, ICON_SIZE);
 SHARED_GEO.add(_iconGeo);          // disposeScene で壊さない (全住民で共有)
+// 吹き出しは 64x52 の絵なので、その比率の板を使う (正方形だと潰れる)
+const _bubbleGeo=new THREE.PlaneGeometry(ICON_SIZE*1.15, ICON_SIZE*1.15*52/64);
+SHARED_GEO.add(_bubbleGeo);
 const _iconMats={};
 
-// 立ち話の吹き出し。欲求アイコンと同じ板 (NEED_ICONS=0 でも出す)
-const TALK_EMOJI={talk:'💬'};
+// 立ち話の吹き出し。**絵文字を使わない**。
+//   本番 (Linux) には絵文字フォントが無く、💬 が豆腐になっていた
+//   (配信画面の日本語が化けたのと同じ原因)。図形だけで描けばフォントに依存しない。
+async function buildTalkBubble(){
+  try{
+    const W=64, H=52;
+    const {tex,opaque}=await svgTexture(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`
+      +`<rect x="3" y="3" width="${W-6}" height="34" rx="12" fill="#ffffff" fill-opacity="0.93"`
+      +` stroke="#16323d" stroke-width="3"/>`
+      +`<path d="M20 36 L20 49 L34 36 Z" fill="#ffffff" fill-opacity="0.93"`
+      +` stroke="#16323d" stroke-width="3" stroke-linejoin="round"/>`
+      +`<circle cx="20" cy="20" r="3.6" fill="#16323d"/>`
+      +`<circle cx="32" cy="20" r="3.6" fill="#16323d"/>`
+      +`<circle cx="44" cy="20" r="3.6" fill="#16323d"/></svg>`);
+    if(opaque>50) _iconMats.talk=new THREE.MeshBasicMaterial(
+      {map:tex, transparent:true, depthTest:false});
+  }catch(e){ /* sharp が無い等 → iconMat のフォールバック板 */ }
+  if(_iconMats.talk){
+    _iconMats.talk.userData.shared=true;
+    if(_iconMats.talk.map){ _iconMats.talk.map.userData=_iconMats.talk.map.userData||{};
+                            _iconMats.talk.map.userData.shared=true; }
+  }
+}
+
 // 起動時に全絵文字をテクスチャ化しておく (毎フレーム生成しない)
 async function buildNeedIcons(){
-  for(const [kind,emoji] of Object.entries({...NEED_EMOJI, ...TALK_EMOJI})){
+  for(const [kind,emoji] of Object.entries(NEED_EMOJI)){
     let mat=null;
     try{
       const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_PX}" height="${ICON_PX}">`
@@ -1275,9 +1301,9 @@ async function buildNeedIcons(){
     if(mat.map){ mat.map.userData=mat.map.userData||{}; mat.map.userData.shared=true; }
     _iconMats[kind]=mat;
   }
-  const kinds=Object.keys(NEED_EMOJI).length+Object.keys(TALK_EMOJI).length;
-  const emojiOk=Object.values(_iconMats).filter(m=>m.map).length;
-  console.log(`[Life] 頭上アイコン生成: ${emojiOk}/${kinds} 種が絵文字`
+  const kinds=Object.keys(NEED_EMOJI).length;
+  const emojiOk=Object.keys(NEED_EMOJI).filter(k=>_iconMats[k] && _iconMats[k].map).length;
+  console.log(`[Life] 欲求アイコン生成: ${emojiOk}/${kinds} 種が絵文字`
             + (emojiOk<kinds ? ' (残りは色板フォールバック)' : ''));
 }
 function iconMat(kind){
@@ -1321,7 +1347,7 @@ function updateTalkBubbles(cam){
     if(a.talkIcon && !on){ scene.remove(a.talkIcon); a.talkIcon=null; }
     if(!on) continue;
     if(!a.talkIcon){
-      a.talkIcon=new THREE.Mesh(_iconGeo, iconMat('talk'));
+      a.talkIcon=new THREE.Mesh(_bubbleGeo, iconMat('talk'));
       scene.add(a.talkIcon);
     }
     a.talkIcon.position.set(m.position.x, m.position.y, m.position.z + CELL*0.62*CHAR_SCALE + ICON_SIZE*0.6);
@@ -1500,6 +1526,51 @@ async function refreshHudCam(){
   hudScene.add(hudCam2);
 }
 
+// ── 会話ログ (画面左下) ─────────────────────────────────────────────────────
+// 頭上の吹き出しだけだと、配信のカメラ距離では何が起きているか読めない。
+// チャットログのように左下へ流す。焼き込む文字は **ASCII のみ** (_ascii)。
+//   本番 (Linux) には日本語フォントも絵文字フォントも無く、非ASCIIは全部豆腐になる。
+const TALK_LOG_ON   = process.env.TALK_LOG !== '0';
+const TALK_LOG_N    = Math.max(2, Math.min(8, envNum('TALK_LOG_LINES', 5)));
+const TALK_LOG_W    = envNum('TALK_LOG_W', 505);   // 名前22 + 本文44 が収まる幅
+const TALK_LOG_LH   = 17;                      // 行の高さ
+const TALK_LOG_H    = TALK_LOG_N*TALK_LOG_LH + 14;
+let hudTalkLog=null, talkLog=[], talkLogDirty=false, talkLogBusy=false, talkLogAt=0;
+
+// 会話ログに1行足す。name は話し手、text は本文 (どちらも ASCII に落とす)。
+function pushTalkLine(name, text){
+  if(!TALK_LOG_ON) return;
+  // 先にコロンを付けて切ると、コロンごと落ちて名前と本文がくっつく
+  talkLog.push({name:_ascii(name).slice(0,22)+':', text:_ascii(text).slice(0,44)});
+  while(talkLog.length>TALK_LOG_N) talkLog.shift();
+  talkLogDirty=true;
+}
+
+async function refreshTalkLog(){
+  if(!hudScene) return;
+  talkLogDirty=false;
+  const lines=talkLog.slice(-TALK_LOG_N);
+  const rows=lines.map((l,i)=>{
+    const y=18+i*TALK_LOG_LH;
+    // 名前だけ色を変える。等幅なので名前の幅は文字数から出せる。
+    return `<text x="10" y="${y}" font-size="12.5" font-family="${HUD_MONO}">`
+         + `<tspan fill="#00d2a0">${_esc(l.name)}</tspan>`
+         + `<tspan fill="#cfe3dc"> ${_esc(l.text)}</tspan></text>`;
+  }).join('');
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${TALK_LOG_W}" height="${TALK_LOG_H}">`
+    +`<rect width="${TALK_LOG_W}" height="${TALK_LOG_H}" rx="6" fill="#050b10" fill-opacity="0.72"/>`
+    +`<rect x="0" y="0" width="3" height="${TALK_LOG_H}" fill="#00d2a0" fill-opacity="0.8"/>`
+    +rows+`</svg>`);
+  if(hudTalkLog){ hudScene.remove(hudTalkLog); hudTalkLog.material.map.dispose();
+                  hudTalkLog.material.dispose(); hudTalkLog.geometry.dispose(); }
+  hudTalkLog=hudPlane(TALK_LOG_W, TALK_LOG_H, tex);
+  // ティッカーの帯 (高さ HUD_TICKER_H + 余白6) の上に置く
+  hudTalkLog.position.set(-WIDTH/2+TALK_LOG_W/2+12,
+                          -HEIGHT/2+HUD_TICKER_H+6+TALK_LOG_H/2+10, 1);
+  hudScene.add(hudTalkLog);
+}
+
 // ── イベントの一言バナー ────────────────────────────────────────────────────
 //   「〇〇が建ちました」「〇〇がなくなりました」を数秒だけ大きく出す。
 //   ティッカーは一周に時間がかかるので、その瞬間に見せたいものは別枠にする。
@@ -1558,6 +1629,11 @@ function updateHud(dt){
   if(!hudCamBusy && now-hudCamAt>1000){
     hudCamBusy=true; hudCamAt=now;
     refreshHudCam().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudCamBusy=false;});
+  }
+  // 会話ログ (新しい行が来たときだけ作り直す)
+  if(TALK_LOG_ON && talkLogDirty && !talkLogBusy && now-talkLogAt>700){
+    talkLogBusy=true; talkLogAt=now;
+    refreshTalkLog().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{talkLogBusy=false;});
   }
   if(hudTicker){
     hudTicker.position.x -= HUD_SPEED*dt;
@@ -3594,6 +3670,9 @@ function freshShopFor(a, b){
   for(const k in (a.pref||{})){
     const st=cellStruct[k];
     if(!st || st.state!=='open' || !st.founded) continue;
+    // 跡地を再利用すると同じキーの typeIdx が住宅などに化ける。
+    // 弾かないと「the new House を試した?」という会話になる。
+    if(!CHOOSABLE(st.typeIdx)) continue;
     if(today-(st.born||0) > NEWSHOP_DAYS) continue;
     if(prefOf(b,k) > 0.05) continue;            // b はもう知っている
     return k;
@@ -3607,7 +3686,8 @@ function deadShopFor(a, b){
     const st=cellStruct[k];
     // 建物ごと消えた / 閉店・解体中 = もう無い店。開いている店を拾わないこと
     // (条件を反転させると、健全な店の好みを会話のたびに消してしまう)。
-    if(!st || (st.state!=='open' && st.state!=='construction')) return k;
+    if(!st) return k;
+    if(st.state!=='open' && st.state!=='construction' && CHOOSABLE(st.typeIdx)) return k;
   }
   return null;
 }
@@ -3627,23 +3707,62 @@ function applyTopic(a, b, topic){
 }
 
 // 立ち話が始まった。吹き出しはレンダラ側 (updateTalkBubbles) が拾う。
+// 会話の中身。**ASCII の英語だけ**にする (本番 Linux に日本語フォントが無い)。
+// 話し手の一言と、相手の返しの2行を出す。
+const TALK_LINES = {
+  newshop: {
+    say:  p=>[`Have you tried the new ${p}?`,
+              `There's a new ${p} now.`,
+              `They just opened a ${p} nearby.`],
+    reply:p=>[`Not yet - I should go.`, `Really? I'll check it out.`, `Oh, I hadn't heard.`],
+  },
+  closed: {
+    say:  p=>[`The ${p} is gone now.`, `Did you hear the ${p} closed?`,
+              `No more ${p} around here.`],
+    reply:p=>[`That's a shame.`, `I liked that place.`, `Guess I'll go somewhere else.`],
+  },
+  place: {
+    say:  p=>[`I always end up at the ${p}.`, `The ${p} is my usual spot.`,
+              `You should try the ${p}.`],
+    reply:p=>[`Good to know.`, `I'll keep that in mind.`, `Maybe I'll come along.`],
+    // 行きつけが無いときの当たり障りのない会話
+    small:  [`Nice weather today.`, `Busy street lately.`, `Long day, isn't it?`,
+             `This town keeps changing.`, `Haven't seen you in a while.`],
+    smallR: [`Sure is.`, `Right?`, `Tell me about it.`, `Same here.`, `Good to see you.`],
+  },
+};
+const _one = arr => arr[Math.floor(Math.random()*arr.length)];
+
 let _talkNewsAt=0;
 function onTalk(a, b, topic){
   if(!TALK_NEWS) return;
-  // 立ち話は多いので、話題のあるもの (新店/閉店) を優先し、
-  // ただの世間話は間隔を空けてしか流さない。
-  const now=Date.now();
-  if(topic.kind==='place'){
-    if(now-_talkNewsAt < TALK_NEWS_COOL_SEC*1000) return;
-  }
-  _talkNewsAt=now;
   const st=topic.key ? cellStruct[topic.key] : null;
-  const what = topic.kind==='newshop' && st ? ` about the new ${enOf(st.typeIdx)}`
-             : topic.kind==='closed'  && st ? ` about the ${enOf(st.typeIdx)} that closed`
-             : '';
+  const T=TALK_LINES[topic.kind] || TALK_LINES.place;
+  // place のときは話し手の行きつけを使う。無ければ世間話。
+  let place=st ? enOf(st.typeIdx) : null;
+  if(!place && topic.kind==='place'){
+    const best=prefBest(a, null);
+    // prefBest は open かどうかしか見ない。跡地の再利用で住宅に化けていることが
+    // あるので、ここでも「訪問先になる種類か」を確かめる。
+    place = (best && CHOOSABLE(best.st.typeIdx)) ? enOf(best.st.typeIdx) : null;
+  }
+  if(place){
+    pushTalkLine(a.name, _one(T.say(place)));
+    pushTalkLine(b.name, _one(T.reply(place)));
+  }else{
+    pushTalkLine(a.name, _one(TALK_LINES.place.small));
+    pushTalkLine(b.name, _one(TALK_LINES.place.smallR));
+  }
+  // ティッカーには「話題のあるもの」だけ流す。世間話まで流すと開店/閉店の
+  // ニュースを押し出すし、左下の会話ログと二重になる。
+  if(topic.kind==='place' || !st) return;
+  const now=Date.now();
+  if(now-_talkNewsAt < TALK_NEWS_COOL_SEC*1000) return;
+  _talkNewsAt=now;
+  const what = topic.kind==='newshop' ? `word is spreading about the new ${enOf(st.typeIdx)}`
+                                      : `the ${enOf(st.typeIdx)} closing is the talk of the town`;
   lifeNews.push({day:gameDay(), shape:'talk',
-    en:`${_ascii(a.name)} is chatting with ${_ascii(b.name)}${what}`,
-    ja:`${a.name} と ${b.name} が立ち話している`});
+    en:_ascii(what), ja:`${a.name} と ${b.name} が立ち話している`});
   while(lifeNews.length>12) lifeNews.shift();
   hudNewsDirty=true;
 }
@@ -6496,7 +6615,8 @@ function startLoops(){
   await preloadTextures();
   await loadRaycastTextures();   // エージェント観測(FPV)用の64×64テクスチャ
   // 頭上の欲求アイコン(絵文字)のテクスチャ化 — 一旦非表示 (NEED_ICONS=1 で復活)
-  if(NEED_ICONS || SOCIAL_ON) await buildNeedIcons();   // 吹き出しは SOCIAL でも要る
+  if(NEED_ICONS) await buildNeedIcons();
+  if(SOCIAL_ON)  await buildTalkBubble();   // 吹き出しは NEED_ICONS と無関係に要る
 
   console.log('[Init] restoring city state...');
   initCity();                    // 保存された街を復元 (無ければ生成)。MAP を差し替えることがある
