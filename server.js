@@ -130,7 +130,11 @@ const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 // ─── Sim constants ────────────────────────────────────────────────────────────
 // 環境変数の数値読み。`parseInt(x)||既定` は 0 を指定できないので使わない。
 const envNum=(k,d)=>{ const v=parseFloat(process.env[k]); return Number.isFinite(v)?v:d; };
-const GRID=30, CELL=2.0, TICK=parseInt(process.env.TICK)||150;
+// 街の最大の一辺 (セル数)。実寸は GRID*CELL。
+//   ★ 変えると保存済みの街を読めなくなる (loadCity が j.grid!==GRID で弾く)。
+//     本番で広げるときは data/city_state.json を退避してから。
+const GRID=Math.max(10, Math.min(120, parseInt(process.env.GRID)||30));
+const CELL=2.0, TICK=parseInt(process.env.TICK)||150;
 // 軌跡(trail)の最大点数。長いほど遠くまで残るが描画コスト(メッシュ数)が増える。
 // 環境変数 MAX_TRAIL で可変。例: MAX_TRAIL=300 node server.js
 const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||10;
@@ -146,6 +150,9 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マー�
 const MW = require('./world.js');
 // 住民どうしの関係と立ち話。街の物理/経済と混ざると読めなくなるので別ファイル。
 const SOC = require('./social.js');
+// お金・仕事・追い詰められ度・犯罪。犯罪だけ足すと飾りになるので、
+// 「失業 → 無一文 → 犯行 → 店の売上減 → さらに失業」の環ごと持たせる。
+const ECO = require('./economy.js');
 const { OTHER, ROAD, BUILDING, TREE } = MW;
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
@@ -236,6 +243,12 @@ function loadPersonaDefs(){
       desc: p.desc || '',
       // 起業性向 [0,1]。街に足りない業種を自分で開くかどうかの重み (0=絶対に起業しない)。
       enterprise: Number.isFinite(+p.enterprise) ? Math.max(0,Math.min(1,+p.enterprise)) : 0.3,
+      // ここは**ホワイトリスト**なので、personas.json に足した項目は
+      // ここにも書かないと黙って既定値になる (sociability / honesty で実際に踏んだ)。
+      // 社交性 [0,1]: 他の住民とどれだけ早く親しくなるか (social.js)
+      sociability: Number.isFinite(+p.sociability) ? Math.max(0,Math.min(1,+p.sociability)) : 0.4,
+      // 正直さ [0,1]: 追い詰められても踏みとどまる強さ (economy.js)
+      honesty:     Number.isFinite(+p.honesty)     ? Math.max(0,Math.min(1,+p.honesty))     : 0.6,
     };
   });
 }
@@ -865,10 +878,26 @@ const BLDG_TYPES = [
   { label:'🖼 博物館',    name:'museum',      footprint:2, height:1.7, category:'tour',    persona:'E',  fallbackColor:0xa09060, textureFile:'./textures/v4/museum.jpg' },
   { label:'🏟 競技場',    name:'stadium',     footprint:2, height:2.1, category:'leisure', persona:'C',  fallbackColor:0x60a080, textureFile:'./textures/v4/stadium.jpg' },
   { label:'🏬 複合ビル',  name:'mall',        footprint:2, height:2.6, category:'shop',    persona:'CD', fallbackColor:0x5878a0, textureFile:'./textures/v4/mall.jpg' },
+  // ★ 追加は必ず**末尾**にすること。途中に挿すと typeIdx がずれて
+  //   保存済みの街 (data/city_state.json) の建物が別物に化ける。
+  //   末尾なら既存の 0〜24 はそのままで、学習済みモデルの goal クラス
+  //   (meta.bldgToZ) に無い型は goalZ=null になるだけで安全に無視される。
+  { label:'🚓 警察署',    name:'police',      footprint:1, height:1.7, category:'civic',   persona:'D',  fallbackColor:0x2d4a72, textureFile:'./textures/v4/police.jpg' },
+  // 学校。既存の 'school' (17) は総合的な学び舎として残し、
+  // 学齢別の4つをここに足す。学生は平日ここへ通う (SCHOOL_OF)。
+  // 小学校と中学校は 1x1。fp=2 は「町」以上でしか建てられないので、
+  // 2マスにすると村に子どもが居ても学校が建たない (実際に建たなかった)。
+  { label:'🏫 小学校',    name:'elementary',  footprint:1, height:1.1, category:'learn',   persona:'F',  fallbackColor:0xe8a13a, textureFile:'./textures/v4/elementary.jpg' },
+  { label:'🏫 中学校',    name:'junior',      footprint:1, height:1.4, category:'learn',   persona:'H',  fallbackColor:0x3f8f6f, textureFile:'./textures/v4/junior.jpg' },
+  { label:'🏫 高校',      name:'high',        footprint:2, height:1.7, category:'learn',   persona:'I',  fallbackColor:0x3a6fb0, textureFile:'./textures/v4/high.jpg' },
+  { label:'🎓 大学',      name:'university',  footprint:2, height:2.1, category:'learn',   persona:'K',  fallbackColor:0x7a4f9e, textureFile:'./textures/v4/university.jpg' },
 ];
 // footprint 別インデックス (型割当で使用)
-const FP1_IDX = BLDG_TYPES.map((b,i)=>b.footprint===1?i:-1).filter(i=>i>=0);
-const FP2_IDX = BLDG_TYPES.map((b,i)=>b.footprint===2?i:-1).filter(i=>i>=0);
+// 街の初期生成で使わない建物。警察署は「治安が悪くなったから建てた」ものであって
+// 最初から街に散らばっているものではない。混ぜたところ 9軒建って警官が114人になった。
+const NO_SPAWN = new Set(['police','elementary','junior','high','university']);
+const FP1_IDX = BLDG_TYPES.map((b,i)=>(b.footprint===1 && !NO_SPAWN.has(b.name))?i:-1).filter(i=>i>=0);
+const FP2_IDX = BLDG_TYPES.map((b,i)=>(b.footprint===2 && !NO_SPAWN.has(b.name))?i:-1).filter(i=>i>=0);
 
 // ─── 建物タイプの「正準体系」 ────────────────────────────────────────────────
 // このサーバの正は BLDG_TYPES(25) の index。マップ/目的地/agent.goalType は全てこれ。
@@ -1096,6 +1125,17 @@ let occluders = {};
 //   以前はこの処理が buildScene の中にあり、シーンを作り直すたびに全建物の用途が
 //   振り直されていた。それでは「あの店が潰れた」という履歴が一切積み上がらない。
 //   1軒の追加/閉店でシーン全体を作り直さないための土台でもある。
+// 初期生成の建物タイプ。**発展段階の上限を尊重する**。
+//   以前は全タイプから引いていたので、集落の段階でランドマークタワーが
+//   3本並ぶようなことが起きた (本番で発生)。しかも職場は潰れる道が無かった。
+//   CITY がまだ無い時点でも呼ばれるので、そのときは最初の段階 (集落) 扱い。
+function pickGenType(pool, rng){
+  const maxH=(CITY_LEVELS[(CITY&&CITY.level)||0]||CITY_LEVELS[0]).maxH;
+  const ok=pool.filter(t=>BLDG_TYPES[t].height<=maxH+1e-6);
+  const use=ok.length?ok:pool;
+  return use[Math.floor(rng()*use.length)];
+}
+
 function planStructures(map){
   const rng=(()=>{let s=CITY_SEED;return()=>{s=(s*1664525+1013904223)>>>0;return s/0xffffffff;};})();
   // 全4セルが BUILDING の正方形を貪欲に 2x2 として検出し、残りは 1x1。
@@ -1105,14 +1145,14 @@ function planStructures(map){
     if(assigned.has(r+'_'+c))continue;
     if(isB(r,c)&&isB(r+1,c)&&isB(r,c+1)&&isB(r+1,c+1)
        && !assigned.has((r+1)+'_'+c) && !assigned.has(r+'_'+(c+1)) && !assigned.has((r+1)+'_'+(c+1))){
-      const typeIdx=FP2_IDX[Math.floor(rng()*FP2_IDX.length)];
+      const typeIdx=pickGenType(FP2_IDX, rng);
       for(let dr=0;dr<2;dr++)for(let dc=0;dc<2;dc++) assigned.add((r+dr)+'_'+(c+dc));
       structs.push(newStruct(r,c,2,typeIdx,0));
     }
   }
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     if(map[r][c]!==BUILDING || assigned.has(r+'_'+c))continue;
-    const typeIdx=FP1_IDX[Math.floor(rng()*FP1_IDX.length)];
+    const typeIdx=pickGenType(FP1_IDX, rng);
     assigned.add(r+'_'+c);
     structs.push(newStruct(r,c,1,typeIdx,0));
   }
@@ -1126,6 +1166,11 @@ function buildScene(map){
   syncCity();          // CITY.structs -> BUILDING_TYPES / cellStruct を作り直す
 
   const S=new THREE.Scene();S.background=new THREE.Color(0xeaf2f7);
+  // フォグ。頂点もドローコールも増えない (フラグメントシェーダ内の混色だけ)。
+  // 色は updateDayNight が毎フレーム空の色に合わせる。
+  const WORLD_W=GRID*CELL;
+  if(FOG_ON) S.fog=new THREE.Fog(S.background.getHex(),
+                                 WORLD_W*FOG_NEAR_K, WORLD_W*FOG_FAR_K);
   const amb=new THREE.AmbientLight(0xbcd0e0,1.3);   S.add(amb);
   const hemi=new THREE.HemisphereLight(0xeaf2f7,0xc8c0b0,1.1); S.add(hemi);
   const sun=new THREE.DirectionalLight(0xfff4e0,1.7);
@@ -1148,6 +1193,20 @@ function buildScene(map){
   // 建物は構造単位 (1x1 / 2x2) の個別メッシュ。開業/閉店/取り壊しで1軒だけ
   // 差し替えられるよう addStructMesh に集約する。
   for(const st of CITY.structs) addStructMesh(S, st);
+  // どこまでも続く地面。フォグで完全に溶ける距離より外まで伸ばしておけば、
+  // 板の縁は決して見えない = 地平線が空との境界になる。
+  //   板1枚 (2三角形) なので、どれだけ大きくしても負荷は変わらない。
+  //   街の下地 (z=0) と重ならないよう少しだけ沈める。
+  if(FAR_GROUND){
+    const far=Math.max(1200, WORLD_W*FOG_FAR_K*2.2);
+    const fx=fieldCenterW();
+    const g=new THREE.Mesh(new THREE.PlaneGeometry(far, far),
+                           new THREE.MeshLambertMaterial({color:FAR_COLOR}));
+    g.position.set(fx, fx, -0.05);
+    g.renderOrder=-1;                  // 先に描いて、街の板を確実に上に乗せる
+    S.add(g);
+    S.userData.farGround=g;
+  }
   rebuildGround(S);   // 道路 / 草地 / 摩耗 の板 (踏み跡で変わるので別関数)
 
   return S;
@@ -1218,6 +1277,8 @@ function updateDayNight(S){
   S.background.copy(_cNight).lerp(_cDay,d);
   // 曇り/雨は空を鈍色へ寄せ、光を落とす (昼ほど効きが分かりやすい)
   if(w.sky!=null) S.background.lerp(_cWeather.setHex(w.sky), 0.25+0.5*d);
+  // 地平線に色の段差を出さないよう、フォグは常に空と同じ色にする
+  if(S.fog) S.fog.color.copy(S.background);
   L.sun.color.copy(_sNight).lerp(_sDay,d).lerp(_sDusk,dusk*0.55*w.light);
   L.sun.intensity  = (0.15+1.55*d)*w.light;
   L.amb.color.copy(_gNight).lerp(_gDay,d);
@@ -1232,6 +1293,19 @@ function updateDayNight(S){
 //   ★ 2026-08-21: 「何のアイコンか分かりにくい」ため**一旦すべて非表示**にしている。
 //     実装は丸ごと残してあるので、復活させるときは NEED_ICONS を true にするか
 //     環境変数 NEED_ICONS=1 で起動するだけでよい (呼び出し側の2か所がこれを見ている)。
+// ── 地平線とフォグ ─────────────────────────────────────────────────────────
+// フィールドの外を何も描かないでいると、街が小さいうちは「板が宙に浮いている」
+// ように見えて空との境目が曖昧になる。そこで
+//   ・フィールドの外側にどこまでも続く地面を1枚敷く (板1枚 = 2三角形 = 1ドローコール)
+//   ・遠くをフォグで空の色に溶かす (シェーダ内の計算なので頂点もドローコールも増えない)
+// フォグの色は空の色に追従させる。ズレると地平線に色の段差が出る。
+const FOG_ON     = process.env.FOG !== '0';
+const FAR_GROUND = process.env.FAR_GROUND !== '0';
+const FAR_COLOR  = parseInt(process.env.FAR_COLOR || '0x93ab74', 16);  // 遠景の土地の色
+// フォグの効き始め / 完全に溶ける距離。街の実寸 (GRID*CELL) を基準にする。
+const FOG_NEAR_K = envNum('FOG_NEAR_K', 0.85);
+const FOG_FAR_K  = envNum('FOG_FAR_K', 3.2);
+
 const NEED_ICONS = process.env.NEED_ICONS === '1';
 const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱'};
 const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈'};
@@ -1583,9 +1657,14 @@ async function refreshTalkLog(){
   const disp=[];
   for(let i=talkLog.length-1; i>=0 && disp.length<TALK_LOG_ROWS; i--)
     disp.unshift(...wrapTalkLine(talkLog[i], TALK_LOG_COLS));
-  const lines=disp.slice(-TALK_LOG_ROWS);
+  let lines=disp.slice(-TALK_LOG_ROWS);
+  // 先頭が「前の会話の折り返しの続き」だけになると、誰の台詞か分からない断片が
+  // 浮いて見える。名前のある行が来るまで落とす。
+  while(lines.length && !lines[0].name) lines.shift();
+  // 新しい行がいつも同じ高さに来るよう下揃えにする
+  const top=TALK_LOG_ROWS-lines.length;
   const rows=lines.map((l,i)=>{
-    const y=TALK_LOG_LH+i*TALK_LOG_LH-1;
+    const y=TALK_LOG_LH+(top+i)*TALK_LOG_LH-1;
     const body=`<tspan fill="#cfe3dc">${_esc((l.name?' ':'')+l.indent+l.text)}</tspan>`;
     return `<text x="${TALK_LOG_PAD}" y="${y}" font-size="${TALK_LOG_FS}"`
          + ` xml:space="preserve" font-family="${HUD_MONO}">`
@@ -1927,10 +2006,25 @@ const SICK_HI       = 0.35;        // これを超えたら病院へ (低めの�
 const IDX_OF   = n => BLDG_NAME_TO_IDX[n];
 const FOOD_IDX = ['kiosk','ramen','gyudon','cafe','bento'].map(IDX_OF).filter(v=>v!=null);
 const HOME_IDX = ['house','apartment'].map(IDX_OF).filter(v=>v!=null);
-const WORK_IDX = ['office','tower','bank','post','cityhall'].map(IDX_OF).filter(v=>v!=null);
+const WORK_IDX = ['office','tower','bank','post','cityhall','police'].map(IDX_OF).filter(v=>v!=null);
+const POLICE_IDX = IDX_OF('police');
+// 学齢別の学校。学生は平日ここへ通う。
+const SCHOOL_IDX = {
+  elementary: IDX_OF('elementary'), junior: IDX_OF('junior'),
+  high:       IDX_OF('high'),       university: IDX_OF('university'),
+};
+const SCHOOL_ALL = Object.values(SCHOOL_IDX).filter(v=>v!=null);
+// どのペルソナがどの学校に通うか。ここに無い住民は通学しない (働く)。
+//   personas.json の schoolLevel でも上書きできる。
+const SCHOOL_OF_PERSONA = { L:'elementary', F:'elementary', H:'junior', I:'high', N:'high', K:'university' };
+const schoolLevelOf = a =>
+  (a.def && a.def.schoolLevel) || SCHOOL_OF_PERSONA[a.def && a.def.id] || null;
 const CARE_IDX = ['hospital','pharmacy'].map(IDX_OF).filter(v=>v!=null);        // 病気
 const BUY_IDX  = ['conbini','supermarket','shop','mall'].map(IDX_OF).filter(v=>v!=null); // 買い物
+// 店も雇用の場にする (economy.js)。ここが閉まると本当に人が職を失う。
+const SHOP_JOB_IDX = [];
 const FUN_IDX  = ['stadium','temple','museum','library'].map(IDX_OF).filter(v=>v!=null);  // 退屈しのぎ
+SHOP_JOB_IDX.push(...FOOD_IDX, ...BUY_IDX, ...FUN_IDX, ...CARE_IDX);
 
 // ゲーム内時刻 [0,24)。起動時刻は START_HOUR から始まる (既定 8時 = 朝の活動時間)。
 //   実時間に直接紐づけると、起動タイミング次第で深夜(=全員sleep)から始まってしまうため。
@@ -2025,6 +2119,7 @@ const EXPAND_TREES    = envNum('EXPAND_TREES', 3);       // 新しい土地の�
 const HOUSE_CAP       = envNum('HOUSE_CAP', 2);
 const APT_CAP         = envNum('APT_CAP', 12);
 const WORK_CAP        = envNum('WORK_CAP', 6);           // 1つの職場が受け入れる人数
+const SHOP_JOBS       = envNum('SHOP_JOBS', 2);          // 店1軒が雇う人数 (economy.js)
 const POP_GROWTH      = envNum('POP_GROWTH', 0.15);      // 1日の転入は人口の何割か
 const MOVEIN_MAX      = envNum('MOVEIN_MAX', 8);         // 1日の転入の上限
 const HOME_PRESSURE   = envNum('HOME_PRESSURE', 0.85);   // 定員のこの割合を超えたら住宅を建てる
@@ -2074,7 +2169,8 @@ const NEED_CAT  = { eat:'eat', shop:'shop', bored:'fun', sick:'care' };
 const CAT_IDX   = { eat:FOOD_IDX, shop:BUY_IDX, fun:FUN_IDX, care:CARE_IDX,
                     home:HOME_IDX, work:WORK_IDX };
 const CAT_LABEL = { eat:'飲食店', shop:'買い物する場所', fun:'遊ぶ場所', care:'医療',
-                    home:'住むところ', work:'働くところ' };
+                    home:'住むところ', work:'働くところ', civic:'公共の施設',
+                    learn:'学ぶところ' };
 
 // 配信画面 (HUD) は英語で描く。Linux に日本語フォントが無いと豆腐になるため、
 // 焼き込む文字は ASCII に統一する。ログ / /city / WebSocket は日本語のまま。
@@ -2088,7 +2184,8 @@ const BLDG_EN = {
 };
 const enOf = t => BLDG_EN[BLDG_TYPES[t].name] || BLDG_TYPES[t].name;
 const CAT_EN = { eat:'food', shop:'shops', fun:'leisure', care:'healthcare',
-                 home:'housing', work:'workplaces' };
+                 home:'housing', work:'workplaces', civic:'public services',
+                 learn:'schools' };
 
 // いまの発展段階で建てられるか。方策の goal は BLDG_TYPES(25) の one-hot なので、
 // **新種を作らない限り再学習は不要**。増えるのは「いつ建つか」だけ。
@@ -2395,14 +2492,15 @@ function cityToJSON(){
   const own={};
   for(const a of agents){
     const rel=SOCIAL_ON ? SOC.serializeAgent(a, REL_SAVE) : undefined;
-    if(a.seenMask || a.owns || a.viewer || a.cheers || rel || (a.pref && Object.keys(a.pref).length)){
+    const eco=ECON_ON ? ECO.serializeAgent(a) : undefined;
+    if(a.seenMask || a.owns || a.viewer || a.cheers || rel || eco || (a.pref && Object.keys(a.pref).length)){
       // 好みは上位6件だけ保存する (1000人ぶん全部持つと保存ファイルが膨らむ)
       const top=Object.entries(a.pref||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,6);
       own[a.aid]={m:a.seenMask||0, o:a.owns||null,
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
                   b:a.viewer?a.by:undefined, c:a.cheers||undefined,
                   p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
-                  t:a.taught||undefined, r:rel};
+                  t:a.taught||undefined, r:rel, e:eco};
     }
   }
   return {
@@ -2413,7 +2511,8 @@ function cityToJSON(){
     structs:CITY.structs.map(st=>({...st})),
     foot:Array.from(CITY.foot),
     demand:Object.fromEntries(CATS.map(c=>[c, Array.from(CITY.demand[c], v=>+v.toFixed(2))])),
-    unmet:CITY.unmet, stats:CITY.stats, news:CITY.news.slice(-200), agents:own,
+    unmet:CITY.unmet, stats:CITY.stats, unrest:CITY.unrest||0,
+    news:CITY.news.slice(-200), agents:own,
     waiting:CITY.waiting||[], recs:CITY.recs||[],
   };
 }
@@ -2509,7 +2608,9 @@ function freshCity(){
     foot:new Int32Array(GRID*GRID),
     demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
     unmet:Object.fromEntries(CATS.map(c=>[c,0])),
-    stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0},
+    stats:{roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
+           crimes:0,jobsLost:0},
+    unrest:0,
     news:[], savedAgents:{}, diag:freshDiag(),
     waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
     recs:[],                         // 視聴者のおすすめ (どこまで広まったか)
@@ -2540,7 +2641,9 @@ function initCity(){
       foot:Int32Array.from(j.foot||[]),
       demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
-      stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0}, j.stats||{}),
+      stats:Object.assign({roadsBorn:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
+                          crimes:0,jobsLost:0}, j.stats||{}),
+      unrest:j.unrest||0,
       news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
       waiting:j.waiting||[], recs:j.recs||[],
     };
@@ -2602,22 +2705,68 @@ function assignHomes(){
     else if(a.work && !okWork(a.work)) a.work=null;
     if(a.work && !a.owns) wocc[cellKey(a.work)]=(wocc[cellKey(a.work)]||0)+1;
   }
-  const homeStructs=openStructsOf(HOME_IDX), workStructs=openStructsOf(WORK_IDX);
-  const take=(list, table, capOf)=>{
+  const homeStructs=openStructsOf(HOME_IDX);
+  // 職場はオフィス類だけでなく**店も含める**。そうしないと、開店・閉店を
+  // 繰り返している店が誰の職場でもなく、「店が潰れて職を失う」が起きない。
+  const workStructs=ECON_ON
+    ? openStructsOf(WORK_IDX).concat(openStructsOf(SHOP_JOB_IDX))
+    : openStructsOf(WORK_IDX);
+  // 定員は建物の大きさで決まる (economy.js の capacityOf と同じ規則)。
+  // タワーは定員が多いぶん、埋まらないと維持費に負ける。
+  const capOfWork = (t, st) => (ECON_ON && SHOP_JOB_IDX.includes(t)) ? SHOP_JOBS
+                    : (ECON_ON && st) ? workCapOf(st) : WORK_CAP;
+  //   spread=true のときは「いま一番空いている所」へ入れる。
+  //   先頭から詰めると、職場ではオフィスばかりが埋まって店に人が回らず、
+  //   「店が潰れて職を失う」が構造的に起きなくなる (実際に起きなかった)。
+  const take=(list, table, capOf, spread)=>{
     let spill=null, spillN=Infinity;
-    for(const st of list){
-      const k=st.r+'_'+st.c, n=table[k]||0;
-      if(n < capOf(st.typeIdx)){ table[k]=n+1; return [st.r,st.c]; }
-      if(n < spillN){ spillN=n; spill=st; }
+    if(spread){
+      let best=null, bestN=Infinity;
+      for(const st of list){
+        const n=table[st.r+'_'+st.c]||0;
+        if(n < capOf(st.typeIdx, st) && n < bestN){ bestN=n; best=st; }
+        if(n < spillN){ spillN=n; spill=st; }
+      }
+      if(best){ const k=best.r+'_'+best.c; table[k]=(table[k]||0)+1; return [best.r,best.c]; }
+    }else{
+      for(const st of list){
+        const k=st.r+'_'+st.c, n=table[k]||0;
+        if(n < capOf(st.typeIdx, st)){ table[k]=n+1; return [st.r,st.c]; }
+        if(n < spillN){ spillN=n; spill=st; }
+      }
     }
     // 全部満室でも路頭に迷わせない。ただし先頭に詰め込まず、いちばん空いている所へ。
     if(!spill) return null;
     const k=spill.r+'_'+spill.c; table[k]=(table[k]||0)+1;
     return [spill.r, spill.c];
   };
+  // 学生の通学先。学齢に合う学校が無ければ、他の段階の学校で代用する
+  //   (小学校しか無い村では中学生もそこへ通う)。学校が1つも無ければ通学しない。
+  const schoolsByLevel={};
+  for(const k in SCHOOL_IDX)
+    if(SCHOOL_IDX[k]!=null) schoolsByLevel[k]=openStructsOf([SCHOOL_IDX[k]]);
+  const anySchool=openStructsOf(SCHOOL_ALL);
+  for(const a of agents){
+    const lv=schoolLevelOf(a);
+    if(!lv){ a.school=null; continue; }
+    const okSchool=b=>{ const st=b&&structAt(b[0],b[1]); return st&&st.state==='open'&&SCHOOL_ALL.includes(st.typeIdx); };
+    if(a.school && okSchool(a.school)) continue;
+    const pool=(schoolsByLevel[lv]&&schoolsByLevel[lv].length)?schoolsByLevel[lv]:anySchool;
+    // 1回だけ抽選する。行と列を別々に引くと、別々の学校の座標が混ざる
+    const pick=pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
+    a.school = pick ? [pick.r, pick.c] : null;
+  }
   for(const a of agents){
     if(!a.home) a.home=take(homeStructs, occ, homeCapOf);
-    if(!a.work) a.work=take(workStructs, wocc, ()=>WORK_CAP);
+    // 学生は働かない (通学が本業)
+    if(isStudent(a)){ a.work=null; a.jobless=-1; continue; }
+    if(a.work) continue;
+    // 失業してすぐには次が見つからない。ここに間があるから生活が傾く。
+    if(ECON_ON && a.jobless>=0 && a.jobless < ECO_STATE.cfg.jobSearchDays) continue;
+    a.work=take(workStructs, wocc, capOfWork, ECON_ON);
+    if(a.work && ECON_ON && a.jobless>=0){
+      a.jobless=-1; ECO_STATE.stats.jobsFound++;
+    }
   }
   const homeless=agents.reduce((n,a)=>n+(a.home?0:1),0);
   const over=Math.max(0, agents.length-housingCapacity());
@@ -2722,7 +2871,10 @@ function shouldLeaveBuilding(a){
   if(n===null) return true;                                   // 用事なし → 外へ
   if(n==='sleep') return a.home ? !(br===a.home[0] && bc===a.home[1])
                                 : !HOME_IDX.includes(t);   // 家なしは住居なら留まる
-  if(n==='work')  return !(a.work && br===a.work[0] && bc===a.work[1]);
+  if(n==='work')  {
+    const w=a.school||a.work;
+    return !(w && br===w[0] && bc===w[1]);
+  }
   if(t==null) return true;
   if(n==='eat')   return !FOOD_IDX.includes(t);               // 飲食店に居るなら留まる
   if(n==='shop')  return !BUY_IDX.includes(t);
@@ -2732,15 +2884,30 @@ function shouldLeaveBuilding(a){
 }
 
 // いま何を求めているか (アイコン表示と目的地抽選で共用)
-//   優先順位: 病気 > 睡眠 > 空腹 > 勤務 > 買い物 > 退屈 (生命に関わる順、最後は暇つぶし)
+//   優先順位: 病気 > 睡眠 > 空腹 > 勤務/通学 > 買い物 > 退屈 (生命に関わる順、最後は暇つぶし)
+//   学生は**平日だけ**学校へ行く。週末は勤務も通学も無いので、街で遊ぶ。
+const WEEK_LEN     = 7;
+const WEEKEND_DAYS = envNum('WEEKEND_DAYS', 2);           // 週の終わりの何日を休みにするか
+const isWeekend    = () => (gameDay() % WEEK_LEN) >= (WEEK_LEN-WEEKEND_DAYS);
+const SCHOOL_FROM  = envNum('SCHOOL_FROM', 8);
+const SCHOOL_TO    = envNum('SCHOOL_TO', 15);
+const isStudent    = a => !!a.school;
 function needOf(a){
   const h=gameHour();
   if((a.sick   ||0) > SICK_HI)                 return 'sick';
   if((a.fatigue||0) > NEED_HI || h<6 || h>=22) return 'sleep';
   if((a.hunger ||0) > NEED_HI)                 return 'eat';
-  if(h>=9 && h<17)                             return 'work';
+  if(isStudent(a))
+    return (!isWeekend() && h>=SCHOOL_FROM && h<SCHOOL_TO) ? 'work' : nonWorkNeed(a, h);
+  if(h>=9 && h<17 && !isWeekend())             return 'work';
   if((a.supply ||0) > NEED_HI)                 return 'shop';
   if((a.bored  ||0) > NEED_HI)                 return 'bored';
+  return null;
+}
+// 勤務/通学の時間でないときの欲求 (学生と週末の住民が使う)
+function nonWorkNeed(a, h){
+  if((a.supply||0) > NEED_HI) return 'shop';
+  if((a.bored ||0) > NEED_HI) return 'bored';
   return null;
 }
 
@@ -2796,6 +2963,7 @@ function pickLifeGoal(a, ex){
     if(a.home) return [...a.home];
     const h=nearestHome(a); if(h) return h;
   }
+  if(n==='work'  && a.school) return [...a.school];   // 学生は学校へ
   if(n==='work'  && a.work) return [...a.work];
   // 欲求 → 行き先カテゴリ。近い方から数軒のランダムで選ぶ (最寄り固定だと往復しやすい)
   const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX}[n];
@@ -3339,6 +3507,7 @@ const catOfType = t => CATS.find(c => (CAT_IDX[c]||[]).includes(t));
 function closeShop(st, day, vacant){
   st.state='closed'; st.closedDay=day; st.ema=0;
   CITY.stats.shopsClosed++;
+  if(ECON_ON) layOff(st, day);        // ここで働いていた人は職を失う
   syncCity(); addStructMesh(scene, st);
   const label=BLDG_TYPES[st.typeIdx].label;
   if(vacant){                                  // 空き家/空き職場は「閉店」ではない
@@ -3348,9 +3517,13 @@ function closeShop(st, day, vacant){
   }
   for(const a of agents){
     if(a.owns && a.owns[0]===st.r && a.owns[1]===st.c){
-      a.owns=null;                                  // 店主は職を失い、また勤め人に戻る
-      const works=buildingsOfTypes(WORK_IDX);
-      a.work = works.length ? [...works[Math.floor(Math.random()*works.length)]] : null;
+      a.owns=null;                                  // 店主は職を失う
+      // 以前はその場で別の職場へ移していたが、それだと「店が潰れた」ことが
+      // 本人に何も起きない。失業の期間を持たせて、生活が傾くようにする。
+      if(!ECON_ON){
+        const works=buildingsOfTypes(WORK_IDX);
+        a.work = works.length ? [...works[Math.floor(Math.random()*works.length)]] : null;
+      }
       news('close', `🚪 ${a.name} の ${label} が閉店しました (${st.r},${st.c})`,
            `${a.name}'s ${enOf(st.typeIdx)} closed down`);
       showCityEvent(st.r, st.c, `${a.name}'s ${enOf(st.typeIdx)} closed down`, 7);
@@ -3666,6 +3839,43 @@ const TEACH_DAYS   = envNum('TEACH_DAYS', 3);      // 定着したか判定す�
 const GOSSIP_P     = envNum('GOSSIP_P', 0.02);     // 近くの人と好みを交換する確率/秒
 const GOSSIP_GAIN  = envNum('GOSSIP_GAIN', 0.25);  // 口コミで伝わる強さ
 
+// ── 経済と犯罪 (economy.js) ────────────────────────────────────────────────
+const ECON_ON   = process.env.ECON !== '0';
+const CRIME_ON  = process.env.CRIME !== '0';
+const ECO_STATE = ECO.createState({
+  startCash:  envNum('START_CASH', 40),
+  wage:       envNum('WAGE', 12),
+  ownerShare: envNum('OWNER_SHARE', 0.35),
+  price:{ eat:envNum('PRICE_EAT', 6), shop:envNum('PRICE_SHOP', 8),
+          fun:envNum('PRICE_FUN', 10), care:envNum('PRICE_CARE', 15) },
+  jobSearchDays: envNum('JOB_SEARCH_DAYS', 3),
+  desperGain: envNum('DESPER_GAIN', 0.30),
+  desperEase: envNum('DESPER_EASE', 0.40),
+  crimeMin:   envNum('CRIME_MIN', 0.45),
+  stealShare: envNum('STEAL_SHARE', 0.6),
+  wantedGain: envNum('WANTED_GAIN', 0.40),
+  wantedDecay:envNum('WANTED_DECAY', 0.82),
+  caughtBase: envNum('CAUGHT_BASE', 0.25),
+  jailDays:   envNum('JAIL_DAYS', 1),
+  livingCost: envNum('LIVING_COST', 8),
+  allowance:  envNum('ALLOWANCE', 10),
+  capUnit:      envNum('CAP_UNIT', 2.5),
+  upkeepUnit:   envNum('UPKEEP_UNIT', 8.75),
+  workerOutput: envNum('WORKER_OUTPUT', 7),
+  rentPerHead:  envNum('RENT_PER_HEAD', 5),
+  civicPerHead: envNum('CIVIC_PER_HEAD', 0.22),
+  bankruptDays: envNum('BANKRUPT_DAYS', 5),
+  oversizePenalty: envNum('OVERSIZE_PENALTY', 3.0),
+});
+// 建物の種類 -> 支払いの区分
+function priceKindOf(typeIdx){
+  if(FOOD_IDX.includes(typeIdx)) return 'eat';
+  if(BUY_IDX.includes(typeIdx))  return 'shop';
+  if(FUN_IDX.includes(typeIdx))  return 'fun';
+  if(CARE_IDX.includes(typeIdx)) return 'care';
+  return null;
+}
+
 // ── 人間関係 (social.js) ────────────────────────────────────────────────────
 const SOCIAL_ON   = process.env.SOCIAL !== '0';
 const REL_SAVE    = envNum('REL_SAVE', 6);         // 1人あたり何件の関係を保存するか
@@ -3788,6 +3998,9 @@ function onTalk(a, b, topic){
     pushTalkLine(a.name, _one(TALK_LINES.place.small));
     pushTalkLine(b.name, _one(TALK_LINES.place.smallR));
   }
+  // 追い詰められた住民は、話しかけた相手から抜き取ることがある。
+  //   立ち話 = 至近距離で向き合っている場面なので、ここに乗せるのが自然。
+  if(CRIME_ON && ECON_ON) maybePickpocket(a, b);
   // ティッカーには「話題のあるもの」だけ流す。世間話まで流すと開店/閉店の
   // ニュースを押し出すし、左下の会話ログと二重になる。
   if(topic.kind==='place' || !st) return;
@@ -3800,6 +4013,33 @@ function onTalk(a, b, topic){
     en:_ascii(what), ja:`${a.name} と ${b.name} が立ち話している`});
   while(lifeNews.length>12) lifeNews.shift();
   hudNewsDirty=true;
+}
+
+// 立ち話の相手から抜き取る。捕まれば通報され、捕まらなくても
+// **相手との関係が壊れて口コミで広まる** ので、犯人は街で孤立していく。
+function maybePickpocket(a, b){
+  for(const [x,y] of [[a,b],[b,a]]){
+    ECO.initAgent(ECO_STATE, x); ECO.initAgent(ECO_STATE, y);
+    if(!ECO.willOffend(ECO_STATE, x)) continue;
+    if((y.cash||0) < 5) continue;
+    const got=ECO.pickpocket(ECO_STATE, x, y);
+    if(!got) continue;
+    // 被害者は犯人を信用しなくなる。関係が壊れると立ち話も起きにくくなる。
+    if(y.rel && y.rel[x.aid]){ y.rel[x.aid].s=Math.max(0, y.rel[x.aid].s-0.6); }
+    if(x.rel && x.rel[y.aid]){ x.rel[y.aid].s=Math.max(0, x.rel[y.aid].s-0.3); }
+    if(ECO.caught(ECO_STATE, x)){
+      x.wanted=Math.min(1, (x.wanted||0)+0.35);
+      crimeNews(x, `${_ascii(y.name)} saw ${_ascii(x.name)} taking their money`,
+                `👀 ${y.name} が ${x.name} に金を抜かれたのを見た`,
+                Math.floor(x.x), Math.floor(x.y), true);
+    }else{
+      pushTalkLine(y.name, 'Wait - where is my money?');
+      crimeNews(x, `${_ascii(y.name)} was robbed in broad daylight`,
+                `🕶 ${y.name} が ${x.name} にすられた`,
+                Math.floor(x.x), Math.floor(x.y), false);
+    }
+    return;
+  }
 }
 
 // 友人になった瞬間。街に残る出来事なので CITY に積む。
@@ -3903,6 +4143,335 @@ function gossip(a, other){
   }
 }
 
+// 1日の経済。給料は**職場の売上から**出るので、万引きで売上が落ちた店は
+// 満額払えなくなり、そこで働く人も傾いていく (犯罪が失業を生む経路)。
+function economyDay(day){
+  ECO.stepDay(ECO_STATE, {
+    agents,
+    drawWage(a, amt){
+      const w=a.owns||a.work;
+      const st=w?structAt(w[0],w[1]):null;
+      if(!st || st.state!=='open') return 0;
+      if(a.owns){                                   // 店主は売上から取る
+        const take=Math.min(st.revenue||0, amt*(1+ECO_STATE.cfg.ownerShare));
+        st.revenue=(st.revenue||0)-Math.max(0,take);
+        return Math.max(0, take);
+      }
+      // 勤め人。売上が細ければ満額もらえない (最低でも半分は街が支える)
+      const pool=Math.max(amt*0.5, Math.min(amt, (st.revenue||0)));
+      st.revenue=(st.revenue||0)-Math.min(st.revenue||0, pool);
+      return pool;
+    },
+    needLevel(a){
+      return Math.max(a.hunger||0, a.supply||0, a.bored||0, a.sick||0);
+    },
+    onDespair(a){
+      if(!CRIME_ON) return;
+      lifeNews.push({day:gameDay(), shape:'despair',
+        en:`${_ascii(a.name)} is out of work and out of money`,
+        ja:`${a.name} は職も金も失っている`});
+      while(lifeNews.length>12) lifeNews.shift();
+      hudNewsDirty=true;
+    },
+  });
+  if(CITY) CITY.unrest=ECO.unrest(ECO_STATE, agents);
+}
+
+// ── 建物の収支と倒産 ────────────────────────────────────────────────────────
+// これまで潰れるのは飲食/買い物/遊び/医療だけで、職場・住宅・公共施設・観光は
+// **構造的に絶対潰れなかった** (isClosable が CLOSABLE_CATS しか見ていない)。
+// 本番でランドマークタワーが3本並んだのはこれが原因。
+// 「大きい建物ほど維持費が高く、使われているほど稼ぐ」という一本の規則で
+// 全種類を同じに扱い、赤字が続いた建物を畳む。
+const BANKRUPT_ON  = process.env.BANKRUPT !== '0';
+const MIN_JOB_RATIO= envNum('MIN_JOB_RATIO', 0.55);   // 雇用の余力がこれを切ったら職場は畳まない
+const structSize   = st => st.fp*st.fp*BLDG_TYPES[st.typeIdx].height;
+function structKind(st){
+  const t=st.typeIdx;
+  if(HOME_IDX.includes(t)) return 'home';
+  if(WORK_IDX.includes(t)) return 'work';
+  const cat=BLDG_TYPES[t].category;
+  if(cat==='civic') return 'civic';
+  return 'visit';
+}
+// 職場/住宅の定員も大きさで決める (economy.js と同じ規則)
+const workCapOf = st => ECON_ON ? ECO.capacityOf(ECO_STATE, structSize(st)) : WORK_CAP;
+
+function bankruptSweep(day){
+  if(!ECON_ON || !BANKRUPT_ON || !CITY) return 0;
+  const workers={}, residents={};
+  for(const a of agents){
+    if(a.work) workers[cellKey(a.work)]=(workers[cellKey(a.work)]||0)+1;
+    if(a.home) residents[cellKey(a.home)]=(residents[cellKey(a.home)]||0)+1;
+  }
+  const ctx={
+    population: agents.length,
+    kindOf: structKind, sizeOf: structSize,
+    workersAt:   st=>workers[st.r+'_'+st.c]||0,
+    residentsAt: st=>residents[st.r+'_'+st.c]||0,
+    // いまの発展段階では建てられない大きさか (= 街に対して大きすぎる)
+    oversized:   st=>!typeAllowed(st.typeIdx),
+    // 公共施設の税収は**街の予算を分け合う**。軒数で割らないと、
+    // 銀行や市役所を何軒建てても全部黒字になり、いくらでも増えてしまう。
+    civicShare:  Math.max(1, CITY.structs.filter(x=>x.state==='open'
+                    && structKind(x)==='civic').length),
+  };
+  // 雇用の余力。ここを切ってまで職場を畳むと街が失業で崩れる。
+  const jobCap = CITY.structs.filter(st=>st.state==='open' && WORK_IDX.includes(st.typeIdx))
+                             .reduce((n,st)=>n+workCapOf(st), 0);
+  const jobsTight = jobCap < agents.length*MIN_JOB_RATIO;
+  const broke=[];
+  for(const st of CITY.structs){
+    if(st.state!=='open') continue;
+    if(day-(st.born||0) < GRACE_DAYS) continue;
+    if(ECO.settleBuilding(ECO_STATE, st, ctx)) broke.push(st);
+  }
+  if(!broke.length) return 0;
+  // 赤字が深いものから畳む。1日に畳む数は既存の上限に合わせる。
+  broke.sort((a,b)=>(a.balance||0)-(b.balance||0));
+  let n=0;
+  for(const st of broke){
+    if(n>=CLOSE_PER_DAY) break;
+    const kind=structKind(st);
+    const over=!typeAllowed(st.typeIdx);
+    // ★ 赤字だけを理由に**職場・住宅・公共を畳んではいけない**。
+    //   一度そうしたところ、職場が減る → 失業 → 誰も払えない → 店が潰れる →
+    //   さらに職場が減る、で街が崩壊した (実測: 失業34%・無一文316人・店3軒)。
+    //   潰していいのは
+    //     ・街の発展段階に対して大きすぎる建物 (村のランドマークタワー)
+    //     ・来客で稼ぐ建物で、実際に稼げていないもの
+    //   職場/住宅の「余り」は markVacant が使われていないものだけ畳む。
+    // ★ 潰すのは「街の発展段階に対して大きすぎる建物」だけにする。
+    //   来客で稼ぐ店の淘汰は既存の maybeClose (同業と比べて悪い店を閉じる) が
+    //   すでに担っていて、あれは同業が減れば止まる自己制限がある。
+    //   絶対額の赤字で店も畳むようにしたら、
+    //     住民が無一文 → 誰も払わない → 店が全部潰れる → 買う場所が無い
+    //   で街が空洞化した (実測: 1000人に対して店2軒まで減った)。
+    //   大きすぎる建物だけなら、身の丈に戻った時点で自然に止まる。
+    if(!over) continue;
+    // 最低限は残す (全部畳むと住むところ/働くところ/公共が消える)
+    const same=CITY.structs.filter(x=>x.state==='open' && structKind(x)===kind).length;
+    if(same<=MIN_PER_KIND) continue;
+    const label=BLDG_TYPES[st.typeIdx].label;
+    closeShop(st, day, true);
+    st.redDays=0;
+    news('close', `📉 ${label} (${st.r},${st.c}) は採算が合わず閉鎖された`,
+         `The ${enOf(st.typeIdx)} could not pay its way and closed`);
+    n++;
+  }
+  return n;
+}
+const MIN_PER_KIND = envNum('MIN_PER_KIND', 2);
+
+// 学生が居るのに学校が無ければ建てる。学齢別に、人数が溜まった段階から順に。
+//   通える学校が無い子は「働きもせず通いもしない」状態になるので、
+//   ここが閉じていないと学生が街をうろつくだけになる。
+const SCHOOL_PER_STUDENT = envNum('SCHOOL_PER_STUDENT', 40);   // 学校1つが受け持つ人数
+function maybeFoundSchool(day){
+  if(!CITY) return false;
+  const need={};
+  for(const a of agents){
+    const lv=schoolLevelOf(a); if(!lv) continue;
+    need[lv]=(need[lv]||0)+1;
+  }
+  // 人数の多い学齢から建てる
+  const order=Object.keys(need).sort((x,y)=>need[y]-need[x]);
+  for(const lv of order){
+    const t=SCHOOL_IDX[lv];
+    if(t==null || !typeAllowed(t)) continue;
+    const have=CITY.structs.filter(st=>st.state==='open' && st.typeIdx===t).length;
+    if(have >= Math.max(1, Math.ceil(need[lv]/SCHOOL_PER_STUDENT))) continue;
+    const site=pickSite(day, BLDG_TYPES[t].footprint, (r,c)=>Math.random());
+    if(!site) continue;
+    foundShop('learn', site, t, null, day);
+    news('found', `🏫 子どもが増えたので ${BLDG_TYPES[t].label} が建てられた`,
+         `A ${enOf(t)} is being built - the town has children to teach`);
+    return true;
+  }
+  return false;
+}
+
+// 治安が悪くなったら街が警察署を建てる。
+//   犯罪は「街に警察署が無い」ことの結果でもあるので、ここが閉じていないと
+//   街はただ荒れるだけになる。unrest が続いたら1軒建てる。
+const POLICE_UNREST  = envNum('POLICE_UNREST', 0.03);  // これを超える不穏が続いたら建てる
+const POLICE_MAX     = envNum('POLICE_MAX', 2);        // 街に置く上限
+const POLICE_PER_POP = envNum('POLICE_PER_POP', 400);  // 人口これごとに1軒まで
+const POLICE_CRIME_MIN = envNum('POLICE_CRIME_MIN', 3); // 累計犯罪がこれを超えても建てる
+function maybeFoundPolice(day){
+  if(!POLICE_ON || POLICE_IDX==null || !CITY) return false;
+  if(!typeAllowed(POLICE_IDX)) return false;            // まだ発展段階が足りない
+  const have=policeCount();
+  const want=Math.min(POLICE_MAX, 1+Math.floor(agents.length/POLICE_PER_POP));
+  if(have>=want) return false;
+  // 1軒目も「必要になってから」建てる。平和な村に最初から警察署があると、
+  // 「治安が悪くなったので建てられた」という筋が消えてしまう。
+  const troubled = (CITY.unrest||0) >= POLICE_UNREST
+                || (CITY.stats.crimes||0) >= POLICE_CRIME_MIN;
+  if(!troubled) return false;
+  // 犯罪が多い場所の近くに建てたい。手配中の住民が居るあたりを score にする。
+  const hot=agents.filter(a=>(a.wanted||0)>0.1);
+  const site=pickSite(day, 1, (r,c)=>{
+    let sc=0;
+    for(const a of hot) sc += 1/(1+Math.hypot(a.x-r, a.y-c));
+    return sc;
+  });
+  if(!site) return false;
+  foundShop('civic', site, POLICE_IDX, null, day);      // 公共施設なので店主は付けない
+  news('found', `🚓 治安が悪くなったので警察署が建てられた`,
+       `A police station is being built - the town has had enough`);
+  return true;
+}
+
+// ── 警察 ────────────────────────────────────────────────────────────────────
+// 警察署に勤めている住民が警官。手配中 (wanted) の住民を見つけたら追いかけて捕まえる。
+//   ・警察署が無い街では誰も捕まらない。前科だけが積み上がり、治安が悪いままになる。
+//   ・追跡には既存のナビ (enterNavigateTo) をそのまま使う。俯瞰カメラで
+//     2つの点が近づいていくのが見えるので、配信としても分かりやすい。
+const POLICE_ON      = process.env.POLICE !== '0';
+const COP_SEE        = envNum('COP_SEE', 9);        // 警官が手配犯に気づく距離 (セル)
+const COP_GRAB       = envNum('COP_GRAB', 1.8);     // この距離まで詰めたら確保
+const COP_WANTED_MIN = envNum('COP_WANTED_MIN', 0.3); // これ以上手配されていたら追う
+const COP_GIVEUP_SEC = envNum('COP_GIVEUP_SEC', 40);  // 追跡をあきらめるまで
+
+const isCop = a => {
+  if(POLICE_IDX==null) return false;
+  const w=a.work; if(!w) return false;
+  const st=structAt(w[0], w[1]);
+  return !!(st && st.state==='open' && st.typeIdx===POLICE_IDX);
+};
+const policeCount = () => POLICE_IDX==null ? 0
+  : (CITY?CITY.structs:[]).filter(st=>st.state==='open' && st.typeIdx===POLICE_IDX).length;
+
+let _copStats={chases:0, arrests:0};
+function stepPolice(){
+  if(!POLICE_ON || !CRIME_ON || !ECON_ON || POLICE_IDX==null) return;
+  const now=Date.now(), near=[];
+  for(const cop of agents){
+    if(!isCop(cop) || MW.isIndoors(cop) || ECO.inJail(cop)) continue;
+
+    // 追跡中の相手がまだ有効か
+    let target = cop.chase ? agents.find(x=>x.aid===cop.chase) : null;
+    // 相手が見つからない (転出した等) ときも chase を外す。
+    // 外し忘れると「追跡中の警官」だけが増えていく (手配犯2人に対し12人が追跡中になっていた)。
+    if(cop.chase && !target){ cop.chase=null; enterWander(cop); }
+    if(target && (now-cop.chaseAt > COP_GIVEUP_SEC*1000
+                  || (target.wanted||0) < COP_WANTED_MIN || ECO.inJail(target))){
+      cop.chase=null; target=null; enterWander(cop);
+    }
+
+    // 追跡していなければ、近くの手配犯を探す
+    if(!target){
+      SOC.neighbors(SOC_STATE, cop, near, 0);
+      let best=null, bd=Infinity;
+      for(const o of near){
+        if((o.wanted||0) < COP_WANTED_MIN || ECO.inJail(o) || isCop(o)) continue;
+        const d=Math.hypot(o.x-cop.x, o.y-cop.y);
+        if(d<bd){ bd=d; best=o; }
+      }
+      // social.js の近傍は半径3セルまで。もう少し広く見張りたいので、
+      // 見つからなければ手配中の住民を直接走査する (手配犯は普通ごく少数)。
+      if(!best){
+        for(const o of agents){
+          if((o.wanted||0) < COP_WANTED_MIN || ECO.inJail(o) || isCop(o) || MW.isIndoors(o)) continue;
+          const d=Math.hypot(o.x-cop.x, o.y-cop.y);
+          if(d<COP_SEE && d<bd){ bd=d; best=o; }
+        }
+      }
+      if(best){
+        cop.chase=best.aid; cop.chaseAt=now; target=best;
+        _copStats.chases++;
+        enterNavigateTo(cop, Math.floor(best.x), Math.floor(best.y), null, false);
+        pushTalkLine(cop.name, `Stop right there, ${_ascii(best.name)}!`);
+      }
+    }
+
+    if(!target) continue;
+    const d=Math.hypot(target.x-cop.x, target.y-cop.y);
+    if(d <= COP_GRAB){
+      ECO.arrest(ECO_STATE, target);
+      target.wanted=0;                       // 罪は償った扱い
+      cop.chase=null; enterWander(cop);
+      _copStats.arrests++;
+      pushTalkLine(target.name, 'All right, all right...');
+      crimeNews(target, `${_ascii(cop.name)} arrested ${_ascii(target.name)}`,
+                `🚓 ${cop.name} が ${target.name} を逮捕した`,
+                Math.floor(target.x), Math.floor(target.y), true);
+    }else if(now-cop.chaseAt > 3000){
+      // 相手は動くので、数秒ごとに経路を引き直す (A* が速いので気にならない)
+      cop.chaseAt=now;
+      enterNavigateTo(cop, Math.floor(target.x), Math.floor(target.y), null, false);
+    }
+  }
+}
+
+// その建物で働いていた人を失業させる。閉店・解体の両方から呼ぶ。
+//   すぐ別の職場に付け替えると「店が潰れた」ことが本人に何も起きないので、
+//   JOB_SEARCH_DAYS のあいだ無職にする。この間に貯金が尽きると追い詰められる。
+function layOff(st, day){
+  let n=0;
+  for(const a of agents){
+    const w=a.work;
+    if(!w || w[0]!==st.r || w[1]!==st.c) continue;
+    a.work=null; a.owns=null;
+    ECO.initAgent(ECO_STATE, a);
+    a.jobless=0;
+    ECO_STATE.stats.jobsLost++; n++;
+  }
+  if(n){
+    CITY.stats.jobsLost=(CITY.stats.jobsLost||0)+n;
+    news('job', `💼 ${BLDG_TYPES[st.typeIdx].label} が閉じて ${n}人が職を失った`,
+         `${n} resident${n>1?'s':''} lost their job when the ${enOf(st.typeIdx)} closed`);
+  }
+  return n;
+}
+
+// 来店の会計。払えない住民が「追い詰められている」ときだけ万引きに転ぶ。
+//   払えないだけでは犯罪にならない (willOffend が正直さと突き合わせる)。
+function settleVisit(a, st){
+  const kind=priceKindOf(st.typeIdx);
+  if(!kind) return;
+  ECO.initAgent(ECO_STATE, a);
+  if(ECO.pay(ECO_STATE, a, kind)){
+    st.revenue=(st.revenue||0)+ECO.priceOf(ECO_STATE, kind);
+    return;
+  }
+  // 払えなかった
+  if(!CRIME_ON || !ECO.willOffend(ECO_STATE, a)) return;
+  ECO.shoplift(ECO_STATE, a);
+  // 店は「売れずに客だけ来た」ぶん損をする。これが積もると人を切ることになる。
+  st.revenue=(st.revenue||0)-ECO.priceOf(ECO_STATE, kind);
+  st.thefts=(st.thefts||0)+1;
+  const what=enOf(st.typeIdx);
+  if(ECO.caught(ECO_STATE, a)){
+    // 目撃された = 手配される。**捕まえるのは警官の仕事**。
+    // 警察署が無い街では誰も捕まらず、前科だけが積み上がっていく。
+    a.wanted=Math.min(1, (a.wanted||0)+0.35);
+    crimeNews(a, `${_ascii(a.name)} was seen shoplifting at the ${what}`,
+              `👀 ${a.name} が ${BLDG_TYPES[st.typeIdx].label} で万引きするのを見られた`,
+              st.r, st.c, true);
+  }else{
+    crimeNews(a, `${_ascii(a.name)} walked out of the ${what} without paying`,
+              `🕶 ${a.name} が ${BLDG_TYPES[st.typeIdx].label} で万引きした`,
+              st.r, st.c, false);
+  }
+}
+
+// 犯罪のニュース。多すぎると街の出来事を押し出すので流量を絞る。
+//   捕まったものは必ず出す (見せ場なので)。
+let _crimeNewsAt=0;
+function crimeNews(a, en, ja, r, c, big){
+  if(CITY) CITY.stats.crimes=(CITY.stats.crimes||0)+1;
+  pushTalkLine(a.name, big ? 'Caught in the act.' : 'Nobody saw me.');
+  const now=Date.now();
+  if(!big && now-_crimeNewsAt < CRIME_NEWS_COOL_SEC*1000) return;
+  _crimeNewsAt=now;
+  news('crime', ja, en);
+  if(big && Math.random()<CRIME_CAM_P) showCityEvent(r, c, en.slice(0,52), 6);
+}
+const CRIME_NEWS_COOL_SEC = envNum('CRIME_NEWS_COOL_SEC', 45);
+const CRIME_CAM_P         = envNum('CRIME_CAM_P', 0.5);
+
 // ── 機能D: 初回性 ──────────────────────────────────────────────────────────
 // 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
 function onArrive(a, dest){
@@ -3913,6 +4482,7 @@ function onArrive(a, dest){
   learnFromVisit(a, st, a.path?a.path.length:null);   // 行きつけを覚える
   if(st.state==='open'){
     st.visits++; st.visitsToday++;
+    if(ECON_ON) settleVisit(a, st);      // 支払い / 払えないときの分岐
     // 経済活動 = 店/施設への来店の累計。これが溜まると発展段階が上がる
     if(CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(st.typeIdx))) CITY.econ++;
     if(!st.firstCustomer){
@@ -3949,6 +4519,13 @@ function dailyRollover(day){
   let opened=0;
   while(opened<budget && maybeFound(day)) opened++;
   const moved=growPopulation(day);              // 住居に空きがあれば人が引っ越してくる
+  // 職探し。以前は転入があったときしか走らず、一度失業した人が永久に
+  // 職を見つけられなかった (実測: 1000人全員が無職・街が崩壊した)。
+  if(ECON_ON) assignHomes();
+  if(ECON_ON) economyDay(day);                  // 給料 / 追い詰められ度 / 疑いの減衰
+  if(ECON_ON && CRIME_ON) maybeFoundPolice(day);// 治安が悪ければ警察署を建てる
+  maybeFoundSchool(day);                        // 学生が居るのに学校が無ければ建てる
+  const bankrupt=bankruptSweep(day);            // 採算の合わない建物を畳む (種類を問わない)
   // 発展段階が上がったか (経済活動の累計で決まる)
   const lv=cityLevel();
   if(lv>(CITY.level||0)){
@@ -4092,7 +4669,61 @@ const TREE_HEIGHT = 1.0;
 const AGENT_SPRITE_W = 0.35, AGENT_SPRITE_H = 0.9;
 const AGENT_SPRITE_RGB = [0.95, 0.75, 0.35];
 const SPRITE_MIN_DIST = 0.25, SPRITE_MAX_DIST = 8.0;   // 重なりで画面が埋まるのを防ぐ
+let _navMs=0, _navN=0, _navPop=0;
 function planPath(sr, sc, gr, gc){
+  const _t=PERF_LOG?process.hrtime.bigint():0n;
+  const r=_planPath(sr, sc, gr, gc);
+  if(PERF_LOG){ _navMs+=Number(process.hrtime.bigint()-_t)/1e6; _navN++; }
+  return r;
+}
+// ── 経路探索 (A* + 二分ヒープ) ──────────────────────────────────────────────
+// 以前は「未確定セルの中から最小を線形走査する」Dijkstra だった。GRID=30 なら
+// 1回 0.85ms で済むが、走査回数は GRID^4 で効くので 45 にすると 3.42ms (4倍) になり、
+// 街を広げるときの律速になっていた (実測)。
+//   ・最小の取り出しを二分ヒープにする → O(V^2) が O(E log V) に
+//   ・残り距離の見積り (A*) を足す → 探索するセル数そのものが減る
+// 見積りは「マンハッタン距離 x 最小の1手コスト」。COST_ROAD=1 が最小なので
+// マンハッタン距離をそのまま使えば必ず実コスト以下 = 最短経路を見失わない。
+const _HEAP_CAP = GRID*GRID*4 + 8;      // 1辺につき高々1回 push されるので 4V で足りる
+const _heapK = new Int32Array(_HEAP_CAP);
+const _heapF = new Float64Array(_HEAP_CAP);
+let _heapN = 0;
+function _heapPush(k, f){
+  if(_heapN>=_HEAP_CAP) return;         // 起こらないはずだが、壊れるより落とす
+  let i=_heapN++;
+  _heapK[i]=k; _heapF[i]=f;
+  while(i>0){
+    const p=(i-1)>>1;
+    if(_heapF[p]<=_heapF[i]) break;
+    const tk=_heapK[p], tf=_heapF[p];
+    _heapK[p]=_heapK[i]; _heapF[p]=_heapF[i];
+    _heapK[i]=tk; _heapF[i]=tf;
+    i=p;
+  }
+}
+function _heapPop(){
+  const top=_heapK[0];
+  _heapN--;
+  if(_heapN>0){
+    _heapK[0]=_heapK[_heapN]; _heapF[0]=_heapF[_heapN];
+    let i=0;
+    for(;;){
+      const l=i*2+1, r=l+1;
+      let m=i;
+      if(l<_heapN && _heapF[l]<_heapF[m]) m=l;
+      if(r<_heapN && _heapF[r]<_heapF[m]) m=r;
+      if(m===i) break;
+      const tk=_heapK[m], tf=_heapF[m];
+      _heapK[m]=_heapK[i]; _heapF[m]=_heapF[i];
+      _heapK[i]=tk; _heapF[i]=tf;
+      i=m;
+    }
+  }
+  return top;
+}
+
+const _NAV_D=[[-1,0],[1,0],[0,-1],[0,1]];
+function _planPath(sr, sc, gr, gc){
   const N=GRID*GRID, key=(r,c)=>r*GRID+c;
   // ゴールの建物セルだけは終点として許可する (玄関まで経路を引くため)。
   const passable=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID
@@ -4101,14 +4732,16 @@ function planPath(sr, sc, gr, gc){
   const dist=new Float64Array(N).fill(Infinity), prev=new Int32Array(N).fill(-1), done=new Uint8Array(N);
   const sk=key(sr,sc), gk=key(gr,gc);
   dist[sk]=0;
-  const D=[[-1,0],[1,0],[0,-1],[0,1]];
-  for(;;){
-    let u=-1, best=Infinity;
-    for(let i=0;i<N;i++) if(!done[i] && dist[i]<best){ best=dist[i]; u=i; }   // GRID=30 なので線形走査で十分
-    if(u<0 || u===gk) break;
+  _heapN=0;
+  _heapPush(sk, Math.abs(sr-gr)+Math.abs(sc-gc));
+  while(_heapN>0){
+    const u=_heapPop();
+    if(done[u]) continue;               // 遅延削除 (同じセルが複数回入りうる)
+    if(u===gk) break;
     done[u]=1;
+    if(PERF_LOG) _navPop++;             // 実際に開いたセル数
     const r=(u/GRID)|0, c=u%GRID;
-    for(const [dr,dc] of D){
+    for(const [dr,dc] of _NAV_D){
       const nr=r+dr, nc=c+dc;
       if(!passable(nr,nc)) continue;
       const k=key(nr,nc); if(done[k]) continue;
@@ -4117,13 +4750,56 @@ function planPath(sr, sc, gr, gc){
       // 大きすぎると空き地を使わず遠回り、小さすぎると道路を無視する。
       const nd=dist[u]+(MAP[nr][nc]===ROAD?COST_ROAD
                        :(WORLD.solidBuildings?COST_OFFROAD:COST_BLDG));
-      if(nd<dist[k]){ dist[k]=nd; prev[k]=u; }
+      if(nd<dist[k]){
+        dist[k]=nd; prev[k]=u;
+        _heapPush(k, nd + Math.abs(nr-gr) + Math.abs(nc-gc));
+      }
     }
   }
   if(dist[gk]===Infinity) return null;   // 到達不能 (木に囲まれた建物など)
   const path=[]; let cur=gk;
   while(cur>=0){ path.push([(cur/GRID)|0, cur%GRID]); cur=prev[cur]; }
   return path.reverse();
+}
+
+// 旧実装 (線形走査の Dijkstra)。A* が同じ最短コストを返すかの照合にだけ使う。
+// NAV_VERIFY=1 で有効。本番では呼ばれない。
+function _planPathSlow(sr, sc, gr, gc){
+  const N=GRID*GRID, key=(r,c)=>r*GRID+c;
+  const passable=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID
+    && (PASSABLE.has(MAP[r][c]) || (r===gr&&c===gc));
+  if(!passable(sr,sc) || !passable(gr,gc)) return null;
+  const dist=new Float64Array(N).fill(Infinity), prev=new Int32Array(N).fill(-1), done=new Uint8Array(N);
+  const sk=key(sr,sc), gk=key(gr,gc);
+  dist[sk]=0;
+  for(;;){
+    let u=-1, best=Infinity;
+    for(let i=0;i<N;i++) if(!done[i] && dist[i]<best){ best=dist[i]; u=i; }
+    if(u<0 || u===gk) break;
+    done[u]=1;
+    const r=(u/GRID)|0, c=u%GRID;
+    for(const [dr,dc] of _NAV_D){
+      const nr=r+dr, nc=c+dc;
+      if(!passable(nr,nc)) continue;
+      const k=key(nr,nc); if(done[k]) continue;
+      const nd=dist[u]+(MAP[nr][nc]===ROAD?COST_ROAD
+                       :(WORLD.solidBuildings?COST_OFFROAD:COST_BLDG));
+      if(nd<dist[k]){ dist[k]=nd; prev[k]=u; }
+    }
+  }
+  if(dist[gk]===Infinity) return null;
+  return {cost:dist[gk]};
+}
+
+// 経路の実コスト (照合用)
+function _pathCost(path){
+  if(!path) return null;
+  let sum=0;
+  for(let i=1;i<path.length;i++){
+    const [r,c]=path[i];
+    sum += MAP[r][c]===ROAD?COST_ROAD:(WORLD.solidBuildings?COST_OFFROAD:COST_BLDG);
+  }
+  return sum;
 }
 
 // そのタイプの建物を「近い方から k 軒」の中からランダムに選ぶ。現在地の隣は除外。
@@ -4317,6 +4993,9 @@ function spawnAgent(S, i){
     viewer:false, by:null, cheers:0, // 視聴者住民か / どの視聴者か / 応援された回数
     pref:{}, taught:null,            // 場所ごとの好み (経験で更新) / 勧められた店
     rel:{}, talk:null, talkIcon:null,// 人間関係 / 立ち話の状態 (social.js が管理)
+    cash:null, desper:null, wanted:null, jobless:null, crimes:null, jail:null, // economy.js が管理
+    chase:null, chaseAt:0,           // 警官が追いかけている相手 (stepPolice)
+    school:null,                     // 学生の通学先 (assignHomes が割り当てる)
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
     hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
@@ -4324,6 +5003,7 @@ function spawnAgent(S, i){
   agents.push(a);
   agentMeshes.push(createAgentMesh(S, def.color));
   setAgentColor(agentMeshes.length-1, def.color);
+  if(ECON_ON) ECO.initAgent(ECO_STATE, a);
   return a;
 }
 
@@ -4373,6 +5053,7 @@ function initAgents(S){
       if(sv.v && sv.n){ a.viewer=true; a.name=sv.n; a.by=sv.b||null; viewers++; }   // 視聴者住民を戻す
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
       if(sv.r && SOCIAL_ON){ SOC.restoreAgent(a, sv.r); rels++; }
+      if(sv.e && ECON_ON) ECO.restoreAgent(a, sv.e);
     }
     if(restored) console.log(`[City] 店主 ${restored}人の職場を復元`);
     if(viewers)  console.log(`[City] 視聴者住民 ${viewers}人を復元`);
@@ -6010,6 +6691,121 @@ tick(); setInterval(tick, ${ms});
   // ── /social : 人間関係の様子 ──
   //   /social            出会い/立ち話/友人関係の累計と、顔の広い住民
   //   /social?who=Marco  その住民が誰と知り合いか
+  // ── /economy : 金・仕事・追い詰められ度・犯罪 ──
+  if(urlPath==='/economy'){
+    res.setHeader('Content-Type','application/json');
+    if(!ECON_ON){ res.writeHead(200); res.end(JSON.stringify({ok:false,enabled:false})); return; }
+    let cash=0, jobless=0, broke=0, desper=0, jailed=0, crim=0;
+    for(const a of agents){
+      cash+=a.cash||0;
+      if(ECO.isJobless(a)) jobless++;
+      if((a.cash||0)<ECO_STATE.cfg.price.eat) broke++;
+      if((a.desper||0)>=ECO_STATE.cfg.crimeMin) desper++;
+      if(ECO.inJail(a)) jailed++;
+      if(a.crimes) crim++;
+    }
+    const n=Math.max(1, agents.length);
+    // 「店が潰れて職を失う」が起きる前提は、店に人が勤めていること。
+    // 起きないときはここを見る (職場の割当が偏っていないか)。
+    let atShop=0, atOffice=0, owner=0;
+    for(const a of agents){
+      if(a.owns){ owner++; continue; }
+      const st=a.work?structAt(a.work[0],a.work[1]):null;
+      if(!st) continue;
+      if(SHOP_JOB_IDX.includes(st.typeIdx)) atShop++; else atOffice++;
+    }
+    const worst=ECO.mostDesperate(agents, 5).map(a=>({
+      name:a.name, desper:+(a.desper||0).toFixed(2), cash:Math.round(a.cash||0),
+      honesty:ECO.honestyOf(a), joblessDays:a.jobless>=0?a.jobless:null,
+      crimes:a.crimes||0, wanted:+(a.wanted||0).toFixed(2)}));
+    // 万引きされている店 (どこが傾いているか)
+    const hit=(CITY?CITY.structs:[]).filter(st=>st.thefts)
+      .sort((x,y)=>y.thefts-x.thefts).slice(0,5)
+      .map(st=>({type:enOf(st.typeIdx), cell:[st.r,st.c], thefts:st.thefts,
+                 revenue:Math.round(st.revenue||0), state:st.state}));
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, enabled:true, crime:CRIME_ON,
+      residents:agents.length,
+      avgCash:+(cash/n).toFixed(1),
+      jobless, joblessPct:+(jobless/n*100).toFixed(1),
+      broke, desperate:desper, jailed, offenders:crim,
+      unrest:+(CITY?(CITY.unrest||0):0).toFixed(3),
+      totals:ECO_STATE.stats,
+      cityStats:CITY?{crimes:CITY.stats.crimes||0, jobsLost:CITY.stats.jobsLost||0,
+                      shopsClosed:CITY.stats.shopsClosed}:null,
+      jobs:{atShop, atOffice, owners:owner, jobless},
+      police:{stations:policeCount(), officers:agents.filter(isCop).length,
+              wantedNow:agents.filter(a=>(a.wanted||0)>=COP_WANTED_MIN).length,
+              chasing:agents.filter(a=>a.chase).length,
+              chases:_copStats.chases, arrests:_copStats.arrests},
+      mostDesperate:worst, mostStolenFrom:hit,
+      config:ECO_STATE.cfg}));
+    return;
+  }
+
+  // ── /school : 学生と通学の状況 ──
+  if(urlPath==='/school'){
+    res.setHeader('Content-Type','application/json');
+    const byLevel={}, atSchool={}, assigned={};
+    let students=0, inClass=0;
+    for(const a of agents){
+      const lv=schoolLevelOf(a); if(!lv) continue;
+      students++;
+      byLevel[lv]=(byLevel[lv]||0)+1;
+      if(a.school) assigned[lv]=(assigned[lv]||0)+1;
+      // 学校に着いている = そのセルか隣接に居る
+      if(a.school && Math.abs(Math.floor(a.x)-a.school[0])<=1
+                  && Math.abs(Math.floor(a.y)-a.school[1])<=1){
+        inClass++; atSchool[lv]=(atSchool[lv]||0)+1;
+      }
+    }
+    const built={};
+    for(const k in SCHOOL_IDX) if(SCHOOL_IDX[k]!=null)
+      built[k]=(CITY?CITY.structs:[]).filter(st=>st.state==='open' && st.typeIdx===SCHOOL_IDX[k]).length;
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true,
+      day:gameDay(), hour:+gameHour().toFixed(1),
+      weekend:isWeekend(), schoolHours:{from:SCHOOL_FROM, to:SCHOOL_TO},
+      inSession: !isWeekend() && gameHour()>=SCHOOL_FROM && gameHour()<SCHOOL_TO,
+      students, byLevel, assignedToSchool:assigned,
+      atSchoolNow:inClass, atSchoolByLevel:atSchool,
+      schoolsBuilt:built}));
+    return;
+  }
+
+  // ── /nav?verify=N : A* が旧実装 (線形走査 Dijkstra) と同じ最短コストを返すか照合 ──
+  //   経路そのものは同コストなら別ルートでも良いので、コストだけ比べる。
+  if(urlPath==='/nav'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    const n=Math.max(1, Math.min(2000, parseInt(q.get('verify'))||200));
+    const cells=[];
+    for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++) if(PASSABLE.has(MAP[r][c])) cells.push([r,c]);
+    let ok=0, diff=0, both=0, fastMs=0, slowMs=0;
+    const bad=[];
+    for(let i=0;i<n && cells.length>1;i++){
+      const a=cells[(Math.random()*cells.length)|0], b=cells[(Math.random()*cells.length)|0];
+      let t=process.hrtime.bigint();
+      const pf=_planPath(a[0],a[1],b[0],b[1]);
+      fastMs+=Number(process.hrtime.bigint()-t)/1e6;
+      t=process.hrtime.bigint();
+      const ps=_planPathSlow(a[0],a[1],b[0],b[1]);
+      slowMs+=Number(process.hrtime.bigint()-t)/1e6;
+      const cf=_pathCost(pf), cs=ps?ps.cost:null;
+      if(cf===null && cs===null){ ok++; continue; }
+      both++;
+      if(cf!==null && cs!==null && Math.abs(cf-cs)<1e-9) ok++;
+      else { diff++; if(bad.length<5) bad.push({from:a, to:b, astar:cf, dijkstra:cs}); }
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:diff===0, tried:n, matched:ok, mismatched:diff,
+      reachablePairs:both, grid:GRID,
+      msPerCall:{astar:+(fastMs/n).toFixed(3), dijkstra:+(slowMs/n).toFixed(3),
+                 speedup:+(slowMs/Math.max(fastMs,1e-9)).toFixed(1)},
+      mismatches:bad}));
+    return;
+  }
+
   if(urlPath==='/social'){
     const q=new URL(req.url,'http://x').searchParams;
     res.setHeader('Content-Type','application/json');
@@ -6481,7 +7277,10 @@ function perfReport(){
   console.log(`[Perf] 1フレーム平均: agent更新${p('agents')}ms フェード${p('fade')}ms `
     + `描画${p('render')}ms 読出${p('pixels')}ms JPEG${p('jpeg')}ms `
     + `| メッシュ${meshes} テクスチャ実体${tex.size} 住民${agents.length} `
-    + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}` + walkStat);
+    + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}/${GRID}` + walkStat
+    + (_navN ? ` | 経路探索${_navN}回 計${_navMs.toFixed(0)}ms (1回${(_navMs/_navN).toFixed(2)}ms`
+             + ` 走査${Math.round(_navPop/_navN).toLocaleString()})` : ''));
+  _navMs=0; _navN=0; _navPop=0;
   for(const k in _perf) _perf[k]=0;
 }
 async function renderLoop(){
@@ -6592,7 +7391,7 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  setInterval(()=>{ stepSocial(1); stepNeeds(1); retargetOnNeedChange(); }, 1000);
+  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepPolice(); retargetOnNeedChange(); }, 1000);
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
     setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子
