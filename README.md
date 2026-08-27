@@ -252,6 +252,7 @@ data/
 | `SOCIAL` | 1 | 住民どうしの関係と立ち話（`social.js`）。`0` で無効 |
 | `GRID` | 30 | 街の最大の一辺（セル数）。実寸は `GRID x CELL`（CELL=2.0） |
 | `FOG` | 1 | 遠景のフォグと地平線。`0` で従来の「浮島」表示に戻る |
+| `LIGHT_KEY` / `LIGHT_FILL` | 1.0 | 陽射しと環境光の強さ（見た目のコントラスト調整） |
 | `ECON` | 1 | お金・仕事・犯罪（`economy.js`）。`0` で無効 |
 | `CRIME` | 1 | 犯罪だけ無効にする。`0` でも経済は動く |
 | `POLICE` | 1 | 警察署と警官。`0` にすると誰も捕まらなくなる |
@@ -273,6 +274,15 @@ data/
 ```bash
 curl http://localhost:8080/economy
 ```
+
+**街を Day 1 から作り直す**（ポートを外に開けていなくても使えます）:
+
+```bash
+node tools/city-reset.js
+```
+
+`--status` で今の街を確認、`--file` でサーバ停止中に保存を外します。
+実行前に自動で `data/city_state.<日時>.bak` へ退避します。
 
 **街を広げるとき**：`GRID` を変えると `data/city_state.json` が読めなくなり、
 Day 1 からやり直しになります。必ず退避してください。

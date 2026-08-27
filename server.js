@@ -1059,18 +1059,50 @@ function disposeScene(S){
 // ため、非インデックス BufferGeometry の position(+uv) を連結する軽量版を自前で持つ。
 
 // フラットな正方形タイル (道路/地面) を2三角形=6頂点ぶん配列に追加する。
-function pushQuad(arr, size, tx, ty, z){
+// ── 接地感 (アンビエントオクルージョン) ────────────────────────────────────
+// 建物や木の際の地面を暗くする。これが無いと、建物が地面に「乗っている」のではなく
+// 板の上に浮いているように見える。**ドローコールは1つも増えない** —
+// 地面はもともと1メッシュにまとめてあるので、頂点カラーを足すだけで済む。
+const AO_ON    = process.env.GROUND_AO !== '0';
+const AO_DEPTH = envNum('AO_DEPTH', 0.42);   // 隅をどこまで暗くするか
+const AO_NOISE = envNum('AO_NOISE', 0.05);   // セルごとの微妙な明暗のばらつき
+const _solidAt = (r,c) => (r<0||r>=GRID||c<0||c>=GRID) ? false
+  : (MAP[r][c]===BUILDING || MAP[r][c]===TREE);
+// セル (r,c) の四隅それぞれの明るさ。隣接する建物/木が多い隅ほど暗い。
+function cornerAO(r, c){
+  if(!AO_ON) return [1,1,1,1];
+  // 巻き順に合わせて (x0y0, x1y0, x1y1, x0y1) = (-c-r, +c-r, +c+r, -c+r)
+  const k=(dr,dc)=>{
+    const side=(_solidAt(r+dr,c)?1:0)+(_solidAt(r,c+dc)?1:0);
+    const diag=_solidAt(r+dr,c+dc)?1:0;
+    // 2辺が塞がっている隅がいちばん暗い
+    const occ=Math.min(3, side*1.35 + diag*0.55);
+    return 1 - AO_DEPTH*(occ/3);
+  };
+  // 地面板の x は列(c)方向、y は行(r)方向
+  return [k(-1,-1), k(-1,1), k(1,1), k(1,-1)];
+}
+
+function pushQuad(arr, size, tx, ty, z, ao, tint){
   const h=size/2, x0=tx-h, x1=tx+h, y0=ty-h, y1=ty+h;
   arr.push(
     x0,y0,z,  x1,y0,z,  x1,y1,z,   // +Z を向く CCW 巻き
     x0,y0,z,  x1,y1,z,  x0,y1,z
   );
+  if(!ao) return;
+  const t=tint==null?1:tint;
+  const [a0,a1,a2,a3]=ao;
+  // 三角形2枚ぶん。頂点の並びに合わせて隅の明るさを配る
+  for(const v of [a0,a1,a2, a0,a2,a3]){ const g=v*t; arr.col.push(g,g,g); }
 }
 function quadMesh(posArr, color){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posArr), 3));
+  if(posArr.col && posArr.col.length)
+    g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(posArr.col), 3));
   g.computeVertexNormals();   // Lambert ライティング用
-  return new THREE.Mesh(g, new THREE.MeshLambertMaterial({color}));
+  return new THREE.Mesh(g, new THREE.MeshLambertMaterial(
+    {color, vertexColors: !!(posArr.col && posArr.col.length)}));
 }
 
 // 複数の非インデックス geometry を1つに連結 (position 必須, uv は任意)。
@@ -1165,7 +1197,10 @@ function buildScene(map){
   boxGeoByH = {};
   syncCity();          // CITY.structs -> BUILDING_TYPES / cellStruct を作り直す
 
-  const S=new THREE.Scene();S.background=new THREE.Color(0xeaf2f7);
+  const S=new THREE.Scene();
+  // background は「空の色」の入れ物としても使う (ドームとフォグがここを見る)。
+  // ドームを出すときは描画には使わないが、色の計算のために持っておく。
+  S.background=new THREE.Color(0xeaf2f7);
   // フォグ。頂点もドローコールも増えない (フラグメントシェーダ内の混色だけ)。
   // 色は updateDayNight が毎フレーム空の色に合わせる。
   const WORLD_W=GRID*CELL;
@@ -1197,6 +1232,24 @@ function buildScene(map){
   // 板の縁は決して見えない = 地平線が空との境界になる。
   //   板1枚 (2三角形) なので、どれだけ大きくしても負荷は変わらない。
   //   街の下地 (z=0) と重ならないよう少しだけ沈める。
+  // 空。単色の背景だと上も下も同じ色で「箱の中」に見える。
+  // 内側を向いた球に**頂点カラーでグラデーション**を焼くと、
+  // 天頂が濃く地平が淡い自然な空になる。1メッシュ = 1ドローコール。
+  //   色は updateDayNight が毎フレーム空と地平の色に合わせる (昼夜/天気に追従)。
+  if(SKY_DOME){
+    const sg=new THREE.SphereGeometry(WORLD_W*6, 16, 10);
+    const pos=sg.attributes.position, col=new Float32Array(pos.count*3);
+    sg.setAttribute('color', new THREE.BufferAttribute(col,3));
+    const sky=new THREE.Mesh(sg, new THREE.MeshBasicMaterial(
+      {vertexColors:true, side:THREE.BackSide, fog:false, depthWrite:false}));
+    sky.renderOrder=-2;                 // いちばん先に描く
+    sky.frustumCulled=false;
+    S.add(sky);
+    S.userData.sky=sky;
+    // ★ S.background は消さない。updateDayNight が「いまの空の色」として
+    //   読み書きし、ドームとフォグの両方がそこから色をもらう。
+    //   消すと fog.color.copy(null) で落ちる。
+  }
   if(FAR_GROUND){
     const far=Math.max(1200, WORLD_W*FOG_FAR_K*2.2);
     const fx=fieldCenterW();
@@ -1268,6 +1321,11 @@ const _cDay=new THREE.Color(0xeaf2f7), _cNight=new THREE.Color(0x0b1a33);
 const _sDay=new THREE.Color(0xfff4e0), _sDusk =new THREE.Color(0xff9a5c), _sNight=new THREE.Color(0x2a4a8a);
 const _gDay=new THREE.Color(0xbcd0e0), _gNight=new THREE.Color(0x24304a);
 const _cWeather=new THREE.Color();
+const SKY_DOME  = process.env.SKY_DOME !== '0';
+const LIGHT_KEY  = envNum('LIGHT_KEY', 1.0);    // 平行光 (陽射し) の強さ
+const LIGHT_FILL = envNum('LIGHT_FILL', 1.0);   // 環境光 (回り込み) の強さ
+const _cZenith  = new THREE.Color();
+const _cDeep    = new THREE.Color(0x1b3a63);   // 天頂に混ぜる深い青
 function updateDayNight(S){
   const L=S&&S.userData&&S.userData.lights; if(!L) return;
   const d=daylight();
@@ -1279,11 +1337,37 @@ function updateDayNight(S){
   if(w.sky!=null) S.background.lerp(_cWeather.setHex(w.sky), 0.25+0.5*d);
   // 地平線に色の段差を出さないよう、フォグは常に空と同じ色にする
   if(S.fog) S.fog.color.copy(S.background);
+  // 空ドーム: 天頂を少し濃く、地平をフォグと同じ色にする。
+  //   地平の色をフォグと一致させないと、遠景の地面との境目に段差が出る。
+  const dome=S.userData.sky;
+  if(dome){
+    const col=dome.geometry.attributes.color, pos=dome.geometry.attributes.position;
+    if(!dome.userData.h){                       // 高さの比 (0=地平, 1=天頂) を一度だけ求める
+      const h=new Float32Array(pos.count); let mx=1e-6;
+      for(let i=0;i<pos.count;i++){ h[i]=Math.max(0,pos.getZ(i)); if(h[i]>mx) mx=h[i]; }
+      for(let i=0;i<pos.count;i++) h[i]/=mx;
+      dome.userData.h=h;
+    }
+    const h=dome.userData.h;
+    _cZenith.copy(S.background).multiplyScalar(0.78).lerp(_cDeep, 0.18*(1-d)+0.10);
+    for(let i=0;i<pos.count;i++){
+      const t=Math.pow(h[i], 0.65);
+      col.setXYZ(i,
+        S.background.r+(_cZenith.r-S.background.r)*t,
+        S.background.g+(_cZenith.g-S.background.g)*t,
+        S.background.b+(_cZenith.b-S.background.b)*t);
+    }
+    col.needsUpdate=true;
+  }
   L.sun.color.copy(_sNight).lerp(_sDay,d).lerp(_sDusk,dusk*0.55*w.light);
-  L.sun.intensity  = (0.15+1.55*d)*w.light;
+  // 環境光と平行光の比。以前は 環境1.3 + 半球1.1 に対して 平行1.55 で、
+  // どの面もほぼ同じ明るさになり **箱に立体感が出ていなかった**。
+  // 環境を落として平行光を上げると、陽の当たる面と陰の面に差がついて形が見える。
+  // LIGHT_KEY / LIGHT_FILL で好みに寄せられる。
+  L.sun.intensity  = (0.18+2.35*d)*w.light*LIGHT_KEY;
   L.amb.color.copy(_gNight).lerp(_gDay,d);
-  L.amb.intensity  = (0.45+0.85*d)*(0.65+0.35*w.light);
-  L.hemi.intensity = (0.25+0.85*d)*(0.65+0.35*w.light);
+  L.amb.intensity  = (0.30+0.38*d)*(0.65+0.35*w.light)*LIGHT_FILL;
+  L.hemi.intensity = (0.20+0.50*d)*(0.65+0.35*w.light)*LIGHT_FILL;
 }
 
 // ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
@@ -2263,11 +2347,23 @@ function catBuildings(cat){
 function catCount(cat){ catBuildings(cat); return _catCache.count[cat]||0; }
 
 // ── 建物メッシュ (1軒単位で差し替えられるようにする) ──
+// 建物ごとの色のわずかなばらつき。同じテクスチャが並ぶと「コピー」に見えるので、
+// 場所から決まる固定の色味を掛ける。**マテリアルはどのみち clone しているので
+// 追加コストはゼロ**。毎回変わるとちらつくので、座標から決める。
+const BLDG_TINT = envNum('BLDG_TINT', 0.10);
+function structTint(st){
+  const h=((st.r*73856093) ^ (st.c*19349663)) >>> 0;
+  const a=((h    )&255)/255-0.5, b=((h>>8)&255)/255-0.5, g=((h>>16)&255)/255-0.5;
+  return [1+a*2*BLDG_TINT, 1+b*2*BLDG_TINT, 1+g*2*BLDG_TINT];
+}
 function structMats(st){
   if(st.state==='construction')                      // 工事中 = 灰色の低い箱
     return new THREE.MeshLambertMaterial({color:0x8f8f86});
   const mats=getBuildingMaterial(st.typeIdx).map(m=>m.clone());
-  if(st.state==='closed') mats.forEach(m=>m.color.setRGB(0.40,0.38,0.36));  // シャッター
+  if(st.state==='closed'){ mats.forEach(m=>m.color.setRGB(0.40,0.38,0.36)); return mats; } // シャッター
+  const [tr,tg,tb]=structTint(st);
+  mats.forEach(m=>m.color.setRGB(
+    Math.min(1,m.color.r*tr), Math.min(1,m.color.g*tg), Math.min(1,m.color.b*tb)));
   return mats;
 }
 function structHeight(st){
@@ -2357,6 +2453,9 @@ function addTreeMesh(S, r, c){
   const T=S && S.userData && S.userData.tree;
   if(!T) return;
   const cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
+  // 木は全部同じ形・同じ色で揃える。
+  //   一度 1本ずつ大きさ・緑の濃さ・向きを振ってみたが、幹も葉も「箱」なので
+  //   回すと立方体が菱形に見えて、揃っているときより不自然だった。戻してある。
   const trunk=new THREE.Mesh(T.trunkGeo, T.trunkMat.clone());
   trunk.position.set(cx,cy,CELL*.2); S.add(trunk);
   const cone=new THREE.Mesh(T.coneGeo, T.coneMat.clone());
@@ -2378,7 +2477,7 @@ function rebuildGround(S){
   // 街が広がると島が大きくなっていくように見える。
   const fs=fieldSize()*CELL, fx=fieldCenterW();
   g.base=new THREE.Mesh(new THREE.PlaneGeometry(fs,fs),
-                        new THREE.MeshLambertMaterial({color:0xe6e9e2}));
+                        new THREE.MeshLambertMaterial({color:0xd3d7cf}));
   g.base.position.set(fx,fx,0);
   S.add(g.base);
   // 上位%の閾値をその場の分布から決める (絶対数だと人数しだいで全面茶色になる)
@@ -2394,19 +2493,27 @@ function rebuildGround(S){
     }
   }
   const road=[], grass=[], w1=[], w2=[];
+  road.col=[]; grass.col=[]; w1.col=[]; w2.col=[];
+  // セルごとの微妙な明暗。一面べったり同じ色だと板に見えるので、
+  // 位置から決まる固定のばらつきを乗せる (毎回変わるとちらつく)。
+  const jit=(r,c)=>1 + (((r*73856093 ^ c*19349663) & 255)/255 - 0.5)*2*AO_NOISE;
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     const t=MAP[r][c], cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
-    if(t===ROAD){ pushQuad(road, CELL*.97, cx, cy, .008); continue; }
+    const ao=cornerAO(r,c), tint=jit(r,c);
+    if(t===ROAD){ pushQuad(road, CELL*.97, cx, cy, .008, ao, tint); continue; }
     if(t!==OTHER) continue;                       // 建物/木のセルには板を敷かない
     const f=CITY?CITY.foot[r*GRID+c]:0;
-    if(f>=t2)      pushQuad(w2,    CELL*.97, cx, cy, .006);
-    else if(f>=t1) pushQuad(w1,    CELL*.97, cx, cy, .006);
-    else           pushQuad(grass, CELL*.97, cx, cy, .005);
+    if(f>=t2)      pushQuad(w2,    CELL*.97, cx, cy, .006, ao, tint);
+    else if(f>=t1) pushQuad(w1,    CELL*.97, cx, cy, .006, ao, tint);
+    else           pushQuad(grass, CELL*.97, cx, cy, .005, ao, tint);
   }
-  if(road.length) { g.road =quadMesh(road,  0xc4c8cc); S.add(g.road); }
-  if(grass.length){ g.grass=quadMesh(grass, 0x9ccc65); S.add(g.grass); }
-  if(w1.length)   { g.wear1=quadMesh(w1,    0xa8a878); S.add(g.wear1); }
-  if(w2.length)   { g.wear2=quadMesh(w2,    0xb9a97e); S.add(g.wear2); }
+  // 雨の日は地面を濡らす (少し暗く・彩度を落とす)。色を変えるだけなので負荷ゼロ。
+  const wet = (CITY && CITY.weather==='rain') ? 0.80 : 1.0;
+  const dim = c => { const x=new THREE.Color(c); x.multiplyScalar(wet); return x.getHex(); };
+  if(road.length) { g.road =quadMesh(road,  dim(0xb3b8bd)); S.add(g.road); }
+  if(grass.length){ g.grass=quadMesh(grass, dim(0x8cbf58)); S.add(g.grass); }
+  if(w1.length)   { g.wear1=quadMesh(w1,    dim(0x9d9c6e)); S.add(g.wear1); }
+  if(w2.length)   { g.wear2=quadMesh(w2,    dim(0xac9c72)); S.add(g.wear2); }
 }
 
 // ── 建物の出現/消滅アニメーション ──────────────────────────────────────────
@@ -5285,23 +5392,38 @@ async function stepAll(){
   }
 }
 
+// 街を Day 1 に戻す。**呼び口は3つあるが実装はここ1つ**
+//   ・HTTP   /city?reset=1
+//   ・シグナル SIGUSR2 (外にポートを開けていなくても叩ける)
+//   ・WebSocket の newmap コマンド (client.html)
+//   newMap=true なら地形も引き直す。false なら CITY_SEED から同じ地形を作り直す。
+function doCityReset(newMap){
+  if(!CITY) return false;
+  const oldScene=scene;
+  if(newMap){
+    MAP=makeMap(GRID, Math.floor(Math.random()*100000));
+    resetCity(true);           // 新しい地形はそのまま使う
+  }else{
+    resetCity(false);          // CITY_SEED から同じ地形を作り直す
+  }
+  if(oldScene){
+    scene=buildScene(MAP);
+    disposeScene(oldScene);    // 古いシーンの GPU リソースを解放
+    initTrailField(scene);     // 足跡/住民メッシュは旧シーンと一緒に破棄されている
+    initAgentInstances(scene);
+    initAgents(scene);
+  }
+  saveCity();
+  console.log(`[City] Day 1 から作り直しました (${newMap?'地形も引き直し':'地形はそのまま'})`);
+  return true;
+}
+
 function handleCommand(msg){
   switch(msg.cmd){
     case 'pause': paused=!paused; break;
     case 'reset': if(scene) initAgents(scene); break;
     case 'speed': speedMul=[1,2,4][(([1,2,4].indexOf(speedMul)+1)%3)]; break;
-    case 'newmap': {
-      const oldScene=scene;
-      MAP=makeMap(GRID,Math.floor(Math.random()*100000));
-      resetCity(true);           // 新しい街 = 蓄積もゼロから (buildScene は CITY を読む)
-      scene=buildScene(MAP);
-      // 古いシーン (建物/道路/エージェント/トレイル) の GPU リソースを解放
-      disposeScene(oldScene);
-      initTrailField(scene);       // 足跡/住民メッシュは旧シーンと一緒に破棄されている
-      initAgentInstances(scene);
-      if(scene) initAgents(scene);
-      break;
-    }
+    case 'newmap': doCityReset(true); break;
   }
 }
 
@@ -5481,11 +5603,31 @@ function shutdownYt(sig, done){
 // 以前は YT_ENABLED のときだけハンドラを張っていたので、WebSocket 運用では
 // 何も後始末されずに落ちていた。
 function shutdownAll(sig){
+  // 止まったのに pid ファイルが残っていると、city-reset が居ないプロセスへ
+  // シグナルを送ろうとして紛らわしい。落ちるときに消しておく。
+  try{ if(fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); }catch(e){}
   try{ saveCity(); console.log(`[City] ${sig}: 街の状態を保存しました`); }catch(e){ console.warn(e.message); }
   shutdownYt(sig, ()=>process.exit(0));
 }
 process.on('SIGTERM', ()=>shutdownAll('SIGTERM'));
 process.on('SIGINT',  ()=>shutdownAll('SIGINT'));
+// 外にポートを開けていなくても街を作り直せるようにする。
+//   kill -USR2 <pid>          … Day 1 へ (地形はそのまま)
+//   kill -USR2 したあと即もう一度 … ではなく、地形も引き直したいときは
+//   RESET_NEWMAP=1 で起動するか tools/city-reset.js --newmap を使う。
+//   ※ SIGUSR1 は Node がデバッガ用に予約しているので使わない。
+process.on('SIGUSR2', ()=>{
+  console.log('[City] SIGUSR2 を受信 — 街を Day 1 から作り直します');
+  try{ doCityReset(process.env.RESET_NEWMAP==='1'); }
+  catch(e){ console.error('[City] リセットに失敗:', e.message); }
+});
+// pid をファイルに残す。pm2 でも systemd でも、これがあれば
+// tools/city-reset.js がプロセスを見つけられる。
+const PID_FILE = process.env.PID_FILE || path.join(__dirname, 'data', 'server.pid');
+try{
+  fs.mkdirSync(path.dirname(PID_FILE), {recursive:true});
+  fs.writeFileSync(PID_FILE, String(process.pid));
+}catch(e){ console.warn('[Init] pid ファイルを書けませんでした:', e.message); }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
@@ -6915,15 +7057,7 @@ tick(); setInterval(tick, ${ms});
     res.setHeader('Content-Type','application/json');
     if(!CITY){ res.writeHead(503); res.end(JSON.stringify({ok:false,error:'city not ready'})); return; }
     if(q.get('reset')==='1'){
-      resetCity(false);
-      if(scene){
-        const old=scene;
-        scene=buildScene(MAP);
-        disposeScene(old);
-        initTrailField(scene);     // 足跡/住民メッシュは旧シーンと一緒に破棄されている
-        initAgentInstances(scene);
-        initAgents(scene);
-      }
+      doCityReset(q.get('newmap')==='1');
       res.writeHead(200); res.end(JSON.stringify({ok:true, reset:true, day:gameDay()+1})); return;
     }
     // 天気の切替 (見た目の確認用): /city?weather=sunny|cloudy|rain

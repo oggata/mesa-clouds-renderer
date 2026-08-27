@@ -151,3 +151,7 @@ dist
 
 # 自動で見つけたライブ動画ID (実行時の状態)
 data/yt_live.json
+
+# 実行中プロセスの pid (tools/city-reset.js が読む)
+data/server.pid
+data/*.bak
