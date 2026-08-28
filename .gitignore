@@ -155,3 +155,6 @@ data/yt_live.json
 # 実行中プロセスの pid (tools/city-reset.js が読む)
 data/server.pid
 data/*.bak
+
+# BGM の再生一覧 (起動時に生成)
+data/music_playlist.txt

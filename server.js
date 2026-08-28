@@ -5458,6 +5458,63 @@ const YT = {
   statNew: 0, statDup: 0, statDrop: 0,
 };
 
+// ── BGM ────────────────────────────────────────────────────────────────────
+// いままで音声は anullsrc (無音) を入れていた。ここを差し替えるだけで曲が載る。
+//   YT_MUSIC にファイルかディレクトリを指定する。
+//   ・ファイル      … その曲をループ
+//   ・ディレクトリ  … 中の音声ファイルを並べて繰り返す (YT_MUSIC_SHUFFLE=1 で順番をばらす)
+// 音声はファイルから読むので ffmpeg が先読みしすぎないよう -re で実時間に合わせる。
+// (映像は Node がパイプへ実時間で書くので勝手に律速されるが、音声には歯止めが無い)
+const YT_MUSIC       = process.env.YT_MUSIC || '';
+const YT_MUSIC_VOL   = process.env.YT_MUSIC_VOL || '0.35';
+const YT_MUSIC_SHUF  = process.env.YT_MUSIC_SHUFFLE !== '0';
+const MUSIC_EXT = /\.(mp3|m4a|aac|ogg|opus|flac|wav)$/i;
+const MUSIC_LIST = path.join(__dirname, 'data', 'music_playlist.txt');
+// 一覧を何回ぶん書くか。ここが尽きると配信が止まるので多めに取る。
+const MUSIC_REPEAT = Math.max(1, envNum('YT_MUSIC_REPEAT', 200));
+
+// ディレクトリなら concat デマクサ用の一覧を書き出してパスを返す。
+// ファイルならそのまま返す。見つからなければ null。
+function resolveMusic(){
+  if(!YT_MUSIC) return null;
+  let fp=YT_MUSIC;
+  if(!path.isAbsolute(fp)) fp=path.join(__dirname, fp);
+  let st=null;
+  try{ st=fs.statSync(fp); }catch(e){
+    console.warn(`[YT] YT_MUSIC が見つかりません: ${fp} — 無音で配信します`);
+    return null;
+  }
+  if(st.isFile()) return {mode:'file', path:fp, n:1};
+  // ディレクトリ
+  let files=[];
+  try{ files=fs.readdirSync(fp).filter(f=>MUSIC_EXT.test(f)).map(f=>path.join(fp,f)); }
+  catch(e){ /* 下で空判定 */ }
+  if(!files.length){
+    console.warn(`[YT] ${fp} に音声ファイルがありません — 無音で配信します`);
+    return null;
+  }
+  files.sort();
+  if(YT_MUSIC_SHUF) for(let i=files.length-1;i>0;i--){
+    const j=Math.floor(Math.random()*(i+1)); [files[i],files[j]]=[files[j],files[i]];
+  }
+  // concat デマクサの一覧。パス中の ' は '\'' に置き換える決まり。
+  //   ★ concat デマクサには **-stream_loop が効かない** (ffmpeg 8.1.2 で確認。
+  //     "Operation not permitted" が出て1周で終わり、音声が尽きた時点で
+  //     ffmpeg が出力を閉じる = 配信が止まる)。
+  //     そこで**一覧そのものを繰り返し書く**。1曲4分としても
+  //     MUSIC_REPEAT=200 で 3曲なら約400時間ぶんになる。
+  const one=files.map(f=>`file '${f.replace(/'/g, "'\\''")}'`).join('\n');
+  const body=Array(MUSIC_REPEAT).fill(one).join('\n')+'\n';
+  try{
+    fs.mkdirSync(path.dirname(MUSIC_LIST), {recursive:true});
+    fs.writeFileSync(MUSIC_LIST, body);
+  }catch(e){
+    console.warn('[YT] 再生一覧を書けませんでした:', e.message);
+    return {mode:'file', path:files[0], n:1};
+  }
+  return {mode:'list', path:MUSIC_LIST, n:files.length, files};
+}
+
 function buildYtArgs(){
   const gop = FPS * 2;   // 2秒に1キーフレーム (YouTube 推奨)
   // 映像エンコーダ。既定 libx264。Mac は YT_VENC=h264_videotoolbox でHWエンコード(CPUほぼ0)。
@@ -5465,6 +5522,18 @@ function buildYtArgs(){
   const vout = (venc === 'libx264')
     ? ['-c:v','libx264','-preset', process.env.YT_PRESET || 'veryfast','-tune','zerolatency','-pix_fmt','yuv420p']
     : ['-c:v', venc, '-pix_fmt','yuv420p','-realtime','1'];   // videotoolbox 等
+  // 音声入力。曲が無ければ従来どおり無音。
+  const m=resolveMusic();
+  const musicArgs = m
+    ? (m.mode==='list'
+        // 一覧は繰り返し書いてあるので -stream_loop は付けない (効かないうえに壊れる)
+        ? ['-re','-f','concat','-safe','0','-i', m.path]
+        // 単一ファイルなら -stream_loop -1 が正しく効く (実測済み)
+        : ['-re','-stream_loop','-1','-i', m.path])
+    : ['-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100'];
+  if(m) console.log(`[YT] BGM: ${m.mode==='list' ? `${m.n}曲 (${YT_MUSIC_SHUF?'シャッフル':'名前順'}) x${MUSIC_REPEAT}周ぶん` : path.basename(m.path)+' をループ'}`
+                  + ` / 音量 ${YT_MUSIC_VOL}`);
+
   return [
     // --- 映像入力: stdin から流れてくる「生RGBAフレーム」(rawvideo) ---
     //     JPEGを挟まず生画素を直接渡す → sharpのJPEGエンコードが不要になりCPU減・画質向上。
@@ -5473,9 +5542,8 @@ function buildYtArgs(){
     '-s', `${WIDTH}x${HEIGHT}`,
     '-framerate', String(FPS),
     '-i', 'pipe:0',
-    // --- 音声入力: 無音 ---
-    '-f', 'lavfi',
-    '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+    // --- 音声入力: BGM (YT_MUSIC 未設定なら無音) ---
+    ...musicArgs,
     // --- 映像出力 ---
     ...vout,
     '-b:v', `${YT_BITRATE_K}k`,
@@ -5488,6 +5556,9 @@ function buildYtArgs(){
     '-c:a', 'aac',
     '-b:a', '128k',
     '-ar', '44100',
+    '-ac', '2',
+    // 音量。曲そのものは触らず、送出時だけ下げる
+    ...(m ? ['-af', `volume=${YT_MUSIC_VOL}`] : []),
     '-map', '0:v:0',
     '-map', '1:a:0',
     '-f', 'flv', `${YT_RTMP_BASE}/${YT_STREAM_KEY}`,
