@@ -150,6 +150,9 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マー�
 const MW = require('./world.js');
 // 住民どうしの関係と立ち話。街の物理/経済と混ざると読めなくなるので別ファイル。
 const SOC = require('./social.js');
+// GLB (glTF) から静的なジオメトリだけ読む最小の読み取り。
+// three の GLTFLoader は ESM で CommonJS から require できないため自前で持つ。
+const GLB = require('./glb.js');
 // お金・仕事・追い詰められ度・犯罪。犯罪だけ足すと飾りになるので、
 // 「失業 → 無一文 → 犯行 → 店の売上減 → さらに失業」の環ごと持たせる。
 const ECO = require('./economy.js');
@@ -912,6 +915,8 @@ function buildBldgToZ(goalClasses){
 
 let BUILDING_TYPES = {};
 const texCache = {};
+// 夜に光らせる部分だけを抜いたテクスチャ (キー は texCache と同じファイルパス)。
+const nightCache = {};
 
 // 建物 material は「建物タイプ × 面」単位で共有する。
 // 以前は建物ごとにテクスチャを clone していたため、同じタイプの建物が
@@ -942,14 +947,120 @@ async function loadTextureFile(filePath) {
     tex.userData = tex.userData || {};
     tex.userData.shared = true;
     texCache[filePath] = tex;
+    await buildNightMask(filePath, fullPath, data, info);   // 夜の明かり用
   } catch(e) {
     console.warn(`[Tex] failed ${filePath}:`, e.message);
     texCache[filePath] = null;
   }
 }
 
+// ファサード写真から「明かり」だけを抜いた画像を作る (夜の emissiveMap)。
+//   ・まわりより明るい所 … 窓・のれん・電球
+//   ・彩度の高い所       … 色つきの看板
+// を拾う。単純に「明るい所」だけで拾うと、写真に写り込んだ**空がそのまま光った**ので、
+// 広めにぼかした画像との差を混ぜて、空や白い壁のような一様に明るい面を落としている。
+// しきい値は画像ごとの輝度分布 (上位 NIGHT_PCT%) から決めるので、写真ごとの調整は要らない。
+const NIGHT_PCT  = envNum('NIGHT_PCT',  88);   // 上位何%を明かりとみなすか
+const NIGHT_BLUR = envNum('NIGHT_BLUR', 4);    // ぼかしの広さ (短辺の 1/n)
+const NIGHT_MIX  = envNum('NIGHT_MIX',  0.55); // 「明るさ」と「まわりとの差」の混ぜ具合
+const NIGHT_GAIN = envNum('NIGHT_GAIN', 1.35); // 抜いた明かりを持ち上げる量
+// 明かり以外の面にも薄く乗せる下駄。0 だと夜のファサードが真っ黒に潰れて、
+// せっかくの業種テクスチャが見えなくなる。街灯に照らされているくらいの量。
+const NIGHT_AMB  = envNum('NIGHT_AMB',  0.10);
+async function buildNightMask(filePath, fullPath, data, info){
+  try{
+    const W=info.width, H=info.height, N=W*H, ch=info.channels;
+    const sig=Math.max(2, Math.min(W,H)/NIGHT_BLUR);
+    const blur=await sharp(fullPath).greyscale().blur(sig).raw().toBuffer();
+    const bs=Math.max(1, Math.round(blur.length/N));      // 1ch のはずだが念のため
+    const sc=new Float32Array(N);
+    for(let i=0;i<N;i++){
+      const r=data[i*ch], g=data[i*ch+1], b=data[i*ch+2];
+      const L=0.299*r+0.587*g+0.114*b;
+      const mx=Math.max(r,g,b), mn=Math.min(r,g,b);
+      const sat=mx>0?(mx-mn)/mx:0;
+      sc[i]=Math.max(NIGHT_MIX*L + (1-NIGHT_MIX)*Math.max(0,L-blur[i*bs])*2.2,
+                     255*sat*0.6*(mx/255)-30);
+    }
+    const t=Float32Array.from(sc).sort()[Math.floor(N*NIGHT_PCT/100)], hi=t+45;
+    const out=new Uint8Array(N*4);
+    for(let i=0;i<N;i++){
+      let w=(sc[i]-t)/Math.max(1,hi-t);
+      w=Math.max(0,Math.min(1,w)); w=w*w*(3-2*w);
+      const k=w*NIGHT_GAIN + NIGHT_AMB;
+      out[i*4  ]=Math.min(255, data[i*ch  ]*k);
+      out[i*4+1]=Math.min(255, data[i*ch+1]*k);
+      out[i*4+2]=Math.min(255, data[i*ch+2]*k);
+      out[i*4+3]=255;
+    }
+    const tex=new THREE.DataTexture(out, W, H, THREE.RGBAFormat);
+    tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping;
+    tex.minFilter=tex.magFilter=THREE.LinearFilter;
+    tex.generateMipmaps=false;
+    tex.flipY=true;
+    tex.needsUpdate=true;
+    tex.userData={shared:true};        // 全建物で共有。disposeScene で壊さない
+    nightCache[filePath]=tex;
+  }catch(e){
+    console.warn(`[Tex] 夜マスクを作れませんでした ${filePath}:`, e.message);
+    nightCache[filePath]=null;
+  }
+}
+
+// ── 地面のテクスチャ (芝生 / 道路) ────────────────────────────────────────────
+// セルごとの板に貼る。UV は**ワールド座標から**作るので、セルをまたいでも模様が繋がる
+// (セル単位で 0..1 を振ると1マスごとに絵が切り替わって、格子状の繰り返しに見える)。
+//
+// ★ headless-gl は WebGL1。**2の冪サイズでないと繰り返し (RepeatWrapping) が効かず、
+//   テクスチャが真っ黒になる**。ミップマップも作れない。だから 256x256 に落としてある
+//   (tools は無し。sharp で resize しただけ: textures/base/*_256.jpg)。
+//   地面は寝た面なので、ミップマップが無いと遠景がちらちらする。
+const GROUND_TEX  = process.env.GROUND_TEX !== '0';
+const GRASS_TEX   = process.env.GRASS_TEX   || './textures/base/grass_256.jpg';
+const ASPHALT_TEX = process.env.ASPHALT_TEX || './textures/base/asphalt_256.jpg';
+const VACANT_TEX  = process.env.VACANT_TEX  || './textures/base/other_256.jpg';
+const GROUND_TILE = envNum('GROUND_TILE', CELL);   // 模様1枚ぶんのワールド長 (既定=1セル)
+// 板1枚の大きさ (セルに対する比)。1.0 で隣とぴったり合って隙間が消える。
+// 0.97 だと3%ぶん下地が覗いて格子状の白い線が出る (以前の見た目。戻したいときはここ)。
+const GROUND_FILL = envNum('GROUND_FILL', 1.0);
+const groundTex = {};                              // {grass, road}
+async function loadGroundTexture(key, filePath){
+  if(!GROUND_TEX) return;
+  const full=path.isAbsolute(filePath)?filePath:path.join(__dirname, filePath);
+  if(!sharp || !fs.existsSync(full)){
+    console.warn(`[Ground] ${full} が無い → ${key} は単色で描画します`);
+    return;
+  }
+  try{
+    const {data, info}=await sharp(full).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+    const pot=n=>n>0 && (n & (n-1))===0;
+    if(!pot(info.width) || !pot(info.height)){
+      console.warn(`[Ground] ${path.basename(full)} は ${info.width}x${info.height} で2の冪でない`
+                 + ` → WebGL1 では繰り返せないので ${key} は単色で描画します`);
+      return;
+    }
+    const tex=new THREE.DataTexture(new Uint8Array(data), info.width, info.height, THREE.RGBAFormat);
+    tex.wrapS=tex.wrapT=THREE.RepeatWrapping;
+    tex.magFilter=THREE.LinearFilter;
+    tex.minFilter=THREE.LinearMipmapLinearFilter;
+    tex.generateMipmaps=true;
+    tex.flipY=true;
+    tex.needsUpdate=true;
+    tex.userData={shared:true};      // 地面を作り直しても disposeScene で壊さない
+    groundTex[key]=tex;
+    console.log(`[Ground] ${path.basename(full)} を読み込み (${info.width}x${info.height})`);
+  }catch(e){
+    console.warn(`[Ground] ${filePath} を読めませんでした: ${e.message}`);
+  }
+}
+
 async function preloadTextures() {
-  await Promise.all(BLDG_TYPES.map(bt => loadTextureFile(bt.textureFile)));
+  await Promise.all([
+    ...BLDG_TYPES.map(bt => loadTextureFile(bt.textureFile)),
+    loadGroundTexture('grass', GRASS_TEX),
+    loadGroundTexture('road',  ASPHALT_TEX),
+    loadGroundTexture('vacant', VACANT_TEX),
+  ]);
 }
 
 // BoxGeometry 面インデックス:
@@ -1089,20 +1200,30 @@ function pushQuad(arr, size, tx, ty, z, ao, tint){
     x0,y0,z,  x1,y0,z,  x1,y1,z,   // +Z を向く CCW 巻き
     x0,y0,z,  x1,y1,z,  x0,y1,z
   );
+  // UV はワールド座標そのまま。セル単位で 0..1 を振ると、板が変わるたびに絵が
+  // 切り替わって「同じ模様のタイルが並んでいる」ことが見えてしまう。
+  if(arr.uv){
+    const k=1/GROUND_TILE, u0=x0*k, u1=x1*k, v0=y0*k, v1=y1*k;
+    arr.uv.push(u0,v0, u1,v0, u1,v1,  u0,v0, u1,v1, u0,v1);
+  }
   if(!ao) return;
   const t=tint==null?1:tint;
   const [a0,a1,a2,a3]=ao;
   // 三角形2枚ぶん。頂点の並びに合わせて隅の明るさを配る
   for(const v of [a0,a1,a2, a0,a2,a3]){ const g=v*t; arr.col.push(g,g,g); }
 }
-function quadMesh(posArr, color){
+function quadMesh(posArr, color, map){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posArr), 3));
   if(posArr.col && posArr.col.length)
     g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(posArr.col), 3));
+  if(posArr.uv && posArr.uv.length)
+    g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(posArr.uv), 2));
   g.computeVertexNormals();   // Lambert ライティング用
-  return new THREE.Mesh(g, new THREE.MeshLambertMaterial(
-    {color, vertexColors: !!(posArr.col && posArr.col.length)}));
+  const m=new THREE.MeshLambertMaterial(
+    {map: map||null, vertexColors: !!(posArr.col && posArr.col.length)});
+  if(color && color.isColor) m.color.copy(color); else m.color.set(color);
+  return new THREE.Mesh(g, m);
 }
 
 // 複数の非インデックス geometry を1つに連結 (position 必須, uv は任意)。
@@ -1195,6 +1316,8 @@ function buildScene(map){
   buildingMatCache = {};
   occluders = {};
   boxGeoByH = {};
+  structGeoCache = {};
+  litStructs.clear();          // 前のシーンのメッシュを夜の点灯リストに残さない
   syncCity();          // CITY.structs -> BUILDING_TYPES / cellStruct を作り直す
 
   const S=new THREE.Scene();
@@ -1216,12 +1339,7 @@ function buildScene(map){
   // (ジオメトリ/一部マテリアルは種類ごとに共有し、ドローコール増加を抑える)。
   // 木のジオメトリ/マテリアルはシーンに持たせる。フィールドが広がったときに
   // addTreeMesh で後から生やすため (モジュール共有だと disposeScene で壊れる)。
-  S.userData.tree={
-    trunkGeo:new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),
-    coneGeo :new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),
-    trunkMat:new THREE.MeshLambertMaterial({color:0x8a5a32}),
-    coneMat :new THREE.MeshLambertMaterial({color:0x4f9e44}),
-  };
+  S.userData.tree=makeTreeAssets();
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++)
     if(map[r][c]===TREE) addTreeMesh(S, r, c);
 
@@ -1308,7 +1426,15 @@ function updateOcclusionFade(){
     if(should===o.faded) continue;
     o.faded=should;
     const mats=Array.isArray(o.mesh.material)?o.mesh.material:[o.mesh.material];
-    mats.forEach(m=>{ m.transparent=should; m.opacity=should?FADE_OPACITY:1; m.depthWrite=!should; m.needsUpdate=true; });
+    // 深度書き込みは切らない。
+    //   建物が中身の詰まった箱だったころは depthWrite=false でも問題なかったが、
+    //   GLB になって**建物の中に塔屋・貯水槽が、外にベランダが**入った。
+    //   深度を書かないと1メッシュ内のグループが提出順 (facade→trim→sign) で
+    //   上書きされ、裏側のベランダや屋上の設備が手前の壁を突き抜けて見える
+    //   (「カメラ位置によって部品が飛び出す」の正体)。
+    //   深度を書いても、住民は不透明として**先に**描かれているので、
+    //   その上に半透明の建物が乗るだけ = 透けて見える動作は変わらない。
+    mats.forEach(m=>{ m.transparent=should; m.opacity=should?FADE_OPACITY:1; m.needsUpdate=true; });
   }
 }
 
@@ -1368,6 +1494,8 @@ function updateDayNight(S){
   L.amb.color.copy(_gNight).lerp(_gDay,d);
   L.amb.intensity  = (0.30+0.38*d)*(0.65+0.35*w.light)*LIGHT_FILL;
   L.hemi.intensity = (0.20+0.50*d)*(0.65+0.35*w.light)*LIGHT_FILL;
+  stepBldgLights(d);                 // 窓・入り口・看板を夜だけ光らせる
+  stepLamps(S, d);                   // 街灯
 }
 
 // ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
@@ -2294,6 +2422,7 @@ const isClosable = t => CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(t)) && t
 let CITY = null;             // 街の恒久状態 (initCity で作るか読み込む)
 let cityStamp = 0;           // 建物の状態が変わるたびに増やす (カテゴリ一覧キャッシュの無効化)
 let boxGeoByH = {};          // 高さ別 BoxGeometry (建物メッシュで共有)
+let structGeoCache = {};     // GLB を積み上げた建物ジオメトリ (fp/階数/種類ごとに共有)
 let groundDirty = false;     // 地面の板を作り直す必要があるか
 const cellStruct = {};       // "r_c" -> struct (2x2 は4セルとも同じ struct を指す)
 
@@ -2356,6 +2485,306 @@ function structTint(st){
   const a=((h    )&255)/255-0.5, b=((h>>8)&255)/255-0.5, g=((h>>16)&255)/255-0.5;
   return [1+a*2*BLDG_TINT, 1+b*2*BLDG_TINT, 1+g*2*BLDG_TINT];
 }
+// ── ビルの GLB (テクスチャの壁 + 立体パーツ) ────────────────────────────────
+// 既定は glb/building.glb を読む (tools/make-building-glb.js で作れる)。
+// 無ければ従来のテクスチャ箱に落ちる (起動は止めない)。BLDG_GLB=0 でも箱に戻る。
+//
+// ★ 壁は従来どおり textures/v4/*.jpg を貼る。あの写真は窓・入り口・のれん・看板まで
+//   描き込まれた「建物の顔」で、同じものをポリゴンで作り直しても情報は増えず、
+//   写真の窓と立体の窓が二重になるだけだった。GLB が足すのは
+//   **平らな面には出せないものだけ** — 看板・屋根・階段・ベランダ。
+//
+// GLB は部品を並べているだけで、**どれを積むかは structVariant がここで決める**。
+// 全部の建物が「陸屋根 + 屋上看板 + 袖看板 + 正面が同じ向き」だと街がコピーに見える:
+//   ・看板は業種で出す/出さないを決める (住宅・学校・警察署に看板は要らない)
+//   ・看板は**屋上か袖のどちらか一方**だけ (両方だとしつこい)
+//   ・正面はいちばん近い道路に向ける (全部 +Y 向きだと看板が一方向に揃う)
+//   ・低層の住宅や寺社は三角屋根、低層の集合住宅には外階段
+//   ・一部の建物は入り口が上がり階段になる
+// 判断はすべて「業種 + 座標から決まるハッシュ」なので、毎回同じ建物は同じ形になる。
+//
+// 建物の高さは BLDG_TYPES で 0.7〜3.3 セルとバラバラなので、1個のモデルを縦に
+// 引き伸ばすのではなく **必要な階数ぶんフロアを積む**。端数は縦 ±20% までで吸収する。
+//
+// マテリアル名でパーツを4グループに分ける = 1軒 1メッシュ / 最大4ドローコール。
+//
+// ★ 観測 (方策の入力) はここを見ていない。DINOv2 に入る画像は renderFPImageCfg の
+//   自前レイキャスタが MAP / BUILDING_TYPES から描くので、見た目をいくら変えても
+//   学習済みモデルの入力は1ビットも変わらない。ベランダにも階段にも当たり判定は無い。
+const BLDG_GLB    = process.env.BLDG_GLB || './glb/building.glb';
+const BLDG_BALCONY_MIN = envNum('BLDG_BALCONY_MIN', 3);   // 何階建て以上にベランダを付けるか (0=付けない)
+const GROUP_ORDER = ['facade','trim','roof','sign'];      // マテリアル配列の順序
+// GLB の**マテリアル名**(小文字) → グループ。ノード名は見ない
+// (見ると fp1_roof の中の trim まで roof 扱いになる)。
+// どれにも当てはまらない名前は trim (コンクリートの単色) 扱い。
+const GLB_PART_RULES = [
+  [/facade|wall|壁/, 'facade'],
+  [/roof|屋根|瓦/,   'roof'],
+  [/sign|看板/,      'sign'],
+];
+const glbGroupOf = nm => { for(const [re,g] of GLB_PART_RULES) if(re.test(nm)) return g; return 'trim'; };
+
+// 看板を出さない業種。住宅・学校・警察署に屋上看板や袖看板は要らない。
+const NO_SIGN = new Set(['house','apartment','school','elementary','junior','high',
+                         'university','police','cityhall','temple']);
+// 三角屋根が似合う業種 (低層のときだけ)。
+const GABLE_TYPES = new Set(['house','kiosk','cafe','ramen','bento','gyudon','shop',
+                             'pharmacy','post','elementary','junior','temple']);
+// 外階段が付きうる業種 (低層の集合住宅)。
+const EXSTAIR_TYPES = new Set(['apartment','hotel']);
+
+let _bldgMods=null, _bldgTried=false;
+// GLB を読んで「fp別 × モジュール別 × グループ別」の頂点配列にする。1回だけ。
+//   モジュールは底面が z=0 に揃っている前提。高さ = z の最大値。
+function bldgModules(){
+  if(_bldgTried) return _bldgMods;
+  _bldgTried=true;
+  if(process.env.BLDG_GLB==='0') return null;      // 明示的にテクスチャ箱へ戻す
+  const fp=path.isAbsolute(BLDG_GLB)?BLDG_GLB:path.join(__dirname, BLDG_GLB);
+  if(!fs.existsSync(fp)){
+    console.warn(`[Bldg] ${fp} が無い → 従来のテクスチャ箱で描画します`
+               + ` (node tools/make-building-glb.js で作れます)`);
+    return null;
+  }
+  try{
+    const g=GLB.loadGlb(fp);
+    const mods={};
+    for(const p of g.parts){
+      const node=(p.node||'').toLowerCase();
+      const m=mods[node]||(mods[node]={g:{}, h:0});
+      const grp=glbGroupOf((p.materialName||node).toLowerCase());
+      const b=m.g[grp]||(m.g[grp]={pos:[], nrm:[]});
+      const n=p.index?p.index.length:p.position.length/3;
+      for(let i=0;i<n;i++){
+        const v=p.index?p.index[i]:i;
+        // Y-up -> Z-up: (x,y,z) -> (x,-z,y)。正面 (glTF の -Z) が世界の +Y になる
+        b.pos.push(p.position[v*3], -p.position[v*3+2], p.position[v*3+1]);
+        if(p.normal) b.nrm.push(p.normal[v*3], -p.normal[v*3+2], p.normal[v*3+1]);
+        else         b.nrm.push(0,0,1);
+        if(p.position[v*3+1]>m.h) m.h=p.position[v*3+1];
+      }
+    }
+    const pick=k=>{
+      const q=n=>mods[`fp${k}_${n}`]||null;
+      const base=q('base'), floor=q('floor');
+      if(!base || !floor) return null;
+      return { base, floor,
+               roof:      q('roof') || {g:{},h:0},
+               gable:     q('roof_gable'),
+               balcony:   q('balcony'),
+               exstair:     q('exstair'),
+               exstairBase: q('exstair_base'),
+               stair:     q('stair'),
+               signRoof:  q('sign_roof'),
+               signBlade: q('sign_blade') };
+    };
+    const out={1:pick(1), 2:pick(2)};
+    if(!out[1]) throw new Error('fp1_base / fp1_floor が無い (ノード名を確認)');
+    if(!out[2]) out[2]=out[1];                     // 2x2 用が無ければ 1x1 を流用
+    const tri=g.parts.reduce((s,p)=>s+(p.index?p.index.length:p.position.length/3)/3,0);
+    const have=['gable','balcony','exstair','stair','signRoof','signBlade']
+      .filter(k=>out[1][k]).join(',') || 'なし';
+    console.log(`[Bldg] ${path.basename(fp)} を読み込み (${tri}三角形 / `
+              + `土台${out[1].base.h.toFixed(2)} フロア${out[1].floor.h.toFixed(2)}`
+              + ` 陸屋根${out[1].roof.h.toFixed(2)} / 追加パーツ: ${have})`);
+    _bldgMods=out;
+  }catch(e){
+    console.warn(`[Bldg] ${fp} を読めませんでした: ${e.message} → 従来のテクスチャ箱で描画します`);
+  }
+  return _bldgMods;
+}
+
+// 建物の「正面」をいちばん近い道路の側に向ける。
+// 全部が +Y を向いていると、看板も入り口も街じゅうで一方向に揃って気持ちが悪い。
+// 道路が2方向にあるときはハッシュで選ぶ (角地の店がどちらを向くかは一定)。
+//   k=0 → 正面が行+ / k=1 → 列- / k=2 → 行- / k=3 → 列+
+function structFacing(st, hash){
+  const fp=st.fp;
+  const isRoad=(r,c)=> r>=0 && r<GRID && c>=0 && c<GRID && MAP[r][c]===ROAD;
+  const sides=[
+    [[st.r+fp, st.c], [st.r+fp, st.c+fp-1]],
+    [[st.r, st.c-1],  [st.r+fp-1, st.c-1]],
+    [[st.r-1, st.c],  [st.r-1, st.c+fp-1]],
+    [[st.r, st.c+fp], [st.r+fp-1, st.c+fp]],
+  ];
+  const hit=[];
+  for(let k=0;k<4;k++) if(sides[k].some(([r,c])=>isRoad(r,c))) hit.push(k);
+  return hit.length ? hit[hash%hit.length] : (hash%4);
+}
+
+// この建物がどの部品を積むか。業種と座標だけで決まる = 何度呼んでも同じ形。
+function structVariant(st){
+  const M=bldgModules();
+  const S=M ? (M[st.fp]||M[1]) : null;
+  const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
+  const hash=((st.r*2654435761) ^ (st.c*40503)) >>> 0;
+  const rnd=i=>((((hash>>>(i*5))&31)+0.5)/32);     // 独立した擬似乱数を何個か取り出す
+  const V={n:0, gable:false, sign:null, balcony:false, exstair:false, stair:false,
+           facing:structFacing(st, hash)};
+  if(!S) return V;
+  const H=structHeight(st);
+  const floors=rh=>Math.max(0, Math.round((H - S.base.h - rh)/S.floor.h));
+  V.n=floors(S.roof.h);
+  // 三角屋根。似合う業種は低層なら大体そうする / それ以外もたまに混ぜる
+  V.gable = !!S.gable && (GABLE_TYPES.has(bt.name) ? (V.n<=3 && rnd(0)<0.85)
+                                                   : (V.n<=2 && rnd(0)<0.18));
+  if(V.gable) V.n=floors(S.gable.h);               // 屋根が変わると入る階数も変わる
+  // 看板は屋上か袖のどちらか一方だけ。三角屋根に屋上看板は載らない
+  if(!NO_SIGN.has(bt.name)){
+    const roofOK=!!S.signRoof && !V.gable, bladeOK=!!S.signBlade;
+    if(roofOK && bladeOK) V.sign=(V.n>=4 || rnd(1)<0.55) ? 'roof' : 'blade';
+    else if(roofOK)       V.sign='roof';
+    else if(bladeOK)      V.sign='blade';
+  }
+  V.exstair = !!S.exstair && !!S.exstairBase && EXSTAIR_TYPES.has(bt.name)
+            && V.n>=2 && V.n<=4 && rnd(2)<0.65;
+  V.balcony = !!S.balcony && BLDG_BALCONY_MIN>0 && V.n>=BLDG_BALCONY_MIN;
+  V.stair   = !!S.stair && !V.exstair && rnd(3)<0.35;
+  return V;
+}
+
+// 高さ H (ワールド単位) に合うようフロアを積み、1つの BufferGeometry にする。
+// グループの並びは GROUP_ORDER。マテリアル配列も必ず同じ順で渡すこと。
+//
+// UV は **facade グループにだけ** ここで貼り直す。業種テクスチャは「1枚で建物の
+// 正面まるごと」の絵なので、モジュール側に UV を持たせると階ごとに絵が繰り返して
+// しまう。組み上がった実寸から箱状に投影すれば、従来のテクスチャ箱と同じ見え方になる。
+// (4面とも同じ絵なので、建物ごと回してもテクスチャの向きは破綻しない)
+function buildStructGeo(fpn, H, V){
+  const M=bldgModules(); if(!M) return null;
+  const S=M[fpn]||M[1];
+  const roofMod=(V.gable && S.gable) ? S.gable : S.roof;
+  const actual=S.base.h + V.n*S.floor.h + roofMod.h;
+  const sz=Math.min(1.25, Math.max(0.80, H/actual));   // 端数は縦の伸縮で吸収
+  const key=[fpn, V.n, sz.toFixed(3), V.gable?'g':'f', V.sign||'-',
+             V.balcony?'b':'-', V.exstair?'x':'-', V.stair?'s':'-', V.facing].join('_');
+  if(structGeoCache[key]) return structGeoCache[key];
+
+  const buf={}; for(const k of GROUP_ORDER) buf[k]={pos:[], nrm:[]};
+  const a=V.facing*Math.PI/2, ca=Math.cos(a), sa=Math.sin(a);
+  let maxZ=0;
+  const put=(mod, z0)=>{
+    if(!mod) return;
+    for(const grp in mod.g){
+      const src=mod.g[grp], dst=buf[grp]||buf.trim;
+      for(let i=0;i<src.pos.length;i+=3){
+        const x=src.pos[i], y=src.pos[i+1], z=(src.pos[i+2]+z0)*sz;
+        dst.pos.push(x*ca - y*sa, x*sa + y*ca, z);     // 正面を facing の向きへ回す
+        const nx=src.nrm[i], ny=src.nrm[i+1];
+        dst.nrm.push(nx*ca - ny*sa, nx*sa + ny*ca, src.nrm[i+2]);
+        if(z>maxZ) maxZ=z;
+      }
+    }
+  };
+  put(S.base, 0);
+  if(V.stair)            put(S.stair,     0);
+  if(V.sign==='blade')   put(S.signBlade, 0);
+  for(let i=0;i<V.n;i++){
+    const z=S.base.h + i*S.floor.h;
+    put(S.floor, z);
+    if(V.balcony) put(S.balcony, z);
+  }
+  if(V.exstair){
+    // 1本目だけ地面から上る (段差が土台の高さぶんある)。以降は1層ずつ。
+    // 最上階の廊下は「n-1本目」で届くので、本数は n-1 + 1本目。
+    put(S.exstairBase, 0);
+    for(let i=0;i<V.n-1;i++) put(S.exstair, S.base.h + i*S.floor.h);
+  }
+  const zTop=S.base.h + V.n*S.floor.h;
+  put(roofMod, zTop);
+  if(V.sign==='roof')    put(S.signRoof, zTop);
+
+  const total=GROUP_ORDER.reduce((s,k)=>s+buf[k].pos.length, 0);
+  const pos=new Float32Array(total), nrm=new Float32Array(total);
+  const uv =new Float32Array(total/3*2);
+  const bw=fpn*CELL*0.8, half=bw/2, Ht=actual*sz;
+  const geo=new THREE.BufferGeometry();
+  let o=0;
+  for(let gi=0; gi<GROUP_ORDER.length; gi++){
+    const g=GROUP_ORDER[gi], b=buf[g];
+    if(!b.pos.length) continue;
+    pos.set(b.pos, o); nrm.set(b.nrm, o);
+    if(g==='facade'){
+      // 面の向きで横方向を決める。外から見て左→右に u が増えるようにする。
+      // v は地面 0 → 屋上 1。
+      for(let i=0;i<b.pos.length;i+=3){
+        const x=b.pos[i], y=b.pos[i+1], z=b.pos[i+2];
+        const nx=b.nrm[i], ny=b.nrm[i+1];
+        const u = Math.abs(nx)>=Math.abs(ny)
+          ? (nx>0 ? (y+half)/bw : (half-y)/bw)
+          : (ny>0 ? (half-x)/bw : (x+half)/bw);
+        uv[(o+i)/3*2  ]=u;
+        uv[(o+i)/3*2+1]=z/Ht;
+      }
+    }
+    geo.addGroup(o/3, b.pos.length/3, gi);      // マテリアルの割り当て
+    o+=b.pos.length;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  geo.setAttribute('normal',   new THREE.BufferAttribute(nrm,3));
+  geo.setAttribute('uv',       new THREE.BufferAttribute(uv,2));
+  geo.userData.hVis=Math.max(Ht, maxZ);   // せり上がり/沈みアニメが使う実寸 (屋根も含む)
+  structGeoCache[key]=geo;
+  return geo;
+}
+
+// 立体パーツ (ベランダ・パラペット・階段) のコンクリート色。
+// 屋上の色は従来の箱の屋上 (0xb0b4ac) に合わせてある。
+const TRIM_COLOR = 0xb2b5ac;
+// 三角屋根の屋根材。業種ごとに変えて、並んだ家が全部同じ色にならないようにする。
+const ROOF_PALETTE=[0x8a5a4a,0x4e5a63,0x6d6a55,0x7a4f43,0x55606a,0x8a7a5a,0x5f6b56,0x6a5450];
+function structGlbMats(st){
+  const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
+  const closed=(st.state==='closed');
+  const tex  = texCache[bt.textureFile] || null;
+  const mask = closed ? null : (nightCache[bt.textureFile] || null);
+  const [tr,tg,tb]=structTint(st);
+  const tint=hex=>{
+    const c=new THREE.Color(hex);
+    if(!closed) c.setRGB(Math.min(1,c.r*tr), Math.min(1,c.g*tg), Math.min(1,c.b*tb));
+    return c;
+  };
+  // 壁: テクスチャを共有し、色 (= テクスチャに掛かる係数) だけ建物ごとに振る。
+  // 閉店中は暗く落として「シャッターが下りている」ことを夜でも分かるようにする。
+  const facade = tex ? new THREE.MeshLambertMaterial({map:tex})
+                     : new THREE.MeshLambertMaterial({color:bt.fallbackColor});
+  facade.color.copy(closed ? new THREE.Color(0x5e5a55)
+                           : tint(tex ? 0xffffff : bt.fallbackColor));
+  if(mask){                                   // 夜に光るのは「明かり」の部分だけ
+    facade.emissive=new THREE.Color(0xffffff);
+    facade.emissiveMap=mask;
+    facade.emissiveIntensity=0;
+  }
+  const trim = new THREE.MeshLambertMaterial({color: tint(closed?0x6a665f:TRIM_COLOR)});
+  const roof = new THREE.MeshLambertMaterial(
+    {color: tint(closed?0x4c4842:ROOF_PALETTE[st.typeIdx%ROOF_PALETTE.length])});
+  const sign = new THREE.MeshLambertMaterial({color: closed?0x4a4640:bt.fallbackColor});
+  if(!closed){ sign.emissive=new THREE.Color(bt.fallbackColor); sign.emissiveIntensity=0; }
+  return [facade, trim, roof, sign];          // ★ GROUP_ORDER と同じ並び
+}
+
+// ── 夜の点灯 ───────────────────────────────────────────────────────────────
+// ファサードの emissiveMap (= テクスチャから明かりだけを抜いた画像) の強度を上げる。
+// 写真に描かれた窓・のれん・店の看板がそのまま光るので、業種ごとに夜の顔が変わる。
+// 立体の看板 (袖看板 / 屋上看板) は業種色で別に光らせる。
+// 建物ごとに点き始めが ±0.06 ずれる。**閉店中と工事中は登録しないので暗いまま**＝
+// 夜でも「あの店は閉まっている」が分かる。
+const litStructs = new Set();
+const BLDG_GLOW  = envNum('BLDG_GLOW', 1.0);       // 夜の明るさの倍率 (0で消灯)
+// 明かりの強さ。ACES トーンマップ (exposure 0.6) を通ると素の emissive は
+// かなり落ちるので、写真の窓がはっきり点いて見えるところまで持ち上げてある。
+const NIGHT_LIT  = envNum('NIGHT_LIT', 2.6);
+function stepBldgLights(d){
+  if(!litStructs.size) return;
+  for(const mesh of litStructs){
+    const u=mesh.userData.lit; if(!u) continue;
+    const t=Math.max(0, Math.min(1, (0.55+u.phase-d)/0.40));
+    const e=t*t*(3-2*t);                            // smoothstep: 夕方にじわっと点く
+    if(u.facade) u.facade.emissiveIntensity=e*NIGHT_LIT*BLDG_GLOW;
+    if(u.sign)   u.sign.emissiveIntensity=(0.25+e*1.25)*BLDG_GLOW;  // 看板は薄暮から
+  }
+}
+
 function structMats(st){
   if(st.state==='construction')                      // 工事中 = 灰色の低い箱
     return new THREE.MeshLambertMaterial({color:0x8f8f86});
@@ -2375,7 +2804,8 @@ function removeStructMesh(S, st){
   structAnims.delete(st.r+'_'+st.c);   // 差し替え前のメッシュを動かし続けない
   if(!o) return;
   if(S) S.remove(o.mesh);
-  // geometry は boxGeoByH で共有、テクスチャは建物タイプで共有。
+  litStructs.delete(o.mesh);
+  // geometry は boxGeoByH / structGeoCache で共有、テクスチャは建物タイプで共有。
   // ここで dispose していいのは clone した material だけ。
   const arr=Array.isArray(o.mesh.material)?o.mesh.material:[o.mesh.material];
   arr.forEach(m=>m.dispose());
@@ -2387,10 +2817,30 @@ function addStructMesh(S, st){
   removeStructMesh(S, st);
   const span=st.fp, bw=span*CELL*0.8, h=structHeight(st);
   const cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
-  const gkey=span+'_'+h.toFixed(3);
-  if(!boxGeoByH[gkey]) boxGeoByH[gkey]=bakeBoxUV(new THREE.BoxGeometry(bw,bw,h));
-  const mesh=new THREE.Mesh(boxGeoByH[gkey], structMats(st));
-  mesh.position.set(cx,cy,h/2);
+  let mesh=null, hVis=h, zRest=h/2;
+  // 工事中はどのみち灰色の低い箱なので GLB を組まない
+  if(st.state!=='construction' && bldgModules()){
+    const geo=buildStructGeo(span, h, structVariant(st));
+    if(geo){
+      mesh=new THREE.Mesh(geo, structGlbMats(st));
+      hVis=geo.userData.hVis; zRest=0;             // GLB は底面が z=0 に揃っている
+    }
+  }
+  if(!mesh){                                       // 従来のテクスチャ箱 (中心が原点)
+    const gkey=span+'_'+h.toFixed(3);
+    if(!boxGeoByH[gkey]) boxGeoByH[gkey]=bakeBoxUV(new THREE.BoxGeometry(bw,bw,h));
+    mesh=new THREE.Mesh(boxGeoByH[gkey], structMats(st));
+  }
+  mesh.position.set(cx,cy,zRest);
+  mesh.userData.hVis=hVis; mesh.userData.zRest=zRest;
+  if(st.state==='open' && Array.isArray(mesh.material) && mesh.material.length===GROUP_ORDER.length){
+    const facade=mesh.material[0], sign=mesh.material[GROUP_ORDER.indexOf('sign')];
+    const hash=((st.r*73856093) ^ (st.c*19349663)) >>> 0;
+    mesh.userData.lit={ facade: facade.emissiveMap?facade:null,
+                        sign:   sign.emissive?sign:null,
+                        phase:((((hash>>16)&255)/255)-0.5)*0.12 };
+    litStructs.add(mesh);
+  }
   S.add(mesh);
   occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
   _occStamp=-1;                       // バケツを作り直す
@@ -2449,6 +2899,110 @@ function stepRain(dt, cam){
   p.geometry.attributes.position.needsUpdate=true;
 }
 
+// ── 木のジオメトリ ────────────────────────────────────────────────────────
+// 既定は glb/tree.glb を読む。無ければ従来の箱2つに落ちる (起動は止めない)。
+//   ・glTF は Y が上、この世界は Z が上なので X 軸まわりに +90度回す
+//   ・GLB の大きさはモデル任せなので、高さが TREE_GLB_H セルぶんになるよう正規化する
+//     ★ 観測側にも TREE_HEIGHT という別の定数がある (FPV_HEIGHTS のときレイキャスタが
+//       木の高さとして使う = **方策の入力**)。あちらは触らないこと。名前を分けてある。
+//       見た目のモデルを替えても観測は変わらない (観測は three.js を使っていない)。
+//   ・材質は名前で幹/葉に振り分ける。GLB 側の baseColorFactor は灰色なので使わない
+//   ・**木は1本ずつ2メッシュのまま**にする。1メッシュにまとめると
+//     近接フェード (occluders) が幹と葉を別々に薄くできなくなる。
+const TREE_GLB    = process.env.TREE_GLB || './glb/tree.glb';
+const TREE_GLB_H  = envNum('TREE_GLB_H', 0.9);     // 3D表示での木の高さ (セル単位)
+let _treeRaw=null, _treeRawTried=false;
+
+// GLB を読んで「幹」「葉」の2つ (position/normal/index) にまとめる。1回だけ。
+function treeRawParts(){
+  if(_treeRawTried) return _treeRaw;
+  _treeRawTried=true;
+  if(process.env.TREE_GLB==='0') return null;      // 明示的に箱へ戻す
+  const fp=path.isAbsolute(TREE_GLB)?TREE_GLB:path.join(__dirname, TREE_GLB);
+  if(!fs.existsSync(fp)){
+    console.warn(`[Tree] ${fp} が無い → 従来の箱で描画します`);
+    return null;
+  }
+  try{
+    const g=GLB.loadGlb(fp);
+    // 全体の高さ (glTF の Y) から倍率を出し、底面を原点に合わせる
+    let minY=Infinity, maxY=-Infinity;
+    for(const p of g.parts) for(let i=1;i<p.position.length;i+=3){
+      if(p.position[i]<minY) minY=p.position[i];
+      if(p.position[i]>maxY) maxY=p.position[i];
+    }
+    const k=(CELL*TREE_GLB_H)/Math.max(1e-6, maxY-minY);
+    // 名前で幹/葉に振り分ける。分からないものは葉に寄せる。
+    const bucket={trunk:[], leaf:[]};
+    for(const p of g.parts){
+      const nm=((p.materialName||'')+' '+(p.node||'')).toLowerCase();
+      bucket[/trunk|wood|bark|幹/.test(nm) ? 'trunk' : 'leaf'].push(p);
+    }
+    const build=arr=>{
+      if(!arr.length) return null;
+      let nv=0, ni=0;
+      for(const p of arr){ nv+=p.position.length/3; ni+=p.index?p.index.length:p.position.length/3; }
+      const pos=new Float32Array(nv*3), nrm=new Float32Array(nv*3), idx=new Uint32Array(ni);
+      let vo=0, io=0;
+      for(const p of arr){
+        const n=p.position.length/3;
+        for(let i=0;i<n;i++){
+          // Y-up -> Z-up: (x, y, z) -> (x, -z, y)。底面を z=0 に合わせる。
+          pos[(vo+i)*3  ] =  p.position[i*3  ]*k;
+          pos[(vo+i)*3+1] = -p.position[i*3+2]*k;
+          pos[(vo+i)*3+2] = (p.position[i*3+1]-minY)*k;
+          if(p.normal){
+            nrm[(vo+i)*3  ] =  p.normal[i*3  ];
+            nrm[(vo+i)*3+1] = -p.normal[i*3+2];
+            nrm[(vo+i)*3+2] =  p.normal[i*3+1];
+          }
+        }
+        if(p.index) for(let i=0;i<p.index.length;i++) idx[io+i]=p.index[i]+vo;
+        else        for(let i=0;i<n;i++)              idx[io+i]=vo+i;
+        io+=p.index?p.index.length:n; vo+=n;
+      }
+      return {pos, nrm, idx};
+    };
+    const out={trunk:build(bucket.trunk), leaf:build(bucket.leaf)};
+    if(!out.trunk && !out.leaf) throw new Error('パーツが空');
+    const tri=((out.trunk?out.trunk.idx.length:0)+(out.leaf?out.leaf.idx.length:0))/3;
+    console.log(`[Tree] ${path.basename(fp)} を読み込み (${tri}三角形 / 高さ${TREE_GLB_H}セル)`);
+    _treeRaw=out;
+  }catch(e){
+    console.warn(`[Tree] ${fp} を読めませんでした: ${e.message} → 従来の箱で描画します`);
+  }
+  return _treeRaw;
+}
+
+// シーンごとにジオメトリを作る (disposeScene で捨てられるため使い回さない)
+function makeTreeAssets(){
+  const raw=treeRawParts();
+  const mk=part=>{
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(part.pos,3));
+    if(part.nrm) g.setAttribute('normal', new THREE.BufferAttribute(part.nrm,3));
+    g.setIndex(new THREE.BufferAttribute(part.idx,1));
+    if(!part.nrm) g.computeVertexNormals();
+    return g;
+  };
+  if(raw && (raw.trunk || raw.leaf)){
+    return {
+      glb:true,
+      trunkGeo: raw.trunk ? mk(raw.trunk) : new THREE.BufferGeometry(),
+      coneGeo : raw.leaf  ? mk(raw.leaf)  : new THREE.BufferGeometry(),
+      trunkMat:new THREE.MeshLambertMaterial({color:0x8a5a32}),
+      coneMat :new THREE.MeshLambertMaterial({color:0x4f9e44}),
+    };
+  }
+  return {
+    glb:false,
+    trunkGeo:new THREE.BoxGeometry(CELL*.15,CELL*.15,CELL*.4),
+    coneGeo :new THREE.BoxGeometry(CELL*.55,CELL*.55,CELL*.45),
+    trunkMat:new THREE.MeshLambertMaterial({color:0x8a5a32}),
+    coneMat :new THREE.MeshLambertMaterial({color:0x4f9e44}),
+  };
+}
+
 function addTreeMesh(S, r, c){
   const T=S && S.userData && S.userData.tree;
   if(!T) return;
@@ -2456,10 +3010,14 @@ function addTreeMesh(S, r, c){
   // 木は全部同じ形・同じ色で揃える。
   //   一度 1本ずつ大きさ・緑の濃さ・向きを振ってみたが、幹も葉も「箱」なので
   //   回すと立方体が菱形に見えて、揃っているときより不自然だった。戻してある。
+  // GLB のジオメトリは底面が z=0 に揃えてあるのでそのまま地面に置く。
+  // 箱のときは中心が原点なので、従来どおり持ち上げる。
+  const zTrunk = T.glb ? 0 : CELL*.2;
+  const zLeaf  = T.glb ? 0 : CELL*.58;
   const trunk=new THREE.Mesh(T.trunkGeo, T.trunkMat.clone());
-  trunk.position.set(cx,cy,CELL*.2); S.add(trunk);
+  trunk.position.set(cx,cy,zTrunk); S.add(trunk);
   const cone=new THREE.Mesh(T.coneGeo, T.coneMat.clone());
-  cone.position.set(cx,cy,CELL*.58); S.add(cone);
+  cone.position.set(cx,cy,zLeaf); S.add(cone);
   occluders[r+'_'+c+'_t1']={mesh:trunk,cx,cy,faded:false};
   occluders[r+'_'+c+'_t2']={mesh:cone,cx,cy,faded:false};
 }
@@ -2494,26 +3052,165 @@ function rebuildGround(S){
   }
   const road=[], grass=[], w1=[], w2=[];
   road.col=[]; grass.col=[]; w1.col=[]; w2.col=[];
+  road.uv =[]; grass.uv =[]; w1.uv =[]; w2.uv =[];
   // セルごとの微妙な明暗。一面べったり同じ色だと板に見えるので、
   // 位置から決まる固定のばらつきを乗せる (毎回変わるとちらつく)。
   const jit=(r,c)=>1 + (((r*73856093 ^ c*19349663) & 255)/255 - 0.5)*2*AO_NOISE;
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     const t=MAP[r][c], cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
     const ao=cornerAO(r,c), tint=jit(r,c);
-    if(t===ROAD){ pushQuad(road, CELL*.97, cx, cy, .008, ao, tint); continue; }
-    if(t!==OTHER) continue;                       // 建物/木のセルには板を敷かない
+    if(t===ROAD){ pushQuad(road, CELL*GROUND_FILL, cx, cy, .008, ao, tint); continue; }
+    // 建物と木のセルにも板を敷く。以前は敷いていなかったが、板どうしの隙間を
+    // 埋めた (GROUND_FILL=1.0) 途端、**下地の板が白い正方形として浮き出た**。
+    // 建物は幅がセルの 0.8 倍しかないので、足元に2割ぶんの余白が出るのも同じ理由。
+    //   建物の足元 → 道と同じ舗装 (歩道に見える)
+    //   木の足元   → 芝生
+    if(t===BUILDING){ pushQuad(road,  CELL*GROUND_FILL, cx, cy, .008, ao, tint); continue; }
+    if(t===TREE)    { pushQuad(grass, CELL*GROUND_FILL, cx, cy, .005, ao, tint); continue; }
+    if(t!==OTHER) continue;
     const f=CITY?CITY.foot[r*GRID+c]:0;
-    if(f>=t2)      pushQuad(w2,    CELL*.97, cx, cy, .006, ao, tint);
-    else if(f>=t1) pushQuad(w1,    CELL*.97, cx, cy, .006, ao, tint);
-    else           pushQuad(grass, CELL*.97, cx, cy, .005, ao, tint);
+    if(f>=t2)      pushQuad(w2,    CELL*GROUND_FILL, cx, cy, .006, ao, tint);
+    else if(f>=t1) pushQuad(w1,    CELL*GROUND_FILL, cx, cy, .006, ao, tint);
+    else           pushQuad(grass, CELL*GROUND_FILL, cx, cy, .005, ao, tint);
   }
   // 雨の日は地面を濡らす (少し暗く・彩度を落とす)。色を変えるだけなので負荷ゼロ。
   const wet = (CITY && CITY.weather==='rain') ? 0.80 : 1.0;
   const dim = c => { const x=new THREE.Color(c); x.multiplyScalar(wet); return x.getHex(); };
-  if(road.length) { g.road =quadMesh(road,  dim(0xb3b8bd)); S.add(g.road); }
-  if(grass.length){ g.grass=quadMesh(grass, dim(0x8cbf58)); S.add(g.grass); }
-  if(w1.length)   { g.wear1=quadMesh(w1,    dim(0x9d9c6e)); S.add(g.wear1); }
-  if(w2.length)   { g.wear2=quadMesh(w2,    dim(0xac9c72)); S.add(g.wear2); }
+  // テクスチャがあるときは色を白にする (色は写真にそのまま掛かるため)。
+  // AO の頂点カラーと雨の濡れはこれまでどおり乗る。
+  if(road.length) { g.road =quadMesh(road,  dim(groundTex.road ?0xffffff:0xb3b8bd), groundTex.road);  S.add(g.road); }
+  if(grass.length){ g.grass=quadMesh(grass, dim(groundTex.grass?0xffffff:0x8cbf58), groundTex.grass); S.add(g.grass); }
+  // 空き地 (踏み固め → 土)。テクスチャは共通で、色だけ段階で変える。
+  // other_256.jpg は平均が暗いので、色は 1.0 を超える値で持ち上げてある
+  // (three の material.color はクランプされないので 1 超えでよい)。
+  // material.color は three ではクランプされないので、1 を超える値で持ち上げられる
+  const wearC=(hex, boost)=> new THREE.Color(dim(hex)).multiplyScalar(boost);
+  if(w1.length)   { g.wear1=quadMesh(w1, groundTex.vacant?wearC(0xb5b08a,1.55):dim(0x9d9c6e), groundTex.vacant); S.add(g.wear1); }
+  if(w2.length)   { g.wear2=quadMesh(w2, groundTex.vacant?wearC(0xc4ab84,1.55):dim(0xac9c72), groundTex.vacant); S.add(g.wear2); }
+  rebuildLamps(S);
+}
+
+// ── 街灯 ────────────────────────────────────────────────────────────────────
+// 道の縁に一定間隔で立てて、夜だけ灯りを点ける。
+//   ★ 本物の PointLight は使わない。Lambert はライト数ぶんシェーダが重くなるので、
+//     ソフトウェア描画では数十本立てた時点で破綻する。代わりに
+//       ・光る灯具 (emissive を夜だけ上げる)
+//       ・地面に落ちる光の輪 (加算合成の板)
+//     の2枚で見せる。何本立てても **合計3ドローコール**で済む。
+const LAMP_ON   = process.env.LAMPS !== '0';
+const LAMP_STEP = envNum('LAMP_STEP', 3);      // 何セルおきに立てるか
+// 住民の目線が CELL*0.66*CHAR_SCALE = 0.44 ワールド単位 (= 身長1.7m 相当) なので、
+// 1 ワールド単位 ≒ 3.4m。街灯5m ≒ 1.45。ここを上げすぎると家より高い電柱になる。
+const LAMP_H    = envNum('LAMP_H', 1.45);      // 灯具の高さ (ワールド単位 ≒ 5m)
+const LAMP_POOL = envNum('LAMP_POOL', 1.5);    // 地面に落ちる光の輪の半径
+const LAMP_GLOW = envNum('LAMP_GLOW', 1.0);    // 明るさの倍率 (0 で消灯)
+
+// 光の輪。中心が明るく縁で 0 になる板。1枚作って全部の街灯で使い回す。
+let _poolTex=null;
+function lampPoolTexture(){
+  if(_poolTex) return _poolTex;
+  const N=64, d=new Uint8Array(N*N*4);
+  for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+    const dx=(x+0.5)/N*2-1, dy=(y+0.5)/N*2-1;
+    const a=Math.pow(Math.max(0, 1-Math.hypot(dx,dy)), 2.2);
+    const i=(y*N+x)*4;
+    d[i]=255; d[i+1]=226; d[i+2]=172; d[i+3]=Math.round(a*255);
+  }
+  const t=new THREE.DataTexture(d,N,N,THREE.RGBAFormat);
+  t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping;
+  t.minFilter=t.magFilter=THREE.LinearFilter;
+  t.generateMipmaps=false; t.needsUpdate=true;
+  t.userData={shared:true};
+  _poolTex=t; return _poolTex;
+}
+
+// 直方体を position/normal 配列に足す (インデックス無し)
+function pushBox(pos, nrm, x0,x1, y0,y1, z0,z1){
+  const F=[
+    [[x1,y0,z1],[x1,y0,z0],[x1,y1,z0],[x1,y1,z1], 1,0,0],
+    [[x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0],-1,0,0],
+    [[x0,y1,z1],[x1,y1,z1],[x1,y1,z0],[x0,y1,z0], 0,1,0],
+    [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1], 0,-1,0],
+    [[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1], 0,0,1],
+    [[x1,y0,z0],[x0,y0,z0],[x0,y1,z0],[x1,y1,z0], 0,0,-1],
+  ];
+  for(const f of F){
+    const [a,b,c,dd,nx,ny,nz]=f;
+    for(const p of [a,b,c, a,c,dd]){ pos.push(p[0],p[1],p[2]); nrm.push(nx,ny,nz); }
+  }
+}
+
+// 道の形が変わると立ち位置も変わるので、地面と一緒に作り直す。
+function rebuildLamps(S){
+  if(!S) return;
+  const L=S.userData.lamps||(S.userData.lamps={});
+  for(const k of ['pole','head','pool']){
+    if(L[k]){ S.remove(L[k]); L[k].geometry.dispose(); L[k].material.dispose(); L[k]=null; }
+  }
+  if(!LAMP_ON) return;
+  const pp=[], pn=[], hp=[], hn=[], qp=[], quv=[];
+  const isRoad=(r,c)=> r>=0 && r<GRID && c>=0 && c<GRID && MAP[r][c]===ROAD;
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(MAP[r][c]!==ROAD) continue;
+    if((r+c)%LAMP_STEP!==0) continue;
+    // 道の縁にだけ立てる。見つからない (四方とも道) なら車道の真ん中なので立てない
+    let dr=0, dc=0, ok=false;
+    for(const [a,b] of [[0,-1],[0,1],[-1,0],[1,0]])
+      if(!isRoad(r+a,c+b)){ dr=a; dc=b; ok=true; break; }
+    if(!ok) continue;
+    const cx=c*CELL+CELL*.5 + dc*CELL*0.36;
+    const cy=r*CELL+CELL*.5 + dr*CELL*0.36;
+    const w=0.028;
+    pushBox(pp,pn, cx-w,cx+w, cy-w,cy+w, 0, LAMP_H);              // 支柱
+    pushBox(pp,pn, cx-0.055,cx+0.055, cy-0.055,cy+0.055, 0, 0.07); // 根巻き
+    // 腕は道の中心側 (縁の反対) へ伸ばす
+    const ax=-dc*0.30, ay=-dr*0.30;
+    pushBox(pp,pn, cx+Math.min(0,ax)-0.022, cx+Math.max(0,ax)+0.022,
+                   cy+Math.min(0,ay)-0.022, cy+Math.max(0,ay)+0.022,
+                   LAMP_H-0.045, LAMP_H);                         // 腕
+    const hx=cx+ax, hy=cy+ay;
+    pushBox(hp,hn, hx-0.085,hx+0.085, hy-0.085,hy+0.085, LAMP_H-0.115, LAMP_H-0.035); // 灯具
+    // 地面の光の輪
+    const R=LAMP_POOL, z=0.02;
+    qp.push(hx-R,hy-R,z, hx+R,hy-R,z, hx+R,hy+R,z,
+            hx-R,hy-R,z, hx+R,hy+R,z, hx-R,hy+R,z);
+    quv.push(0,0, 1,0, 1,1,  0,0, 1,1, 0,1);
+  }
+  if(!pp.length) return;
+  const mk=(pos,nrm,mat)=>{
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos),3));
+    g.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(nrm),3));
+    return new THREE.Mesh(g, mat);
+  };
+  L.pole=mk(pp,pn, new THREE.MeshLambertMaterial({color:0x4a4f54}));
+  S.add(L.pole);
+  const hm=new THREE.MeshLambertMaterial({color:0x2b2c28});
+  hm.emissive=new THREE.Color(0xffdca8); hm.emissiveIntensity=0;
+  L.head=mk(hp,hn, hm);
+  S.add(L.head);
+  const gq=new THREE.BufferGeometry();
+  gq.setAttribute('position', new THREE.BufferAttribute(new Float32Array(qp),3));
+  gq.setAttribute('uv',       new THREE.BufferAttribute(new Float32Array(quv),2));
+  L.pool=new THREE.Mesh(gq, new THREE.MeshBasicMaterial({
+    map:lampPoolTexture(), transparent:true, opacity:0, depthWrite:false,
+    blending:THREE.AdditiveBlending, fog:false }));
+  L.pool.visible=false;
+  L.pool.renderOrder=1;
+  S.add(L.pool);
+}
+
+// 夜だけ点ける。建物の窓と同じ曲線 (日暮れ 0.55 あたりからじわっと)。
+function stepLamps(S, d){
+  const L=S && S.userData && S.userData.lamps;
+  if(!L || !L.head) return;
+  const t=Math.max(0, Math.min(1, (0.55-d)/0.40));
+  const e=t*t*(3-2*t);
+  L.head.material.emissiveIntensity = e*2.4*LAMP_GLOW;
+  if(L.pool){
+    L.pool.visible = LAMP_GLOW>0 && e>0.02;
+    L.pool.material.opacity = e*0.85*LAMP_GLOW;
+  }
 }
 
 // ── 建物の出現/消滅アニメーション ──────────────────────────────────────────
@@ -2528,16 +3225,17 @@ const structAnims = new Map();          // "r_c" -> {mesh, kind, t0, dur, h, onD
 function prepStructAnim(st, kind){
   const o=occluders[st.r+'_'+st.c+'_b'];
   if(!o) return;
-  if(kind==='rise') o.mesh.position.z = -structHeight(st)/2;   // 地面の下に完全に潜る
+  const u=o.mesh.userData, z0=u.zRest||0, h=u.hVis||structHeight(st);
+  if(kind==='rise') o.mesh.position.z = z0-h;                        // 地面の下に完全に潜る
 }
 
 function animateStruct(st, kind, onDone){
   const o=occluders[st.r+'_'+st.c+'_b'];
   if(!o){ if(onDone) onDone(); return; }
-  const h=structHeight(st);
+  const u=o.mesh.userData, z0=u.zRest||0, h=u.hVis||structHeight(st);
   const dur=(kind==='rise'?ANIM_RISE_SEC:ANIM_SINK_SEC)*1000;
-  if(kind==='rise') o.mesh.position.z = -h/2;
-  structAnims.set(st.r+'_'+st.c, {mesh:o.mesh, kind, t0:Date.now(), dur, h, onDone});
+  if(kind==='rise') o.mesh.position.z = z0-h;
+  structAnims.set(st.r+'_'+st.c, {mesh:o.mesh, kind, t0:Date.now(), dur, h, z0, onDone});
 }
 
 // 毎フレーム呼ぶ。終わったら onDone (取り壊しの後始末はここで走る)。
@@ -2547,7 +3245,7 @@ function stepStructAnims(){
   for(const [k,a] of structAnims){
     const p=Math.min(1, (now-a.t0)/a.dur);
     const e=1-Math.pow(1-p, 3);                  // ease-out (最後にふわっと止まる)
-    a.mesh.position.z = (a.kind==='rise') ? (-a.h/2 + e*a.h) : (a.h/2 - e*a.h);
+    a.mesh.position.z = (a.kind==='rise') ? (a.z0 - a.h + e*a.h) : (a.z0 - e*a.h);
     if(p>=1){ structAnims.delete(k); if(a.onDone) a.onDone(); }
   }
 }
@@ -6603,8 +7301,11 @@ async function ytcPoll(){
   }
 }
 
+// 一人称にするかを決める。**屋内の住民は選ばない**。
+//   建物の中に居るときの目線は壁しか映らず、何をしているのか分からない画になる。
 function rollFPV() {
-  camFPV = (camTargetIdx > 0) && (Math.random() < FPV_CHANCE);
+  const a = camTargetIdx > 0 ? agents[camTargetIdx - 1] : null;
+  camFPV = !!a && !MW.isIndoors(a) && (Math.random() < FPV_CHANCE);
 }
 
 // 次に映すターゲットを決める (モード別)。camTargetIdx を更新する。
@@ -6673,6 +7374,10 @@ function updateTrackingCamera(cam) {
     if (!a) return;
     const tx = a.y * CELL + CELL * .5;   // world X (=足元)
     const ty = a.x * CELL + CELL * .5;   // world Y
+    // 撮影中に建物へ入ったら一人称をやめる。ショットの途中で切れるが、
+    // 壁の中を映し続けるよりは良い。次のターゲットまで追跡カメラで通す
+    // (毎フレーム出入りで切り替わるとちらつくので、いったん降りたら戻さない)。
+    if (camFPV && MW.isIndoors(a)) camFPV = false;
     if (camFPV) {
       // ── 一人称視点 (キャラの目線) ──
       // world 進行方向 = (sin th, cos th) (stepAll の移動則より導出)。
@@ -7252,6 +7957,14 @@ tick(); setInterval(tick, ${ms});
         waiting:(CITY.waiting||[]).map(w=>w.name),
         limit:Math.max(5, Math.round(NUM_AGENTS*VIEWER_MAX_FRAC)),
         favorite:(()=>{ const f=townFavorite(); return f?{name:f.name, cheers:f.cheers||0}:null; })()},
+      // いま何をどう映しているか。一人称が屋内で使われていないかの確認に使う
+      //   (屋内の目線は壁しか映らないので fpv=true かつ indoors=true にはならない)
+      camera:(()=>{
+        const a=camTargetIdx>0?agents[camTargetIdx-1]:null;
+        return {target:a?a.name:'overview', fpv:camFPV,
+                indoors:a?MW.isIndoors(a):null,
+                event:!!camEventCur};
+      })(),
       chat:{enabled:CHAT_CMD, focusSec:CHAT_FOCUS_SEC, cooldownSec:CHAT_COOLDOWN,
         holding: camHold ? {target:camHold.idx<0?'overview':(agents[camHold.idx]||{}).name,
                             by:camHold.by, leftSec:Math.max(0,Math.round((camHold.until-Date.now())/1000))} : null,
