@@ -265,11 +265,19 @@ function loadPersonaDefs(){
   });
 }
 const PERSONA_DEFS = loadPersonaDefs();
-// キャラクター数 (1-50)。未設定ならペルソナ数。ペルソナ数より多い場合は一覧を巡回して割り当てる。
-const _numAgentsEnv = parseInt(process.env.CAM_INTERVAL_MS)  || 1000;
-const NUM_AGENTS = Number.isFinite(_numAgentsEnv)
-  ? Math.max(1, Math.min(_numAgentsEnv, _numAgentsEnv))
-  : PERSONA_DEFS.length;
+// キャラクター数の上限。人は住居が建つたびに増えるので、これは「これ以上は増えない」枠。
+// 実際の人口は POP_MAX か住居の定員のほうで先に頭打ちになるのが普通。
+// ペルソナ数より多い場合は一覧を巡回して割り当てる。
+//   ★ ここは **process.env.CAM_INTERVAL_MS** を読んでいた (カメラの切替間隔との取り違え)。
+//     そのため CAM_INTERVAL_MS=8000 のようにカメラを設定すると、人口の上限が 8000 になり、
+//     人型の InstancedMesh と足跡バッファがその人数ぶん確保されていた
+//     (AGENT_CAP / TRAIL_CAP がこれを見ている)。既定値 1000 は据え置いてある。
+//   ★ 旧コードは parseInt(...)||1000 で NaN になりえず、Number.isFinite の
+//     else 側 (ペルソナ数) は到達しなかった。min(x,x) も何もしていなかった。
+const _numAgentsEnv = parseInt(process.env.NUM_AGENTS, 10);
+const NUM_AGENTS = (Number.isFinite(_numAgentsEnv) && _numAgentsEnv > 0)
+  ? Math.min(5000, _numAgentsEnv)
+  : 1000;
 console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`);
 
 // ─── マップ生成 ───────────────────────────────────────────────────────────────
@@ -2137,6 +2145,58 @@ const CULL_DIST    = envNum('CULL_DIST', 0);
 const CULL_DIST_SQ = CULL_DIST>0 ? CULL_DIST*CULL_DIST : 0;
 const _camPos      = new THREE.Vector3();
 
+// ── 遠くの住民を間引く (密度LOD) ──────────────────────────────────────────────
+//   引きの画では住民が数ピクセルの点にしかならず、そこに何人居るかは誰にも
+//   数えられない。**遠い人ほど描く割合を落とす**ことで、絵の印象をほぼ変えずに
+//   頂点処理を減らす。ここでも動かしているのは描画だけで、座標・経路・踏み跡・
+//   人間関係は 1000 人ぶん回り続ける (POP の表示も実人数のまま)。
+//
+//   「引きのショットかどうか」で切り替えるのではなく **1人ずつカメラからの距離**
+//   で決める。斜め見下ろしの追跡カメラは手前が大きく奥が小さいので、ショット単位
+//   だと「手前の主役まで間引く / 奥の点を描き続ける」のどちらかになってしまう。
+//
+//   判定は見かけの大きさ (px) で持つ。解像度や FOV を変えても意味が変わらない。
+//     見かけ px ≒ 身長(ワールド) × (縦解像度 / 2tan(FOV/2)) ÷ 距離
+//   LOD_NEAR_PX より大きく映る人は全員描く。LOD_FAR_PX まで小さくなったら
+//   LOD_MIN_KEEP の割合まで落とす。その間は線形。
+//   【既定 OFF の理由 — 実測して効果が出なかったため】
+//   俯瞰ショットに固定して A/B を取ったところ、住民を 825人 → 380人 に間引いても
+//   描画時間は 6.2〜7.2ms のまま変わらなかった (各5サンプル)。住民は InstancedMesh
+//   2本 = **何人居ても 2 ドローコール**なので、人数はコストにほとんど乗らない。
+//   同じショットの内訳は 描画呼 571 / 三角 1166k で、三角の 96% は確かに住民
+//   (1人あたり約1350三角) だが、支配的なのは三角数ではなく**ドローコール数**で、
+//   その 556 本は建物 (1軒 = facade/trim/roof/sign の 4 グループ × 139軒) だった。
+//   つまり間引いても絵から人が減るだけで速くはならない → 既定は OFF。
+//   本番 (Ubuntu) が llvmpipe のソフトウェア描画なら頂点コストの比重が上がるので
+//   結果が変わる可能性はある。LOD_THIN=1 で入れて Perf ログを見比べること。
+const LOD_THIN     = process.env.LOD_THIN === '1';
+const LOD_NEAR_PX  = envNum('LOD_NEAR_PX', 10);    // これ以上の大きさなら間引かない
+const LOD_FAR_PX   = envNum('LOD_FAR_PX', 4);      // ここまで小さくなったら最大まで間引く
+// 間引きの下限。1人が突然現れる「ポップイン」は LOD_NEAR_PX の大きさで起きるので、
+// ここを下げるほど軽くなるが、遠景の人の増減が目に付きやすくなる。
+const LOD_MIN_KEEP = Math.max(0.05, Math.min(1, envNum('LOD_MIN_KEEP', 0.35)));
+const AGENT_H      = CELL*0.66*CHAR_SCALE;         // 住民の実高 (身長1.7m 相当)
+let _lodPxPerUnit  = 0;                            // 距離1あたりの見かけ px (カメラ更新時に算出)
+
+// 間引く相手は**毎フレーム同じ顔ぶれ**でなければならない。ランダムに選び直すと
+// 群衆がチカチカ点滅する。aid から作った 0..1 の固定値を「間引き順」に使い、
+// 割合が下がるほど後ろの人から消える = カメラが引くにつれ数人ずつ静かに減る。
+function lodRank(a){
+  if(a._lodRank!=null) return a._lodRank;
+  let h=2166136261;                                 // FNV-1a
+  for(let i=0;i<a.aid.length;i++){ h^=a.aid.charCodeAt(i); h=Math.imul(h,16777619); }
+  return a._lodRank=((h>>>0)%100000)/100000;
+}
+// この距離の住民を何割描くか
+function lodKeepRatio(dist){
+  if(!LOD_THIN || _lodPxPerUnit<=0) return 1;
+  const px=AGENT_H*_lodPxPerUnit/Math.max(0.001,dist);
+  if(px>=LOD_NEAR_PX) return 1;
+  if(px<=LOD_FAR_PX)  return LOD_MIN_KEEP;
+  const t=(px-LOD_FAR_PX)/(LOD_NEAR_PX-LOD_FAR_PX);
+  return LOD_MIN_KEEP+(1-LOD_MIN_KEEP)*t;
+}
+
 // カメラの視錐台を作り直す。renderer.render() の中でも同じ計算をしているが、
 // そこは描画の直前なので、住民のインスタンス配列を組む前に自分で更新しておく。
 function updateCullFrustum(cam){
@@ -2145,13 +2205,20 @@ function updateCullFrustum(cam){
   _cullMat.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
   _cullFrustum.setFromProjectionMatrix(_cullMat);
   _camPos.setFromMatrixPosition(cam.matrixWorld);
+  // 縦解像度 / 2tan(FOV/2)。これに「実高 ÷ 距離」を掛けると見かけの px になる。
+  _lodPxPerUnit = HEIGHT/(2*Math.tan(cam.fov*Math.PI/360));
   _cullReady = true;
 }
-function inCameraView(pos){
+// 描くべきか。keepAll=true (カメラが今追っている本人) は間引きの対象から外す。
+function inCameraView(pos, agent, keepAll){
   if(!CULL_AGENTS || !_cullReady) return true;
-  if(CULL_DIST_SQ && _camPos.distanceToSquared(pos) > CULL_DIST_SQ) return false;
+  const d2=_camPos.distanceToSquared(pos);
+  if(CULL_DIST_SQ && d2 > CULL_DIST_SQ) return false;
   _cullSphere.center.copy(pos);
-  return _cullFrustum.intersectsSphere(_cullSphere);
+  if(!_cullFrustum.intersectsSphere(_cullSphere)) return false;
+  if(keepAll || !agent) return true;
+  const keep=lodKeepRatio(Math.sqrt(d2));
+  return keep>=1 || lodRank(agent)<keep;
 }
 
 function initAgentInstances(S){
@@ -2217,9 +2284,11 @@ function syncAgentInstances(){
   const n=Math.min(agents.length, AGENT_CAP);
   const w=AgentInst.walk.array;
   let k=0, colDirty=false;
+  // カメラが今追っている本人だけは絶対に間引かない (主役が消えたら画が成立しない)
+  const star = camTargetIdx>0 ? camTargetIdx-1 : -1;
   for(let i=0;i<n;i++){
     const o=agentMeshes[i]; if(!o) continue;
-    const on = o.visible && inCameraView(o.position);
+    const on = o.visible && inCameraView(o.position, agents[i], i===star);
     o.userData.onScreen = on;
     if(!on) continue;
     o.updateMatrix();
@@ -2418,6 +2487,21 @@ const START_VILLAGE   = process.env.START_VILLAGE !== '0';
 const START_SIZE      = envNum('START_SIZE', 10);        // 最初のフィールドの一辺 (最大 GRID)
 const START_BUILDINGS = envNum('START_BUILDINGS', 12);   // 最初に建っている建物の数
 const START_POP       = envNum('START_POP', 8);          // 最初の人口
+// 人口の上限。サーバの余力を超えると描画も推論も破綻するので、ここに達したら
+// その街を「完走」とみなして Day 1 から作り直す。
+//   ・POP_MAX=0 で無効 (いくらでも増える)
+//   ・いきなり切り替えると視聴者は何が起きたか分からないので、
+//     街全体を映す引きの画で祝ってから切り替える
+const POP_MAX         = envNum('POP_MAX', 100);          // この人数に達したら街をリセット
+const POP_MAX_SEC     = envNum('POP_MAX_SEC', 14);       // 祝いの画を出す秒数
+const POP_MAX_NEWMAP  = process.env.POP_MAX_NEWMAP === '1';  // 1 で地形も引き直す
+// NUM_AGENTS は「存在できる住民の上限」なので、これが POP_MAX 以下だと人口が
+// POP_MAX に届かず、**リセットが永久に発火しない**。何も起きないだけで
+// エラーにならず気づけないので、起動時に叩いておく。
+if(POP_MAX>0 && NUM_AGENTS<=POP_MAX)
+  console.warn(`[Config] ⚠ NUM_AGENTS=${NUM_AGENTS} が POP_MAX=${POP_MAX} 以下です。`
+    + ` 人口が ${POP_MAX} に届かないので街のリセットが発火しません。`
+    + ` NUM_AGENTS を ${POP_MAX+20} 以上にするか、POP_MAX を ${NUM_AGENTS-1} 以下にしてください。`);
 // 土地が足りなくなったらフィールドを広げる (1日1回まで)
 const EXPAND_STEP     = envNum('EXPAND_STEP', 2);        // 1回に広げる幅 (両側に1セルずつ)
 // 拡張の主な判断は**建て込み具合**。空き区画の数で見ると、建物が増えるほど
@@ -5603,6 +5687,7 @@ function cityTick(){
   if(_lastDay===null) _lastDay=d;
   else if(d!==_lastDay){ _lastDay=d; dailyRollover(d); }
   finishConstruction();
+  stepPopReset();                 // 人口が上限に達したら祝ってからリセット
 }
 
 // ═══ 行動モード A/B ══════════════════════════════════════════════════════════
@@ -6331,6 +6416,41 @@ function doCityReset(newMap){
   saveCity();
   console.log(`[City] Day 1 から作り直しました (${newMap?'地形も引き直し':'地形はそのまま'})`);
   return true;
+}
+
+// ── 人口の上限に達したら街を作り直す ──────────────────────────────────────
+// cityTick (1秒ごと) から呼ぶ。人口が増えるのは日次の転入と視聴者の参加なので、
+// 1秒ごとに見ておけば取りこぼさない。
+//   祝いの画 → POP_MAX_SEC 秒待つ → リセット、の2段階。待っている間に
+//   もう一度火が点かないよう _popResetAt で状態を持つ。
+let _popResetAt = 0;                    // この時刻を過ぎたらリセット (0 = 予定なし)
+function stepPopReset(){
+  if(!CITY || !CITY_EVOLVE || POP_MAX<=0) return;
+  if(_popResetAt){
+    if(Date.now() < _popResetAt) return;
+    _popResetAt=0;
+    console.log(`[City] 人口が ${POP_MAX} に達したので街を作り直します`);
+    doCityReset(POP_MAX_NEWMAP);
+    return;
+  }
+  if(agents.length < POP_MAX) return;
+
+  _popResetAt = Date.now() + POP_MAX_SEC*1000;
+  const pop=agents.length, days=gameDay()+1;
+  const en=`Congratulations!  ${pop} residents in ${days} days`;
+  news('level',
+    `🎉 この街は ${days}日で人口 ${pop}人に到達しました。おめでとう！ まもなく次の街が始まります`,
+    en);
+  // 街全体を引きで映して祝う。待ち行列に他のイベントが残っていると
+  // 祝いの画が出る前にリセットの時刻が来てしまうので、先に空にする
+  // (どのみち街ごと作り直すので、捨てたイベントの続きは要らない)。
+  camEvents.length=0;
+  camEventCur=null;
+  let sr=0, sc=0, n=0;
+  for(const st of CITY.structs) if(st.state==='open'){ sr+=st.r; sc+=st.c; n++; }
+  showCityEvent(n?Math.round(sr/n):Math.floor(GRID/2), n?Math.round(sc/n):Math.floor(GRID/2),
+                en, POP_MAX_SEC, null, {wide:true});
+  console.log(`[City] 🎉 人口 ${pop}人 (Day ${days}) — ${POP_MAX_SEC}秒後にリセットします`);
 }
 
 function handleCommand(msg){
@@ -8572,6 +8692,7 @@ tick(); setInterval(tick, ${ms});
         next:CITY_LEVELS[cityLevel()+1]?{name:CITY_LEVELS[cityLevel()+1].name,
           econ:CITY_LEVELS[cityLevel()+1].econ}:null},
       population:{now:agents.length, cap:housingCapacity(), max:NUM_AGENTS,
+        resetAt:POP_MAX, resetPending:_popResetAt ? Math.max(0, Math.round((_popResetAt-Date.now())/1000)) : null,
         workCap:workplaceCapacity(),
         homeless:agents.reduce((n,a)=>n+(a.home?0:1),0),
         homes:openStructsOf(HOME_IDX).map(st=>({label:BLDG_TYPES[st.typeIdx].label, cell:[st.r,st.c],
@@ -8834,6 +8955,7 @@ let frameCount=0, encoding=false, _groundAt=0;
 //   フィールドが広がると重くなる、という話を数字で切り分けるため。
 const PERF_LOG = process.env.PERF_LOG === '1';
 const _perf = {agents:0, fade:0, render:0, pixels:0, jpeg:0, n:0, sim:0, simN:0};
+const _gl   = {calls:0, tris:0};   // 3D パスの描画呼び出し数 / 三角数 (10秒ぶんの累計→平均)
 function perfReport(){
   if(!_perf.n) return;
   let meshes=0, tex=new Set();
@@ -8851,12 +8973,14 @@ function perfReport(){
   const sim=_perf.simN ? ` | 1tick平均: シム${(_perf.sim/_perf.simN).toFixed(1)}ms (TICK=${TICK}ms)` : '';
   console.log(`[Perf] 1フレーム平均: agent更新${p('agents')}ms フェード${p('fade')}ms `
     + `描画${p('render')}ms 読出${p('pixels')}ms JPEG${p('jpeg')}ms `
-    + `| メッシュ${meshes} テクスチャ実体${tex.size} 住民${_drawnAgents}/${agents.length}描画 `
+    + `| 描画呼${Math.round(_gl.calls/_perf.n)} 三角${(_gl.tris/_perf.n/1000).toFixed(0)}k `
+    + `メッシュ${meshes} テクスチャ実体${tex.size} 住民${_drawnAgents}/${agents.length}描画 `
     + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}/${GRID}` + walkStat
     + (_navN ? ` | 経路探索${_navN}回 計${_navMs.toFixed(0)}ms (1回${(_navMs/_navN).toFixed(2)}ms`
              + ` 走査${Math.round(_navPop/_navN).toLocaleString()})` : '') + sim);
   _navMs=0; _navN=0; _navPop=0;
   for(const k in _perf) _perf[k]=0;
+  _gl.calls=0; _gl.tris=0;
 }
 async function renderLoop(){
   if(!scene) return;          // ★ scene null ガード (二重保険)
@@ -8917,6 +9041,9 @@ async function renderLoop(){
     renderer.autoClear=false;
     renderer.clear();
     renderer.render(scene, mainCam);
+    // 3D パスぶんのドローコール/三角数。住民 (InstancedMesh 2本) と建物 (1軒あたり
+    // マテリアル数ぶん) のどちらが呼び出しを食っているかを切り分けるため。
+    if(PERF_LOG){ _gl.calls+=renderer.info.render.calls; _gl.tris+=renderer.info.render.triangles; }
     if(hudScene){ updateHud(dt); renderer.clearDepth(); renderer.render(hudScene, hudCam); }
     if(PERF_LOG){ _perf.render+=Date.now()-_t2; _perf.n++; if(_perf.n>=FPS*10) perfReport(); }
     frameCount++;
