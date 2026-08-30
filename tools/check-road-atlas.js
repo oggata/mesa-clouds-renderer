@@ -173,6 +173,54 @@ if(!curbNote){
   curbBad += windBad + faceBad;
 }
 
+// ── 6) groundKind が絵と一致しているか ──────────────────────────────────────
+// roads.js の groundKind は「足元が歩道か車道か横断歩道か」を式で答える。
+// 床の描画・歩道を優先して歩く判定・学習の報酬が全部これを見るので、
+// **アトラスの絵とズレていると、見た目と挙動が食い違う**。
+// タイルの中を格子状に走査して、式の答えと PNG のピクセルを突き合わせる。
+{
+  const RD2=require('../roads.js');
+  const V={OTHER:0, ROAD:1, BUILDING:2, TREE:3};
+  const N=40;                                   // タイルあたり N x N 点
+  let gkN=0, gkBad=0;
+  // 不透明で灰色 = 歩道の舗装 (縁石の天端も含む)。アルファは 200 で切る。
+  // 250 だと縁石天端の帯の縁 (被覆 94%) を取りこぼす。車道は 0 なので判別は保てる。
+  const isPaving=c=> c[3]>200 && c[0]>150 && c[0]<225
+                  && Math.abs(c[0]-c[2])<28 && Math.abs(c[0]-c[1])<28;
+  const isWhite =c=> c[3]>200 && c[0]>225 && c[1]>225 && c[2]>215;
+  for(const [cls,base] of [[RD2.TWOLANE,0],[RD2.ONEWAY,16]]){
+    for(let m=0;m<16;m++){
+      const slot=base+m, [ox,oy]=org(slot);
+      for(let j=0;j<N;j++) for(let i=0;i<N;i++){
+        const fu=(i+0.5)/N, fv=(j+0.5)/N;
+        const k=RD2.groundKind(V.ROAD, cls, m, fu, fv, V);
+        // 判定が切り替わる境目の画素はアンチエイリアスで中間色になっている。
+        // そこを厳密に見ても意味が無いので、**1 画素ぶん動かして判定が変わる点は
+        // 飛ばし**、領域の内側だけを突き合わせる (D = 1/112 ≒ 1 画素)。
+        const D=0.012;
+        let edge=false;
+        for(const [du,dv] of [[D,0],[-D,0],[0,D],[0,-D]])
+          if(RD2.groundKind(V.ROAD, cls, m, fu+du, fv+dv, V)!==k){ edge=true; break; }
+        if(edge) continue;
+        const c=img.px(ox+Math.min(CONTENT-1,(fu*CONTENT)|0),
+                       oy+Math.min(CONTENT-1,(fv*CONTENT)|0));
+        gkN++;
+        let ok;
+        // 車道の上にはアスファルト (透明) のほかに白線・黄線とその中間色が載る。
+        // 見るべきは「**歩道の舗装に見えないこと**」なので、それだけを確かめる。
+        if(k===RD2.GROUND.SIDEWALK)       ok = isPaving(c);
+        else if(k===RD2.GROUND.CROSSWALK) ok = isWhite(c);
+        else                              ok = !isPaving(c);
+        if(!ok){ gkBad++;
+          if(gkBad<=4) console.log(`      NG slot${slot} (${fu.toFixed(2)},${fv.toFixed(2)}) `
+            + `判定=${Object.keys(RD2.GROUND).find(n=>RD2.GROUND[n]===k)} 絵=${JSON.stringify(c)}`); }
+      }
+    }
+  }
+  console.log(`  足元の判定          : ${gkN} 点 (境目は除外) / 絵と食い違い ${gkBad}`);
+  curbBad += gkBad;
+}
+
 const ok = maxStruct<1 && covBad===0 && rgbBad===0 && curbBad===0 && !curbNote;
 console.log(ok ? '  → 全ペアで継ぎ目なし' : '  → 上記を確認すること');
 process.exit(ok?0:1);
