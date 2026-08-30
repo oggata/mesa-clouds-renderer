@@ -6791,6 +6791,41 @@ function addTrail(S,agent){
 }
 
 // (x,y) から角度 th へ move 進んだ先のセルが通行可能か
+// ── 歩行者を歩道へ寄せる ────────────────────────────────────────────────────
+// 方策 (または追従コントローラ) が出した行動はそのまま使い、**結果の座標だけ**
+// 歩道帯の中心へ少しずつ寄せる。
+//   ★ MAP のセル種別は触らないので、学習済み方策の観測は 1 ビットも変わらない。
+//     セル内の横位置が変わるだけで、それは元から連続値で自由に動いていた範囲。
+//   ★ 交差点 (次数 3 以上) では寄せない。そこは横断中かもしれないので、
+//     引っぱると横断歩道を渡り切れなくなる。
+//   ★ 学習側 (build_pro_onnx_by_persona.ipynb) には同じ狙いの報酬
+//     (sidewalk_bonus x WALK_PREF) を入れてある。そちらが効くようになれば
+//     この補正は無くても歩道を歩くようになるので、WALK_SIDEWALK=0 で切れる。
+const WALK_SIDEWALK = process.env.WALK_SIDEWALK !== '0';
+const SIDEWALK_PULL = envNum('SIDEWALK_PULL', 0.25);   // 1 tick で詰める割合
+
+function pullToSidewalk(a){
+  if(!WALK_SIDEWALK || !CITY || !CITY.roadClass) return;
+  const r=Math.floor(a.x), c=Math.floor(a.y);
+  if(r<0||r>=GRID||c<0||c>=GRID || MAP[r][c]!==ROAD) return;
+  const cls=CITY.roadClass[r*GRID+c];
+  if(cls===RD.PATH) return;                       // 歩行者専用は全面が歩道
+  const mask=RD.roadMask(MAP,r,c,ROAD);
+  if(RD.maskDegree(mask)>=3) return;              // 交差点は触らない (横断中かもしれない)
+  const fu=a.y-c, fv=a.x-r;                       // fu=列方向 fv=行方向
+  if(RD.groundKind(ROAD, cls, mask, fu, fv, MW)!==RD.GROUND.ROADWAY) return;
+  const off=RD.sidewalkOffset(cls);
+  if(mask & 5){                                   // 南北の道 → 列方向へ寄せる
+    const t=(fu<0.5 ? 0.5-off : 0.5+off);
+    a.y+=((c+t)-a.y)*SIDEWALK_PULL;
+  }else if(mask & 10){                            // 東西の道 → 行方向へ寄せる
+    const t=(fv<0.5 ? 0.5-off : 0.5+off);
+    a.x+=((r+t)-a.x)*SIDEWALK_PULL;
+  }
+  a.x=Math.max(0.01, Math.min(GRID-0.01, a.x));
+  a.y=Math.max(0.01, Math.min(GRID-0.01, a.y));
+}
+
 function passableToward(x, y, th, move){
   const nx=x+Math.cos(th)*move, ny=y+Math.sin(th)*move;
   const r=Math.floor(nx), c=Math.floor(ny);
@@ -6884,6 +6919,7 @@ async function stepAll(){
                      : (useSeg ? (segPassCache[a.aid] ?? true) : PASSABLE.has(MAP[r][c]));
       if(passable){
         a.x=nx;a.y=ny;
+        pullToSidewalk(a);        // 車道に出ていたら歩道帯へ寄せる
         const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
         // 踏み跡: 空き地を踏んだ回数を数える。よく踏まれた空き地は日次で道になる。
         // 道路の上の足跡は数えない (既に道なので情報が無い)。
