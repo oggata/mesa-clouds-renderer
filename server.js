@@ -172,6 +172,11 @@ const { OTHER, ROAD, BUILDING, TREE } = MW;
 // 枠割りとマスクのビット順の唯一の定義でもあり、tools/make-road-atlas.js が
 // 焼くときも同じものを引いている。
 const RD = require('./roads.js');
+// 住民の骨格 (関節・骨・色) と歩行ポーズ。world.js / roads.js と同じ理由で切り出す:
+// 同じ式を server.js の頂点シェーダと tools/preview-walk.js の両方が使う。
+// three が要る server.js はテスト環境で動かせないので、ポーズの式がここに無いと
+// 「歩き方が正しいか」を実機に載せる前に確かめる手段が無くなる。
+const SK = require('./skeleton.js');
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
 //   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
@@ -2096,74 +2101,143 @@ function mergeGeos(list){
 //   体だけ住民ごとに色が変わるので、インスタンスカラーで塗り分けられるよう別にする。
 //   残りは色が固定なので頂点カラーに焼いて1マテリアルにまとめる。
 const AGENT_BASE = -CELL*.26;                 // 足元 (ローカル原点からの高さ)
-const AGENT_HIP  = AGENT_BASE + CELL*.22;     // 脚の付け根。ここより下が「脚」
+const AGENT_H_GEO = CELL*0.66;                // 骨格の身長 (ジオメトリ単位)。AGENT_H と同じ定義
+// 関節の高さ (ジオメトリ単位)。シェーダの回転支点にそのまま使う。
+const SKZ = k => AGENT_BASE + SK.J[k].z*AGENT_H_GEO;
+// 頭だけ住民ごとの色にする。骨は姿勢推定の配色 (シアン/黄/マゼンタ) の固定色。
+// 胴まで住民色にすると骨格に見えなくなり、かといって全部固定色だと 1000 人の
+// 見分けが付かない。いちばん大きく上にある頭が識別子として素直だった。
+const SKEL_HEAD_TINT = process.env.SKEL_HEAD_TINT !== '0';
+// 円柱と球の分割数。細い骨なので粗くてよい。実測でこの設定なら 1 体あたり
+// 約 490 三角形で、以前の丸い人型 (約 1350) より軽い。
+const BONE_SEG = 5, JOINT_SEG = [5,3], HEAD_SEG = [8,5];
 let _agentGeoBody=null, _agentGeoParts=null;
 
+// 住民の体を「頭 (住民ごとの色)」と「骨と関節 (固定色)」の 2 本に分けて作る。
+// 形も配色も歩き方も skeleton.js が持っている。ここは three のジオメトリに
+// 起こすだけで、寸法や角度をここで決め直さない。
 function buildAgentGeos(){
   if(_agentGeoBody) return;
-  const base=AGENT_BASE;
-  const skin=new THREE.Color(0xf1c9a5), hair=new THREE.Color(0x4a3b2f), pants=new THREE.Color(0x2b303a);
-  const upZ=g=>{ g.rotateX(Math.PI/2); return g; };       // Y軸ジオメトリを Z 上向きに
-  const put=(g,x,y,z,sx=1,sy=1,sz=1)=>{
-    g.applyMatrix4(new THREE.Matrix4().compose(
-      new THREE.Vector3(x,y,z), new THREE.Quaternion(), new THREE.Vector3(sx,sy,sz)));
-    return g;
-  };
-  // ── 体 (住民ごとに色が変わる) ──
-  _agentGeoBody = mergeGeos([
-    // 胴体: 裾に向かってわずかに広がるテーパー (コート/ワンピース風シルエット)
-    { geo: put(upZ(new THREE.CylinderGeometry(CELL*.095,CELL*.135,CELL*.30,16)), 0,0,base+CELL*.35) },
-    // 丸い肩
-    { geo: put(new THREE.SphereGeometry(CELL*.12,16,10), 0,0,base+CELL*.49, 1.05,.8,.7) },
-  ]);
-  // ── 肌・髪・ズボン (色が固定なので頂点カラーに焼く) ──
-  //   この中で AGENT_HIP より下にあるのは脚だけ。歩行シェーダはそれを目印に脚を振る。
-  const legGeo=()=>upZ(new THREE.CylinderGeometry(CELL*.032,CELL*.028,CELL*.22,8));
-  _agentGeoParts = mergeGeos([
-    { geo: put(legGeo(), -CELL*.05,0,base+CELL*.11), color: pants },   // 脚 (細身・左右)
-    { geo: put(legGeo(),  CELL*.05,0,base+CELL*.11), color: pants },
-    { geo: put(upZ(new THREE.CylinderGeometry(CELL*.04,CELL*.045,CELL*.06,8)), 0,0,base+CELL*.55), color: skin }, // 首
-    { geo: put(new THREE.SphereGeometry(CELL*.115,18,14), 0,0,base+CELL*.66, 1,.95,1.05), color: skin },          // 頭
-    // 髪 (頭頂のドーム)
-    { geo: put(upZ(new THREE.SphereGeometry(CELL*.122,18,12,0,Math.PI*2,0,Math.PI*.62)), 0,-CELL*.012,base+CELL*.665), color: hair },
-    // 正面マーカー (鼻) — 進行方向の判別用に控えめに残す。Cone は既定で +Y を向く。
-    { geo: put(new THREE.ConeGeometry(CELL*.03,CELL*.06,8), 0,CELL*.11,base+CELL*.655), color: skin },
-  ]);
+  const H=AGENT_H_GEO;
+  const P=p=>new THREE.Vector3(p.x*H, p.y*H, AGENT_BASE+p.z*H);
+  const head=[], rest=[];
+  // 骨 = 端を開けた細い円柱。継ぎ目は関節の玉が隠すので蓋は要らない。
+  for(const b of SK.boneSegments()){
+    const a=P(b.a), c=P(b.b), d=new THREE.Vector3().subVectors(c,a);
+    const L=d.length(); if(L<1e-6) continue;
+    const g=new THREE.CylinderGeometry(b.r*H, b.r*H, L, BONE_SEG, 1, true);
+    g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(
+      new THREE.Vector3(0,1,0), d.clone().normalize()));
+    g.translate((a.x+c.x)/2, (a.y+c.y)/2, (a.z+c.z)/2);
+    rest.push({geo:g, color:new THREE.Color(b.col), bone:b.bone});
+  }
+  // 関節の玉と頭
+  for(const s of SK.jointSpheres()){
+    const p=P(s.p), isHead=s.r>=SK.HEAD_R-1e-9;
+    const sg=isHead?HEAD_SEG:JOINT_SEG;
+    const g=new THREE.SphereGeometry(s.r*H, sg[0], sg[1]);
+    g.translate(p.x, p.y, p.z);
+    // 頭は住民ごとの色を載せる側 (body) に置く。**その頂点カラーは白**にすること。
+    // 骨格の配色をそのまま残すと instanceColor と掛け算になって色が濁る。
+    const tint = isHead && SKEL_HEAD_TINT;
+    (isHead ? head : rest).push({geo:g, bone:s.bone,
+      color:new THREE.Color(tint ? 0xffffff : s.col)});
+  }
+  if(!head.length) head.push(rest.pop());     // 念のため (頭は必ず1個ある)
+  _agentGeoBody =mergeWithBone(head);
+  _agentGeoParts=mergeWithBone(rest);
   SHARED_GEO.add(_agentGeoBody); SHARED_GEO.add(_agentGeoParts);
+}
+
+// mergeGeos に「頂点ごとの骨番号」を足す。mergeGeos は渡した順に頂点を並べる
+// ので、各ジオメトリの頂点数を先に数えておけば同じ並びで aBone を作れる。
+function mergeWithBone(list){
+  const counts=list.map(it=>it.geo.attributes.position.count);
+  const geo=mergeGeos(list);                    // ← ここで入力ジオメトリは破棄される
+  const bone=new Float32Array(counts.reduce((a,b)=>a+b,0));
+  let o=0;
+  list.forEach((it,i)=>{ bone.fill(it.bone, o, o+counts[i]); o+=counts[i]; });
+  geo.setAttribute('aBone', new THREE.BufferAttribute(bone,1));
+  return geo;
 }
 
 // ── シェーダ歩行 ─────────────────────────────────────────────────────────────
 // ボーン (SkinnedMesh) を使うと、住民ごとにスケルトンとボーン行列の更新が要るうえ
 // three.js r132 には InstancedSkinnedMesh が無いのでインスタンシングと排他になる。
-// 歩かせたいだけなら頂点シェーダで足りる。住民ごとの歩行位相と振幅を
-// インスタンス属性 aWalk = (位相, 振幅) で渡し、脚の付け根から下だけを前後に振る。
+// 住民は全員同じ骨格で、違うのは位相と振幅だけなので、頂点属性
+//   aWalk = (位相, 振幅)   aBone = (骨番号)
+// を渡してシェーダ側で関節を回せば足りる。ドローコールは 2 本のまま。
 //   位相は「実際に進んだ距離」で進めるので、歩幅と速さが自然に一致する。
-//   振幅は止まると 0 に落ちるので、立ち止まっているときは脚も止まる。
+//   振幅は止まると 0 に落ちるので、立ち止まっているときは姿勢も rest に戻る。
 const WALK_CYCLE = parseFloat(process.env.WALK_CYCLE) || CELL*0.30;  // 1歩行周期で進む距離
-const WALK_FULL  = parseFloat(process.env.WALK_FULL)  || CELL*0.018; // 振幅が最大になる1フレームの移動量 (実測の歩行速度に合わせた)
-const WALK_SWING = parseFloat(process.env.WALK_SWING) || 0.55;       // 脚の振れ角 (rad)
+const WALK_FULL  = parseFloat(process.env.WALK_FULL)  || CELL*0.018; // 振幅が最大になる1フレームの移動量
 const WALK_RATE  = Math.PI*2 / WALK_CYCLE;
 
-// マテリアルに歩行を仕込む。legs=true なら脚を振る (体側は位相を受け取るだけ)。
-function addWalkShader(mat, legs){
+// 関節角の計算。**skeleton.js の limbAngles と同じ式**を GLSL で書いたもの。
+// 位置と法線の 2 か所から使うので、文字列としてはここ 1 か所に持つ。
+const _f = v => v.toFixed(5);
+const WALK_ANGLES_GLSL = `
+  float _ph=aWalk.x, _am=aWalk.y;
+  // 骨番号: 1,2=左脚 3,4=右脚 5,6=左腕 7,8=右腕 0=胴と頭
+  float _isL = (aBone==1.0||aBone==2.0||aBone==5.0||aBone==6.0) ? 1.0 : -1.0;
+  float _p  = _ph + (_isL>0.0 ? 0.0 : 3.14159265);
+  float _pa = _p + 3.14159265;                       // 腕は同じ側の脚と逆位相
+  float _cp = max(0.0, cos(_p));
+  float _thigh = ${_f(SK.WALK.thigh)}*_am*sin(_p);
+  float _knee  = -_am*(${_f(SK.WALK.kneeStance)} + ${_f(SK.WALK.kneeSwing)}*pow(_cp,1.5));
+  float _shd   = ${_f(SK.WALK.arm)}*_am*sin(_pa);
+  float _elb   = _am*(${_f(SK.WALK.elbowBase)} + ${_f(SK.WALK.elbowSwing)}*max(0.0,sin(_pa)));
+  float _lean  = ${_f(SK.WALK.lean)}*_am;
+  // X 軸まわりの回転は合成が「角度の和」になるので、法線はこの 1 個で回せる
+  // (位置だけは支点が違うので連鎖が要る)。
+  float _ang = (aBone==2.0||aBone==4.0) ? (_knee+_thigh)
+             : (aBone==1.0||aBone==3.0) ? _thigh
+             : (aBone==6.0||aBone==8.0) ? (_elb+_shd+_lean)
+             : (aBone==5.0||aBone==7.0) ? (_shd+_lean)
+             : _lean;
+`;
+
+// マテリアルに歩行を仕込む。位置と法線の両方を回す。
+function addWalkShader(mat){
   mat.onBeforeCompile = (sh)=>{
-    sh.vertexShader = 'attribute vec2 aWalk;\n' + sh.vertexShader;
-    if(legs){
-      sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
-        `#include <begin_vertex>
-        if(aWalk.y > 0.001 && transformed.z < ${AGENT_HIP.toFixed(5)}){
-          float side = transformed.x < 0.0 ? 1.0 : -1.0;      // 左右の脚は逆位相
-          float ang  = sin(aWalk.x) * ${WALK_SWING.toFixed(3)} * aWalk.y * side;
-          float dz   = transformed.z - ${AGENT_HIP.toFixed(5)};
-          float sa   = sin(ang), ca = cos(ang);
-          float y0   = transformed.y;
-          transformed.y = y0*ca - dz*sa;                      // 付け根まわりの回転
-          transformed.z = ${AGENT_HIP.toFixed(5)} + y0*sa + dz*ca;
-        }`);
-    }
+    sh.vertexShader =
+      'attribute vec2 aWalk;\nattribute float aBone;\n'
+    + 'vec3 mesaRotX(vec3 p, float pz, float a){\n'
+    + '  float s=sin(a), c=cos(a); float y=p.y, z=p.z-pz;\n'
+    + '  return vec3(p.x, y*c - z*s, pz + y*s + z*c);\n}\n'
+    + sh.vertexShader;
+    // 法線。角度の和 1 個で回すだけ。
+    sh.vertexShader = sh.vertexShader.replace('#include <beginnormal_vertex>',
+      `#include <beginnormal_vertex>
+      {${WALK_ANGLES_GLSL}
+        float _s=sin(_ang), _c=cos(_ang);
+        objectNormal = vec3(objectNormal.x,
+                            objectNormal.y*_c - objectNormal.z*_s,
+                            objectNormal.y*_s + objectNormal.z*_c);
+      }`);
+    // 位置。支点が違うので関節の連鎖で回す。
+    sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
+      `#include <begin_vertex>
+      {${WALK_ANGLES_GLSL}
+        if(aBone==2.0 || aBone==4.0){                       // 脛と足
+          transformed = mesaRotX(transformed, ${_f(SKZ('knee'))}, _knee);
+          transformed = mesaRotX(transformed, ${_f(SKZ('hip'))}, _thigh);
+        }else if(aBone==1.0 || aBone==3.0){                 // 腿
+          transformed = mesaRotX(transformed, ${_f(SKZ('hip'))}, _thigh);
+        }else if(aBone==6.0 || aBone==8.0){                 // 前腕と手
+          transformed = mesaRotX(transformed, ${_f(SKZ('elbow'))}, _elb);
+          transformed = mesaRotX(transformed, ${_f(SKZ('shoulder'))}, _shd);
+          transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
+        }else if(aBone==5.0 || aBone==7.0){                 // 上腕
+          transformed = mesaRotX(transformed, ${_f(SKZ('shoulder'))}, _shd);
+          transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
+        }else{                                              // 胴と頭 (前傾のみ)
+          transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
+        }
+        transformed.z += ${_f(SK.WALK.bob*AGENT_H_GEO)}*_am*cos(2.0*_ph);
+      }`);
   };
-  // onBeforeCompile を付けたマテリアルは別プログラムとしてキャッシュさせる
-  mat.customProgramCacheKey = ()=> legs ? 'agentWalkLegs' : 'agentWalkBody';
+  mat.customProgramCacheKey = ()=> 'agentSkelWalk';
 }
 
 // ── 住民のインスタンス描画 ───────────────────────────────────────────────────
@@ -2286,12 +2360,12 @@ function initAgentInstances(S){
 
   // three 0.132 の color_fragment は USE_COLOR / USE_COLOR_ALPHA のときしか vColor を
   // 使わない。USE_INSTANCING_COLOR だけだと頂点側で計算した色が捨てられ、全員白になる。
-  // 体ジオメトリには mergeGeos が白の頂点カラーを入れてあるので、vertexColors を
-  // 有効にして経路を通し、その上に instanceColor を掛けさせる。
+  // 頭のジオメトリには白の頂点カラーを入れてあるので、vertexColors を有効にして
+  // 経路を通し、その上に instanceColor (住民ごとの色) を掛けさせる。
   const bodyMat=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
   const partsMat=new THREE.MeshLambertMaterial({vertexColors:true});
   bodyMat.userData.shared=true; partsMat.userData.shared=true;
-  addWalkShader(bodyMat,false); addWalkShader(partsMat,true);
+  addWalkShader(bodyMat); addWalkShader(partsMat);
 
   const body =new THREE.InstancedMesh(_agentGeoBody,  bodyMat,  AGENT_CAP);
   const parts=new THREE.InstancedMesh(_agentGeoParts, partsMat, AGENT_CAP);
@@ -2309,7 +2383,7 @@ function initAgentInstances(S){
 const _acol=new THREE.Color();
 function setAgentColor(i, hex){
   if(!AgentInst.body || i>=AGENT_CAP) return;
-  AgentInst.body.setColorAt(i, _acol.set(hex));
+  AgentInst.body.setColorAt(i, _acol.set(SKEL_HEAD_TINT ? hex : 0xffffff));
   AgentInst.body.instanceColor.needsUpdate=true;
   // 色の持ち主は syncAgentInstances (スロット詰め直しのたびに書く)。
   // ここで直接書いた値をキャッシュと食い違わせないよう、スロットを無効化しておく。
@@ -2348,7 +2422,7 @@ function syncAgentInstances(){
     if(!on) continue;
     o.updateMatrix();
     B.setMatrixAt(k,o.matrix); P.setMatrixAt(k,o.matrix);
-    const col=agents[i].def.color;
+    const col=SKEL_HEAD_TINT ? agents[i].def.color : 0xffffff;
     if(_slotColor[k]!==col){ B.setColorAt(k, _acol.set(col)); _slotColor[k]=col; colDirty=true; }
     w[k*2]=o.userData.ph||0; w[k*2+1]=o.userData.amp||0;
     k++;
