@@ -440,6 +440,9 @@ function buildPersonaMeta(m){
     cfg:{
       w:iw, h:ih,
       fov:(m.fov_deg||60)*Math.PI/180,
+      // 床キャスト。学習側が床を見るように作られたモデルだけ true になる。
+      // 旧モデルは meta にこのフラグが無いので false = 従来どおり下半分は単色。
+      floorCast: m.floor_cast===true,
       rayMax:m.ray_max||FP_RAY_MAX,
       rayStep:FP_RAY_STEP,
       cell:(m.cell_rgb||[[12,30,74],[176,180,172],[196,32,32],[35,104,40]]).map(c=>c.map(div)),
@@ -559,6 +562,58 @@ async function loadRaycastTextures(){
   console.log(`[Raycast] textures ${rcTex.filter(t=>t).length}/${rcTex.length} loaded  ready=${rcTexReady}`);
 }
 
+// ── 観測用の床テクスチャ ────────────────────────────────────────────────────
+// 床キャストが引くアトラス。壁のテクスチャ (rcTex) と同じく、小さく落として
+// Float32 で持つ。**アトラスは車道の内側が透明**なので、読み込み時に
+// アスファルトの上へ合成して不透明にしておく (毎画素で合成しないため)。
+//   ★ 縮小のしかたも Python 側と揃えること。出力画素 (i,j) は
+//     元の [i*CONTENT/RC_FW, (i+1)*CONTENT/RC_FW) に中心が入る画素の平均。
+const RC_FW = RD.RC_FW;                 // 1 枠あたりの床テクスチャの一辺 (roads.js)
+let rcFloor=null, rcFloorReady=false;
+
+async function loadFloorTexture(){
+  if(!sharp) return;
+  const fp=path.isAbsolute(ROAD_ATLAS)?ROAD_ATLAS:path.join(__dirname, ROAD_ATLAS);
+  if(!fs.existsSync(fp)){ console.warn(`[Floor] ${fp} が無い → 床は単色`); return; }
+  try{
+    const {data, info}=await sharp(fp).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+    // 縮小と合成の規則は roads.js が持つ (Python 側と揃えるため)
+    rcFloor=RD.bakeFloorBank(data, info.width);
+    rcFloorReady=true;
+    console.log(`[Floor] ${path.basename(fp)} を観測用に縮小 (${RC_FW}px/枠)`);
+  }catch(e){ console.warn(`[Floor] ${fp} を読めませんでした: ${e.message}`); }
+}
+
+// セルごとのアトラス枠。床キャストは 1 画素ごとにこれを引くので、
+// 近傍マスクをその場で数えると重い。道が変わったときにまとめて作り直す。
+let floorSlot=null;
+function rebuildFloorSlots(){
+  if(!CITY || !CITY.roadClass){ floorSlot=null; return; }
+  const out=new Int16Array(GRID*GRID).fill(-1);
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(MAP[r][c]!==ROAD) continue;
+    out[r*GRID+c]=RD.atlasSlot(CITY.roadClass[r*GRID+c], RD.roadMask(MAP,r,c,ROAD));
+  }
+  floorSlot=out;
+}
+
+// 地面の 1 点の色。fr/fc はセル内の相対位置 (fr=行方向, fc=列方向)。
+const _floorCol=[0,0,0];
+function floorSample(r, c, fr, fc){
+  const t=MAP[r][c];
+  if(t===VOID) return RD.FLOOR_RGB.VOID;
+  if(t===TREE) return RD.FLOOR_RGB.GRASS;
+  if(t===OTHER) return RD.FLOOR_RGB.DIRT;
+  const s=floorSlot ? floorSlot[r*GRID+c] : -1;
+  if(s<0 || !rcFloor) return RD.FLOOR_RGB.ASPHALT;   // 建物の足元 = 舗装
+  // タイルの u は列方向 (東)、v は行方向 (南)。groundKind と同じ向き。
+  const i=Math.min(RC_FW-1, Math.max(0, (fc*RC_FW)|0));
+  const j=Math.min(RC_FW-1, Math.max(0, (fr*RC_FW)|0));
+  const k=(s*RC_FW*RC_FW + j*RC_FW + i)*3;
+  _floorCol[0]=rcFloor[k]; _floorCol[1]=rcFloor[k+1]; _floorCol[2]=rcFloor[k+2];
+  return _floorCol;
+}
+
 // テクスチャ付きDDAレイキャスタ (学習 render_fp_batch と一致)。返り値 CHW [0,1]。
 // 壁=建物セルのみ (BUILDING_TYPES でタイプ決定)。木/空地/道路は通過。
 // 他エージェントをビルボードとして壁の手前に重ねる。
@@ -607,6 +662,30 @@ function renderFPImageCfg(map, agent, cfg, others){
   if(!rcTexReady) return buf;   // テクスチャ未ロード → 背景のみ
   const dirX=Math.cos(agent.th), dirY=Math.sin(agent.th);
   const pl=Math.tan(FOV/2), planeX=-dirY*pl, planeY=dirX*pl;
+  // ── 床キャスト ────────────────────────────────────────────────────────────
+  // 地平線より下の行は、その行が指す地面の 1 点を引いて塗る。
+  //   行 y までの距離は roads.js の floorDist(y,H) が返す。壁の足元の投影
+  //   bot = H/2 + (H/perp)*EYE_HEIGHT を perp について解いたものなので、
+  //   床と壁の足元がぴったり合う。**Python 側も同じ式を使うこと。**
+  // 壁より先に塗る。壁は必ず床より手前なので、あとから上書きされて正しくなる。
+  // cfg.floorCast が false (床を見ないモデル) のときは従来どおり下半分は単色。
+  if(cfg.floorCast && rcFloorReady){
+    for(let yi=Math.floor(H/2)+1; yi<H; yi++){
+      const perp=RD.floorDist(yi, H);
+      if(perp>RD.FLOOR_MAX) continue;              // 遠すぎる行は地の色のまま
+      const br=Math.min(1.0, Math.max(0.35, 1.0-perp/9));   // 壁と同じ距離減衰
+      for(let xi=0;xi<W;xi++){
+        const cam=2*xi/W-1;
+        const fx=agent.x+(dirX+planeX*cam)*perp;   // fx = 行方向 / fy = 列方向
+        const fy=agent.y+(dirY+planeY*cam)*perp;
+        const r=Math.floor(fx), c=Math.floor(fy);
+        if(r<0||r>=GRID||c<0||c>=GRID) continue;
+        const col=floorSample(r, c, fx-r, fy-c);
+        const pi=yi*W+xi;
+        buf[pi]=col[0]*br; buf[HW+pi]=col[1]*br; buf[2*HW+pi]=col[2]*br;
+      }
+    }
+  }
   for(let x=0;x<W;x++){
     const cam=2*x/W-1;
     const rdx=dirX+planeX*cam, rdy=dirY+planeY*cam;
@@ -1128,6 +1207,7 @@ async function preloadTextures() {
     loadGroundTexture('grass', GRASS_TEX),
     loadGroundTexture('road',  ASPHALT_TEX),
     loadGroundTexture('vacant', VACANT_TEX),
+    loadFloorTexture(),                       // 観測の床キャスト用 (アトラスを縮小)
     // アトラスも同じ読み込み経路に乗せる (RGBA・2の冪チェック・ミップマップ)。
     ROAD_MARKS ? loadGroundTexture('roadmark', ROAD_ATLAS) : null,
   ]);
@@ -4870,6 +4950,7 @@ function reclassRoads(){
   let ch=0;
   if(prev) for(let i=0;i<next.length;i++){ if(next[i]!==prev[i]) ch++; }
   CITY.roadClass=next;
+  rebuildFloorSlots();            // 床キャストが引くセルごとの枠
   if(ch){ groundDirty=true; _carGwDirty=true; }
   return ch;
 }
@@ -6975,6 +7056,41 @@ function addTrail(S,agent){
 }
 
 // (x,y) から角度 th へ move 進んだ先のセルが通行可能か
+// ── 歩行者を歩道へ寄せる ────────────────────────────────────────────────────
+// 方策 (または追従コントローラ) が出した行動はそのまま使い、**結果の座標だけ**
+// 歩道帯の中心へ少しずつ寄せる。
+//   ★ MAP のセル種別は触らないので、学習済み方策の観測は 1 ビットも変わらない。
+//     セル内の横位置が変わるだけで、それは元から連続値で自由に動いていた範囲。
+//   ★ 交差点 (次数 3 以上) では寄せない。そこは横断中かもしれないので、
+//     引っぱると横断歩道を渡り切れなくなる。
+//   ★ 学習側 (build_pro_onnx_by_persona.ipynb) には同じ狙いの報酬
+//     (sidewalk_bonus x WALK_PREF) を入れてある。そちらが効くようになれば
+//     この補正は無くても歩道を歩くようになるので、WALK_SIDEWALK=0 で切れる。
+const WALK_SIDEWALK = process.env.WALK_SIDEWALK !== '0';
+const SIDEWALK_PULL = envNum('SIDEWALK_PULL', 0.25);   // 1 tick で詰める割合
+
+function pullToSidewalk(a){
+  if(!WALK_SIDEWALK || !CITY || !CITY.roadClass) return;
+  const r=Math.floor(a.x), c=Math.floor(a.y);
+  if(r<0||r>=GRID||c<0||c>=GRID || MAP[r][c]!==ROAD) return;
+  const cls=CITY.roadClass[r*GRID+c];
+  if(cls===RD.PATH) return;                       // 歩行者専用は全面が歩道
+  const mask=RD.roadMask(MAP,r,c,ROAD);
+  if(RD.maskDegree(mask)>=3) return;              // 交差点は触らない (横断中かもしれない)
+  const fu=a.y-c, fv=a.x-r;                       // fu=列方向 fv=行方向
+  if(RD.groundKind(ROAD, cls, mask, fu, fv, MW)!==RD.GROUND.ROADWAY) return;
+  const off=RD.sidewalkOffset(cls);
+  if(mask & 5){                                   // 南北の道 → 列方向へ寄せる
+    const t=(fu<0.5 ? 0.5-off : 0.5+off);
+    a.y+=((c+t)-a.y)*SIDEWALK_PULL;
+  }else if(mask & 10){                            // 東西の道 → 行方向へ寄せる
+    const t=(fv<0.5 ? 0.5-off : 0.5+off);
+    a.x+=((r+t)-a.x)*SIDEWALK_PULL;
+  }
+  a.x=Math.max(0.01, Math.min(GRID-0.01, a.x));
+  a.y=Math.max(0.01, Math.min(GRID-0.01, a.y));
+}
+
 function passableToward(x, y, th, move){
   const nx=x+Math.cos(th)*move, ny=y+Math.sin(th)*move;
   const r=Math.floor(nx), c=Math.floor(ny);
@@ -7068,6 +7184,7 @@ async function stepAll(){
                      : (useSeg ? (segPassCache[a.aid] ?? true) : PASSABLE.has(MAP[r][c]));
       if(passable){
         a.x=nx;a.y=ny;
+        pullToSidewalk(a);        // 車道に出ていたら歩道帯へ寄せる
         const key=`${r},${c}`;if(!a.visited.has(key)){a.visited.add(key);a.explored++;}
         // 踏み跡: 空き地を踏んだ回数を数える。よく踏まれた空き地は日次で道になる。
         // 道路の上の足跡は数えない (既に道なので情報が無い)。
