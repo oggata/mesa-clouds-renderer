@@ -110,7 +110,7 @@ const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); retu
 const FPV_EYE          = (()=>{ const v=parseFloat(process.env.FPV_EYE); return isNaN(v)?1.0:Math.max(0.3,Math.min(4.0,v)); })();
 // CAM_DIST: 追跡カメラのプレイヤーまでの距離倍率 (1.0=従来)。小さいほど寄る。 例: CAM_DIST=0.5 node server.js
 //const CAM_DIST         = (()=>{ const v=parseFloat(process.env.CAM_DIST); return isNaN(v)?1.0:Math.max(0.2,Math.min(3.0,v)); })();
-const CAM_DIST = 0.6;
+const CAM_DIST = 0.5;      // 追跡カメラの引き。小さいほど住民に寄る
 // CAM_OVERVIEW: 俯瞰ショットの引き具合 (フィールドの一辺に対するカメラ高さの倍率)。
 //   小さいほど寄る = 画角から外れる建物が増え、three の視錐台カリングが効いて
 //   ドローコール(1建物=1メッシュ)が減る。ただし画面が埋まる面積は変わらないので
@@ -157,7 +157,9 @@ const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大�
 //   node tools/scale-report.js  で一覧できる。
 const SCALE = require('./scale.js');
 const DIM = SCALE.make(CELL, CHAR_SCALE, process.env);
-const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マーカーの大きさ
+// 軌跡マーカーの大きさ。1/3 だと 1 枚が 0.13 ワールド単位 = 0.52m あり、住民の
+// 足元に対して大きすぎて「足跡」というより敷石に見えていた。1/9 で約 0.17m。
+const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/9;   // 軌跡マーカーの大きさ
 // INFER_EVERY / ONNX_THREADS は先頭の「CPU負荷」設定ブロックに移動
 // ─── 世界の物理 (world.js に一本化) ─────────────────────────────────────────
 // マップ生成・通行判定・マップ補修・屋内状態は world.js が持つ。Python 側
@@ -1588,6 +1590,7 @@ function updateDayNight(S){
   L.hemi.intensity = (0.20+0.50*d)*(0.65+0.35*w.light)*LIGHT_FILL;
   stepBldgLights(d);                 // 窓・入り口・看板を夜だけ光らせる
   stepLamps(S, d);                   // 街灯
+  stepSignals(S, d);                 // 交差点の信号 (赤青黄の切り替え)
 }
 
 // ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
@@ -2258,7 +2261,7 @@ function addWalkShader(mat){
 //   ★ 街の中を周回させない。外周で街の外に面した走行可能な道を「他の町との
 //     接点」とみなし、そこから湧いて別の接点で消える。
 const CARS_ON   = process.env.CARS !== '0';
-const CAR_MAX   = Math.max(0, parseInt(process.env.CAR_MAX) || 18);
+const CAR_MAX   = Math.max(0, parseInt(process.env.CAR_MAX) || 5);
 const CAR_LANE  = envNum('CAR_LANE', 0.165*CELL);   // 車線中心までの横ずらし
 const CAR_SPEED = envNum('CAR_SPEED', 3.4);         // ワールド単位/秒 (≒40km/h)
 // 車体の寸法は scale.js から。軽自動車サイズ (3.30 x 1.46 x 1.58m)。
@@ -2269,8 +2272,43 @@ const CAR_BODY_Z=DIM.CAR.bodyZ, CAR_CAB_Z=DIM.CAR.cabZ, CAR_WHEEL_R=DIM.CAR.whee
 const CAR_COLORS=[0xd8d8d4,0x2f3a4a,0xa83a32,0x2e6ea8,0x3f7a4a,0xd8a838,0x8a8f96,0x1f2227];
 const CAR_CAP = CAR_MAX + 4;
 
-let cars=[], _carGw=null, _carGwDirty=true;
-const CarInst={ body:null, trim:null };
+// ── 車が街の道を使い切るための 3 つの仕掛け ──────────────────────────────────
+// 「通っていない道がたくさんある」を tools/preview-traffic.js で測ると、原因は
+// 2 つに分かれていた (30x30 / 走行可能な道 295 セルでの実測):
+//   ・出入口どうしを結ぶだけでは **行き止まりの 52 セルに永久に車が来ない**
+//   ・同じ 2 点をいつも最短で結ぶので、通り抜けの道も一部しか使われない
+// 踏破率 64% → 97%。3 つとも 0 にすれば従来どおりの動きに戻せる。
+const CAR_SPREAD  = envNum('CAR_SPREAD', 1.0);   // 経路のばらけ具合 (0=純粋な最短経路)
+const CAR_LOCAL_P = envNum('CAR_LOCAL_P', 0.35); // 発着点が街の中の行き止まりになる割合
+const CAR_REROUTE = envNum('CAR_REROUTE', 14);   // 走行中に経路を引き直す間隔(秒)。0=しない
+// 湧かせる間隔。**毎フレーム試すと湧き口で団子になる** (これが「湧くあたりで
+// 重なる」の主因だった)。加えて湧き口に車が居るあいだは湧かせない。
+const CAR_SPAWN_SEC = envNum('CAR_SPAWN_SEC', 0.7);
+const CAR_SPAWN_CLR = envNum('CAR_SPAWN_CLR', CELL*0.8);
+const CAR_FADE_SEC  = envNum('CAR_FADE_SEC', 1.6);   // 湧いてから見えきるまで
+const CAR_FADE_DIST = envNum('CAR_FADE_DIST', CELL*1.5); // 終点までこの距離で消えていく
+
+// 車種のばらつき (長さだけ倍率で変える)。**車間の計算はいちばん長い車を基準に
+// する** — 平均で見積もると、長い車どうしが並んだときだけ車体が重なる。
+const CAR_LEN_VARY = [0.90, 1.25];
+
+// 車間 (traffic.js に渡す)。**寸法は scale.js の車体から引く**ので、車の大きさを
+// 変えれば車間も一緒に動く。ここに生の数字を置くと必ず食い違う。
+const CAR_STEP_OPTS = {
+  len:      CAR_L*CAR_LEN_VARY[1],
+  stopGap:  CAR_L*0.95,     // 停止時に空けるバンパー間 (車長ぶんくらい)
+  jamGap:   CAR_L*0.45,     // 渋滞で長く止まったときはここまで詰めてよい
+  timeGap:  envNum('CAR_TIME_GAP', 0.42),   // 速度1あたり何秒ぶん余計に空けるか
+  laneHalf: CAR_W*0.73,     // 「前の車」とみなす横方向の許容
+  fadeSec:  CAR_FADE_SEC,
+  fadeDist: CAR_FADE_DIST,
+};
+
+let cars=[], _carGw=null, _carEnd=null, _carGwDirty=true;
+let _carSpawnAt=0, _carSeed=1;
+// 最近どのセルを車が通ったか。経路の重みに効かせて、同じ道ばかり選ばせない。
+let _carUse=null;
+const CarInst={ body:null, trim:null, alpha:null };
 
 // 車のジオメトリ。前方は +X (traffic.js の car.th と同じ向き)。
 function buildCarGeos(){
@@ -2303,12 +2341,37 @@ function buildCarGeos(){
   SHARED_GEO.add(CarInst.geoBody); SHARED_GEO.add(CarInst.geoTrim);
 }
 
+// 1台ずつの透明度。湧いた瞬間に実体が現れ、終点でぱっと消えるのが不自然なので
+// 両端をなめらかにする。
+//   ★ InstancedMesh の instanceColor は RGB しか無く、アルファは持てない。
+//     住民の歩行 (addWalkShader) と同じやり方で、インスタンス属性を 1 本足して
+//     フラグメントで gl_FragColor.a に掛ける。**マテリアル1本のままなので
+//     ドローコールは増えない。**
+//   ★ alpha=0 の車が深度だけ書いて後ろの車を隠さないよう、消えかけは discard する。
+function addCarFadeShader(mat){
+  mat.transparent=true;
+  mat.onBeforeCompile=(sh)=>{
+    sh.vertexShader = 'attribute float aAlpha;\nvarying float vAlpha;\n' + sh.vertexShader;
+    sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n  vAlpha = aAlpha;');
+    sh.fragmentShader = 'varying float vAlpha;\n' + sh.fragmentShader;
+    sh.fragmentShader = sh.fragmentShader.replace('#include <output_fragment>',
+      '#include <output_fragment>\n  if(vAlpha < 0.01) discard;\n  gl_FragColor.a *= vAlpha;');
+  };
+  mat.customProgramCacheKey = ()=> 'carFade';
+}
+
 function initCarInstances(S){
   if(!S || !CARS_ON || CAR_MAX<=0) return;
   buildCarGeos();
   const bm=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
   const tm=new THREE.MeshLambertMaterial({vertexColors:true});
   bm.userData.shared=true; tm.userData.shared=true;
+  addCarFadeShader(bm); addCarFadeShader(tm);
+  // 属性は 1 本を車体と装飾で共有する (GPU バッファも 1 本で済む)
+  const alpha=new THREE.InstancedBufferAttribute(new Float32Array(CAR_CAP), 1);
+  CarInst.geoBody.setAttribute('aAlpha', alpha);
+  CarInst.geoTrim.setAttribute('aAlpha', alpha);
   const body =new THREE.InstancedMesh(CarInst.geoBody, bm, CAR_CAP);
   const trim =new THREE.InstancedMesh(CarInst.geoTrim, tm, CAR_CAP);
   for(const m of [body,trim]){
@@ -2316,17 +2379,40 @@ function initCarInstances(S){
     m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     S.add(m);
   }
-  CarInst.body=body; CarInst.trim=trim;
+  CarInst.body=body; CarInst.trim=trim; CarInst.alpha=alpha;
 }
 
-// 道が変わったら出入口を引き直す (道が生えたり廃れたりするので固定できない)
-function carGateways(){
-  if(!_carGwDirty && _carGw) return _carGw;
+// 道が変わったら出入口と行き止まりを引き直す (道が生えたり廃れたりするので
+// 固定できない)。行き止まりは「街の中の発着点」。ここを混ぜないと袋小路には
+// 永久に車が来ない (traffic.js の deadEnds を参照)。
+function carSpots(){
+  if(!_carGwDirty && _carGw) return;
   _carGwDirty=false;
-  _carGw = (CITY && CITY.roadClass)
-    ? TR.gateways(MAP, CITY.roadClass, ROAD, VOID) : [];
-  return _carGw;
+  const ok = CITY && CITY.roadClass;
+  _carGw  = ok ? TR.gateways(MAP, CITY.roadClass, ROAD, VOID) : [];
+  _carEnd = ok ? TR.deadEnds(MAP, CITY.roadClass, ROAD) : [];
 }
+
+// 発着点を 1 つ選ぶ。既定では 35% が街の中の行き止まり (= 出発 / 到着する車)、
+// 残りが街の外との接点 (= 通過交通)。
+function carSpot(){
+  if(_carEnd && _carEnd.length && Math.random()<CAR_LOCAL_P)
+    return _carEnd[(Math.random()*_carEnd.length)|0];
+  return _carGw.length ? _carGw[(Math.random()*_carGw.length)|0] : null;
+}
+
+// 経路の重み。最近ほかの車が通ったセルほど重くして、同じ道に固まらせない。
+// seed は経路ごとに変える (同じだと同じ 2 点はいつも同じ道を通る)。
+function carCost(){
+  if(CAR_SPREAD<=0) return null;
+  _carSeed=(Math.imul(_carSeed, 1103515245)+12345)>>>0;
+  return TR.spreadCost(GRID, _carUse, _carSeed, CAR_SPREAD);
+}
+function carMarkUse(path){
+  if(!_carUse) return;
+  for(const [r,c] of path){ const i=r*GRID+c; _carUse[i]=Math.min(1.5, _carUse[i]+0.35); }
+}
+const carLine = p => TR.laneLine(p, MAP, CITY.roadClass, ROAD, 1, CELL, CAR_LANE);
 
 const _carMat=new THREE.Matrix4(), _carQ=new THREE.Quaternion(),
       _carP=new THREE.Vector3(), _carS=new THREE.Vector3(), _carC=new THREE.Color();
@@ -2334,24 +2420,58 @@ const _carZ=new THREE.Vector3(0,0,1);
 
 function stepTraffic(dt){
   if(!CARS_ON || !CarInst.body || !CITY || !CITY.roadClass) return;
-  const gw=carGateways();
-  // 湧かせる。経路が引けない組み合わせもあるので、1 フレームに 1 台まで試す。
-  if(gw.length>1 && cars.length<CAR_MAX){
-    const a=gw[(Math.random()*gw.length)|0], b=gw[(Math.random()*gw.length)|0];
-    if(a!==b){
-      const p=TR.route(MAP, CITY.roadClass, a, b, ROAD);
+  carSpots();
+  if(!_carUse || _carUse.length!==GRID*GRID) _carUse=new Float32Array(GRID*GRID);
+  // 通行の記憶を薄れさせる (半減期およそ 17 秒)。これが無いと最初に選ばれた道が
+  // 永久に重いままになり、こんどはその道を誰も通らなくなる。
+  const decay=Math.exp(-dt/25);
+  for(let i=0;i<_carUse.length;i++) _carUse[i]*=decay;
+
+  // ── 湧かせる ──
+  // 間隔を空ける。毎フレーム試すと、経路が引けるかぎり湧き口に連続で置かれて
+  // 車体が重なる。加えて、湧き口に車が居るあいだは湧かせない。
+  const now=Date.now();
+  if(_carGw.length>1 && cars.length<CAR_MAX && now-_carSpawnAt>=CAR_SPAWN_SEC*1000){
+    const a=carSpot(), b=carSpot();
+    if(a && b && (a.r!==b.r || a.c!==b.c)){
+      const p=TR.route(MAP, CITY.roadClass, a, b, ROAD, 1, {cost:carCost()});
       if(p && p.length>=3){
-        const line=TR.laneLine(p, MAP, CITY.roadClass, ROAD, 1, CELL, CAR_LANE);
-        const car=TR.makeCar(line, CAR_SPEED*(0.85+Math.random()*0.4), (Math.random()*3)|0);
-        car.color=CAR_COLORS[(Math.random()*CAR_COLORS.length)|0];
-        car.len=0.9+Math.random()*0.35;             // 車種のばらつき (長さだけ)
-        cars.push(car);
+        const line=carLine(p);
+        const x0=line[0].x, y0=line[0].y;
+        if(cars.every(c=>Math.hypot(c.x-x0, c.y-y0)>CAR_SPAWN_CLR)){
+          carMarkUse(p);
+          const car=TR.makeCar(line, CAR_SPEED*(0.85+Math.random()*0.4), (Math.random()*3)|0);
+          car.color=CAR_COLORS[(Math.random()*CAR_COLORS.length)|0];
+          car.len=CAR_LEN_VARY[0]+Math.random()*(CAR_LEN_VARY[1]-CAR_LEN_VARY[0]);
+          car.nextRoute=CAR_REROUTE*(0.5+Math.random());
+          cars.push(car);
+          _carSpawnAt=now;
+        }
       }
     }
   }
-  cars=TR.stepCars(cars, dt);
+
+  // ── 走行中に経路を引き直す ──
+  // 湧いたときの 1 本で終点まで決め打ちにすると、車は同じ幹線を流れ続ける。
+  // 途中で行き先を選び直すと、街のあちこちへ散る。手前の経路は残すので、
+  // 位置も向きも飛ばない (traffic.js の retarget)。
+  if(CAR_REROUTE>0) for(const c of cars){
+    c.nextRoute=(c.nextRoute==null?CAR_REROUTE:(c.nextRoute-dt));
+    if(c.nextRoute>0) continue;
+    c.nextRoute=CAR_REROUTE*(0.7+Math.random()*0.6);
+    const cur=c.line[c.idx];
+    if(!cur) continue;
+    if((c.cum[c.idx]||0) < CAR_FADE_DIST*3) continue;   // 消えかけの車は触らない
+    const b=carSpot(); if(!b) continue;
+    const back=c.line[c.idx-1];
+    const p=TR.route(MAP, CITY.roadClass, {r:cur.r, c:cur.c}, b, ROAD, 1,
+                     {cost:carCost(), ban:back?[back.r, back.c]:null});
+    if(p && p.length>=2 && TR.retarget(c, carLine(p))) carMarkUse(p);
+  }
+
+  cars=TR.stepCars(cars, dt, CAR_STEP_OPTS);
   // インスタンスへ流す
-  const B=CarInst.body, T=CarInst.trim;
+  const B=CarInst.body, T=CarInst.trim, A=CarInst.alpha;
   let k=0;
   for(const c of cars){
     if(k>=CAR_CAP) break;
@@ -2361,10 +2481,12 @@ function stepTraffic(dt){
     _carMat.compose(_carP, _carQ, _carS);
     B.setMatrixAt(k, _carMat); T.setMatrixAt(k, _carMat);
     B.setColorAt(k, _carC.set(c.color||0xcccccc));
+    if(A) A.array[k]=(c.alpha==null?1:c.alpha);
     k++;
   }
   B.count=T.count=k;
   B.instanceMatrix.needsUpdate=true; T.instanceMatrix.needsUpdate=true;
+  if(A) A.needsUpdate=true;
   if(B.instanceColor) B.instanceColor.needsUpdate=true;
 }
 
@@ -3654,6 +3776,7 @@ function rebuildGround(S){
     S.add(g.curb);
   }
   rebuildLamps(S);
+  rebuildSignals(S);            // 交差点の信号 (道が変わると交差点も変わる)
   rebuildStreetTrees(S);        // 道沿いと建物の隙間の木 (InstancedMesh 2 本)
 }
 
@@ -3857,6 +3980,142 @@ function stepLamps(S, d){
   if(L.pool){
     L.pool.visible = LAMP_GLOW>0 && e>0.02;
     L.pool.material.opacity = e*0.85*LAMP_GLOW;
+  }
+}
+
+// ── 信号機 ──────────────────────────────────────────────────────────────────
+// 交差点に立てて、赤 → 青 → 黄 を定期的に切り替える。
+//
+//   ★ **車も住民も信号を見ない。** 制御を入れると、車の譲り合い (occKey) と
+//     信号の二重の停止条件になって交差点が固まる。ここは見た目の設備として
+//     独立させ、traffic.js には一切触らない。止めたいときは SIGNALS=0。
+//
+//   ★ 街灯と同じ理由で、灯火に PointLight は使わない。emissive を上げ下げする
+//     だけにして、何基立てても描画コストを一定に保つ。
+//
+// ── なぜ「灯火の色ごとにメッシュを分ける」のか ──
+// 交差点ごとに別マテリアルにすると、交差点の数だけドローコールが増える
+// (30x30 の街で数十基 = 数百本)。切り替わり方は**同じ位相の組**しか無いので、
+//     位相(2) × 灯火の色(3) = 6 本
+// にまとめて、その 6 本の emissiveIntensity を毎フレーム動かすだけにする。
+// 位相は「南北の流れ」か「東西の流れ」かで決まり、隣の交差点とは (r+c) の
+// 偶奇でさらに入れ替える (街じゅうの信号が一斉に変わると作り物に見える)。
+// この 2 つを XOR すると取りうる状態は 2 通りしか無いので、6 本で足りる。
+const SIGNAL_ON     = process.env.SIGNALS !== '0';
+const SIGNAL_CYCLE  = Math.max(6, envNum('SIGNAL_CYCLE', 24));   // 1 周期 (秒)
+const SIGNAL_YELLOW = envNum('SIGNAL_YELLOW', 3);                // 黄の秒数
+const SIGNAL_ALLRED = envNum('SIGNAL_ALLRED', 1.5);              // 全赤の秒数
+const SIGNAL_LENS   = [0xe03a26, 0xf0c020, 0x22c070];            // 赤 / 黄 / 青
+const SIGNAL_GROUPS = 2;
+// どの交差点に立てるか。**次数3以上の交差点すべてに立てると多すぎる** (30x30 の
+// 街で 68 基。街灯と並んで柱だらけになった)。二車線 (幹線) が絡む交差点だけに
+// 限ると 20 基前後になり、住宅街の細い辻には信号が無い実際の街並みに近づく。
+// SIGNAL_MIN_CLASS=1 にすれば一通どうしの辻にも立つ。
+const SIGNAL_MIN_CLASS = Math.max(RD.ONEWAY, envNum('SIGNAL_MIN_CLASS', RD.TWOLANE));
+
+// 位相 g の交差点が、時刻 t (秒) にどの灯火を点けているか。0=赤 1=黄 2=青
+function signalPhase(g, t){
+  const half=SIGNAL_CYCLE/2;
+  const green=Math.max(1, half-SIGNAL_YELLOW-SIGNAL_ALLRED);
+  const p=((t + g*half) % SIGNAL_CYCLE + SIGNAL_CYCLE) % SIGNAL_CYCLE;
+  return p<green ? 2 : (p<green+SIGNAL_YELLOW ? 1 : 0);
+}
+
+function rebuildSignals(S){
+  if(!S) return;
+  const G=S.userData.signals||(S.userData.signals={});
+  for(const m of (G.meshes||[])){ S.remove(m); m.geometry.dispose(); m.material.dispose(); }
+  G.meshes=[]; G.lens=null;
+  const wasPosts=G.posts;
+  if(!SIGNAL_ON || !CITY || !CITY.roadClass) return;
+  const D=DIM.SIGNAL;
+  const drive=(r,c)=>TR.drivable(MAP, CITY.roadClass, r, c, ROAD, RD.ONEWAY);
+  const pp=[], pn=[], hp=[], hn=[];
+  // lens[位相][色] の position/normal
+  const lp=[], ln=[];
+  for(let g=0; g<SIGNAL_GROUPS; g++){ lp.push([[],[],[]]); ln.push([[],[],[]]); }
+  // 進行方向/横方向のどちらが x 軸かで、箱の半径の割り当てが入れ替わる。
+  const put=(pos,nrm, cx,cy,cz, hLat,hTrav,hZ, alongX)=>{
+    const hx=alongX?hTrav:hLat, hy=alongX?hLat:hTrav;
+    pushBox(pos,nrm, cx-hx,cx+hx, cy-hy,cy+hy, cz-hZ,cz+hZ);
+  };
+  let posts=0;
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(!drive(r,c)) continue;
+    const arms=TR.D4.filter(([dr,dc])=>drive(r+dr,c+dc));
+    if(arms.length<3) continue;                       // 交差点だけ (次数3以上)
+    // 幹線が絡まない辻には立てない
+    if(CITY.roadClass[r*GRID+c]<SIGNAL_MIN_CLASS
+       && !arms.some(([dr,dc])=>CITY.roadClass[(r+dr)*GRID+(c+dc)]>=SIGNAL_MIN_CLASS)) continue;
+    const cx0=c*CELL+CELL*0.5, cy0=r*CELL+CELL*0.5;
+    for(const [dr,dc] of arms){
+      // その隣から入ってくる車の進行方向 (ワールド座標)。x=列, y=行 なので
+      // 行の差 dr が y、列の差 dc が x に対応する。
+      const tx=-dc, ty=-dr;
+      const lx=-ty,  ly=tx;                           // 進行方向の左 (z上向きの右手系)
+      const alongX=tx!==0;
+      // 交差点の**向こう側の左角**に立てる (日本の信号の位置)
+      const px=cx0+tx*CELL*0.42+lx*CELL*0.42, py=cy0+ty*CELL*0.42+ly*CELL*0.42;
+      const hx=px-lx*D.armLen, hy=py-ly*D.armLen;     // 灯器は腕の先 = 車道の上
+      const topZ=D.h+D.headH+D.armR;
+      pushBox(pp,pn, px-D.poleR,px+D.poleR, py-D.poleR,py+D.poleR, 0, topZ+D.armR);
+      // 腕 (支柱から灯器まで)。左右どちらへ伸びるかは lx,ly の符号で決まる。
+      const ax0=Math.min(px,hx)-D.armR, ax1=Math.max(px,hx)+D.armR;
+      const ay0=Math.min(py,hy)-D.armR, ay1=Math.max(py,hy)+D.armR;
+      pushBox(pp,pn, ax0,ax1, ay0,ay1, topZ-D.armR, topZ+D.armR);
+      // 灯器の箱 (横長。長い辺は進行方向と直角)
+      put(hp,hn, hx,hy,D.h, D.headW, D.headD, D.headH, alongX);
+      // 灯火 3 つ。運転者から見て左から 青・黄・赤 なので、赤は腕の先側になる。
+      // 灯器の前面 (運転者側 = -進行方向) から少しだけ出す。
+      const g=((dr!==0?0:1) ^ ((r+c)&1)) % SIGNAL_GROUPS;
+      const fx=hx-tx*(D.headD+D.visor*0.5), fy=hy-ty*(D.headD+D.visor*0.5);
+      for(let k=0;k<3;k++){
+        const off=(1-k)*D.lensGap;                    // k=0 赤 → -left 側 (腕の先)
+        put(lp[g][k], ln[g][k], fx-lx*off, fy-ly*off, D.h,
+            D.lensR, D.visor*0.5, D.lensR, alongX);
+      }
+      posts++;
+    }
+  }
+  if(!posts) return;
+  const mk=(pos,nrm,mat)=>{
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos),3));
+    geo.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(nrm),3));
+    const m=new THREE.Mesh(geo, mat); S.add(m); G.meshes.push(m); return m;
+  };
+  mk(pp,pn, new THREE.MeshLambertMaterial({color:0x4a4f54}));   // 支柱と腕
+  mk(hp,hn, new THREE.MeshLambertMaterial({color:0x36423a}));   // 灯器
+  G.lens=[];
+  for(let g=0; g<SIGNAL_GROUPS; g++){
+    const row=[];
+    for(let k=0;k<3;k++){
+      const col=new THREE.Color(SIGNAL_LENS[k]);
+      // 消えている灯火は「濃い色のレンズ」。真っ黒にすると穴に見える。
+      const mat=new THREE.MeshLambertMaterial({color:col.clone().multiplyScalar(0.22)});
+      mat.emissive=col; mat.emissiveIntensity=0;
+      mk(lp[g][k], ln[g][k], mat);
+      row.push(mat);
+    }
+    G.lens.push(row);
+  }
+  // 地面は 20 秒ごとに作り直されるので、基数が変わったときだけ知らせる
+  if(wasPosts!==posts){
+    G.posts=posts;
+    console.log(`[Signal] 交差点の信号 ${posts}基 (位相${SIGNAL_GROUPS} / 周期${SIGNAL_CYCLE}s`
+              + ` / 描画 ${G.meshes.length}本)`);
+  }
+}
+
+// 灯火を切り替える。d は昼夜 (1=真昼)。夜は少し強く光らせる。
+function stepSignals(S, d){
+  const G=S && S.userData && S.userData.signals;
+  if(!G || !G.lens) return;
+  const t=Date.now()/1000;
+  const boost=1.0+0.9*Math.max(0, Math.min(1, (0.55-d)/0.40));
+  for(let g=0; g<G.lens.length; g++){
+    const on=signalPhase(g, t);
+    for(let k=0;k<3;k++) G.lens[g][k].emissiveIntensity = (k===on ? 1.6*boost : 0);
   }
 }
 
