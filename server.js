@@ -2972,6 +2972,11 @@ const GABLE_TYPES = new Set(['house','kiosk','cafe','ramen','bento','gyudon','sh
                              'pharmacy','post','elementary','junior','temple']);
 // 外階段が付きうる業種 (低層の集合住宅)。
 const EXSTAIR_TYPES = new Set(['apartment','hotel']);
+// 庇 (テント) が付きうる業種。店と飲食店。業種色が乗るので入り口が目立つ。
+const AWNING_TYPES = new Set(['kiosk','conbini','pharmacy','cafe','gyudon','ramen','bento',
+                              'shop','supermarket','bank','post','hotel']);
+// 塀と門で敷地を囲う業種。低層で、庭のある建物。
+const FENCE_TYPES = new Set(['house','temple','elementary','junior','school','museum']);
 
 let _bldgMods=null, _bldgTried=false;
 // GLB を読んで「fp別 × モジュール別 × グループ別」の頂点配列にする。1回だけ。
@@ -3010,7 +3015,11 @@ function bldgModules(){
       if(!base || !floor) return null;
       return { base, floor,
                roof:      q('roof') || {g:{},h:0},
+               roof2:     q('roof2'),        // 陸屋根のもう一種 (塔屋と室外機の位置違い)
                gable:     q('roof_gable'),
+               hip:       q('roof_hip'),     // 寄棟。切妻と混ぜて棟の線を揃えない
+               awning:    q('awning'),       // 庇 (店の入り口が一目で分かる)
+               fence:     q('fence'),        // 塀と門 (住宅が家に見える)
                balcony:   q('balcony'),
                exstair:     q('exstair'),
                exstairBase: q('exstair_base'),
@@ -3022,7 +3031,7 @@ function bldgModules(){
     if(!out[1]) throw new Error('fp1_base / fp1_floor が無い (ノード名を確認)');
     if(!out[2]) out[2]=out[1];                     // 2x2 用が無ければ 1x1 を流用
     const tri=g.parts.reduce((s,p)=>s+(p.index?p.index.length:p.position.length/3)/3,0);
-    const have=['gable','balcony','exstair','stair','signRoof','signBlade']
+    const have=['gable','hip','roof2','awning','fence','balcony','exstair','stair','signRoof','signBlade']
       .filter(k=>out[1][k]).join(',') || 'なし';
     console.log(`[Bldg] ${path.basename(fp)} を読み込み (${tri}三角形 / `
               + `土台${out[1].base.h.toFixed(2)} フロア${out[1].floor.h.toFixed(2)}`
@@ -3058,17 +3067,33 @@ function structVariant(st){
   const S=M ? (M[st.fp]||M[1]) : null;
   const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
   const hash=((st.r*2654435761) ^ (st.c*40503)) >>> 0;
-  const rnd=i=>((((hash>>>(i*5))&31)+0.5)/32);     // 独立した擬似乱数を何個か取り出す
-  const V={n:0, gable:false, sign:null, balcony:false, exstair:false, stair:false,
-           facing:structFacing(st, hash)};
+  // 独立した擬似乱数。以前は hash から 5 ビットずつ取り出していたが、それだと
+  // 使えるのは 6 個までで、i=6 は 2 ビットしか残らず 4 値しか出なかった
+  // (バリエーションを足すほど痩せていく)。i ごとに混ぜ直して 16 ビット取る。
+  const rnd=i=>{
+    let h=(hash ^ Math.imul(i+1, 0x9E3779B1))>>>0;
+    h=Math.imul(h ^ (h>>>15), 0x85EBCA6B)>>>0;
+    return ((h>>>8) & 0xFFFF)/0x10000;
+  };
+  const V={n:0, roof:'flat', gable:false, sign:null, balcony:false, exstair:false,
+           stair:false, awning:false, fence:false, facing:structFacing(st, hash)};
   if(!S) return V;
   const H=structHeight(st);
   const floors=rh=>Math.max(0, Math.round((H - S.base.h - rh)/S.floor.h));
   V.n=floors(S.roof.h);
-  // 三角屋根。似合う業種は低層なら大体そうする / それ以外もたまに混ぜる
-  V.gable = !!S.gable && (GABLE_TYPES.has(bt.name) ? (V.n<=3 && rnd(0)<0.85)
-                                                   : (V.n<=2 && rnd(0)<0.18));
-  if(V.gable) V.n=floors(S.gable.h);               // 屋根が変わると入る階数も変わる
+  // 屋根は 4 通り: 陸屋根 2 種 / 切妻 / 寄棟。
+  // 勾配屋根が似合う業種は低層なら大体そうする / それ以外もたまに混ぜる。
+  // 切妻ばかりだと棟の線が街じゅうで揃ってしまうので、寄棟を半分ほど混ぜる。
+  const pitched = GABLE_TYPES.has(bt.name) ? (V.n<=3 && rnd(0)<0.85)
+                                           : (V.n<=2 && rnd(0)<0.18);
+  if(pitched && (S.gable || S.hip)){
+    V.roof = (S.hip && S.gable) ? (rnd(4)<0.45 ? 'hip' : 'gable')
+                                : (S.hip ? 'hip' : 'gable');
+  }else if(S.roof2 && rnd(4)<0.42){
+    V.roof='flat2';                                // 陸屋根でも屋上の表情を変える
+  }
+  V.gable = (V.roof==='gable' || V.roof==='hip');  // 屋上看板が載らない屋根かどうか
+  V.n=floors(roofModOf(S, V).h);                   // 屋根が変わると入る階数も変わる
   // 看板は屋上か袖のどちらか一方だけ。三角屋根に屋上看板は載らない
   if(!NO_SIGN.has(bt.name)){
     const roofOK=!!S.signRoof && !V.gable, bladeOK=!!S.signBlade;
@@ -3080,7 +3105,20 @@ function structVariant(st){
             && V.n>=2 && V.n<=4 && rnd(2)<0.65;
   V.balcony = !!S.balcony && BLDG_BALCONY_MIN>0 && V.n>=BLDG_BALCONY_MIN;
   V.stair   = !!S.stair && !V.exstair && rnd(3)<0.35;
+  // 庇は低層の店だけ。袖看板と喧嘩しないよう、袖看板が出ているときは控える。
+  V.awning  = !!S.awning && AWNING_TYPES.has(bt.name) && V.n<=3
+            && V.sign!=='blade' && rnd(5)<0.55;
+  V.fence   = !!S.fence && FENCE_TYPES.has(bt.name) && V.n<=2 && rnd(6)<0.60;
   return V;
+}
+
+// V.roof からモジュールを引く。structVariant (階数の計算) と buildStructGeo
+// (実際に積む) の両方から使うので、対応表はここ 1 か所に置く。
+function roofModOf(S, V){
+  return V.roof==='gable' ? (S.gable||S.roof)
+       : V.roof==='hip'   ? (S.hip  ||S.roof)
+       : V.roof==='flat2' ? (S.roof2||S.roof)
+       :                     S.roof;
 }
 
 // 高さ H (ワールド単位) に合うようフロアを積み、1つの BufferGeometry にする。
@@ -3093,11 +3131,12 @@ function structVariant(st){
 function buildStructGeo(fpn, H, V){
   const M=bldgModules(); if(!M) return null;
   const S=M[fpn]||M[1];
-  const roofMod=(V.gable && S.gable) ? S.gable : S.roof;
+  const roofMod=roofModOf(S, V);
   const actual=S.base.h + V.n*S.floor.h + roofMod.h;
   const sz=Math.min(1.25, Math.max(0.80, H/actual));   // 端数は縦の伸縮で吸収
-  const key=[fpn, V.n, sz.toFixed(3), V.gable?'g':'f', V.sign||'-',
-             V.balcony?'b':'-', V.exstair?'x':'-', V.stair?'s':'-', V.facing].join('_');
+  const key=[fpn, V.n, sz.toFixed(3), V.roof, V.sign||'-',
+             V.balcony?'b':'-', V.exstair?'x':'-', V.stair?'s':'-',
+             V.awning?'a':'-', V.fence?'w':'-', V.facing].join('_');
   if(structGeoCache[key]) return structGeoCache[key];
 
   const buf={}; for(const k of GROUP_ORDER) buf[k]={pos:[], nrm:[]};
@@ -3119,6 +3158,8 @@ function buildStructGeo(fpn, H, V){
   put(S.base, 0);
   if(V.stair)            put(S.stair,     0);
   if(V.sign==='blade')   put(S.signBlade, 0);
+  if(V.awning)           put(S.awning,    0);   // 庇と塀はモジュール側が絶対高さを持つ
+  if(V.fence)            put(S.fence,     0);
   for(let i=0;i<V.n;i++){
     const z=S.base.h + i*S.floor.h;
     put(S.floor, z);

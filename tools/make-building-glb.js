@@ -218,6 +218,60 @@ function makeGable(fp){
 //   (支柱を入れてはいたが細すぎて何も支えていないように見える)。
 //   下端を最上階の壁の前まで下ろすと、建物と地続きの色帯になる。
 // 高さは頭打ちにする — 2x2 で幅なりに大きくすると「屋根に蓋」に見えた。
+// 寄棟屋根。切妻と違って四方に流れるので、棟の線が短くなり印象が変わる。
+// 低層の住宅・寺社・学校が並んだとき、全部が切妻だとコピーに見えるので混ぜる。
+function makeHip(fp){
+  const m = {}, W = WIDTH(fp), h = W/2, e = Math.min(0.12, W*0.075);
+  const o = h + e, y0 = 0.05, y1 = 0.05 + W*0.26, rx = o*0.34;   // rx = 棟の長さの半分
+  box(m,'trim', -o, o, 0, y0, -o, o, 'xXyzZ');                   // 軒の見切り
+  // 巻き順は「外から見て反時計回り」。makeGable と同じ並びで、棟を短くしただけ。
+  quad(m,'roof', [-o,y0,-o],[-rx,y1, 0],[ rx,y1, 0],[ o,y0,-o]); // 前の流れ
+  quad(m,'roof', [ o,y0, o],[ rx,y1, 0],[-rx,y1, 0],[-o,y0, o]); // 後ろの流れ
+  tri (m,'roof', [ o,y0,-o],[ rx,y1, 0],[ o,y0, o]);             // 右の流れ
+  tri (m,'roof', [-o,y0,-o],[-o,y0, o],[-rx,y1, 0]);             // 左の流れ
+  return m;
+}
+
+// 陸屋根のもう一種。パラペットは同じだが、塔屋を反対側に寄せ、貯水槽の代わりに
+// 室外機を並べる。同じ高さのビルが並んだとき屋上の表情が変わる。
+function makeRoof2(fp){
+  const m = {}, W = WIDTH(fp), h = W/2;
+  box(m,'trim', -h-0.03,h+0.03, 0,0.15, -h-0.03,h+0.03, 'xXYzZ');   // パラペット (少し高い)
+  box(m,'trim', -W*0.30,-W*0.02, 0.15, 0.34, W*0.02, W*0.30, 'xXYzZ'); // 塔屋 (奥の左)
+  for(let i=0;i<3;i++){                                              // 室外機を 3 台
+    const zx = -W*0.26 + i*W*0.20;
+    box(m,'trim', W*0.10, W*0.30, 0.15, 0.24, zx-W*0.07, zx+W*0.07);
+  }
+  return m;
+}
+
+// 庇 (テント)。前へ張り出して 1 階に影を作る。業種色が乗るので 'sign' に置く。
+// 店・飲食店に付けると「そこが入り口だ」と一目で分かるようになる。
+function makeAwning(fp){
+  const m = {}, W = WIDTH(fp), h = W/2;
+  const y = H_BASE*0.66, d = Math.min(0.22, W*0.14), x = h*0.86;
+  quad(m,'sign', [-x,y,-h], [-x,y-0.05,-h-d], [x,y-0.05,-h-d], [x,y,-h]);  // 天板 (前下がり)
+  box(m,'sign', -x, x, y-0.14, y-0.05, -h-d-0.015, -h-d);                  // 前縁の垂れ
+  for(const sx of [-x*0.88, x*0.88])                                       // 受けの腕
+    box(m,'trim', sx-0.018, sx+0.018, y-0.11, y, -h-d, -h);
+  return m;
+}
+
+// 塀と門。敷地を囲って前だけ開ける。住宅が「家」に見えるようになる。
+// 建物の幅は CELL*0.8 なので、CELL*1.0 のセルに対して外側に少し余裕がある。
+function makeFence(fp){
+  const m = {}, W = WIDTH(fp), h = W/2;
+  const o = h + Math.min(0.20, W*0.12), t = 0.04, y = 0.22, g = W*0.17;   // g = 門の開口の半分
+  box(m,'trim', -o, -o+t, 0, y, -o, o);          // 左
+  box(m,'trim',  o-t, o,  0, y, -o, o);          // 右
+  box(m,'trim', -o, o, 0, y, o-t, o);            // 後ろ
+  box(m,'trim', -o, -g, 0, y, -o, -o+t);         // 前 (門の左)
+  box(m,'trim',  g, o,  0, y, -o, -o+t);         // 前 (門の右)
+  for(const sx of [-g, g])                       // 門柱
+    box(m,'trim', sx-0.05, sx+0.05, 0, y*1.55, -o-0.012, -o+t+0.012);
+  return m;
+}
+
 function makeSignRoof(fp){
   const m = {}, W = WIDTH(fp), h = W/2;
   const sw = W*0.44, sy0 = -0.10, sy1 = 0.13 + Math.min(W*0.13, 0.26);
@@ -362,6 +416,10 @@ for(const fp of [1,2]){
   mods.push({ name:`fp${fp}_stair`,      mod: makeStair(fp) });
   mods.push({ name:`fp${fp}_roof`,       mod: makeRoof(fp) });
   mods.push({ name:`fp${fp}_roof_gable`, mod: makeGable(fp) });
+  mods.push({ name:`fp${fp}_roof_hip`,   mod: makeHip(fp) });
+  mods.push({ name:`fp${fp}_roof2`,      mod: makeRoof2(fp) });
+  mods.push({ name:`fp${fp}_awning`,     mod: makeAwning(fp) });
+  mods.push({ name:`fp${fp}_fence`,      mod: makeFence(fp) });
   mods.push({ name:`fp${fp}_sign_roof`,  mod: makeSignRoof(fp) });
   mods.push({ name:`fp${fp}_sign_blade`, mod: makeSignBlade(fp) });
 }
