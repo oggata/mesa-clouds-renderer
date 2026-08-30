@@ -76,8 +76,11 @@ const CURB_W  = 0.030;                     // 縁石天端の見える幅 (歩�
 // 0.085 にしていたときは 1 セルに 11.76 個で、セル境界で目地がズレた
 // (継ぎ目検査で 512/512 不一致になった唯一の原因がこれ)。
 const PAVE_P  = 1/12, PAVE_L = 0.010;
-const XW_A = 0.012, XW_B = 0.014;          // 横断歩道の帯の前後マージン
-const XW_P = 0.055, XW_T = 0.032;          // 横断歩道の縞の周期と太さ
+const XW_A = 0.012, XW_B = 0.012;          // 横断歩道の帯の前後マージン
+// 横断歩道の縞。日本の規格は幅 45cm / 間隔 45cm なので、1 セル 7.73m に対して
+// 周期 0.9m ≒ 0.116。**縞の本数は車道幅から割り出す** (固定の周期だと端の縞が
+// 中途半端に切れて縁石と重なる)。
+const XW_PITCH = 0.116, XW_DUTY = 0.52;
 
 // ── 色 ────────────────────────────────────────────────────────────────────────
 const C_PAVE   = [186,189,193,255];   // 歩道
@@ -207,15 +210,20 @@ function bandOn(t, period, width){
 const dashOn = t => bandOn(t, DASH_P, DASH_L);
 
 // 横断歩道。交差点 (n>=3) の各腕の、セル端と交差点ボックスの間の帯に縞を引く。
-// 縞は進行方向に直交して伸び、進行方向に沿って繰り返す (アビーロード式)。
+// 縞は**進行方向に沿って伸び、道幅の方向に繰り返す** (日本の横断歩道)。
+// 最初これを 90 度取り違えて、縞が進行方向に直交して並んでいた。
+//   s = その腕の端からの奥行き (進行方向)   w = 道幅の方向
+// 縞が伸びるのは s、繰り返すのは w。
 function crosswalk(u,v,mask,RW){
-  const lo=0.5-RW, hi=0.5+RW;
+  const lo=0.5-RW, hi=0.5+RW, W=hi-lo;
+  const n=Math.max(4, Math.round(W/XW_PITCH));   // 車道幅に収まる本数
+  const p=W/n;                                   // 実際の周期 (幅を割り切る)
   const arms=[[1, v,   u], [2, 1-u, v], [4, 1-v, u], [8, u,   v]];
   for(const [bit, s, w] of arms){
     if(!(mask&bit)) continue;
-    if(w<lo || w>hi) continue;                 // その腕の車道幅の中だけ
-    if(s<XW_A || s>lo-XW_B) continue;
-    if((((s-XW_A)/XW_P)%1)*XW_P < XW_T) return true;
+    if(w<lo || w>hi) continue;                   // その腕の車道幅の中だけ
+    if(s<XW_A || s>lo-XW_B) continue;            // 帯の奥行き
+    if((((w-lo)/p)%1)*p < p*XW_DUTY) return true;
   }
   return false;
 }
