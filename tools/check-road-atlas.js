@@ -17,6 +17,11 @@
 //      ので 0.3px 程度は必ず残る。0.5px 未満なら見た目には出ない。
 //   3. 塗りの色 — 両側とも不透明なピクセルどうしの RGB。周期パターン (破線・歩道の
 //      目地) の位相が境界で飛んでいるとここに出る。
+//   4. 縁石の輪郭 (road_curbs.json) と PNG の一致 — 輪郭の各頂点で、法線の
+//      内側が車道・外側が歩道になっているか。PNG と JSON は同じ SDF から作られる
+//      ので本来ズレようが無いが、**片方だけ焼き直したときに静かにズレる**。
+//      server.js は JSON を信じて縦の面を立てるので、ここが狂うと縁石が
+//      道の真ん中や歩道の奥に立つ。
 
 const fs=require('fs'), path=require('path');
 const PNG=require('./png.js');
@@ -81,6 +86,93 @@ console.log(`  車道の位置ズレ      : 最大 ${maxStruct}px  (1px以上の
 console.log(`  縁石のサブピクセル差: 最大 ${maxCov.toFixed(2)}px  (0.5px以上のペア ${covBad})`);
 console.log(`  塗りの色差          : 最大 ${maxRGB}/255  (差>8 のペア ${rgbBad})`);
 for(const [v,k] of worst.slice(0,5)) console.log(`      ${k}  差${v}`);
-const ok = maxStruct<1 && covBad===0 && rgbBad===0;
+// ── 4) 縁石の輪郭が PNG の境界に乗っているか ─────────────────────────────────
+// 各頂点から法線の内側/外側へ D だけ離れた点を PNG から引く。
+//   内側 (車道) … 透明 (下地が透ける) か、白い標示 (横断歩道・センターライン)
+//   外側 (歩道) … 不透明の灰色の舗装
+// D は黄色い外側線 (車道の縁から 0.014〜0.036) の外に取る。
+const curbFile=path.join(path.dirname(file),'road_curbs.json');
+let curbBad=0, curbPts=0, curbLines=0, curbNote='';
+if(!fs.existsSync(curbFile)){
+  curbNote='road_curbs.json が無い (node tools/make-road-atlas.js で作られる)';
+}else{
+  const D=0.05;
+  const tilePx=(slot,x,y)=>{
+    const [ox,oy]=org(slot);
+    return img.px(ox+Math.min(CONTENT-1,Math.max(0,Math.round(x*CONTENT-0.5))),
+                  oy+Math.min(CONTENT-1,Math.max(0,Math.round(y*CONTENT-0.5))));
+  };
+  const isRoadSide=c=> c[3]<128 || (c[0]>225 && c[1]>225 && c[2]>215);   // 透明 or 白い塗料
+  const isWalkSide=c=> c[3]>250 && c[0]>150 && c[0]<225
+                       && Math.abs(c[0]-c[2])<25 && Math.abs(c[0]-c[1])<25;
+  const J=JSON.parse(fs.readFileSync(curbFile,'utf8'));
+  for(const slot of Object.keys(J.slots)){
+    for(const line of J.slots[slot]){
+      curbLines++;
+      for(const [x,y,nx,ny] of line){
+        const ix=x-nx*D, iy=y-ny*D, ox2=x+nx*D, oy2=y+ny*D;
+        // セルの外へ出る点 (輪郭の端) は隣のセルの絵になるので判定しない
+        if(ix<0||ix>1||iy<0||iy>1||ox2<0||ox2>1||oy2<0||oy2>1) continue;
+        curbPts++;
+        if(!isRoadSide(tilePx(+slot,ix,iy)) || !isWalkSide(tilePx(+slot,ox2,oy2))){
+          curbBad++;
+          if(curbBad<=4) console.log(`      NG slot${slot} (${x},${y}) `
+            + `内=${JSON.stringify(tilePx(+slot,ix,iy))} 外=${JSON.stringify(tilePx(+slot,ox2,oy2))}`);
+        }
+      }
+    }
+  }
+}
+console.log(`  縁石の輪郭          : ${curbNote || `${curbLines}本 / 判定 ${curbPts}点 / 不一致 ${curbBad}`}`);
+
+// ── 5) 縁石の立体 (roads.js pushCurb) の巻き方と法線 ─────────────────────────
+// 三角形の巻き方から出る幾何法線と、頂点に載せた法線が**同じ側**を向いていること。
+// 食い違う (内積が負) と、両面描画でも three が裏面と判定して法線を反転させ、
+// 陰影が裏返る。見るのは符号であって滑らかさではない:
+//   ・円弧の上   … 頂点法線が 1 線分ぶん傾く (数度)
+//   ・直角の隅   … SDF の勾配が二等分線になるので **cos45° = 0.707** になる
+// どちらも法線を頂点ごとに持つ以上ふつうに起きることで、面は正しく向いている。
+// あわせて、縦の面が**車道の側**を向いていることも見る (輪郭の法線は車道→歩道
+// なので、縦の面の法線はその逆でなければならない)。
+if(!curbNote){
+  const RD2=require('../roads.js');
+  const J2=JSON.parse(fs.readFileSync(curbFile,'utf8'));
+  const P={zRoad:0, zTop:0.06, zWalk:0.014, chamfer:0.06};
+  let tris=0, windBad=0, faceBad=0, soft=0, worstDot=1;
+  for(const slot of Object.keys(J2.slots)){
+    const pos=[], nrm=[];
+    RD2.pushCurb(pos, nrm, J2.slots[slot], 0, 0, 1, P);
+    for(let t=0;t*9<pos.length;t++){
+      const V=i=>[pos[t*9+i*3], pos[t*9+i*3+1], pos[t*9+i*3+2]];
+      const N=i=>[nrm[t*9+i*3], nrm[t*9+i*3+1], nrm[t*9+i*3+2]];
+      const [v0,v1,v2]=[V(0),V(1),V(2)];
+      const e1=[v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
+      const e2=[v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
+      const g=[e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
+      const gl=Math.hypot(...g); if(gl<1e-12) continue;   // 退化三角形は飛ばす
+      const a=[0,1,2].reduce((s,k)=>s+(N(0)[k]+N(1)[k]+N(2)[k])/3*g[k]/gl, 0);
+      tris++;
+      if(a<worstDot) worstDot=a;
+      if(a<=0.2){ windBad++;      // 0.2 = 78°。反転 (負) と退化を捕まえるための線
+        if(windBad<=3) console.log(`      NG slot${slot} 三角形${t} 巻き方と法線の内積 ${a.toFixed(3)}`); }
+      else if(a<0.9) soft++;
+      // 縦の面 (法線の z が 0) は車道側を向くこと = 輪郭の法線の逆向き
+      const n0=N(0);
+      if(Math.abs(n0[2])<1e-6){
+        const key=`${v0[0].toFixed(4)},${v0[1].toFixed(4)}`;
+        for(const line of J2.slots[slot]) for(const [x,y,nx,ny] of line){
+          if(`${x.toFixed(4)},${y.toFixed(4)}`!==key) continue;
+          if(n0[0]*nx + n0[1]*ny > -0.9) faceBad++;
+          break;
+        }
+      }
+    }
+  }
+  console.log(`  縁石の立体          : 三角形 ${tris} / 反転 ${windBad} / 向きの不一致 ${faceBad}`
+            + ` (隅で法線が寝ている三角形 ${soft} / 最小内積 ${worstDot.toFixed(3)})`);
+  curbBad += windBad + faceBad;
+}
+
+const ok = maxStruct<1 && covBad===0 && rgbBad===0 && curbBad===0 && !curbNote;
 console.log(ok ? '  → 全ペアで継ぎ目なし' : '  → 上記を確認すること');
 process.exit(ok?0:1);

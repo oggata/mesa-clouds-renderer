@@ -172,6 +172,14 @@ const { OTHER, ROAD, BUILDING, TREE } = MW;
 // 枠割りとマスクのビット順の唯一の定義でもあり、tools/make-road-atlas.js が
 // 焼くときも同じものを引いている。
 const RD = require('./roads.js');
+// 住民の骨格 (関節・骨・色) と歩行ポーズ。world.js / roads.js と同じ理由で切り出す:
+// 同じ式を server.js の頂点シェーダと tools/preview-walk.js の両方が使う。
+// three が要る server.js はテスト環境で動かせないので、ポーズの式がここに無いと
+// 「歩き方が正しいか」を実機に載せる前に確かめる手段が無くなる。
+const SK = require('./skeleton.js');
+// 車の出入口・経路・走行。住民 (ONNX 推論・欲求・屋内状態) とは別系統にする。
+// three にも server.js にも依存しない計算なので単体で検証できる。
+const TR = require('./traffic.js');
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
 //   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
@@ -1062,6 +1070,18 @@ const MARK_Z = envNum('MARK_Z', 0.014);
 // 症状は一目で分かる: **道が隣のセルと繋がらず、半セルずれた絵になる。**
 // そうなったら MARK_FLIP_Y=0 で起動する (コード変更は要らない)。
 const MARK_FLIP_Y = process.env.MARK_FLIP_Y !== '0';
+// 縁石。参考写真の「歩道が一段上がっている」感じは平らなテクスチャでは出ない。
+// 輪郭は road_curbs.json (アトラスと同じ SDF から書き出したもの) を読む。
+// ここで輪郭を計算し直すと、その SDF が 2 か所に増える。
+const ROAD_CURBS = process.env.ROAD_CURBS || './textures/road/road_curbs.json';
+const CURB_ON    = process.env.CURB !== '0';
+const CURB_H     = envNum('CURB_H', 0.060);   // 縁石天端の高さ (≒20cm)
+// 天端から歩道面へ落とす面取りの幅。アトラス側の縁石天端の帯 (正規化 0.030) に
+// 合わせてあるので、立体の面取りとテクスチャの明るい帯がぴったり重なる。
+const CURB_W     = envNum('CURB_W', 0.030*CELL);
+// 縁石の断面。立体は roads.js の pushCurb が組む (three に依存しない配列操作なので
+// 検算しやすいところに置いてある)。zRoad は下地の道の板と同じ高さ。
+const CURB_PROFILE = {zRoad:0.008, zTop:CURB_H, zWalk:MARK_Z, chamfer:CURB_W};
 const groundTex = {};                              // {grass, road, vacant, roadmark}
 async function loadGroundTexture(key, filePath){
   if(!GROUND_TEX) return;
@@ -2084,74 +2104,258 @@ function mergeGeos(list){
 //   体だけ住民ごとに色が変わるので、インスタンスカラーで塗り分けられるよう別にする。
 //   残りは色が固定なので頂点カラーに焼いて1マテリアルにまとめる。
 const AGENT_BASE = -CELL*.26;                 // 足元 (ローカル原点からの高さ)
-const AGENT_HIP  = AGENT_BASE + CELL*.22;     // 脚の付け根。ここより下が「脚」
+const AGENT_H_GEO = CELL*0.66;                // 骨格の身長 (ジオメトリ単位)。AGENT_H と同じ定義
+// 関節の高さ (ジオメトリ単位)。シェーダの回転支点にそのまま使う。
+const SKZ = k => AGENT_BASE + SK.J[k].z*AGENT_H_GEO;
+// 頭だけ住民ごとの色にする。骨は姿勢推定の配色 (シアン/黄/マゼンタ) の固定色。
+// 胴まで住民色にすると骨格に見えなくなり、かといって全部固定色だと 1000 人の
+// 見分けが付かない。いちばん大きく上にある頭が識別子として素直だった。
+const SKEL_HEAD_TINT = process.env.SKEL_HEAD_TINT !== '0';
+// 円柱と球の分割数。細い骨なので粗くてよい。実測でこの設定なら 1 体あたり
+// 約 490 三角形で、以前の丸い人型 (約 1350) より軽い。
+const BONE_SEG = 5, JOINT_SEG = [5,3], HEAD_SEG = [8,5];
 let _agentGeoBody=null, _agentGeoParts=null;
 
+// 住民の体を「頭 (住民ごとの色)」と「骨と関節 (固定色)」の 2 本に分けて作る。
+// 形も配色も歩き方も skeleton.js が持っている。ここは three のジオメトリに
+// 起こすだけで、寸法や角度をここで決め直さない。
 function buildAgentGeos(){
   if(_agentGeoBody) return;
-  const base=AGENT_BASE;
-  const skin=new THREE.Color(0xf1c9a5), hair=new THREE.Color(0x4a3b2f), pants=new THREE.Color(0x2b303a);
-  const upZ=g=>{ g.rotateX(Math.PI/2); return g; };       // Y軸ジオメトリを Z 上向きに
-  const put=(g,x,y,z,sx=1,sy=1,sz=1)=>{
-    g.applyMatrix4(new THREE.Matrix4().compose(
-      new THREE.Vector3(x,y,z), new THREE.Quaternion(), new THREE.Vector3(sx,sy,sz)));
-    return g;
-  };
-  // ── 体 (住民ごとに色が変わる) ──
-  _agentGeoBody = mergeGeos([
-    // 胴体: 裾に向かってわずかに広がるテーパー (コート/ワンピース風シルエット)
-    { geo: put(upZ(new THREE.CylinderGeometry(CELL*.095,CELL*.135,CELL*.30,16)), 0,0,base+CELL*.35) },
-    // 丸い肩
-    { geo: put(new THREE.SphereGeometry(CELL*.12,16,10), 0,0,base+CELL*.49, 1.05,.8,.7) },
-  ]);
-  // ── 肌・髪・ズボン (色が固定なので頂点カラーに焼く) ──
-  //   この中で AGENT_HIP より下にあるのは脚だけ。歩行シェーダはそれを目印に脚を振る。
-  const legGeo=()=>upZ(new THREE.CylinderGeometry(CELL*.032,CELL*.028,CELL*.22,8));
-  _agentGeoParts = mergeGeos([
-    { geo: put(legGeo(), -CELL*.05,0,base+CELL*.11), color: pants },   // 脚 (細身・左右)
-    { geo: put(legGeo(),  CELL*.05,0,base+CELL*.11), color: pants },
-    { geo: put(upZ(new THREE.CylinderGeometry(CELL*.04,CELL*.045,CELL*.06,8)), 0,0,base+CELL*.55), color: skin }, // 首
-    { geo: put(new THREE.SphereGeometry(CELL*.115,18,14), 0,0,base+CELL*.66, 1,.95,1.05), color: skin },          // 頭
-    // 髪 (頭頂のドーム)
-    { geo: put(upZ(new THREE.SphereGeometry(CELL*.122,18,12,0,Math.PI*2,0,Math.PI*.62)), 0,-CELL*.012,base+CELL*.665), color: hair },
-    // 正面マーカー (鼻) — 進行方向の判別用に控えめに残す。Cone は既定で +Y を向く。
-    { geo: put(new THREE.ConeGeometry(CELL*.03,CELL*.06,8), 0,CELL*.11,base+CELL*.655), color: skin },
-  ]);
+  const H=AGENT_H_GEO;
+  const P=p=>new THREE.Vector3(p.x*H, p.y*H, AGENT_BASE+p.z*H);
+  const head=[], rest=[];
+  // 骨 = 端を開けた細い円柱。継ぎ目は関節の玉が隠すので蓋は要らない。
+  for(const b of SK.boneSegments()){
+    const a=P(b.a), c=P(b.b), d=new THREE.Vector3().subVectors(c,a);
+    const L=d.length(); if(L<1e-6) continue;
+    const g=new THREE.CylinderGeometry(b.r*H, b.r*H, L, BONE_SEG, 1, true);
+    g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(
+      new THREE.Vector3(0,1,0), d.clone().normalize()));
+    g.translate((a.x+c.x)/2, (a.y+c.y)/2, (a.z+c.z)/2);
+    rest.push({geo:g, color:new THREE.Color(b.col), bone:b.bone});
+  }
+  // 関節の玉と頭
+  for(const s of SK.jointSpheres()){
+    const p=P(s.p), isHead=s.r>=SK.HEAD_R-1e-9;
+    const sg=isHead?HEAD_SEG:JOINT_SEG;
+    const g=new THREE.SphereGeometry(s.r*H, sg[0], sg[1]);
+    g.translate(p.x, p.y, p.z);
+    // 頭は住民ごとの色を載せる側 (body) に置く。**その頂点カラーは白**にすること。
+    // 骨格の配色をそのまま残すと instanceColor と掛け算になって色が濁る。
+    const tint = isHead && SKEL_HEAD_TINT;
+    (isHead ? head : rest).push({geo:g, bone:s.bone,
+      color:new THREE.Color(tint ? 0xffffff : s.col)});
+  }
+  if(!head.length) head.push(rest.pop());     // 念のため (頭は必ず1個ある)
+  _agentGeoBody =mergeWithBone(head);
+  _agentGeoParts=mergeWithBone(rest);
   SHARED_GEO.add(_agentGeoBody); SHARED_GEO.add(_agentGeoParts);
+}
+
+// mergeGeos に「頂点ごとの骨番号」を足す。mergeGeos は渡した順に頂点を並べる
+// ので、各ジオメトリの頂点数を先に数えておけば同じ並びで aBone を作れる。
+function mergeWithBone(list){
+  const counts=list.map(it=>it.geo.attributes.position.count);
+  const geo=mergeGeos(list);                    // ← ここで入力ジオメトリは破棄される
+  const bone=new Float32Array(counts.reduce((a,b)=>a+b,0));
+  let o=0;
+  list.forEach((it,i)=>{ bone.fill(it.bone, o, o+counts[i]); o+=counts[i]; });
+  geo.setAttribute('aBone', new THREE.BufferAttribute(bone,1));
+  return geo;
 }
 
 // ── シェーダ歩行 ─────────────────────────────────────────────────────────────
 // ボーン (SkinnedMesh) を使うと、住民ごとにスケルトンとボーン行列の更新が要るうえ
 // three.js r132 には InstancedSkinnedMesh が無いのでインスタンシングと排他になる。
-// 歩かせたいだけなら頂点シェーダで足りる。住民ごとの歩行位相と振幅を
-// インスタンス属性 aWalk = (位相, 振幅) で渡し、脚の付け根から下だけを前後に振る。
+// 住民は全員同じ骨格で、違うのは位相と振幅だけなので、頂点属性
+//   aWalk = (位相, 振幅)   aBone = (骨番号)
+// を渡してシェーダ側で関節を回せば足りる。ドローコールは 2 本のまま。
 //   位相は「実際に進んだ距離」で進めるので、歩幅と速さが自然に一致する。
-//   振幅は止まると 0 に落ちるので、立ち止まっているときは脚も止まる。
+//   振幅は止まると 0 に落ちるので、立ち止まっているときは姿勢も rest に戻る。
 const WALK_CYCLE = parseFloat(process.env.WALK_CYCLE) || CELL*0.30;  // 1歩行周期で進む距離
-const WALK_FULL  = parseFloat(process.env.WALK_FULL)  || CELL*0.018; // 振幅が最大になる1フレームの移動量 (実測の歩行速度に合わせた)
-const WALK_SWING = parseFloat(process.env.WALK_SWING) || 0.55;       // 脚の振れ角 (rad)
+const WALK_FULL  = parseFloat(process.env.WALK_FULL)  || CELL*0.018; // 振幅が最大になる1フレームの移動量
 const WALK_RATE  = Math.PI*2 / WALK_CYCLE;
 
-// マテリアルに歩行を仕込む。legs=true なら脚を振る (体側は位相を受け取るだけ)。
-function addWalkShader(mat, legs){
+// 関節角の計算。**skeleton.js の limbAngles と同じ式**を GLSL で書いたもの。
+// 位置と法線の 2 か所から使うので、文字列としてはここ 1 か所に持つ。
+const _f = v => v.toFixed(5);
+const WALK_ANGLES_GLSL = `
+  float _ph=aWalk.x, _am=aWalk.y;
+  // 骨番号: 1,2=左脚 3,4=右脚 5,6=左腕 7,8=右腕 0=胴と頭
+  float _isL = (aBone==1.0||aBone==2.0||aBone==5.0||aBone==6.0) ? 1.0 : -1.0;
+  float _p  = _ph + (_isL>0.0 ? 0.0 : 3.14159265);
+  float _pa = _p + 3.14159265;                       // 腕は同じ側の脚と逆位相
+  float _cp = max(0.0, cos(_p));
+  float _thigh = ${_f(SK.WALK.thigh)}*_am*sin(_p);
+  float _knee  = -_am*(${_f(SK.WALK.kneeStance)} + ${_f(SK.WALK.kneeSwing)}*pow(_cp,1.5));
+  float _shd   = ${_f(SK.WALK.arm)}*_am*sin(_pa);
+  float _elb   = _am*(${_f(SK.WALK.elbowBase)} + ${_f(SK.WALK.elbowSwing)}*max(0.0,sin(_pa)));
+  float _lean  = ${_f(SK.WALK.lean)}*_am;
+  // X 軸まわりの回転は合成が「角度の和」になるので、法線はこの 1 個で回せる
+  // (位置だけは支点が違うので連鎖が要る)。
+  float _ang = (aBone==2.0||aBone==4.0) ? (_knee+_thigh)
+             : (aBone==1.0||aBone==3.0) ? _thigh
+             : (aBone==6.0||aBone==8.0) ? (_elb+_shd+_lean)
+             : (aBone==5.0||aBone==7.0) ? (_shd+_lean)
+             : _lean;
+`;
+
+// マテリアルに歩行を仕込む。位置と法線の両方を回す。
+function addWalkShader(mat){
   mat.onBeforeCompile = (sh)=>{
-    sh.vertexShader = 'attribute vec2 aWalk;\n' + sh.vertexShader;
-    if(legs){
-      sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
-        `#include <begin_vertex>
-        if(aWalk.y > 0.001 && transformed.z < ${AGENT_HIP.toFixed(5)}){
-          float side = transformed.x < 0.0 ? 1.0 : -1.0;      // 左右の脚は逆位相
-          float ang  = sin(aWalk.x) * ${WALK_SWING.toFixed(3)} * aWalk.y * side;
-          float dz   = transformed.z - ${AGENT_HIP.toFixed(5)};
-          float sa   = sin(ang), ca = cos(ang);
-          float y0   = transformed.y;
-          transformed.y = y0*ca - dz*sa;                      // 付け根まわりの回転
-          transformed.z = ${AGENT_HIP.toFixed(5)} + y0*sa + dz*ca;
-        }`);
-    }
+    sh.vertexShader =
+      'attribute vec2 aWalk;\nattribute float aBone;\n'
+    + 'vec3 mesaRotX(vec3 p, float pz, float a){\n'
+    + '  float s=sin(a), c=cos(a); float y=p.y, z=p.z-pz;\n'
+    + '  return vec3(p.x, y*c - z*s, pz + y*s + z*c);\n}\n'
+    + sh.vertexShader;
+    // 法線。角度の和 1 個で回すだけ。
+    sh.vertexShader = sh.vertexShader.replace('#include <beginnormal_vertex>',
+      `#include <beginnormal_vertex>
+      {${WALK_ANGLES_GLSL}
+        float _s=sin(_ang), _c=cos(_ang);
+        objectNormal = vec3(objectNormal.x,
+                            objectNormal.y*_c - objectNormal.z*_s,
+                            objectNormal.y*_s + objectNormal.z*_c);
+      }`);
+    // 位置。支点が違うので関節の連鎖で回す。
+    sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
+      `#include <begin_vertex>
+      {${WALK_ANGLES_GLSL}
+        if(aBone==2.0 || aBone==4.0){                       // 脛と足
+          transformed = mesaRotX(transformed, ${_f(SKZ('knee'))}, _knee);
+          transformed = mesaRotX(transformed, ${_f(SKZ('hip'))}, _thigh);
+        }else if(aBone==1.0 || aBone==3.0){                 // 腿
+          transformed = mesaRotX(transformed, ${_f(SKZ('hip'))}, _thigh);
+        }else if(aBone==6.0 || aBone==8.0){                 // 前腕と手
+          transformed = mesaRotX(transformed, ${_f(SKZ('elbow'))}, _elb);
+          transformed = mesaRotX(transformed, ${_f(SKZ('shoulder'))}, _shd);
+          transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
+        }else if(aBone==5.0 || aBone==7.0){                 // 上腕
+          transformed = mesaRotX(transformed, ${_f(SKZ('shoulder'))}, _shd);
+          transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
+        }else{                                              // 胴と頭 (前傾のみ)
+          transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
+        }
+        transformed.z += ${_f(SK.WALK.bob*AGENT_H_GEO)}*_am*cos(2.0*_ph);
+      }`);
   };
-  // onBeforeCompile を付けたマテリアルは別プログラムとしてキャッシュさせる
-  mat.customProgramCacheKey = ()=> legs ? 'agentWalkLegs' : 'agentWalkBody';
+  mat.customProgramCacheKey = ()=> 'agentSkelWalk';
+}
+
+// ── 車 ──────────────────────────────────────────────────────────────────────
+// 走らせ方 (出入口・経路・追従・交差点の譲り合い) は traffic.js が持つ。
+// ここは three のジオメトリに起こしてインスタンスへ流し込むだけ。
+//   ★ 住民とは完全に別系統。車には推論も欲求も屋内状態も要らないので、
+//     agents に混ぜず cars 配列で持つ。
+//   ★ 街の中を周回させない。外周で街の外に面した走行可能な道を「他の町との
+//     接点」とみなし、そこから湧いて別の接点で消える。
+const CARS_ON   = process.env.CARS !== '0';
+const CAR_MAX   = Math.max(0, parseInt(process.env.CAR_MAX) || 18);
+const CAR_LANE  = envNum('CAR_LANE', 0.165*CELL);   // 車線中心までの横ずらし
+const CAR_SPEED = envNum('CAR_SPEED', 3.4);         // ワールド単位/秒 (≒40km/h)
+// 車体の寸法 (ワールド単位。1 単位 ≒ 3.4m)
+const CAR_L=1.20, CAR_W=0.52, CAR_BODY_Z=[0.10,0.30], CAR_CAB_Z=[0.30,0.46], CAR_WHEEL_R=0.09;
+const CAR_COLORS=[0xd8d8d4,0x2f3a4a,0xa83a32,0x2e6ea8,0x3f7a4a,0xd8a838,0x8a8f96,0x1f2227];
+const CAR_CAP = CAR_MAX + 4;
+
+let cars=[], _carGw=null, _carGwDirty=true;
+const CarInst={ body:null, trim:null };
+
+// 車のジオメトリ。前方は +X (traffic.js の car.th と同じ向き)。
+function buildCarGeos(){
+  if(CarInst.geoBody) return;
+  const box=(lx,ly,z0,z1,dx)=>{
+    const g=new THREE.BoxGeometry(lx,ly,z1-z0);
+    g.translate(dx||0, 0, (z0+z1)/2);
+    return g;
+  };
+  const body=[
+    {geo:box(CAR_L, CAR_W, CAR_BODY_Z[0], CAR_BODY_Z[1]), color:new THREE.Color(0xffffff)},
+    {geo:box(CAR_L*0.52, CAR_W*0.86, CAR_CAB_Z[0], CAR_CAB_Z[1], -CAR_L*0.06),
+     color:new THREE.Color(0xffffff)},
+  ];
+  const trim=[];
+  // 車輪。前方 +X なので前後は ±X、左右は ±Y。
+  for(const sx of [1,-1]) for(const sy of [1,-1]){
+    const w=new THREE.CylinderGeometry(CAR_WHEEL_R, CAR_WHEEL_R, 0.07, 7);
+    w.translate(sx*CAR_L*0.32, sy*(CAR_W*0.5+0.005), CAR_WHEEL_R);
+    trim.push({geo:w, color:new THREE.Color(0x1a1c1f)});
+  }
+  // 窓 (フロントとリア)。夜に光らせたくなったらここを emissive にする。
+  for(const sx of [1,-1]){
+    const g=new THREE.BoxGeometry(0.02, CAR_W*0.72, (CAR_CAB_Z[1]-CAR_CAB_Z[0])*0.72);
+    g.translate(sx*CAR_L*0.20, 0, (CAR_CAB_Z[0]+CAR_CAB_Z[1])/2);
+    trim.push({geo:g, color:new THREE.Color(0x9fd8e8)});
+  }
+  CarInst.geoBody=mergeGeos(body);
+  CarInst.geoTrim=mergeGeos(trim);
+  SHARED_GEO.add(CarInst.geoBody); SHARED_GEO.add(CarInst.geoTrim);
+}
+
+function initCarInstances(S){
+  if(!S || !CARS_ON || CAR_MAX<=0) return;
+  buildCarGeos();
+  const bm=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
+  const tm=new THREE.MeshLambertMaterial({vertexColors:true});
+  bm.userData.shared=true; tm.userData.shared=true;
+  const body =new THREE.InstancedMesh(CarInst.geoBody, bm, CAR_CAP);
+  const trim =new THREE.InstancedMesh(CarInst.geoTrim, tm, CAR_CAP);
+  for(const m of [body,trim]){
+    m.count=0; m.frustumCulled=false;
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    S.add(m);
+  }
+  CarInst.body=body; CarInst.trim=trim;
+}
+
+// 道が変わったら出入口を引き直す (道が生えたり廃れたりするので固定できない)
+function carGateways(){
+  if(!_carGwDirty && _carGw) return _carGw;
+  _carGwDirty=false;
+  _carGw = (CITY && CITY.roadClass)
+    ? TR.gateways(MAP, CITY.roadClass, ROAD, VOID) : [];
+  return _carGw;
+}
+
+const _carMat=new THREE.Matrix4(), _carQ=new THREE.Quaternion(),
+      _carP=new THREE.Vector3(), _carS=new THREE.Vector3(), _carC=new THREE.Color();
+const _carZ=new THREE.Vector3(0,0,1);
+
+function stepTraffic(dt){
+  if(!CARS_ON || !CarInst.body || !CITY || !CITY.roadClass) return;
+  const gw=carGateways();
+  // 湧かせる。経路が引けない組み合わせもあるので、1 フレームに 1 台まで試す。
+  if(gw.length>1 && cars.length<CAR_MAX){
+    const a=gw[(Math.random()*gw.length)|0], b=gw[(Math.random()*gw.length)|0];
+    if(a!==b){
+      const p=TR.route(MAP, CITY.roadClass, a, b, ROAD);
+      if(p && p.length>=3){
+        const line=TR.laneLine(p, MAP, CITY.roadClass, ROAD, 1, CELL, CAR_LANE);
+        const car=TR.makeCar(line, CAR_SPEED*(0.85+Math.random()*0.4), (Math.random()*3)|0);
+        car.color=CAR_COLORS[(Math.random()*CAR_COLORS.length)|0];
+        car.len=0.9+Math.random()*0.35;             // 車種のばらつき (長さだけ)
+        cars.push(car);
+      }
+    }
+  }
+  cars=TR.stepCars(cars, dt);
+  // インスタンスへ流す
+  const B=CarInst.body, T=CarInst.trim;
+  let k=0;
+  for(const c of cars){
+    if(k>=CAR_CAP) break;
+    _carP.set(c.x, c.y, 0.008);
+    _carQ.setFromAxisAngle(_carZ, c.th);
+    _carS.set(c.len||1, 1, 1);
+    _carMat.compose(_carP, _carQ, _carS);
+    B.setMatrixAt(k, _carMat); T.setMatrixAt(k, _carMat);
+    B.setColorAt(k, _carC.set(c.color||0xcccccc));
+    k++;
+  }
+  B.count=T.count=k;
+  B.instanceMatrix.needsUpdate=true; T.instanceMatrix.needsUpdate=true;
+  if(B.instanceColor) B.instanceColor.needsUpdate=true;
 }
 
 // ── 住民のインスタンス描画 ───────────────────────────────────────────────────
@@ -2274,12 +2478,12 @@ function initAgentInstances(S){
 
   // three 0.132 の color_fragment は USE_COLOR / USE_COLOR_ALPHA のときしか vColor を
   // 使わない。USE_INSTANCING_COLOR だけだと頂点側で計算した色が捨てられ、全員白になる。
-  // 体ジオメトリには mergeGeos が白の頂点カラーを入れてあるので、vertexColors を
-  // 有効にして経路を通し、その上に instanceColor を掛けさせる。
+  // 頭のジオメトリには白の頂点カラーを入れてあるので、vertexColors を有効にして
+  // 経路を通し、その上に instanceColor (住民ごとの色) を掛けさせる。
   const bodyMat=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
   const partsMat=new THREE.MeshLambertMaterial({vertexColors:true});
   bodyMat.userData.shared=true; partsMat.userData.shared=true;
-  addWalkShader(bodyMat,false); addWalkShader(partsMat,true);
+  addWalkShader(bodyMat); addWalkShader(partsMat);
 
   const body =new THREE.InstancedMesh(_agentGeoBody,  bodyMat,  AGENT_CAP);
   const parts=new THREE.InstancedMesh(_agentGeoParts, partsMat, AGENT_CAP);
@@ -2297,7 +2501,7 @@ function initAgentInstances(S){
 const _acol=new THREE.Color();
 function setAgentColor(i, hex){
   if(!AgentInst.body || i>=AGENT_CAP) return;
-  AgentInst.body.setColorAt(i, _acol.set(hex));
+  AgentInst.body.setColorAt(i, _acol.set(SKEL_HEAD_TINT ? hex : 0xffffff));
   AgentInst.body.instanceColor.needsUpdate=true;
   // 色の持ち主は syncAgentInstances (スロット詰め直しのたびに書く)。
   // ここで直接書いた値をキャッシュと食い違わせないよう、スロットを無効化しておく。
@@ -2336,7 +2540,7 @@ function syncAgentInstances(){
     if(!on) continue;
     o.updateMatrix();
     B.setMatrixAt(k,o.matrix); P.setMatrixAt(k,o.matrix);
-    const col=agents[i].def.color;
+    const col=SKEL_HEAD_TINT ? agents[i].def.color : 0xffffff;
     if(_slotColor[k]!==col){ B.setColorAt(k, _acol.set(col)); _slotColor[k]=col; colDirty=true; }
     w[k*2]=o.userData.ph||0; w[k*2+1]=o.userData.amp||0;
     k++;
@@ -2774,6 +2978,11 @@ const GABLE_TYPES = new Set(['house','kiosk','cafe','ramen','bento','gyudon','sh
                              'pharmacy','post','elementary','junior','temple']);
 // 外階段が付きうる業種 (低層の集合住宅)。
 const EXSTAIR_TYPES = new Set(['apartment','hotel']);
+// 庇 (テント) が付きうる業種。店と飲食店。業種色が乗るので入り口が目立つ。
+const AWNING_TYPES = new Set(['kiosk','conbini','pharmacy','cafe','gyudon','ramen','bento',
+                              'shop','supermarket','bank','post','hotel']);
+// 塀と門で敷地を囲う業種。低層で、庭のある建物。
+const FENCE_TYPES = new Set(['house','temple','elementary','junior','school','museum']);
 
 let _bldgMods=null, _bldgTried=false;
 // GLB を読んで「fp別 × モジュール別 × グループ別」の頂点配列にする。1回だけ。
@@ -2812,7 +3021,11 @@ function bldgModules(){
       if(!base || !floor) return null;
       return { base, floor,
                roof:      q('roof') || {g:{},h:0},
+               roof2:     q('roof2'),        // 陸屋根のもう一種 (塔屋と室外機の位置違い)
                gable:     q('roof_gable'),
+               hip:       q('roof_hip'),     // 寄棟。切妻と混ぜて棟の線を揃えない
+               awning:    q('awning'),       // 庇 (店の入り口が一目で分かる)
+               fence:     q('fence'),        // 塀と門 (住宅が家に見える)
                balcony:   q('balcony'),
                exstair:     q('exstair'),
                exstairBase: q('exstair_base'),
@@ -2824,7 +3037,7 @@ function bldgModules(){
     if(!out[1]) throw new Error('fp1_base / fp1_floor が無い (ノード名を確認)');
     if(!out[2]) out[2]=out[1];                     // 2x2 用が無ければ 1x1 を流用
     const tri=g.parts.reduce((s,p)=>s+(p.index?p.index.length:p.position.length/3)/3,0);
-    const have=['gable','balcony','exstair','stair','signRoof','signBlade']
+    const have=['gable','hip','roof2','awning','fence','balcony','exstair','stair','signRoof','signBlade']
       .filter(k=>out[1][k]).join(',') || 'なし';
     console.log(`[Bldg] ${path.basename(fp)} を読み込み (${tri}三角形 / `
               + `土台${out[1].base.h.toFixed(2)} フロア${out[1].floor.h.toFixed(2)}`
@@ -2860,17 +3073,33 @@ function structVariant(st){
   const S=M ? (M[st.fp]||M[1]) : null;
   const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
   const hash=((st.r*2654435761) ^ (st.c*40503)) >>> 0;
-  const rnd=i=>((((hash>>>(i*5))&31)+0.5)/32);     // 独立した擬似乱数を何個か取り出す
-  const V={n:0, gable:false, sign:null, balcony:false, exstair:false, stair:false,
-           facing:structFacing(st, hash)};
+  // 独立した擬似乱数。以前は hash から 5 ビットずつ取り出していたが、それだと
+  // 使えるのは 6 個までで、i=6 は 2 ビットしか残らず 4 値しか出なかった
+  // (バリエーションを足すほど痩せていく)。i ごとに混ぜ直して 16 ビット取る。
+  const rnd=i=>{
+    let h=(hash ^ Math.imul(i+1, 0x9E3779B1))>>>0;
+    h=Math.imul(h ^ (h>>>15), 0x85EBCA6B)>>>0;
+    return ((h>>>8) & 0xFFFF)/0x10000;
+  };
+  const V={n:0, roof:'flat', gable:false, sign:null, balcony:false, exstair:false,
+           stair:false, awning:false, fence:false, facing:structFacing(st, hash)};
   if(!S) return V;
   const H=structHeight(st);
   const floors=rh=>Math.max(0, Math.round((H - S.base.h - rh)/S.floor.h));
   V.n=floors(S.roof.h);
-  // 三角屋根。似合う業種は低層なら大体そうする / それ以外もたまに混ぜる
-  V.gable = !!S.gable && (GABLE_TYPES.has(bt.name) ? (V.n<=3 && rnd(0)<0.85)
-                                                   : (V.n<=2 && rnd(0)<0.18));
-  if(V.gable) V.n=floors(S.gable.h);               // 屋根が変わると入る階数も変わる
+  // 屋根は 4 通り: 陸屋根 2 種 / 切妻 / 寄棟。
+  // 勾配屋根が似合う業種は低層なら大体そうする / それ以外もたまに混ぜる。
+  // 切妻ばかりだと棟の線が街じゅうで揃ってしまうので、寄棟を半分ほど混ぜる。
+  const pitched = GABLE_TYPES.has(bt.name) ? (V.n<=3 && rnd(0)<0.85)
+                                           : (V.n<=2 && rnd(0)<0.18);
+  if(pitched && (S.gable || S.hip)){
+    V.roof = (S.hip && S.gable) ? (rnd(4)<0.45 ? 'hip' : 'gable')
+                                : (S.hip ? 'hip' : 'gable');
+  }else if(S.roof2 && rnd(4)<0.42){
+    V.roof='flat2';                                // 陸屋根でも屋上の表情を変える
+  }
+  V.gable = (V.roof==='gable' || V.roof==='hip');  // 屋上看板が載らない屋根かどうか
+  V.n=floors(roofModOf(S, V).h);                   // 屋根が変わると入る階数も変わる
   // 看板は屋上か袖のどちらか一方だけ。三角屋根に屋上看板は載らない
   if(!NO_SIGN.has(bt.name)){
     const roofOK=!!S.signRoof && !V.gable, bladeOK=!!S.signBlade;
@@ -2882,7 +3111,20 @@ function structVariant(st){
             && V.n>=2 && V.n<=4 && rnd(2)<0.65;
   V.balcony = !!S.balcony && BLDG_BALCONY_MIN>0 && V.n>=BLDG_BALCONY_MIN;
   V.stair   = !!S.stair && !V.exstair && rnd(3)<0.35;
+  // 庇は低層の店だけ。袖看板と喧嘩しないよう、袖看板が出ているときは控える。
+  V.awning  = !!S.awning && AWNING_TYPES.has(bt.name) && V.n<=3
+            && V.sign!=='blade' && rnd(5)<0.55;
+  V.fence   = !!S.fence && FENCE_TYPES.has(bt.name) && V.n<=2 && rnd(6)<0.60;
   return V;
+}
+
+// V.roof からモジュールを引く。structVariant (階数の計算) と buildStructGeo
+// (実際に積む) の両方から使うので、対応表はここ 1 か所に置く。
+function roofModOf(S, V){
+  return V.roof==='gable' ? (S.gable||S.roof)
+       : V.roof==='hip'   ? (S.hip  ||S.roof)
+       : V.roof==='flat2' ? (S.roof2||S.roof)
+       :                     S.roof;
 }
 
 // 高さ H (ワールド単位) に合うようフロアを積み、1つの BufferGeometry にする。
@@ -2895,11 +3137,12 @@ function structVariant(st){
 function buildStructGeo(fpn, H, V){
   const M=bldgModules(); if(!M) return null;
   const S=M[fpn]||M[1];
-  const roofMod=(V.gable && S.gable) ? S.gable : S.roof;
+  const roofMod=roofModOf(S, V);
   const actual=S.base.h + V.n*S.floor.h + roofMod.h;
   const sz=Math.min(1.25, Math.max(0.80, H/actual));   // 端数は縦の伸縮で吸収
-  const key=[fpn, V.n, sz.toFixed(3), V.gable?'g':'f', V.sign||'-',
-             V.balcony?'b':'-', V.exstair?'x':'-', V.stair?'s':'-', V.facing].join('_');
+  const key=[fpn, V.n, sz.toFixed(3), V.roof, V.sign||'-',
+             V.balcony?'b':'-', V.exstair?'x':'-', V.stair?'s':'-',
+             V.awning?'a':'-', V.fence?'w':'-', V.facing].join('_');
   if(structGeoCache[key]) return structGeoCache[key];
 
   const buf={}; for(const k of GROUP_ORDER) buf[k]={pos:[], nrm:[]};
@@ -2921,6 +3164,8 @@ function buildStructGeo(fpn, H, V){
   put(S.base, 0);
   if(V.stair)            put(S.stair,     0);
   if(V.sign==='blade')   put(S.signBlade, 0);
+  if(V.awning)           put(S.awning,    0);   // 庇と塀はモジュール側が絶対高さを持つ
+  if(V.fence)            put(S.fence,     0);
   for(let i=0;i<V.n;i++){
     const z=S.base.h + i*S.floor.h;
     put(S.floor, z);
@@ -3267,10 +3512,35 @@ function addTreeMesh(S, r, c){
 // 道路 / 草地 / 摩耗した地面の板。踏み跡が溜まると草地→踏み固め→土に変わる。
 //   「閾値を超えた瞬間にアスファルトが生える」より、土が露出していく過程が
 //   見えているほうが蓄積に見える。板は3枚のマージ済みメッシュにまとめる。
+// 縁石の輪郭。初回に一度だけ読む。無ければ縁石を立てないだけで描画は続く。
+let _curbSlots=null, _curbTried=false;
+function roadCurbs(){
+  if(_curbTried) return _curbSlots;
+  _curbTried=true;
+  if(!CURB_ON) return null;
+  try{
+    const fp=path.isAbsolute(ROAD_CURBS)?ROAD_CURBS:path.join(__dirname, ROAD_CURBS);
+    if(!fs.existsSync(fp)){
+      console.warn(`[Curb] ${fp} が無い → 縁石は立てません`
+                 + ` (node tools/make-road-atlas.js で作れます)`);
+      return null;
+    }
+    const j=JSON.parse(fs.readFileSync(fp,'utf8'));
+    _curbSlots=j.slots||null;
+    if(_curbSlots){
+      let ln=0, vt=0;
+      for(const k in _curbSlots){ ln+=_curbSlots[k].length;
+        for(const c of _curbSlots[k]) vt+=c.length; }
+      console.log(`[Curb] ${path.basename(fp)} を読み込み (輪郭${ln}本 / 頂点${vt})`);
+    }
+  }catch(e){ console.warn(`[Curb] ${ROAD_CURBS} を読めませんでした: ${e.message}`); }
+  return _curbSlots;
+}
+
 function rebuildGround(S){
   if(!S) return;
   const g=S.userData.ground||(S.userData.ground={});
-  for(const k of ['base','road','grass','wear1','wear2','marks']){
+  for(const k of ['base','road','grass','wear1','wear2','marks','curb']){
     if(g[k]){ S.remove(g[k]); g[k].geometry.dispose(); g[k].material.dispose(); g[k]=null; }
   }
   // 下地の板。フィールドの外は何も描かない (世界の果て = 背景色) ので、
@@ -3299,6 +3569,9 @@ function rebuildGround(S){
   // 積まずに従来どおりのべた塗りの道に戻る。
   const marks=[]; marks.col=[]; marks.uv=[];
   const markOn = ROAD_MARKS && !!groundTex.roadmark && !!CITY && !!CITY.roadClass;
+  // 縁石 (標示レイヤーが出ているときだけ。テクスチャ無しで縁石だけ立つと浮く)
+  const curbSlots = markOn ? roadCurbs() : null;
+  const cpos=[], cnrm=[];
   // セルごとの微妙な明暗。一面べったり同じ色だと板に見えるので、
   // 位置から決まる固定のばらつきを乗せる (毎回変わるとちらつく)。
   const jit=(r,c)=>1 + (((r*73856093 ^ c*19349663) & 255)/255 - 0.5)*2*AO_NOISE;
@@ -3312,6 +3585,10 @@ function rebuildGround(S){
         const cls=CITY.roadClass[r*GRID+c];
         const slot=RD.atlasSlot(cls, RD.roadMask(MAP, r, c, ROAD));
         pushMarkQuad(marks, CELL*GROUND_FILL, cx, cy, MARK_Z, ao, RD.atlasUV(slot, MARK_FLIP_Y));
+        // 縁石は標示の板とまったく同じ矩形に載せる (ずれると天端と帯が食い違う)
+        const cl=curbSlots && curbSlots[slot];
+        if(cl) RD.pushCurb(cpos, cnrm, cl, cx-CELL*GROUND_FILL/2, cy-CELL*GROUND_FILL/2,
+                           CELL*GROUND_FILL, CURB_PROFILE);
       }
       continue;
     }
@@ -3351,6 +3628,15 @@ function rebuildGround(S){
       {transparent:true, depthWrite:false,
        polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2});
     S.add(g.marks);
+  }
+  // 縁石。両面にしておく (輪郭の巻き方に描画が依存しないほうが事故が少ない)。
+  if(cpos.length){
+    const cg=new THREE.BufferGeometry();
+    cg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cpos),3));
+    cg.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(cnrm),3));
+    g.curb=new THREE.Mesh(cg, new THREE.MeshLambertMaterial(
+      {color:dim(0xc6c8cb), side:THREE.DoubleSide}));
+    S.add(g.curb);
   }
   rebuildLamps(S);
 }
@@ -3699,6 +3985,7 @@ function freshCity(){
 function resetCity(keepMap){
   if(!keepMap) MAP=makeMap(GRID, CITY_SEED);
   CITY=freshCity();
+  cars=[]; _carGwDirty=true;
   _lastDay=null;
   for(const a of agents){ a.owns=null; a.seenMask=0; a.unmetBy=null; }
   syncCity(); rebuildBuildings(MAP); reclassRoads(); groundDirty=true; saveCity();
@@ -4228,7 +4515,7 @@ function reclassRoads(){
   let ch=0;
   if(prev) for(let i=0;i<next.length;i++){ if(next[i]!==prev[i]) ch++; }
   CITY.roadClass=next;
-  if(ch) groundDirty=true;
+  if(ch){ groundDirty=true; _carGwDirty=true; }
   return ch;
 }
 
@@ -6511,6 +6798,7 @@ function doCityReset(newMap){
     disposeScene(oldScene);    // 古いシーンの GPU リソースを解放
     initTrailField(scene);     // 足跡/住民メッシュは旧シーンと一緒に破棄されている
     initAgentInstances(scene);
+    initCarInstances(scene);
     initAgents(scene);
   }
   saveCity();
@@ -9113,6 +9401,7 @@ async function renderLoop(){
       m.userData.amp=(m.userData.amp||0)*0.75 + Math.min(1, sp/WALK_FULL)*0.25;
     });
     if(PERF_LOG){ _perf.agents+=Date.now()-_t0; }
+    stepTraffic(dt);              // 車 (出入口から湧いて別の出入口で消える)
     stepStructAnims();            // 建物のせり上がり / 沈み込み
     stepRain(dt, mainCam);        // 雨 (天気が rain のときだけ)
     // 地面の板 (道路 / 摩耗) を作り直す。道が増えたとき (groundDirty) は即、
@@ -9267,6 +9556,7 @@ function startLoops(){
 
   initTrailField(scene);
   initAgentInstances(scene);
+  initCarInstances(scene);
   initAgents(scene);
 
   httpServer.listen(PORT, ()=>{

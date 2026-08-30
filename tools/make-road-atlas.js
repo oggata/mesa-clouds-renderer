@@ -109,27 +109,50 @@ function quadrants(lo, hi){
   ];
 }
 
+// 角を r で丸めた「象限」の SDF。負 = 内側。
+// a,b は 2 本の境界線までの符号付き距離 (どちらも負なら象限の内側)。
+// 角が r の円弧で落とされた形になる。これが**歩道の隅**の形そのもの。
+function sdRoundedQuad(a,b,r){
+  const ax=Math.max(a+r,0), bx=Math.max(b+r,0);
+  return Math.hypot(ax,bx) + Math.min(Math.max(a+r,b+r),0) - r;
+}
+
 // 車道領域の SDF。負 = 車道の内側。
-//   腕 (arm) の和 ∪ 隅のフィレット。
-//   隣り合う2方向がどちらも道 → 内側の角を rIn(RW) で丸める (車道が歩道側へ膨らむ)
-//   隣り合う2方向だけが道 (= 曲がり角) は腕の和では作らず、**同心の円環**にする。
-//     内側の縁石 = 半径 rIn(RW) / 外側の縁石 = 半径 rIn(RW) + 車道幅、中心は共通。
-//     こうすると内外のカーブが実際の道路と同じ同心円になり、腕の和 + 角の面取り
-//     では出せない滑らかさが出る (面取り方式だと外側に三角形の破片が残った)。
+//
+// ── 腕の和ではなく「歩道の交わり」として作る ──
+// 以前は腕 (arm) の和を取り、隅に `max(象限ボックス, 円の外)` でフィレットを
+// 足していた。**形は正しいが SDF としては壊れていた**: 象限ボックスの壁
+// (u=hi) が稜線になり、車道の内部に値 0 の線ができる。図形は変わらないので
+// 塗り分けには出ないが、
+//   ・黄色い外側線が、その偽の線に沿って車道の中にも引かれる
+//   ・縁石の輪郭抽出 (マーチングスクエア) がその偽の線を拾う
+// という形で漏れ出す。実際 T 字と十字で法線が反転した頂点が 96 点出た。
+//
+// 正しくは「車道 = すべての歩道領域の**外側**」= 補集合の交わり (max)。
+//   繋がっていない側      → 交差点ボックスの外がまるごと歩道 (半平面)
+//   両隣が繋がっている隅  → 角を rIn(RW) で丸めた象限が歩道
+// 図形は以前と厳密に一致する (象限 ∩ 円の外 = 象限 - 角丸象限) が、
+// こちらは車道のどこでも「いちばん近い歩道までの距離」になる。
+//
+// 曲がり角 (隣り合う2方向だけが道) だけは別扱いで、**同心の円環**にする。
+//   内側の縁石 = 半径 rIn(RW) / 外側の縁石 = 半径 rIn(RW) + 車道幅、中心は共通。
+//   内外のカーブが実際の道路と同じ同心円になる。
 function roadSDF(u,v,mask,RW){
-  const lo=0.5-RW, hi=0.5+RW;
-  if(popcount(mask)===2 && mask!==5 && mask!==10) return cornerSDF(u,v,mask,RW);
-  let d=1e9;
-  if(mask&1) d=Math.min(d, sdBox(u,v,  lo,-0.5,  hi, hi));   // N
-  if(mask&2) d=Math.min(d, sdBox(u,v,  lo,  lo, 1.5, hi));   // E
-  if(mask&4) d=Math.min(d, sdBox(u,v,  lo,  lo,  hi,1.5));   // S
-  if(mask&8) d=Math.min(d, sdBox(u,v,-0.5,  lo,  hi, hi));   // W
+  const lo=0.5-RW, hi=0.5+RW, n=popcount(mask);
+  if(n===0) return 1e9;                                   // 孤立 = 全面が舗装
+  if(n===2 && mask!==5 && mask!==10) return cornerSDF(u,v,mask,RW);
   const r=rIn(RW);
+  // 軸に平行な制約はまとめて 1 個の矩形にする。半平面を素の max で畳むと
+  // 外側がチェビシェフ距離になり、凸角の外で「いちばん近い車道までの距離」を
+  // 過小評価する (縁石天端の帯が角で四角く広がる)。矩形の SDF なら外側も厳密。
+  //   繋がっている側は制約を掛けない = セルの外まで伸ばす
+  let d=sdBox(u,v, (mask&8)?-0.5:lo, (mask&1)?-0.5:lo,
+                   (mask&2)? 1.5:hi, (mask&4)? 1.5:hi);
   for(const q of quadrants(lo,hi)){
-    const ca=!!(mask&(1<<q.a)), cb=!!(mask&(1<<q.b));
-    if(!(ca&&cb)) continue;                    // 両側が道の隅だけ丸める
-    const Cu=q.pu+q.su*r, Cv=q.pv+q.sv*r;
-    d=Math.min(d, Math.max(sdBox(u,v,...q.box), r-Math.hypot(u-Cu, v-Cv)));
+    if(!((mask&(1<<q.a)) && (mask&(1<<q.b)))) continue;    // 両側が道の隅だけ丸める
+    const a=(q.su>0) ? hi-u : u-lo;
+    const b=(q.sv>0) ? hi-v : v-lo;
+    d=Math.max(d, -sdRoundedQuad(a,b,r));
   }
   return d;
 }
@@ -290,6 +313,23 @@ function main(){
   // ── デモ: 小さな街を実際に並べて、隣のセルと繋がるかを確認する ──
   // タイルセットの本当のテストはこれ。端の車道幅・歩道幅・黄線の位置が全タイルで
   // 揃っていないと、ここで継ぎ目がズレて一目で分かる。
+  // 縁石の輪郭。server.js はこれを読んで縦の面に立ち上げる (SDF を持たずに済む)。
+  const curbs={version:1,
+    note:'正規化タイル座標の折れ線。頂点は [x,y,nx,ny]。x=+列(東) y=+行(南)、'
+       + '(nx,ny)=車道から歩道へ向かう単位法線。tools/make-road-atlas.js が生成。',
+    tile:{rw:{2:RW2, 1:RW1}}, slots:{}};
+  let vtx=0, lines=0;
+  for(const cls of [RD.TWOLANE, RD.ONEWAY]) for(let m=0;m<16;m++){
+    const cs=contoursFor(m, cls);
+    if(!cs.length) continue;
+    curbs.slots[RD.atlasSlot(cls,m)]=cs;
+    lines+=cs.length; for(const c of cs) vtx+=c.length;
+  }
+  const curbFile=outPng.replace(/[^/\\]*\.png$/, 'road_curbs.json');
+  fs.writeFileSync(curbFile, JSON.stringify(curbs));
+  console.log(`[RoadAtlas] ${path.relative(process.cwd(),curbFile)} `
+            + `(縁石の輪郭 ${lines}本 / 頂点${vtx})`);
+
   const demoPng=outPng.replace(/\.png$/, "_demo.png");
   fs.writeFileSync(demoPng, PNG.encode(...renderDemo(atlas)));
   console.log(`[RoadAtlas] ${path.relative(process.cwd(),demoPng)} (並べて繋がるかの確認)`);
@@ -299,6 +339,125 @@ function main(){
     const nb = [(m&1)?'N':'-', (m&2)?'E':'-', (m&4)?'S':'-', (m&8)?'W':'-'].join(' ');
     console.log(`  ${String(s).padStart(4)}  ${cn}  ${String(m).padStart(4)}  ${nb}  ${c===0?'全面舗装':SHAPE[m]}`);
   }
+}
+
+// ── 縁石の輪郭を取り出す ────────────────────────────────────────────────────
+// 参考画像の「歩道が一段上がっている」感じは平らなテクスチャでは出ない。
+// けれど輪郭を server.js 側で描き直すと、この SDF の二重実装になる。
+// **PNG と一緒に輪郭線も書き出して、server.js にはそれを読ませる。**
+//
+// 出力は正規化タイル座標 [0,1] の折れ線。頂点は [x, y, nx, ny] で、
+//   x = +列方向 (東)  y = +行方向 (南)   … タイル画像と同じ向き
+//   (nx,ny) = SDF の勾配 = **車道から歩道へ向かう単位ベクトル**
+// 法線を持たせるのは、折れ線の巻き方から向きを導くと、その導出が
+// server.js 側にもう一度必要になるから (= また二重実装になる)。
+
+const CONTOUR_N   = 64;      // マーチングスクエアの分割数
+const CONTOUR_EPS = 0.001;   // 間引きの許容誤差 (正規化。0.001 ≒ 7mm)
+
+// SDF の勾配 (中心差分) を正規化して返す。負の側が車道なので、+勾配が歩道向き。
+function sdfNormal(u,v,mask,cls){
+  const RW = cls===2 ? RW2 : RW1, h=0.0015;
+  const gx=roadSDF(u+h,v,mask,RW)-roadSDF(u-h,v,mask,RW);
+  const gy=roadSDF(u,v+h,mask,RW)-roadSDF(u,v-h,mask,RW);
+  const L=Math.hypot(gx,gy)||1;
+  return [gx/L, gy/L];
+}
+
+// マーチングスクエアで sdf=0 の線分を集める。
+function marchSegments(mask,cls){
+  const RW = cls===2 ? RW2 : RW1, N=CONTOUR_N;
+  const g=new Float64Array((N+1)*(N+1));
+  for(let j=0;j<=N;j++)for(let i=0;i<=N;i++) g[j*(N+1)+i]=roadSDF(i/N, j/N, mask, RW);
+  const at=(i,j)=>g[j*(N+1)+i];
+  const segs=[];
+  // 辺の上の零点を線形補間で求める
+  const lerp=(a,b)=> a===b ? 0.5 : a/(a-b);
+  for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+    const d0=at(i,j), d1=at(i+1,j), d2=at(i+1,j+1), d3=at(i,j+1);
+    const k=(d0<0?1:0)|(d1<0?2:0)|(d2<0?4:0)|(d3<0?8:0);
+    if(k===0||k===15) continue;
+    const x0=i/N, x1=(i+1)/N, y0=j/N, y1=(j+1)/N;
+    const T=()=>[x0+(x1-x0)*lerp(d0,d1), y0];          // 上辺
+    const R=()=>[x1, y0+(y1-y0)*lerp(d1,d2)];          // 右辺
+    const B=()=>[x0+(x1-x0)*lerp(d3,d2), y1];          // 下辺
+    const L=()=>[x0, y0+(y1-y0)*lerp(d0,d3)];          // 左辺
+    const push=(a,b)=>segs.push([a,b]);
+    switch(k){
+      case 1: case 14: push(L(),T()); break;
+      case 2: case 13: push(T(),R()); break;
+      case 3: case 12: push(L(),R()); break;
+      case 4: case 11: push(R(),B()); break;
+      case 6: case  9: push(T(),B()); break;
+      case 7: case  8: push(L(),B()); break;
+      // 鞍点。中央の符号で 2 本の線分の繋ぎ方を決める
+      case 5: case 10: {
+        const mid=roadSDF((x0+x1)/2,(y0+y1)/2,mask,RW);
+        if((k===5) === (mid<0)){ push(L(),T()); push(R(),B()); }
+        else                   { push(T(),R()); push(L(),B()); }
+        break;
+      }
+    }
+  }
+  return segs;
+}
+
+// 線分を折れ線に繋ぐ。端点が一致するものを辿るだけ (格子から出るので誤差は無い)。
+function stitch(segs){
+  const key=p=>p[0].toFixed(5)+','+p[1].toFixed(5);
+  const ends=new Map();
+  segs.forEach((sg,i)=>{ for(const p of sg){ const k=key(p);
+    (ends.get(k)||ends.set(k,[]).get(k)).push(i); } });
+  const used=new Array(segs.length).fill(false);
+  const lines=[];
+  const walk=(i,from)=>{                       // from 側から反対の端へ伸ばしていく
+    const pts=[from];
+    let cur=i, at=from;
+    while(true){
+      used[cur]=true;
+      const nx = key(segs[cur][0])===key(at) ? segs[cur][1] : segs[cur][0];
+      pts.push(nx); at=nx;
+      const cand=(ends.get(key(at))||[]).filter(j=>!used[j]);
+      if(cand.length!==1) break;               // 分岐 or 行き止まり
+      cur=cand[0];
+    }
+    return pts;
+  };
+  // まず端 (片側にしか繋がらない点) から。開いた線を先に拾う
+  for(let i=0;i<segs.length;i++){
+    if(used[i]) continue;
+    for(const p of segs[i]){
+      if((ends.get(key(p))||[]).length===1){ lines.push(walk(i,p)); break; }
+    }
+  }
+  for(let i=0;i<segs.length;i++) if(!used[i]) lines.push(walk(i, segs[i][0]));   // 閉じた輪
+  return lines.filter(l=>l.length>=2);
+}
+
+// Douglas-Peucker。直線は 2 点に潰れ、円弧は許容誤差ぶんの細かさで残る。
+function simplify(pts, eps){
+  if(pts.length<3) return pts;
+  let mi=0, md=0;
+  const [ax,ay]=pts[0], [bx,by]=pts[pts.length-1];
+  const dx=bx-ax, dy=by-ay, L=Math.hypot(dx,dy);
+  for(let i=1;i<pts.length-1;i++){
+    const [px,py]=pts[i];
+    const d = L<1e-9 ? Math.hypot(px-ax,py-ay)
+                     : Math.abs(dy*px - dx*py + bx*ay - by*ax)/L;
+    if(d>md){ md=d; mi=i; }
+  }
+  if(md<=eps) return [pts[0], pts[pts.length-1]];
+  return simplify(pts.slice(0,mi+1), eps).slice(0,-1).concat(simplify(pts.slice(mi), eps));
+}
+
+function contoursFor(mask, cls){
+  if(cls===RD.PATH) return [];                 // 歩行者専用は全面が舗装 = 縁石が無い
+  return stitch(marchSegments(mask,cls)).map(l=>{
+    return simplify(l, CONTOUR_EPS).map(([x,y])=>{
+      const [nx,ny]=sdfNormal(x,y,mask,cls);
+      return [ +x.toFixed(4), +y.toFixed(4), +nx.toFixed(3), +ny.toFixed(3) ];
+    });
+  });
 }
 
 // ── デモの街 ────────────────────────────────────────────────────────────────
@@ -351,4 +510,5 @@ function renderDemo(atlas){
   return [img, W, W];
 }
 
-main();
+if(require.main===module) main();
+module.exports={roadSDF, contoursFor, RW2, RW1, sdfNormal};
