@@ -110,7 +110,7 @@ const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); retu
 const FPV_EYE          = (()=>{ const v=parseFloat(process.env.FPV_EYE); return isNaN(v)?1.0:Math.max(0.3,Math.min(4.0,v)); })();
 // CAM_DIST: 追跡カメラのプレイヤーまでの距離倍率 (1.0=従来)。小さいほど寄る。 例: CAM_DIST=0.5 node server.js
 //const CAM_DIST         = (()=>{ const v=parseFloat(process.env.CAM_DIST); return isNaN(v)?1.0:Math.max(0.2,Math.min(3.0,v)); })();
-const CAM_DIST = 0.5;      // 追跡カメラの引き。小さいほど住民に寄る
+const CAM_DIST = 0.42;     // 追跡カメラの引き。小さいほど住民に寄る
 // CAM_OVERVIEW: 俯瞰ショットの引き具合 (フィールドの一辺に対するカメラ高さの倍率)。
 //   小さいほど寄る = 画角から外れる建物が増え、three の視錐台カリングが効いて
 //   ドローコール(1建物=1メッシュ)が減る。ただし画面が埋まる面積は変わらないので
@@ -139,6 +139,27 @@ const YT_ENABLED    = Boolean(YT_STREAM_KEY);
 // ─── Sim constants ────────────────────────────────────────────────────────────
 // 環境変数の数値読み。`parseInt(x)||既定` は 0 を指定できないので使わない。
 const envNum=(k,d)=>{ const v=parseFloat(process.env[k]); return Number.isFinite(v)?v:d; };
+
+// ── 影 ──────────────────────────────────────────────────────────────────────
+// SHADOW_MAP … 影のテクスチャの一辺。大きいほど輪郭が細かいが、深度パスの塗り面積は
+//              辺の2乗で効く (1024 で 1.0M ピクセル ≒ 本編の 2 倍)。
+// SHADOW_SPAN … 影を落とす範囲の半径 (ワールド単位)。カメラの見ている点を中心に取る。
+//              街全体を覆うと 1 テクセルが粗くなるので、寄りの画では狭く取る。
+const SHADOW_ON   = process.env.SHADOWS !== '0';
+const SHADOW_MAP  = Math.max(256, envNum('SHADOW_MAP', 1024));
+const SHADOW_SOFT = process.env.SHADOW_SOFT === '1';
+const SHADOW_SPAN = envNum('SHADOW_SPAN', 16);     // 追跡ショットで覆う半径
+const SHADOW_BIAS = envNum('SHADOW_BIAS', -0.0016);
+const SHADOW_DIST = envNum('SHADOW_DIST', 90);     // 光源を焦点からどれだけ引くか
+// ── 画質 ────────────────────────────────────────────────────────────────────
+// SSAA … 何倍の解像度で描いて縮小するか。headless-gl の WebGL1 では MSAA が使えず
+//        `antialias:false` しか選べないので、輪郭のギザギザを消すにはこれしかない。
+//        塗り面積は2乗で効く (2 で 4 倍) が、縮小したぶん JPEG は素直になる。
+const SSAA     = Math.max(1, Math.min(3, envNum('SSAA', 1)));
+const RENDER_W = Math.round(WIDTH*SSAA), RENDER_H = Math.round(HEIGHT*SSAA);
+// 露出。0.6 は淡すぎて、影を入れても全体が乳白色に沈んでいた。影がコントラストを
+// 作るようになったぶん、露出を上げても白飛びしない。
+const EXPOSURE = envNum('EXPOSURE', 0.78);
 // 街の最大の一辺 (セル数)。実寸は GRID*CELL。
 //   ★ 変えると保存済みの街を読めなくなる (loadCity が j.grid!==GRID で弾く)。
 //     本番で広げるときは data/city_state.json を退避してから。
@@ -1273,7 +1294,11 @@ function getBuildingMaterial(typeIdx) {
 
 // ─── headless-gl + Three.js ───────────────────────────────────────────────────
 function createRenderer(){
-  const glCtx=gl(WIDTH,HEIGHT,{preserveDrawingBuffer:true});
+  // ★ headless-gl の描画バッファは**生成時のサイズで固定**。あとから
+  //   renderer.setSize() を大きくしても、はみ出したぶんは切り落とされる
+  //   (SSAA=2 にしたら画面の左下 1/4 にしか絵が出なかった)。
+  //   スーパーサンプリングするなら、コンテキストから大きく作ること。
+  const glCtx=gl(RENDER_W,RENDER_H,{preserveDrawingBuffer:true});
   const vaoExt=glCtx.getExtension('OES_vertex_array_object');
   if(vaoExt){
     glCtx.createVertexArray=()=>vaoExt.createVertexArrayOES();
@@ -1285,11 +1310,21 @@ function createRenderer(){
     glCtx.createVertexArray=()=>({_stub:true});
     glCtx.bindVertexArray=()=>{};glCtx.deleteVertexArray=()=>{};glCtx.isVertexArray=()=>false;
   }
-  const canvasMock={width:WIDTH,height:HEIGHT,style:{},addEventListener:()=>{},removeEventListener:()=>{},setAttribute:()=>{},getContext:()=>glCtx};
+  const canvasMock={width:RENDER_W,height:RENDER_H,style:{},addEventListener:()=>{},removeEventListener:()=>{},setAttribute:()=>{},getContext:()=>glCtx};
   const renderer=new THREE.WebGLRenderer({canvas:canvasMock,context:glCtx,antialias:false});
-  renderer.setSize(WIDTH,HEIGHT,false);renderer.setPixelRatio(1);
+  renderer.setSize(RENDER_W,RENDER_H,false);renderer.setPixelRatio(1);
   renderer.toneMapping=THREE.ACESFilmicToneMapping;   // dinov2seg と同じ淡いフィルミック調
-  renderer.toneMappingExposure=0.6;
+  renderer.toneMappingExposure=EXPOSURE;
+  // ── 影 ──
+  // 平行光の深度パスが1本増える = **影を落とす物の数だけ描画呼が増える**。
+  // 影のあるなしは接地感を決めるので、ここは払う価値のあるコスト。
+  //   PCFSoft は縁がぼけて綺麗だがフラグメントが重い。ソフトウェア描画 (llvmpipe)
+  //   では PCF (既定) のほうが無難なので、SHADOW_SOFT=1 のときだけ Soft にする。
+  if(SHADOW_ON){
+    renderer.shadowMap.enabled=true;
+    renderer.shadowMap.type=SHADOW_SOFT ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+    renderer.shadowMap.autoUpdate=true;
+  }
   return{renderer,glCtx};
 }
 
@@ -1502,6 +1537,19 @@ function buildScene(map){
   const hemi=new THREE.HemisphereLight(0xeaf2f7,0xc8c0b0,1.1); S.add(hemi);
   const sun=new THREE.DirectionalLight(0xfff4e0,1.7);
   sun.position.set(W*.4,-W*.3,W*.8);S.add(sun);
+  // 平行光は「向き」しか持たない。影の箱をカメラの見ている点に寄せて動かすため、
+  // target も明示的にシーンへ入れる (入れないと target の行列が更新されない)。
+  S.add(sun.target);
+  if(SHADOW_ON){
+    sun.castShadow=true;
+    sun.shadow.mapSize.set(SHADOW_MAP, SHADOW_MAP);
+    // アクネ (自分の面に自分の影が出る縞) を消す。負の bias で影を少し奥へ押す。
+    sun.shadow.bias=SHADOW_BIAS;
+    // 直方体の投影。left/right/top/bottom は updateShadowBox が毎フレーム決める。
+    const sc=sun.shadow.camera;
+    sc.near=1; sc.far=SHADOW_DIST*2.2;
+    sc.updateProjectionMatrix();
+  }
   // 昼夜表現のため参照を保持 (updateDayNight が毎フレーム色/強度を更新)
   S.userData.lights={amb,hemi,sun};
   // 建物/木はキャラクター近接フェードのため個別メッシュとして生成する
@@ -1533,6 +1581,17 @@ function buildScene(map){
     sky.frustumCulled=false;
     S.add(sky);
     S.userData.sky=sky;
+    // 太陽。空が階調になっていても、光源そのものが見えないと「どこから照っているか」
+    // が絵の中で分からない。中心が白く縁がにじむ板を 1 枚、太陽の方向に置く。
+    //   加算合成なので空の色に溶ける。**1 メッシュ = 1 ドローコール。**
+    //   位置と明るさは updateDayNight が sunDir から毎フレーム決める。
+    const sun2=new THREE.Mesh(new THREE.PlaneGeometry(1,1),
+      new THREE.MeshBasicMaterial({ map:sunDiscTexture(), transparent:true, opacity:0,
+        blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, fog:false }));
+    sun2.renderOrder=-1;                // 空ドームの後、地面より前
+    sun2.frustumCulled=false;
+    S.add(sun2);
+    S.userData.sunDisc=sun2;
     // ★ S.background は消さない。updateDayNight が「いまの空の色」として
     //   読み書きし、ドームとフォグの両方がそこから色をもらう。
     //   消すと fog.color.copy(null) で落ちる。
@@ -1625,6 +1684,10 @@ const SKY_DOME  = process.env.SKY_DOME !== '0';
 const LIGHT_KEY  = envNum('LIGHT_KEY', 1.0);    // 平行光 (陽射し) の強さ
 const LIGHT_FILL = envNum('LIGHT_FILL', 1.0);   // 環境光 (回り込み) の強さ
 const _cZenith  = new THREE.Color();
+const _sunV     = new THREE.Vector3();         // 太陽の向き (sunDir が毎フレーム書く)
+const _sunLit   = new THREE.Vector3();         // 光と影に使う向き (高度に下限をかけたもの)
+const _sunFocus = new THREE.Vector3();
+const SUN_MIN_Z = Math.sin(envNum('SUN_MIN_ALT', 14)*Math.PI/180);   // 影に使う最低高度
 const _cDeep    = new THREE.Color(0x1b3a63);   // 天頂に混ぜる深い青
 function updateDayNight(S){
   const L=S&&S.userData&&S.userData.lights; if(!L) return;
@@ -1659,6 +1722,47 @@ function updateDayNight(S){
     }
     col.needsUpdate=true;
   }
+  // ── 太陽を動かす ──
+  // 影の向き・面の陰影・空の太陽の位置が、すべてこの 1 本のベクトルから決まる。
+  sunDir(_sunV);
+  // 光と影に使う向きは**高度に下限をかける**。日の出/日の入り前後で太陽が地平に
+  // 貼り付くと、影が画面の端まで伸びて何がどこに立っているのか分からなくなる。
+  // 空に描く円盤のほうは本当の高度を使うので、見た目の日の出は正しいまま。
+  _sunLit.copy(_sunV);
+  if(_sunLit.z < SUN_MIN_Z){ _sunLit.z=SUN_MIN_Z; _sunLit.normalize(); }
+  // 影の箱はカメラが見ている点を中心に取る。街全体を覆うと 1 テクセルが粗くなり、
+  // 追跡ショットで住民の影が四角い塊になる。俯瞰のときだけ広く取る。
+  const fx=fieldCenterW();
+  const foc=_camLookAt.lengthSq()>0 ? _camLookAt : _sunFocus.set(fx,fx,0);
+  L.sun.position.set(foc.x+_sunLit.x*SHADOW_DIST,
+                     foc.y+_sunLit.y*SHADOW_DIST,
+                     foc.z+_sunLit.z*SHADOW_DIST);
+  L.sun.target.position.copy(foc);
+  L.sun.target.updateMatrixWorld();
+  if(SHADOW_ON && L.sun.shadow){
+    // 俯瞰 (camTargetIdx===0) では街の一辺、追跡では SHADOW_SPAN の箱。
+    const span = camTargetIdx===0 ? fieldSize()*CELL*0.62 : SHADOW_SPAN;
+    const sc=L.sun.shadow.camera;
+    if(sc.right!==span){
+      sc.left=-span; sc.right=span; sc.top=span; sc.bottom=-span;
+      sc.updateProjectionMatrix();
+    }
+    // 夜は影を切る。太陽が地平の下にあるのに影だけ出ると、月明かりにしては濃すぎる。
+    L.sun.castShadow = d>0.12;
+  }
+  // 空の太陽。**本当の高度**を使うので、地平の下に沈めば見えなくなる。
+  const disc=S.userData.sunDisc;
+  if(disc){
+    const R=GRID*CELL*4.2;
+    disc.position.set(fx+_sunV.x*R, fx+_sunV.y*R, _sunV.z*R);
+    disc.lookAt(fx, fx, Math.max(0, _sunV.z*R*0.15));
+    const size=GRID*CELL*(0.55+0.55*dusk);      // 地平近くでは大きく見える
+    disc.scale.set(size, size, 1);
+    // 曇り/雨では雲に隠れる。夜は消す。
+    const above=Math.max(0, Math.min(1, _sunV.z*6));
+    disc.material.opacity=above*w.light*w.light*(0.55+0.45*dusk);
+    disc.visible=disc.material.opacity>0.01;
+  }
   L.sun.color.copy(_sNight).lerp(_sDay,d).lerp(_sDusk,dusk*0.55*w.light);
   // 環境光と平行光の比。以前は 環境1.3 + 半球1.1 に対して 平行1.55 で、
   // どの面もほぼ同じ明るさになり **箱に立体感が出ていなかった**。
@@ -1666,11 +1770,35 @@ function updateDayNight(S){
   // LIGHT_KEY / LIGHT_FILL で好みに寄せられる。
   L.sun.intensity  = (0.18+2.35*d)*w.light*LIGHT_KEY;
   L.amb.color.copy(_gNight).lerp(_gDay,d);
-  L.amb.intensity  = (0.30+0.38*d)*(0.65+0.35*w.light)*LIGHT_FILL;
-  L.hemi.intensity = (0.20+0.50*d)*(0.65+0.35*w.light)*LIGHT_FILL;
+  // 影が入ったので**環境光を落とせる**。以前は環境光だけで形を見せていたので
+  // 高くせざるを得なかったが、それが影を薄めてもいた。曇り/雨の日は逆に環境光を
+  // 残す (実際、曇天は影が出ずに全体が明るい)。
+  const flat=1.0-0.45*(1.0-w.light);            // 晴れ 1.0 / 雨 0.78
+  L.amb.intensity  = (0.24+0.30*d)*(0.65+0.35*w.light)*LIGHT_FILL/flat;
+  L.hemi.intensity = (0.16+0.40*d)*(0.65+0.35*w.light)*LIGHT_FILL/flat;
   stepBldgLights(d);                 // 窓・入り口・看板を夜だけ光らせる
   stepLamps(S, d);                   // 街灯
   stepSignals(S, d);                 // 交差点の信号 (赤青黄の切り替え)
+  stepProps(S, d);                   // 自販機の窓
+  stepWet(S, d);                     // 濡れた路面
+}
+
+// 濡れた路面。地面の板を作り直さずに色だけ動かす (作り直しは 20 秒に 1 回なので、
+// そこに任せると天気が変わってから路面が追いつくまで遅れて見える)。
+//   ・暗く沈める … 濡れたアスファルトは乾いているときより暗い
+//   ・空の色をわずかに混ぜる … 濡れた面は空を映す。これが「艶」の正体で、
+//     鏡面反射を入れなくても濡れて見える (Lambert のままで済む)
+const _wetBase=new THREE.Color(), _wetTmp=new THREE.Color();
+function stepWet(S, d){
+  const g=S && S.userData && S.userData.ground;
+  if(!g || !g.road || !g.road.material) return;
+  const m=g.road.material;
+  if(!m.userData.dryColor) m.userData.dryColor=m.color.clone();
+  const k=wetness();
+  _wetTmp.copy(m.userData.dryColor).multiplyScalar(1-0.30*k);
+  // 空の映り込み。昼ほど強い (夜は映すものが無い)。
+  _wetBase.copy(S.background).multiplyScalar(0.55*d);
+  m.color.copy(_wetTmp).lerp(_wetBase, 0.30*k);
 }
 
 // ── 欲求アイコン: キャラの頭上に絵文字を出す ──────────────────────────────
@@ -2457,6 +2585,7 @@ function initCarInstances(S){
   for(const m of [body,trim]){
     m.count=0; m.frustumCulled=false;
     m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    markShadow(m, true, false);
     S.add(m);
   }
   CarInst.body=body; CarInst.trim=trim; CarInst.alpha=alpha;
@@ -2703,6 +2832,7 @@ function initAgentInstances(S){
     m.count=0;
     m.frustumCulled=false;     // 境界球はジオメトリ1体ぶんしか無く、街全体には効かない
     m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    markShadow(m, true, false);
     S.add(m);
   }
   AgentInst.body=body; AgentInst.parts=parts; AgentInst.walk=walk;
@@ -2778,13 +2908,26 @@ async function rgbaToJpeg(rgba, width, height){
 // ─── Pixel readout ────────────────────────────────────────────────────────────
 // バッファは毎フレーム使い回す (renderLoop は encoding ガードで直列実行されるため安全)。
 // 以前は毎フレーム 2 本の TypedArray を確保しており GC 圧の原因になっていた。
-const _pxBuf=new Uint8ClampedArray(WIDTH*HEIGHT*4);
-const _flBuf=new Uint8ClampedArray(WIDTH*HEIGHT*4);
+const _pxBuf=new Uint8ClampedArray(RENDER_W*RENDER_H*4);
+const _flBuf=new Uint8ClampedArray(RENDER_W*RENDER_H*4);
+// GL から画素を読み出して上下を反転する。SSAA>1 のときは**描いた解像度で**読む
+// (縮小は sharp にやらせる。ここで自前に平均すると、そのループが JPEG より重くなる)。
 function readPixels(glCtx){
-  glCtx.readPixels(0,0,WIDTH,HEIGHT,glCtx.RGBA,glCtx.UNSIGNED_BYTE,_pxBuf);
-  const row=WIDTH*4;
-  for(let y=0;y<HEIGHT;y++)_flBuf.set(_pxBuf.subarray((HEIGHT-1-y)*row,(HEIGHT-y)*row),y*row);
+  glCtx.readPixels(0,0,RENDER_W,RENDER_H,glCtx.RGBA,glCtx.UNSIGNED_BYTE,_pxBuf);
+  const row=RENDER_W*4;
+  for(let y=0;y<RENDER_H;y++)_flBuf.set(_pxBuf.subarray((RENDER_H-1-y)*row,(RENDER_H-y)*row),y*row);
   return _flBuf;
+}
+
+// SSAA で描いた画をストリームの解像度へ落とす。
+//   headless-gl の WebGL1 には MSAA が無く `antialias:false` しか選べないので、
+//   輪郭のギザギザを消す手段はこれしかない。縮小したぶん高周波が減るので、
+//   **同じ JPEG 品質でもファイルが小さく・素直になる**という副次効果もある。
+//   sharp が無ければ諦めてそのまま返す (起動は止めない)。
+async function downscale(rgba){
+  if(SSAA<=1 || !sharp) return rgba;
+  return await sharp(Buffer.from(rgba),{raw:{width:RENDER_W,height:RENDER_H,channels:4}})
+    .resize(WIDTH,HEIGHT,{kernel:'lanczos3'}).raw().toBuffer();
 }
 
 // ─── Simulation state ─────────────────────────────────────────────────────────
@@ -2861,6 +3004,46 @@ function gameHour(){
 function daylight(){
   const h=gameHour();
   return Math.max(0, Math.min(1, (Math.cos((h-13)/24*Math.PI*2)+1)/2 ));
+}
+
+// 影を落とす/受ける印を付ける。**ここを1か所に集める。** メッシュを足すたびに
+// 2 行書き足す方式にすると、必ずどれかが忘れられて「その物だけ影が無い」になる。
+//   cast=true    … 影を落とす (建物・木・車・住民・電柱・信号)
+//   receive=true … 影を受ける (地面・道路・建物の壁)
+function markShadow(obj, cast, receive){
+  if(!SHADOW_ON || !obj) return obj;
+  obj.castShadow=!!cast; obj.receiveShadow=!!receive;
+  return obj;
+}
+
+// ── 太陽の位置 ──────────────────────────────────────────────────────────────
+// 平行光の向きを時刻から決める。**以前は起動時に1回置いたきりだった**ので、
+// 朝6時と夕方6時で光が同じ方向から来ていた。色と強さだけが変わっても、影の向きも
+// 面の陰影も一日じゅう動かないので「時間が流れている」ようには見えない。
+//
+//   方位 … 東 (+X) から昇り、南 (-Y) を通って西 (-X) へ沈む。
+//          world の x=列 / y=行 で、カメラは -Y 側から街を見下ろすことが多いので、
+//          正午に -Y 側 = 手前上から当たる。建物の正面に光が回る。
+//   高度 … 正午にいちばん高い。地平の下に潜っても向きは持っておく (夜の月明かり
+//          として弱い平行光を同じ向きで使うため。切り替えると影が飛ぶ)。
+// 返すのは正規化した「太陽のある方向」。平行光の position はここに距離を掛ける。
+// SUN_ALT_MAX … 南中高度 (度)。**影の長さはこれでほぼ決まる。** 62 度にしていたら
+//   正午の影が建物の足元に潜り込んで、一日の大半で影が見えなかった。48 度だと
+//   高さと同じくらいの長さの影が出て、街の凹凸が読める。
+// SUN_AZ_OFF … 太陽の軌道を何度ねじるか。追跡カメラは住民の**真南 (-Y)** に構える
+//   ことが多く、太陽の軌道もそのまま真南を通ると、正午前後は光がカメラの真後ろから
+//   当たって影が全部物陰に隠れる (これで「影が出ていない」と読み違えた)。
+//   街路が真北を向いていないだけのことなので、軌道ごと少しねじって光を横から入れる。
+const SUN_ALT_MAX = envNum('SUN_ALT_MAX', 48);
+const SUN_AZ_OFF  = envNum('SUN_AZ_OFF', 34) * Math.PI/180;
+function sunDir(out){
+  const h=gameHour();
+  const t=(h-6)/12*Math.PI;                     // 6時=日の出 / 12時=南中 / 18時=日の入り
+  const alt=Math.sin(t)*(SUN_ALT_MAX*Math.PI/180);
+  // 方位: 6時に東 (+X)、12時に南 (-Y)、18時に西 (-X)。そこへオフセットを足す。
+  const az=-t + SUN_AZ_OFF;
+  const ca=Math.cos(alt);
+  return out.set(Math.cos(az)*ca, Math.sin(az)*ca, Math.sin(alt));
 }
 
 // ═══ 街の恒久状態 CITY (不可逆な蓄積) ══════════════════════════════════════════
@@ -3009,8 +3192,31 @@ const WEATHERS = {
 const WEATHER_KEYS = Object.keys(WEATHERS);
 const weatherNow = () => WEATHERS[(CITY && CITY.weather) || 'sunny'] || WEATHERS.sunny;
 
+// 天気を固定する。見た目を詰めるとき、抽選待ちで晴れが来ないと確認できない。
+//   WEATHER=sunny|cloudy|rain
+const WEATHER_FORCE = WEATHERS[process.env.WEATHER] ? process.env.WEATHER : null;
+
+// ── 濡れ具合 ────────────────────────────────────────────────────────────────
+// 0=乾いている / 1=降っている最中。雨が上がってからゆっくり 0 へ戻る。
+// 路面の色 (rebuildGround) と艶 (stepWet) の両方がここを読む。
+const WET_WET_MIN = envNum('WET_WET_MIN', 6);    // 降り出してから濡れきるまで (分)
+const WET_DRY_MIN = envNum('WET_DRY_MIN', 14);   // 上がってから乾くまで (分)
+let _wet=0, _wetAt=0;
+function wetness(){
+  const now=Date.now();
+  if(_wetAt){
+    const dt=(now-_wetAt)/60000;
+    const raining=CITY && CITY.weather==='rain';
+    _wet += raining ? dt/WET_WET_MIN : -dt/WET_DRY_MIN;
+    _wet = Math.max(0, Math.min(1, _wet));
+  }
+  _wetAt=now;
+  return _wet;
+}
+
 function stepWeather(){
   if(!CITY) return;
+  if(WEATHER_FORCE){ CITY.weather=WEATHER_FORCE; return; }
   const now=Date.now();
   if(CITY.weatherUntil && now < CITY.weatherUntil) return;
   let r=Math.random(), pick=WEATHER_KEYS[0];
@@ -3399,6 +3605,7 @@ function buildStructGeo(fpn, H, V){
   const total=GROUP_ORDER.reduce((s,k)=>s+buf[k].pos.length, 0);
   const pos=new Float32Array(total), nrm=new Float32Array(total);
   const uv =new Float32Array(total/3*2);
+  const col=new Float32Array(total);         // 足元の汚し (facade だけ濃くする)
   const bw=fpn*CELL*DIM.BLDG.fill, half=bw/2, Ht=actual*sz;
   const geo=new THREE.BufferGeometry();
   let o=0;
@@ -3417,6 +3624,16 @@ function buildStructGeo(fpn, H, V){
           : (ny>0 ? (half-x)/bw : (x+half)/bw);
         uv[(o+i)/3*2  ]=u;
         uv[(o+i)/3*2+1]=z/Ht;
+        // 足元の汚し。実際の建物は雨の跳ね返りで腰から下が黒ずむ。**新品の
+        // ファサード写真が地面まで同じ明るさで届いている**のが、街が CG に
+        // 見える理由のひとつだった。ここは頂点カラーなので追加コストは無い。
+        const t=Math.max(0, 1 - (z/Ht)/BLDG_GRIME_H);
+        const k=1 - BLDG_GRIME*t*t;
+        col[(o+i)/3*3  ]=k; col[(o+i)/3*3+1]=k*0.995; col[(o+i)/3*3+2]=k*0.985;
+      }
+    }else{
+      for(let i=0;i<b.pos.length;i+=3){
+        col[(o+i)/3*3]=1; col[(o+i)/3*3+1]=1; col[(o+i)/3*3+2]=1;
       }
     }
     geo.addGroup(o/3, b.pos.length/3, gi);      // マテリアルの割り当て
@@ -3425,6 +3642,7 @@ function buildStructGeo(fpn, H, V){
   geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
   geo.setAttribute('normal',   new THREE.BufferAttribute(nrm,3));
   geo.setAttribute('uv',       new THREE.BufferAttribute(uv,2));
+  geo.setAttribute('color',    new THREE.BufferAttribute(col,3));
   geo.userData.hVis=Math.max(Ht, maxZ);   // せり上がり/沈みアニメが使う実寸 (屋根も含む)
   structGeoCache[key]=geo;
   return geo;
@@ -3433,6 +3651,9 @@ function buildStructGeo(fpn, H, V){
 // 立体パーツ (ベランダ・パラペット・階段) のコンクリート色。
 // 屋上の色は従来の箱の屋上 (0xb0b4ac) に合わせてある。
 const TRIM_COLOR = 0xb2b5ac;
+// 足元の汚し。BLDG_GRIME が濃さ、BLDG_GRIME_H が「建物の高さの何割まで」。
+const BLDG_GRIME   = envNum('BLDG_GRIME', 0.26);
+const BLDG_GRIME_H = Math.max(0.02, envNum('BLDG_GRIME_H', 0.22));
 // 三角屋根の屋根材。業種ごとに変えて、並んだ家が全部同じ色にならないようにする。
 const ROOF_PALETTE=[0x8a5a4a,0x4e5a63,0x6d6a55,0x7a4f43,0x55606a,0x8a7a5a,0x5f6b56,0x6a5450];
 function structGlbMats(st){
@@ -3448,8 +3669,10 @@ function structGlbMats(st){
   };
   // 壁: テクスチャを共有し、色 (= テクスチャに掛かる係数) だけ建物ごとに振る。
   // 閉店中は暗く落として「シャッターが下りている」ことを夜でも分かるようにする。
-  const facade = tex ? new THREE.MeshLambertMaterial({map:tex})
-                     : new THREE.MeshLambertMaterial({color:bt.fallbackColor});
+  // vertexColors … buildStructGeo が焼いた「足元の汚し」を掛ける。
+  //   trim/roof/sign のグループには白 (1,1,1) を入れてあるので、そちらは変わらない。
+  const facade = tex ? new THREE.MeshLambertMaterial({map:tex, vertexColors:true})
+                     : new THREE.MeshLambertMaterial({color:bt.fallbackColor, vertexColors:true});
   facade.color.copy(closed ? new THREE.Color(0x5e5a55)
                            : tint(tex ? 0xffffff : bt.fallbackColor));
   if(mask){                                   // 夜に光るのは「明かり」の部分だけ
@@ -3534,6 +3757,8 @@ function addStructMesh(S, st){
     mesh=new THREE.Mesh(boxGeoByH[gkey], structMats(st));
   }
   mesh.position.set(cx,cy,zRest);
+  // 建物は落とすし受ける (隣のビルの影が壁に落ちる)。ここが街の影の主役。
+  markShadow(mesh, true, true);
   mesh.userData.hVis=hVis; mesh.userData.zRest=zRest;
   if(st.state==='open' && Array.isArray(mesh.material) && mesh.material.length===GROUP_ORDER.length){
     const facade=mesh.material[0], sign=mesh.material[GROUP_ORDER.indexOf('sign')];
@@ -3719,9 +3944,9 @@ function addTreeMesh(S, r, c){
   const zTrunk = T.glb ? 0 : CELL*.2;
   const zLeaf  = T.glb ? 0 : CELL*.58;
   const trunk=new THREE.Mesh(T.trunkGeo, T.trunkMat.clone());
-  trunk.position.set(cx,cy,zTrunk); S.add(trunk);
+  trunk.position.set(cx,cy,zTrunk); markShadow(trunk,true,false); S.add(trunk);
   const cone=new THREE.Mesh(T.coneGeo, T.coneMat.clone());
-  cone.position.set(cx,cy,zLeaf); S.add(cone);
+  cone.position.set(cx,cy,zLeaf); markShadow(cone,true,false); S.add(cone);
   occluders[r+'_'+c+'_t1']={mesh:trunk,cx,cy,faded:false};
   occluders[r+'_'+c+'_t2']={mesh:cone,cx,cy,faded:false};
 }
@@ -3766,7 +3991,7 @@ function rebuildGround(S){
   g.base=new THREE.Mesh(new THREE.PlaneGeometry(fs,fs),
                         new THREE.MeshLambertMaterial({color:0xd3d7cf}));
   g.base.position.set(fx,fx,0);
-  S.add(g.base);
+  markShadow(g.base, false, true); S.add(g.base);
   // 上位%の閾値をその場の分布から決める (絶対数だと人数しだいで全面茶色になる)
   let t1=Infinity, t2=Infinity;
   if(CITY){
@@ -3823,12 +4048,16 @@ function rebuildGround(S){
     else           pushQuad(grass, CELL*GROUND_FILL, cx, cy, .005, ao, tint);
   }
   // 雨の日は地面を濡らす (少し暗く・彩度を落とす)。色を変えるだけなので負荷ゼロ。
-  const wet = (CITY && CITY.weather==='rain') ? 0.80 : 1.0;
+  // 濡れ具合 0..1。**雨が止んだ瞬間に乾かない。** 以前は weather==='rain' の間だけ
+  // 一律 0.80 を掛けていたので、雨が上がった途端に路面がぱっと乾いて嘘に見えた。
+  // 降っている間に溜まり、上がってから WET_DRY_MIN 分ぶんかけて引いていく。
+  const wetK = wetness();
+  const wet = 1.0 - 0.24*wetK;
   const dim = c => { const x=new THREE.Color(c); x.multiplyScalar(wet); return x.getHex(); };
   // テクスチャがあるときは色を白にする (色は写真にそのまま掛かるため)。
   // AO の頂点カラーと雨の濡れはこれまでどおり乗る。
-  if(road.length) { g.road =quadMesh(road,  dim(groundTex.road ?0xffffff:0xb3b8bd), groundTex.road);  S.add(g.road); }
-  if(grass.length){ g.grass=quadMesh(grass, dim(groundTex.grass?0xffffff:0x8cbf58), groundTex.grass); S.add(g.grass); }
+  if(road.length) { g.road =quadMesh(road,  dim(groundTex.road ?0xffffff:0xb3b8bd), groundTex.road);  markShadow(g.road,false,true);  S.add(g.road); }
+  if(grass.length){ g.grass=quadMesh(grass, dim(groundTex.grass?0xffffff:0x8cbf58), groundTex.grass); markShadow(g.grass,false,true); S.add(g.grass); }
   // 空き地 (踏み固め → 土)。テクスチャは共通で、色だけ段階で変える。
   // other_256.jpg は平均が暗いので、色は 1.0 を超える値で持ち上げてある
   // (three の material.color はクランプされないので 1 超えでよい)。
@@ -3857,6 +4086,7 @@ function rebuildGround(S){
   }
   rebuildLamps(S);
   rebuildSignals(S);            // 交差点の信号 (道が変わると交差点も変わる)
+  rebuildProps(S);              // 自販機・ガードレール・自転車など
   rebuildStreetTrees(S);        // 道沿いと建物の隙間の木 (InstancedMesh 2 本)
 }
 
@@ -3933,6 +4163,7 @@ function rebuildStreetTrees(S){
   // GLB は底面が z=0。箱で代替しているときは中心が原点なので持ち上げる。
   T.trunk=mk(A.trunkGeo, A.trunkMat, A.glb?0:CELL*.2);
   T.leaf =mk(A.coneGeo,  A.coneMat,  A.glb?0:CELL*.58);
+  markShadow(T.trunk,true,false); markShadow(T.leaf,true,false);
   S.add(T.trunk); S.add(T.leaf);
 }
 
@@ -3950,6 +4181,25 @@ const LAMP_STEP = envNum('LAMP_STEP', 3);      // 何セルおきに立てるか
 const LAMP_H    = DIM.LAMP.h;                  // 灯具の高さ (scale.js: 4.60m)
 const LAMP_POOL = DIM.LAMP.poolR;              // 地面に落ちる光の輪の半径
 const LAMP_GLOW = envNum('LAMP_GLOW', 1.0);    // 明るさの倍率 (0 で消灯)
+
+// 太陽の円盤。中心が白く、縁へ二段階でにじむ (芯 + かさ)。
+let _sunTex=null;
+function sunDiscTexture(){
+  if(_sunTex) return _sunTex;
+  const N=64, d=new Uint8Array(N*N*4);
+  for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+    const dx=(x+0.5)/N*2-1, dy=(y+0.5)/N*2-1, r=Math.hypot(dx,dy);
+    const core=Math.pow(Math.max(0,1-r*2.6), 2.0);     // 芯
+    const halo=Math.pow(Math.max(0,1-r), 3.2)*0.45;    // かさ
+    const a=Math.min(1, core+halo), i=(y*N+x)*4;
+    d[i]=255; d[i+1]=246; d[i+2]=226; d[i+3]=Math.round(a*255);
+  }
+  const t=new THREE.DataTexture(d,N,N,THREE.RGBAFormat);
+  t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping;
+  t.minFilter=t.magFilter=THREE.LinearFilter;
+  t.generateMipmaps=false; t.needsUpdate=true; t.userData={shared:true};
+  _sunTex=t; return _sunTex;
+}
 
 // 光の輪。中心が明るく縁で 0 になる板。1枚作って全部の街灯で使い回す。
 let _poolTex=null;
@@ -3990,11 +4240,11 @@ function pushBox(pos, nrm, x0,x1, y0,y1, z0,z1){
 function rebuildLamps(S){
   if(!S) return;
   const L=S.userData.lamps||(S.userData.lamps={});
-  for(const k of ['pole','head','pool']){
+  for(const k of ['pole','head','pool','wire']){
     if(L[k]){ S.remove(L[k]); L[k].geometry.dispose(); L[k].material.dispose(); L[k]=null; }
   }
   if(!LAMP_ON) return;
-  const pp=[], pn=[], hp=[], hn=[], qp=[], quv=[];
+  const pp=[], pn=[], hp=[], hn=[], qp=[], quv=[], poles=[];
   const isRoad=(r,c)=> r>=0 && r<GRID && c>=0 && c<GRID && MAP[r][c]===ROAD;
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     if(MAP[r][c]!==ROAD) continue;
@@ -4025,7 +4275,9 @@ function rebuildLamps(S){
     qp.push(hx-R,hy-R,z, hx+R,hy-R,z, hx+R,hy+R,z,
             hx-R,hy-R,z, hx+R,hy+R,z, hx-R,hy+R,z);
     quv.push(0,0, 1,0, 1,1,  0,0, 1,1, 0,1);
+    poles.push({x:cx, y:cy, r, c, dr, dc});
   }
+  buildWires(S, poles);
   if(!pp.length) return;
   const mk=(pos,nrm,mat)=>{
     const g=new THREE.BufferGeometry();
@@ -4034,6 +4286,7 @@ function rebuildLamps(S){
     return new THREE.Mesh(g, mat);
   };
   L.pole=mk(pp,pn, new THREE.MeshLambertMaterial({color:0x4a4f54}));
+  markShadow(L.pole,true,false);
   S.add(L.pole);
   const hm=new THREE.MeshLambertMaterial({color:0x2b2c28});
   hm.emissive=new THREE.Color(0xffdca8); hm.emissiveIntensity=0;
@@ -4048,6 +4301,197 @@ function rebuildLamps(S){
   L.pool.visible=false;
   L.pool.renderOrder=1;
   S.add(L.pool);
+}
+
+// ── 街のもの ────────────────────────────────────────────────────────────────
+// 自販機・ガードレール・カーブミラー・自転車・室外機。どれも「その辺にある」から
+// こそ街に見えるもので、無いと**新品の模型**に見える。
+//
+//   ★ 全部まとめて **3 ドローコール** (色つきの箱 / 白っぽい箱 / 光る面)。
+//     1 個ずつメッシュにすると数百本になるので、位置から決まる固定のハッシュで
+//     置き場所を決め、頂点をひとつの配列に流し込む。
+//   ★ 当たり判定は無い。住民も車も素通りする。**観測 (方策の入力) にも入らない** —
+//     あれは MAP からレイキャスタが描いているので、ここに何を足しても学習済み
+//     モデルの入力は 1 ビットも変わらない。
+const PROPS_ON  = process.env.PROPS !== '0';
+const PROP_P    = envNum('PROP_P', 0.34);       // 置ける場所のうち実際に置く割合
+
+function rebuildProps(S){
+  if(!S) return;
+  const P=S.userData.props||(S.userData.props={});
+  for(const k of ['body','pale','glow']){
+    if(P[k]){ S.remove(P[k]); P[k].geometry.dispose(); P[k].material.dispose(); P[k]=null; }
+  }
+  if(!PROPS_ON || !CITY || !CITY.roadClass) return;
+  const M=DIM.mPerWu, wu=m=>m/M;                    // m → ワールド単位
+  const bp=[], bn=[], bc=[];                        // 色つき (自販機の本体・自転車)
+  const pp=[], pn=[];                               // 白っぽい (ガードレール・室外機・ミラー)
+  const gp=[], gn=[], gc=[];                        // 光る面 (自販機の陳列窓)
+  const hash=(r,c,k)=>{ let h=(Math.imul(r,73856093)^Math.imul(c,19349663)^Math.imul(k,83492791))>>>0;
+    h=Math.imul(h^(h>>>13),0x85EBCA6B)>>>0; return ((h>>>8)&0xFFFF)/0x10000; };
+  const isRoad=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID&&MAP[r][c]===ROAD;
+  const box=(a,n,x0,x1,y0,y1,z0,z1,col,cArr)=>{
+    const before=a.length;
+    pushBox(a,n,x0,x1,y0,y1,z0,z1);
+    if(cArr && col) for(let i=before;i<a.length;i+=3) cArr.push(col.r,col.g,col.b);
+  };
+  const C=(hex)=>new THREE.Color(hex);
+  const COL_VEND=[C(0xc03a2e), C(0x2f6fb0), C(0xe8b32a), C(0x2f8f5a)];
+  const COL_BIKE=[C(0x30343a), C(0x8a2f2f), C(0x2f5a8a), C(0x5a5a5a)];
+
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(MAP[r][c]!==ROAD) continue;
+    const cls=CITY.roadClass[r*GRID+c];
+    if(cls<RD.ONEWAY) continue;
+    // 道の縁 (歩道側) を探す。四方とも道なら車道の真ん中なので何も置かない。
+    let dr=0, dc=0, ok=false;
+    for(const [a,b] of [[0,-1],[0,1],[-1,0],[1,0]]) if(!isRoad(r+a,c+b)){ dr=a; dc=b; ok=true; break; }
+    if(!ok) continue;
+    // 街灯 (r+c)%3 / 街路樹 (r*2+c)%4 と場所が重ならないよう位相をずらす
+    if((r+c*2)%3!==2) continue;
+    if(hash(r,c,1)>PROP_P) continue;
+    const cx=c*CELL+CELL*0.5 + dc*CELL*0.38;
+    const cy=r*CELL+CELL*0.5 + dr*CELL*0.38;
+    const along=Math.abs(dr)>0 ? 'x' : 'y';          // 歩道が伸びる向き
+    const pick=hash(r,c,2);
+
+    if(pick<0.26){
+      // 自販機。日本の街の記号。奥行 0.75m / 幅 1.1m / 高さ 1.9m
+      const w=wu(0.55), dp=wu(0.36), h=wu(1.90);
+      const hx=along==='x'?w:dp, hy=along==='x'?dp:w;
+      const col=COL_VEND[(hash(r,c,3)*COL_VEND.length)|0];
+      box(bp,bn, cx-hx,cx+hx, cy-hy,cy+hy, 0, h, col, bc);
+      // 陳列窓 (夜に光る)。道路側の面に少しだけ張り出す
+      const ox=-dc*(dp+wu(0.02)), oy=-dr*(dp+wu(0.02));
+      const gx=along==='x'?w*0.78:wu(0.02), gy=along==='x'?wu(0.02):w*0.78;
+      box(gp,gn, cx+ox-gx,cx+ox+gx, cy+oy-gy,cy+oy+gy, h*0.42, h*0.88, C(0xfff2d0), gc);
+    }else if(pick<0.50){
+      // 室外機。建物の壁際に積む。奥行 0.3m / 幅 0.8m / 高さ 0.6m
+      const w=wu(0.40), dp=wu(0.16), h=wu(0.62);
+      const hx=along==='x'?w:dp, hy=along==='x'?dp:w;
+      const z0=hash(r,c,4)<0.4 ? wu(0.9) : 0;        // たまに壁に持ち上げる
+      box(pp,pn, cx-hx,cx+hx, cy-hy,cy+hy, z0, z0+h);
+    }else if(pick<0.72){
+      // ガードレール。歩道の縁に沿って 1 セルぶん。支柱 2 本 + 横板 2 段
+      const h=wu(0.70), th=wu(0.05);
+      const L0=-CELL*0.42, L1=CELL*0.42;
+      for(const zz of [h*0.62, h*0.95]){
+        if(along==='x') box(pp,pn, cx+L0,cx+L1, cy-th,cy+th, zz-wu(0.07), zz+wu(0.07));
+        else            box(pp,pn, cx-th,cx+th, cy+L0,cy+L1, zz-wu(0.07), zz+wu(0.07));
+      }
+      for(const t of [L0, L1]){
+        const px=along==='x'?cx+t:cx, py=along==='x'?cy:cy+t;
+        box(pp,pn, px-th,px+th, py-th,py+th, 0, h);
+      }
+    }else if(pick<0.88){
+      // 自転車。停めてある。車輪 2 枚 + フレーム。真横から見て自転車に見えれば十分
+      const w=wu(0.85), th=wu(0.03), rr=wu(0.33);
+      const col=COL_BIKE[(hash(r,c,5)*COL_BIKE.length)|0];
+      for(const t of [-w*0.62, w*0.62]){             // 車輪 (薄い箱で代用)
+        const px=along==='x'?cx+t:cx, py=along==='x'?cy:cy+t;
+        box(bp,bn, px-(along==='x'?rr:th), px+(along==='x'?rr:th),
+                   py-(along==='x'?th:rr), py+(along==='x'?th:rr), wu(0.02), rr*2, C(0x1a1c1f), bc);
+      }
+      if(along==='x') box(bp,bn, cx-w*0.55,cx+w*0.55, cy-th,cy+th, rr*1.1, rr*1.35, col, bc);
+      else            box(bp,bn, cx-th,cx+th, cy-w*0.55,cy+w*0.55, rr*1.1, rr*1.35, col, bc);
+      // ハンドル
+      const hx2=along==='x'?th:wu(0.22), hy2=along==='x'?wu(0.22):th;
+      const bx=along==='x'?cx+w*0.62:cx, by=along==='x'?cy:cy+w*0.62;
+      box(bp,bn, bx-hx2,bx+hx2, by-hy2,by+hy2, rr*1.9, rr*2.05, col, bc);
+    }else{
+      // カーブミラー。交差点の角にだけ立てる
+      let deg=0; for(const [a,b] of [[0,-1],[0,1],[-1,0],[1,0]]) if(isRoad(r+a,c+b)) deg++;
+      if(deg<3) continue;
+      const pr=wu(0.045), h=wu(2.4);
+      box(pp,pn, cx-pr,cx+pr, cy-pr,cy+pr, 0, h);
+      const mr=wu(0.42), mt=wu(0.06);
+      const mx=along==='x'?mr:mt, my=along==='x'?mt:mr;
+      box(pp,pn, cx-mx,cx+mx, cy-my,cy+my, h-mr*1.1, h+mr*0.9);
+    }
+  }
+  const mk=(pos,nrm,col,mat)=>{
+    if(!pos.length) return null;
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos),3));
+    g.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(nrm),3));
+    if(col && col.length) g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col),3));
+    const m=new THREE.Mesh(g, mat);
+    markShadow(m, true, false);
+    S.add(m); return m;
+  };
+  P.body=mk(bp,bn,bc, new THREE.MeshLambertMaterial({vertexColors:true}));
+  P.pale=mk(pp,pn,null, new THREE.MeshLambertMaterial({color:0xa8aeb2}));
+  const gm=new THREE.MeshLambertMaterial({vertexColors:true});
+  gm.emissive=new THREE.Color(0xffe9c0); gm.emissiveIntensity=0;
+  P.glow=mk(gp,gn,gc, gm);
+  if(P.glow) P.glow.castShadow=false;
+}
+
+// 自販機の窓は夜に光る (街灯と同じ曲線)。
+function stepProps(S, d){
+  const P=S && S.userData && S.userData.props;
+  if(!P || !P.glow) return;
+  const t=Math.max(0, Math.min(1, (0.55-d)/0.40));
+  P.glow.material.emissiveIntensity = (t*t*(3-2*t))*1.9;
+}
+
+// ── 電線 ──────────────────────────────────────────────────────────────────
+// 日本の街並みの記号そのもの。空が広いほど「作り物」に見えるので、頭上に線を
+// 何本か渡すだけで一気に生活感が出る。
+//
+//   ★ **1 メッシュ = 1 ドローコール。** 線は THREE.LineSegments にまとめる。
+//     太さを持たせたいところだが、WebGL の線幅はほぼ全ての実装で 1px 固定なので
+//     素直に線で描く。遠景では細く消えるが、それは実物も同じ。
+//   ★ 影は落とさない。1px の線の影はシャドウマップに乗らず、ちらつくだけ。
+//
+// 隣り合う街灯どうしを結ぶ。**同じ道の上に並んでいる組だけ**を結ばないと、
+// 街を横切る対角線が張られて蜘蛛の巣になる。
+const WIRE_ON   = process.env.WIRES !== '0';
+const WIRE_SAG  = envNum('WIRE_SAG', 0.28);     // たるみ (支間に対する比)
+// 結ぶ相手の距離の上限。**街灯の間隔から決める。** 生の数字を書いたら 4.2 に
+// なっていて、LAMP_STEP=3 (= 6.0 ワールド単位) の街では 1 本も張られなかった。
+const WIRE_MAX  = envNum('WIRE_SPAN', CELL*LAMP_STEP*1.45);
+const WIRE_SEG  = 6;                            // 1 本を何分割して曲げるか
+
+function buildWires(S, poles){
+  if(!WIRE_ON || !poles || poles.length<2) return;
+  const L=S.userData.lamps;
+  const pos=[];
+  // 電線を吊る高さ。灯具より少し下に 3 本。
+  const hs=[LAMP_H*0.92, LAMP_H*0.84, LAMP_H*0.76];
+  const off=[-DIM.LAMP.poleR*2.2, 0, DIM.LAMP.poleR*2.2];   // 支柱に対する横のずれ
+  for(let i=0;i<poles.length;i++){
+    const a=poles[i];
+    for(let j=i+1;j<poles.length;j++){
+      const b=poles[j];
+      // 同じ行か同じ列に並び、かつ近い組だけ (道に沿って張るのと同じことになる)
+      if(a.r!==b.r && a.c!==b.c) continue;
+      const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy);
+      if(len<0.1 || len>WIRE_MAX) continue;
+      // 道の同じ側に立っている街灯どうしだけ。反対側の縁と結ぶと道路を横断する。
+      if(a.dr!==b.dr || a.dc!==b.dc) continue;
+      const px=-dy/len, py=dx/len;               // 支間に直交する向き
+      for(let k=0;k<hs.length;k++){
+        const o=off[k];
+        let prevX=a.x+px*o, prevY=a.y+py*o, prevZ=hs[k];
+        for(let t=1;t<=WIRE_SEG;t++){
+          const u=t/WIRE_SEG;
+          const x=a.x+dx*u+px*o, y=a.y+dy*u+py*o;
+          // たるみは放物線。支間が長いほど深く垂れる。
+          const z=hs[k] - WIRE_SAG*len*0.25*(4*u*(1-u));
+          pos.push(prevX,prevY,prevZ, x,y,z);
+          prevX=x; prevY=y; prevZ=z;
+        }
+      }
+    }
+  }
+  if(!pos.length) return;
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos),3));
+  // 空を背にした電線は逆光でほぼ黒く見える。フォグは効かせて遠くでは溶かす。
+  L.wire=new THREE.LineSegments(g, new THREE.LineBasicMaterial({color:0x24282c}));
+  L.wire.frustumCulled=false;
+  S.add(L.wire);
 }
 
 // 夜だけ点ける。建物の窓と同じ曲線 (日暮れ 0.55 あたりからじわっと)。
@@ -4162,7 +4606,7 @@ function rebuildSignals(S){
     const geo=new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos),3));
     geo.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(nrm),3));
-    const m=new THREE.Mesh(geo, mat); S.add(m); G.meshes.push(m); return m;
+    const m=new THREE.Mesh(geo, mat); markShadow(m,true,false); S.add(m); G.meshes.push(m); return m;
   };
   mk(pp,pn, new THREE.MeshLambertMaterial({color:0x4a4f54}));   // 支柱と腕
   mk(hp,hn, new THREE.MeshLambertMaterial({color:0x36423a}));   // 灯器
@@ -7597,7 +8041,12 @@ try{
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 const {renderer, glCtx} = createRenderer();
-const mainCam = new THREE.PerspectiveCamera(60, WIDTH/HEIGHT, 0.1, 1200);
+// 画角。60 度は広角で、遠近が強くつきすぎて「ゲームの見下ろし」に見えていた。
+// 40 度前後まで絞ると遠近が圧縮され、望遠で街を切り取った写真の見え方に近づく。
+// ★ 一人称だけは人の視野に合わせて広いまま (FPV_FOV)。
+const CAM_FOV = envNum('FOV', 40);
+const FPV_FOV = envNum('FPV_FOV', 68);
+const mainCam = new THREE.PerspectiveCamera(CAM_FOV, WIDTH/HEIGHT, 0.1, 1200);
 mainCam.up.set(0,0,1);
 
 // ── 追跡カメラ ────────────────────────────────────────────────
@@ -7606,6 +8055,14 @@ mainCam.up.set(0,0,1);
 let camTargetIdx  = 0;
 let camSwitchTimer = Date.now();
 let camFPV = false;
+// カメラが見ている点。影の箱をここに寄せるので、**lookAt するたびに必ず入れる**
+// (入れ忘れた分岐では影が前のショットの場所に取り残される)。
+const _camLookAt = new THREE.Vector3();
+// 追跡カメラの「遅れ」の状態。目標値ではなく、実際に置いた位置を持ち回る。
+const _camPos0 = new THREE.Vector3(), _camAim0 = new THREE.Vector3();
+let _camPrevTarget = -1, _camLastT = 0;
+const CAM_LAG   = envNum('CAM_LAG', 3.2);      // 大きいほど速く追いつく (∞ で従来の完全固定)
+const CAM_SHAKE = envNum('CAM_SHAKE', 0.012);  // 手持ちの揺れ幅 (セル比)
 
 // ターゲット切替が起きた瞬間に呼び、たまに一人称視点ショットにする。
 // FPV はエージェント対象のときのみ (俯瞰では無効)。
@@ -8890,18 +9347,33 @@ function pickCameraTarget() {
   const timeUp = now - camSwitchTimer > CAM_INTERVAL_MS;
 
   if (CAM_MODE === 'B') {
-    // 動いている(直近stepで移動した = stall が小さい)エージェントの index を集める
-    const moving = [];
-    for (let i = 0; i < agents.length; i++) if (agents[i].stall <= 1) moving.push(i);
+    // 映す相手を集める。条件は 2 つで、**屋外かどうかが先**。
+    //   ・屋内の住民は建物に隠れて見えない。追跡カメラは無人の壁を映し続け、
+    //     一人称に至っては rollFPV が (正しく) 断るので永久に始まらない
+    //   ・動いている (直近 step で移動した = stall が小さい)
+    // 実測: 屋内を弾く前は**カメラの対象の 80% が屋内**で、そのあいだ一人称は
+    // 構造的に選ばれなかった (FPV_CHANCE=0.25 に対して実効 7%)。屋外のショットに
+    // 限れば 33% で、確率そのものは最初から効いていた。
+    const outdoor = [], moving = [];
+    for (let i = 0; i < agents.length; i++) {
+      if (MW.isIndoors(agents[i])) continue;
+      outdoor.push(i);
+      if (agents[i].stall <= 1) moving.push(i);
+    }
+    // 夜など全員が屋内の時間帯は誰も居なくなるので、そのときは屋内でも動いて
+    // いる人を拾う (下の「誰も動いていない」分岐に落ちて俯瞰になるより良い)。
+    const pool0 = moving.length ? moving : outdoor;
     const cur = camTargetIdx > 0 ? agents[camTargetIdx - 1] : null;
-    // 俯瞰中、または追跡中の対象がしばらく停止していて、他に動いてる人が居れば早めに切替
-    const curStalled = !cur || cur.stall >= CAM_STALL_SWITCH;
-    if (!(timeUp || (curStalled && moving.length > 0))) return;
+    // 俯瞰中、または追跡中の対象がしばらく停止していて、他に動いてる人が居れば早めに切替。
+    // **対象が建物に入った時点でも切り替える** — 入るところまでは映るが、その後
+    // 20 秒も壁を映し続けない。
+    const curStalled = !cur || cur.stall >= CAM_STALL_SWITCH || MW.isIndoors(cur);
+    if (!(timeUp || (curStalled && pool0.length > 0))) return;
 
-    if (moving.length > 0) {
-      // 動いている人を優先。できれば今と違う人を選ぶ (同じ人ばかり映さない)
-      const others = moving.filter(i => i !== camTargetIdx - 1);
-      const pool = others.length ? others : moving;
+    if (pool0.length > 0) {
+      // できれば今と違う人を選ぶ (同じ人ばかり映さない)
+      const others = pool0.filter(i => i !== camTargetIdx - 1);
+      const pool = others.length ? others : pool0;
       camTargetIdx = pool[Math.floor(Math.random() * pool.length)] + 1;
     } else {
       // 誰も動いていない → ランダム (俯瞰 or いずれかのエージェント)
@@ -8920,6 +9392,11 @@ function pickCameraTarget() {
 }
 
 function updateTrackingCamera(cam) {
+  // 遅れの計算に要る実時間。描画ループの dt をそのまま使うと、重いフレームで
+  // カメラが飛ぶ (dt が跳ねる) ので、ここで測って上限をかける。
+  const _now=Date.now();
+  const dtCam=Math.min(0.2, _camLastT ? (_now-_camLastT)/1000 : 0.06);
+  _camLastT=_now;
   // 優先順位: チャットの指名 > 街のイベント > 自動切替。
   // 指名は数秒なので、その間イベントは待ち行列で待つ (アニメも開始しない)。
   const held = holdCamera();
@@ -8935,6 +9412,7 @@ function updateTrackingCamera(cam) {
     cam.up.set(0, 0, 1);
     cam.position.set(tx + Math.sin(ang)*dist, ty - Math.cos(ang)*dist, hgt);
     cam.lookAt(tx, ty, ev.wide ? CELL*2 : CELL*0.7);
+    _camLookAt.set(tx, ty, 0);
     camSwitchTimer = Date.now();     // イベント明けに即切り替わらないように
     camFPV = false;
     return;
@@ -8945,6 +9423,7 @@ function updateTrackingCamera(cam) {
     cam.up.set(0, 1, 0);
     cam.position.set(fx, fx, fs*CAM_OVERVIEW);
     cam.lookAt(fx, fx + 1, 0);
+    _camLookAt.set(fx, fx, 0);
   } else {
     const a = agents[camTargetIdx - 1];
     if (!a) return;
@@ -8954,6 +9433,9 @@ function updateTrackingCamera(cam) {
     // 壁の中を映し続けるよりは良い。次のターゲットまで追跡カメラで通す
     // (毎フレーム出入りで切り替わるとちらつくので、いったん降りたら戻さない)。
     if (camFPV && MW.isIndoors(a)) camFPV = false;
+    // 画角は一人称だけ広く。切り替えたときだけ行列を作り直す。
+    const wantFov = camFPV ? FPV_FOV : CAM_FOV;
+    if (cam.fov !== wantFov) { cam.fov = wantFov; cam.updateProjectionMatrix(); }
     if (camFPV) {
       // ── 一人称視点 (キャラの目線) ──
       // world 進行方向 = (sin th, cos th) (stepAll の移動則より導出)。
@@ -8967,11 +9449,35 @@ function updateTrackingCamera(cam) {
       cam.up.set(0, 0, 1);     // Z が上 → 水平線が水平に見える
       cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
       cam.lookAt(tx + dwx*(fwd+4), ty + dwy*(fwd+4), eyeZ*0.85);   // 進行方向やや下向き
+      _camLookAt.set(tx + dwx*(fwd+4), ty + dwy*(fwd+4), 0);
     } else {
       // ── 追跡カメラ (斜め後方から) ── CAM_DIST でプレイヤーまでの距離を調整 (小さいほど寄る)
+      //
+      // ★ 目標の座標をそのまま毎フレーム代入すると、カメラが住民に**完全に固定**
+      //   されて、街のほうが動いて見える。少し遅れて追わせると「人を追いかけて
+      //   撮っている」画になる。さらに微かな揺れを足すと手持ちのカメラに見える。
+      //   どちらも見た目だけの話で、シミュレーションには一切触れない。
       cam.up.set(0, 1, 0);
-      cam.position.set(tx, ty - CELL*5*CAM_DIST, CELL*7*CAM_DIST);
-      cam.lookAt(tx, ty + CELL * 1.5, 0);
+      const wx=tx, wy=ty - CELL*5*CAM_DIST, wz=CELL*7*CAM_DIST;
+      // ショットが切り替わった瞬間だけは飛ばす (街を横切って滑っていくと切替に見えない)
+      const cut = camTargetIdx!==_camPrevTarget;
+      _camPrevTarget=camTargetIdx;
+      if(cut || _camPos0.lengthSq()===0){ _camPos0.set(wx,wy,wz); _camAim0.set(tx, ty+CELL*1.5, 0); }
+      else{
+        const k=Math.min(1, dtCam*CAM_LAG);
+        _camPos0.x+=(wx-_camPos0.x)*k; _camPos0.y+=(wy-_camPos0.y)*k; _camPos0.z+=(wz-_camPos0.z)*k;
+        const ak=Math.min(1, dtCam*CAM_LAG*1.6);          // 注視点は少し早く追う
+        _camAim0.x+=(tx-_camAim0.x)*ak;
+        _camAim0.y+=((ty+CELL*1.5)-_camAim0.y)*ak;
+      }
+      // 手持ちの揺れ。周期の違う正弦を重ねて、往復に見えないようにする。
+      const T=Date.now()/1000, A=CELL*CAM_SHAKE;
+      const sx=(Math.sin(T*0.73)+Math.sin(T*1.19)*0.6)*A;
+      const sy=(Math.sin(T*0.61+2.1)+Math.sin(T*1.37+0.7)*0.6)*A;
+      const sz=(Math.sin(T*0.47+1.3))*A*0.7;
+      cam.position.set(_camPos0.x+sx, _camPos0.y+sy, _camPos0.z+sz);
+      cam.lookAt(_camAim0.x, _camAim0.y, 0);
+      _camLookAt.set(tx, ty, 0);
     }
   }
 }
@@ -9913,7 +10419,7 @@ async function renderLoop(){
     if(clients.size===0 && !YT.ready) return;
 
     const _t3=PERF_LOG?Date.now():0;
-    const rgba=readPixels(glCtx);
+    const rgba=await downscale(readPixels(glCtx));
     if(PERF_LOG) _perf.pixels+=Date.now()-_t3;
     // YouTube: 生RGBAフレームを直接 ffmpeg へ (JPEGを経由しない)
     if(YT.ready) setYtFrame(rgba);
