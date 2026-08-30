@@ -2502,6 +2502,12 @@ if(POP_MAX>0 && NUM_AGENTS<=POP_MAX)
   console.warn(`[Config] ⚠ NUM_AGENTS=${NUM_AGENTS} が POP_MAX=${POP_MAX} 以下です。`
     + ` 人口が ${POP_MAX} に届かないので街のリセットが発火しません。`
     + ` NUM_AGENTS を ${POP_MAX+20} 以上にするか、POP_MAX を ${NUM_AGENTS-1} 以下にしてください。`);
+// 起動時にこの機能の設定を1行出す。「新しいコードが本当に動いているか」「どの値に
+// 解決されたか」がログだけで分かる (本番で発火しないときの切り分けはまずここ)。
+console.log(`[City] 人口リセット: ${POP_MAX>0 ? `POP_MAX=${POP_MAX} 祝い${POP_MAX_SEC}秒 `
+  + `地形${POP_MAX_NEWMAP?'引き直す':'据え置き'}` : '無効 (POP_MAX=0)'}`
+  + ` | NUM_AGENTS=${NUM_AGENTS} CITY_EVOLVE=${CITY_EVOLVE?'on':'off'}`
+  + `${CITY_EVOLVE?'':' ← off だと人口リセットも起きません'}`);
 // 土地が足りなくなったらフィールドを広げる (1日1回まで)
 const EXPAND_STEP     = envNum('EXPAND_STEP', 2);        // 1回に広げる幅 (両側に1セルずつ)
 // 拡張の主な判断は**建て込み具合**。空き区画の数で見ると、建物が増えるほど
