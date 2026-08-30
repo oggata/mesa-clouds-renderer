@@ -150,6 +150,13 @@ const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||10;
 // キャラクター / 軌跡マーカーの大きさ倍率 (1=従来)。街や建物に対して小さくしたい時に下げる。
 // 環境変数 CHAR_SCALE / TRAIL_SCALE で可変。例: CHAR_SCALE=0.5 node server.js
 const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
+// 街の寸法表。**メートルで書いてある** (scale.js)。車・木・街灯・建物の大きさは
+// 全部ここから引く。以前はワールド単位の生の数字が散らばっていて、どれが何 m
+// 相当なのか分からなくなっていた (実測すると車 4.64m・木 6.95m・街灯の支柱が
+// 実物の約2倍という具合に、個別には妥当でも並べると揃っていなかった)。
+//   node tools/scale-report.js  で一覧できる。
+const SCALE = require('./scale.js');
+const DIM = SCALE.make(CELL, CHAR_SCALE, process.env);
 const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/3;   // 軌跡マーカーの大きさ
 // INFER_EVERY / ONNX_THREADS は先頭の「CPU負荷」設定ブロックに移動
 // ─── 世界の物理 (world.js に一本化) ─────────────────────────────────────────
@@ -2254,8 +2261,11 @@ const CARS_ON   = process.env.CARS !== '0';
 const CAR_MAX   = Math.max(0, parseInt(process.env.CAR_MAX) || 18);
 const CAR_LANE  = envNum('CAR_LANE', 0.165*CELL);   // 車線中心までの横ずらし
 const CAR_SPEED = envNum('CAR_SPEED', 3.4);         // ワールド単位/秒 (≒40km/h)
-// 車体の寸法 (ワールド単位。1 単位 ≒ 3.4m)
-const CAR_L=1.20, CAR_W=0.52, CAR_BODY_Z=[0.10,0.30], CAR_CAB_Z=[0.30,0.46], CAR_WHEEL_R=0.09;
+// 車体の寸法は scale.js から。軽自動車サイズ (3.30 x 1.46 x 1.58m)。
+// 1車線 2.55m の生活道路なので、大型セダン (以前の 4.64m) だと車線から
+// はみ出さんばかりに見えていた。
+const CAR_L=DIM.CAR.len, CAR_W=DIM.CAR.wid;
+const CAR_BODY_Z=DIM.CAR.bodyZ, CAR_CAB_Z=DIM.CAR.cabZ, CAR_WHEEL_R=DIM.CAR.wheelR;
 const CAR_COLORS=[0xd8d8d4,0x2f3a4a,0xa83a32,0x2e6ea8,0x3f7a4a,0xd8a838,0x8a8f96,0x1f2227];
 const CAR_CAP = CAR_MAX + 4;
 
@@ -2278,7 +2288,7 @@ function buildCarGeos(){
   const trim=[];
   // 車輪。前方 +X なので前後は ±X、左右は ±Y。
   for(const sx of [1,-1]) for(const sy of [1,-1]){
-    const w=new THREE.CylinderGeometry(CAR_WHEEL_R, CAR_WHEEL_R, 0.07, 7);
+    const w=new THREE.CylinderGeometry(CAR_WHEEL_R, CAR_WHEEL_R, DIM.CAR.wheelW, 7);
     w.translate(sx*CAR_L*0.32, sy*(CAR_W*0.5+0.005), CAR_WHEEL_R);
     trim.push({geo:w, color:new THREE.Color(0x1a1c1f)});
   }
@@ -3140,6 +3150,9 @@ function buildStructGeo(fpn, H, V){
   if(structGeoCache[key]) return structGeoCache[key];
 
   const buf={}; for(const k of GROUP_ORDER) buf[k]={pos:[], nrm:[]};
+  // GLB は占有率 0.8 で焼いてあるので、目標の占有率へ横だけ縮める。
+  // 縦は縮めない (背は変えず、足元の隙間だけ広げたい)。
+  const hs=DIM.BLDG.fill/DIM.BLDG.glbFill;
   const a=V.facing*Math.PI/2, ca=Math.cos(a), sa=Math.sin(a);
   let maxZ=0;
   const put=(mod, z0)=>{
@@ -3147,7 +3160,7 @@ function buildStructGeo(fpn, H, V){
     for(const grp in mod.g){
       const src=mod.g[grp], dst=buf[grp]||buf.trim;
       for(let i=0;i<src.pos.length;i+=3){
-        const x=src.pos[i], y=src.pos[i+1], z=(src.pos[i+2]+z0)*sz;
+        const x=src.pos[i]*hs, y=src.pos[i+1]*hs, z=(src.pos[i+2]+z0)*sz;
         dst.pos.push(x*ca - y*sa, x*sa + y*ca, z);     // 正面を facing の向きへ回す
         const nx=src.nrm[i], ny=src.nrm[i+1];
         dst.nrm.push(nx*ca - ny*sa, nx*sa + ny*ca, src.nrm[i+2]);
@@ -3178,7 +3191,7 @@ function buildStructGeo(fpn, H, V){
   const total=GROUP_ORDER.reduce((s,k)=>s+buf[k].pos.length, 0);
   const pos=new Float32Array(total), nrm=new Float32Array(total);
   const uv =new Float32Array(total/3*2);
-  const bw=fpn*CELL*0.8, half=bw/2, Ht=actual*sz;
+  const bw=fpn*CELL*DIM.BLDG.fill, half=bw/2, Ht=actual*sz;
   const geo=new THREE.BufferGeometry();
   let o=0;
   for(let gi=0; gi<GROUP_ORDER.length; gi++){
@@ -3391,7 +3404,9 @@ function stepRain(dt, cam){
 //   ・**木は1本ずつ2メッシュのまま**にする。1メッシュにまとめると
 //     近接フェード (occluders) が幹と葉を別々に薄くできなくなる。
 const TREE_GLB    = process.env.TREE_GLB || './glb/tree.glb';
-const TREE_GLB_H  = envNum('TREE_GLB_H', 0.9);     // 3D表示での木の高さ (セル単位)
+// 木の高さ (セル単位)。以前の 0.9 は 6.95m の大木で、1.7m の住民と 5.7m の建物の
+// 間で明らかに浮いていた。scale.js のメートル指定から逆算する。
+const TREE_GLB_H  = DIM.TREE.h/CELL;
 let _treeRaw=null, _treeRawTried=false;
 
 // GLB を読んで「幹」「葉」の2つ (position/normal/index) にまとめる。1回だけ。
@@ -3633,6 +3648,83 @@ function rebuildGround(S){
     S.add(g.curb);
   }
   rebuildLamps(S);
+  rebuildStreetTrees(S);        // 道沿いと建物の隙間の木 (InstancedMesh 2 本)
+}
+
+// ── 街路樹 ──────────────────────────────────────────────────────────────────
+// 木のセルの木 (addTreeMesh) は 1 本ずつメッシュを作り occluders に登録して、
+// カメラとの間に入ると薄くなる。街路樹は本数が多いので同じことをすると
+// ドローコールが数百本に増える。こちらは **InstancedMesh 2 本**にまとめる
+// (薄くなる仕掛けは無いが、歩道の端と建物の隙間に立つので視線を遮りにくい)。
+// ジオメトリとマテリアルは木のセルの木と共用するので、ここでは破棄しない。
+const STREET_TREE_ON = process.env.STREET_TREES !== '0';
+const TREE_STEP      = Math.max(2, envNum('TREE_STEP', 4));   // 道沿いに何セルおきか
+const GAP_TREE_P     = envNum('GAP_TREE_P', 0.42);            // 建物の隙間に植える確率
+const STREET_TREE_CAP= 900;
+
+const _stMat=new THREE.Matrix4(), _stQ=new THREE.Quaternion(),
+      _stP=new THREE.Vector3(), _stS=new THREE.Vector3(), _stZ=new THREE.Vector3(0,0,1);
+
+function rebuildStreetTrees(S){
+  if(!S) return;
+  const T=S.userData.streetTrees||(S.userData.streetTrees={});
+  for(const k of ['trunk','leaf']){
+    // InstancedMesh.dispose() が捨てるのはインスタンス属性のバッファだけで、
+    // ジオメトリとマテリアルは触らない。ここでは木のセルの木と共用しているので
+    // それが正しい (S.userData.tree ごとシーンの破棄で片付く)。
+    if(T[k]){ S.remove(T[k]); T[k].dispose(); T[k]=null; }
+  }
+  if(!STREET_TREE_ON) return;
+  const A=S.userData.tree; if(!A || !A.trunkGeo || !A.coneGeo) return;
+
+  // 位置は座標から決まる固定のハッシュで振る (毎回変わると木が飛び回る)
+  const hash=(r,c,s)=>{ let h=(r*73856093 ^ c*19349663 ^ s*83492791)>>>0;
+    h=Math.imul(h^(h>>>13), 0x85EBCA6B)>>>0; return ((h>>>8)&0xFFFF)/0x10000; };
+  const isRoad=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID&&MAP[r][c]===ROAD;
+  const gap=(1-DIM.BLDG.fill)/2;              // 建物を細くしたぶんの片側の余白 (セル比)
+  const spots=[];
+  for(let r=0;r<GRID && spots.length<STREET_TREE_CAP;r++)
+  for(let c=0;c<GRID && spots.length<STREET_TREE_CAP;c++){
+    const t=MAP[r][c];
+    if(t===ROAD){
+      if(!CITY || !CITY.roadClass || CITY.roadClass[r*GRID+c]<RD.ONEWAY) continue;
+      // 街灯は (r+c)%LAMP_STEP、街路樹は (r*2+c)%TREE_STEP。位相をずらして
+      // 同じセルに両方立たないようにする。
+      if((r*2+c)%TREE_STEP!==1) continue;
+      let dr=0, dc=0, ok=false;
+      for(const [a,b] of [[0,-1],[0,1],[-1,0],[1,0]]) if(!isRoad(r+a,c+b)){ dr=a; dc=b; ok=true; break; }
+      if(!ok) continue;                       // 四方とも道 = 車道の真ん中なので植えない
+      spots.push([c*CELL+CELL*.5 + dc*CELL*0.40, r*CELL+CELL*.5 + dr*CELL*0.40,
+                  hash(r,c,1), DIM.TREE.streetH]);
+    }else if(t===BUILDING){
+      if(hash(r,c,2)>GAP_TREE_P) continue;
+      const sx=hash(r,c,3)<0.5?-1:1, sy=hash(r,c,4)<0.5?-1:1;
+      if(isRoad(r,c+sx) || isRoad(r+sy,c)) continue;   // 道に面した側は歩道なので置かない
+      const d=0.5-gap*0.5;                             // 建物の壁とセルの端の中間
+      spots.push([c*CELL+CELL*(.5+sx*d), r*CELL+CELL*(.5+sy*d),
+                  hash(r,c,5), DIM.TREE.streetH*0.85]);
+    }
+  }
+  if(!spots.length) return;
+
+  const base=A.glb ? DIM.TREE.h : CELL*0.9;   // 幹/葉ジオメトリが作られたときの高さ
+  const mk=(geo,mat,zOff)=>{
+    const im=new THREE.InstancedMesh(geo, mat, spots.length);
+    im.frustumCulled=false;
+    spots.forEach(([x,y,h,ht],i)=>{
+      const sc=(ht/base)*(1+(h-0.5)*2*DIM.TREE.vary);
+      _stP.set(x, y, zOff*sc);
+      _stQ.setFromAxisAngle(_stZ, h*Math.PI*2);
+      _stS.set(sc,sc,sc);
+      im.setMatrixAt(i, _stMat.compose(_stP,_stQ,_stS));
+    });
+    im.instanceMatrix.needsUpdate=true;
+    return im;
+  };
+  // GLB は底面が z=0。箱で代替しているときは中心が原点なので持ち上げる。
+  T.trunk=mk(A.trunkGeo, A.trunkMat, A.glb?0:CELL*.2);
+  T.leaf =mk(A.coneGeo,  A.coneMat,  A.glb?0:CELL*.58);
+  S.add(T.trunk); S.add(T.leaf);
 }
 
 // ── 街灯 ────────────────────────────────────────────────────────────────────
@@ -3646,8 +3738,8 @@ const LAMP_ON   = process.env.LAMPS !== '0';
 const LAMP_STEP = envNum('LAMP_STEP', 3);      // 何セルおきに立てるか
 // 住民の目線が CELL*0.66*CHAR_SCALE = 0.44 ワールド単位 (= 身長1.7m 相当) なので、
 // 1 ワールド単位 ≒ 3.4m。街灯5m ≒ 1.45。ここを上げすぎると家より高い電柱になる。
-const LAMP_H    = envNum('LAMP_H', 1.45);      // 灯具の高さ (ワールド単位 ≒ 5m)
-const LAMP_POOL = envNum('LAMP_POOL', 1.5);    // 地面に落ちる光の輪の半径
+const LAMP_H    = DIM.LAMP.h;                  // 灯具の高さ (scale.js: 4.60m)
+const LAMP_POOL = DIM.LAMP.poolR;              // 地面に落ちる光の輪の半径
 const LAMP_GLOW = envNum('LAMP_GLOW', 1.0);    // 明るさの倍率 (0 で消灯)
 
 // 光の輪。中心が明るく縁で 0 になる板。1枚作って全部の街灯で使い回す。
@@ -3705,16 +3797,20 @@ function rebuildLamps(S){
     if(!ok) continue;
     const cx=c*CELL+CELL*.5 + dc*CELL*0.36;
     const cy=r*CELL+CELL*.5 + dr*CELL*0.36;
-    const w=0.028;
-    pushBox(pp,pn, cx-w,cx+w, cy-w,cy+w, 0, LAMP_H);              // 支柱
-    pushBox(pp,pn, cx-0.055,cx+0.055, cy-0.055,cy+0.055, 0, 0.07); // 根巻き
+    // 太さは scale.js から。高さは元から妥当だったが、支柱が径 0.22m と実物の
+    // 約2倍あって「太い街灯」に見えていた。
+    const w=DIM.LAMP.poleR, cr=DIM.LAMP.collarR;
+    pushBox(pp,pn, cx-w,cx+w, cy-w,cy+w, 0, LAMP_H);                        // 支柱
+    pushBox(pp,pn, cx-cr,cx+cr, cy-cr,cy+cr, 0, DIM.LAMP.collarH);          // 根巻き
     // 腕は道の中心側 (縁の反対) へ伸ばす
-    const ax=-dc*0.30, ay=-dr*0.30;
-    pushBox(pp,pn, cx+Math.min(0,ax)-0.022, cx+Math.max(0,ax)+0.022,
-                   cy+Math.min(0,ay)-0.022, cy+Math.max(0,ay)+0.022,
-                   LAMP_H-0.045, LAMP_H);                         // 腕
-    const hx=cx+ax, hy=cy+ay;
-    pushBox(hp,hn, hx-0.085,hx+0.085, hy-0.085,hy+0.085, LAMP_H-0.115, LAMP_H-0.035); // 灯具
+    const ax=-dc*DIM.LAMP.armLen, ay=-dr*DIM.LAMP.armLen, ar=DIM.LAMP.armR;
+    pushBox(pp,pn, cx+Math.min(0,ax)-ar, cx+Math.max(0,ax)+ar,
+                   cy+Math.min(0,ay)-ar, cy+Math.max(0,ay)+ar,
+                   LAMP_H-ar*1.6, LAMP_H);                                  // 腕
+    const hx=cx+ax, hy=cy+ay, hw=DIM.LAMP.headW, hl=DIM.LAMP.headL;
+    // 灯具は腕の向きに長い箱にする (正方形だと真上から見て向きが分からない)
+    const hex=Math.abs(dc)>0?hl:hw, hey=Math.abs(dr)>0?hl:hw;
+    pushBox(hp,hn, hx-hex,hx+hex, hy-hey,hy+hey, LAMP_H-hw*1.3, LAMP_H-hw*0.3); // 灯具
     // 地面の光の輪
     const R=LAMP_POOL, z=0.02;
     qp.push(hx-R,hy-R,z, hx+R,hy-R,z, hx+R,hy+R,z,

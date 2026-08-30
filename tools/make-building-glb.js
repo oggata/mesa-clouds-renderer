@@ -60,10 +60,14 @@ const fs = require('fs');
 const path = require('path');
 
 // ── 寸法 (ワールド単位) ──────────────────────────────────────────────────────
+const SCALE  = require('../scale.js');
 const CELL   = 2.0;
-const WIDTH  = fp => fp * CELL * 0.8;   // addStructMesh の bw と同じ式
-const H_BASE = 0.85;                    // 土台 (1階) の高さ
-const H_FLR  = 0.55;                    // 1フロアの高さ
+// 寸法は scale.js から引く (メートルで書いてある)。焼く側と使う側で別々に
+// 数字を持つと、片方だけ直したときに建物の背だけが変わって気付きにくい。
+const DIM    = SCALE.make(CELL, 1/3);
+const WIDTH  = fp => fp * CELL * DIM.BLDG.glbFill;   // server.js の bw と同じ式
+const H_BASE = DIM.BLDG.baseH;          // 土台 (1階) の高さ = 3.28m
+const H_FLR  = DIM.BLDG.floorH;         // 基準階の高さ = 2.13m
 
 // ── ジオメトリ組み立て ───────────────────────────────────────────────────────
 // mod = { マテリアル名: {pos:[], nrm:[]} }。インデックス無しの三角形で持つ。
@@ -367,7 +371,11 @@ function writeGlb(outPath, mods){
         if(arr[i+j]<mn[j]) mn[j]=arr[i+j];
         if(arr[i+j]>mx[j]) mx[j]=arr[i+j];
       }
-      acc.min=mn; acc.max=mx;
+      // 頂点は float32 で書くので、min/max を float64 の生の値で載せると
+      // 3.2840909090909092 のような長い小数が JSON に並ぶ。寸法の定義を少し
+      // 触っただけで JSON の文字数が変わり、差分が読みにくくなるので丸める。
+      const r6=v=>Math.round(v*1e6)/1e6;
+      acc.min=mn.map(r6); acc.max=mx.map(r6);
     }
     json.accessors.push(acc);
     return json.accessors.length-1;
