@@ -138,9 +138,54 @@ function classifyRoads(map, roadUse, prev, roadVal) {
   return out;
 }
 
+// ── 縁石の立体 ──────────────────────────────────────────────────────────────
+// road_curbs.json の折れ線を、縦の面 + 面取りに立ち上げる。断面はこうなる:
+//
+//     歩道面 (zWalk) ─┐
+//                      \  面取り (chamfer)
+//        天端 (zTop) ──┘
+//                      │  縦の面 … 車道から見える
+//     車道面 (zRoad) ──┘
+//
+// three に依存しないただの配列操作なので **server.js ではなくここに置く**。
+// 巻き方と法線が食い違うと、両面描画でも裏面判定で法線が反転して陰影が壊れる。
+// ここにあれば tools/check-road-atlas.js から直接呼んで検算できる。
+//
+// 巻き方は輪郭の向きに依存させない。d x n の符号を見て、必要なら線分の向きを
+// 入れ替える。「輪郭はこの向きに巻いてある」という取り決めを生成側と描画側の
+// 両方に持たせると、生成側を触ったときに静かに壊れるため。
+function pushCurb(pos, nrm, lines, x0, y0, span, P) {
+  const dz = P.zTop - P.zWalk;
+  const L = Math.hypot(dz, P.chamfer) || 1, sn = dz / L, sz = P.chamfer / L;
+  const q = (px, py, pz, nx, ny, nz) => { pos.push(px, py, pz); nrm.push(nx, ny, nz); };
+  for (const line of lines) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      let [ax, ay, anx, any] = line[i], [bx, by, bnx, bny] = line[i + 1];
+      let wax = x0 + ax * span, way = y0 + ay * span;
+      let wbx = x0 + bx * span, wby = y0 + by * span;
+      if ((wbx - wax) * ((any + bny) / 2) - (wby - way) * ((anx + bnx) / 2) <= 0) {
+        [wax, wbx] = [wbx, wax]; [way, wby] = [wby, way];
+        [anx, bnx] = [bnx, anx]; [any, bny] = [bny, any];
+      }
+      // 縦の面 (法線は車道向き = -n)
+      q(wax, way, P.zRoad, -anx, -any, 0); q(wbx, wby, P.zRoad, -bnx, -bny, 0);
+      q(wbx, wby, P.zTop, -bnx, -bny, 0);
+      q(wax, way, P.zRoad, -anx, -any, 0); q(wbx, wby, P.zTop, -bnx, -bny, 0);
+      q(wax, way, P.zTop, -anx, -any, 0);
+      // 面取り (天端から歩道面へ)
+      const cax = wax + anx * P.chamfer, cay = way + any * P.chamfer;
+      const cbx = wbx + bnx * P.chamfer, cby = wby + bny * P.chamfer;
+      q(wax, way, P.zTop, anx * sn, any * sn, sz); q(wbx, wby, P.zTop, bnx * sn, bny * sn, sz);
+      q(cbx, cby, P.zWalk, bnx * sn, bny * sn, sz);
+      q(wax, way, P.zTop, anx * sn, any * sn, sz); q(cbx, cby, P.zWalk, bnx * sn, bny * sn, sz);
+      q(cax, cay, P.zWalk, anx * sn, any * sn, sz);
+    }
+  }
+}
+
 module.exports = {
   PATH, ONEWAY, TWOLANE,
   TILE, GUT, CONTENT, COLS, ROWS, ATLAS, SLOT_BASE, SLOT_USED,
   roadMask, maskDegree, atlasSlot, atlasUV,
-  CLASS_HI, CLASS_LO, PATH_MAX_DEGREE, classifyRoads,
+  CLASS_HI, CLASS_LO, PATH_MAX_DEGREE, classifyRoads, pushCurb,
 };

@@ -24,7 +24,8 @@ const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?
 const GRID=parseInt(arg('grid'))||30;
 const SEED=parseInt(arg('seed'))||1234;
 const TRIPS=parseInt(arg('trips'))||400;
-const PX=24;                                  // 1 セルの出力サイズ (px)
+const CURB_DEBUG=arg('curb')==='debug';
+const PX=parseInt(arg('px'))||24;                // 1 セルの出力サイズ (px)
 const out=process.argv.slice(2).find(a=>!a.startsWith('--'))
        || path.join(__dirname,'..','textures','road','city_preview.png');
 
@@ -122,8 +123,60 @@ for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     img[o]=col[0]; img[o+1]=col[1]; img[o+2]=col[2]; img[o+3]=255;
   }
 }
+// ── 4b) 縁石の立体を上から重ねる ────────────────────────────────────────────
+// three が無いので陰影だけの簡易ラスタライズ。縦の面は真上から見ると潰れるので、
+// 見えるのは面取り (天端から歩道面へ落ちる帯) だけ。**その帯がテクスチャの
+// 明るい縁石帯とぴったり重なっていれば、輪郭と絵が同じ場所を指している**。
+const curbFile=path.join(__dirname,'..','textures','road','road_curbs.json');
+let curbTris=0;
+if(fs.existsSync(curbFile)){
+  const J=JSON.parse(fs.readFileSync(curbFile,'utf8')).slots;
+  // server.js の CURB_PROFILE と同じ寸法を、この絵のピクセル単位に直す。
+  // 位置は 1 セル = PX ピクセル、server.js は 1 セル = CELL(2.0) ワールド単位なので
+  // 倍率は PX/CELL。**z と面取り幅を同じ単位に揃えないと陰影の傾きが狂う**
+  // (最初これを混ぜてしまい、面取りが 0.03 ピクセル幅になって見えなかった)。
+  const CELL=2.0, K=PX/CELL;
+  const P={zRoad:0.008*K, zTop:0.060*K, zWalk:0.014*K, chamfer:0.030*CELL*K};
+  const Lx=-0.42, Ly=-0.53, Lz=0.74;                               // 光の向き
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(MAP[r][c]!==ROAD) continue;
+    const slot=RD.atlasSlot(roadClass[r*GRID+c], RD.roadMask(MAP,r,c,ROAD));
+    const lines=J[slot]; if(!lines) continue;
+    const pos=[], nrm=[];
+    RD.pushCurb(pos, nrm, lines, c*PX, r*PX, PX, P);
+    for(let t=0;t*9<pos.length;t++){
+      const X=[0,1,2].map(i=>pos[t*9+i*3]), Y=[0,1,2].map(i=>pos[t*9+i*3+1]);
+      const area=(X[1]-X[0])*(Y[2]-Y[0])-(X[2]-X[0])*(Y[1]-Y[0]);
+      if(Math.abs(area)<0.25) continue;                            // 縦の面は潰れる
+      const n=[0,1,2].map(k=>(nrm[t*9+k]+nrm[t*9+3+k]+nrm[t*9+6+k])/3);
+      const nl=Math.hypot(...n)||1;
+      const lam=Math.max(0.30, (n[0]*Lx+n[1]*Ly+n[2]*Lz)/nl);
+      // 既定はコンクリート色。設計どおりなら**テクスチャの縁石帯とぴったり重なる**
+      // ので、真上から見ると見分けが付かない (それが正しい状態)。位置を目で確かめたい
+      // ときは --curb=debug で色を変える。ズレていれば車道や歩道の奥にはみ出して見える。
+      const col = CURB_DEBUG ? [235*lam, 70*lam, 190*lam]
+                             : [198*lam+40, 200*lam+40, 204*lam+40];
+      curbTris++;
+      const x0=Math.max(0,Math.floor(Math.min(...X))), x1=Math.min(W-1,Math.ceil(Math.max(...X)));
+      const y0=Math.max(0,Math.floor(Math.min(...Y))), y1=Math.min(W-1,Math.ceil(Math.max(...Y)));
+      for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+        const px2=x+0.5, py=y+0.5;
+        const w0=((X[1]-X[0])*(py-Y[0])-(Y[1]-Y[0])*(px2-X[0]))/area;
+        const w1=((X[2]-X[1])*(py-Y[1])-(Y[2]-Y[1])*(px2-X[1]))/area;
+        const w2=((X[0]-X[2])*(py-Y[2])-(Y[0]-Y[2])*(px2-X[2]))/area;
+        if(w0<0||w1<0||w2<0) continue;
+        const o=((y*W)+x)*4;
+        img[o]=Math.min(255,col[0]); img[o+1]=Math.min(255,col[1]); img[o+2]=Math.min(255,col[2]);
+      }
+    }
+  }
+}
+
+// 書き出しは**すべての描画が終わってから**。縁石を img に描くより前に
+// 書いてしまい、縁石が入らない絵が出ていた。
 fs.mkdirSync(path.dirname(out),{recursive:true});
 fs.writeFileSync(out, PNG.encode(img, W, W));
+
 // ── 5) 車が通れる網 (格>=1) が連結しているか ─────────────────────────────────
 // 将来 車を走らせるとき、これが割れていると「出口に辿り着けない車」が出る。
 // 歩行者専用のセルで幹線が寸断されていないかの見張りでもある。
@@ -155,5 +208,6 @@ const tot=count[0]+count[1]+count[2];
 console.log(`[Preview] ${path.relative(process.cwd(),out)}  ${W}x${W}  GRID=${GRID} seed=${SEED}`);
 console.log(`[Preview] 通行量: ${useSrc}`);
 console.log(`[Preview] 道 ${tot} セル — 歩行者専用 ${count[0]} / 一通 ${count[1]} / 二車線 ${count[2]}`);
+console.log(`[Preview] 縁石: 三角形 ${curbTris} (面取りの帯だけが真上から見える)`);
 console.log(`[Preview] 車が通れる網: ${net.total} セル / 最大連結成分 ${net.best} `
   + `(${(net.best/Math.max(1,net.total)*100).toFixed(0)}%) / 分断 ${net.comps} 個`);

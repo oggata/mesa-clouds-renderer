@@ -1062,6 +1062,18 @@ const MARK_Z = envNum('MARK_Z', 0.014);
 // 症状は一目で分かる: **道が隣のセルと繋がらず、半セルずれた絵になる。**
 // そうなったら MARK_FLIP_Y=0 で起動する (コード変更は要らない)。
 const MARK_FLIP_Y = process.env.MARK_FLIP_Y !== '0';
+// 縁石。参考写真の「歩道が一段上がっている」感じは平らなテクスチャでは出ない。
+// 輪郭は road_curbs.json (アトラスと同じ SDF から書き出したもの) を読む。
+// ここで輪郭を計算し直すと、その SDF が 2 か所に増える。
+const ROAD_CURBS = process.env.ROAD_CURBS || './textures/road/road_curbs.json';
+const CURB_ON    = process.env.CURB !== '0';
+const CURB_H     = envNum('CURB_H', 0.060);   // 縁石天端の高さ (≒20cm)
+// 天端から歩道面へ落とす面取りの幅。アトラス側の縁石天端の帯 (正規化 0.030) に
+// 合わせてあるので、立体の面取りとテクスチャの明るい帯がぴったり重なる。
+const CURB_W     = envNum('CURB_W', 0.030*CELL);
+// 縁石の断面。立体は roads.js の pushCurb が組む (three に依存しない配列操作なので
+// 検算しやすいところに置いてある)。zRoad は下地の道の板と同じ高さ。
+const CURB_PROFILE = {zRoad:0.008, zTop:CURB_H, zWalk:MARK_Z, chamfer:CURB_W};
 const groundTex = {};                              // {grass, road, vacant, roadmark}
 async function loadGroundTexture(key, filePath){
   if(!GROUND_TEX) return;
@@ -3261,10 +3273,35 @@ function addTreeMesh(S, r, c){
 // 道路 / 草地 / 摩耗した地面の板。踏み跡が溜まると草地→踏み固め→土に変わる。
 //   「閾値を超えた瞬間にアスファルトが生える」より、土が露出していく過程が
 //   見えているほうが蓄積に見える。板は3枚のマージ済みメッシュにまとめる。
+// 縁石の輪郭。初回に一度だけ読む。無ければ縁石を立てないだけで描画は続く。
+let _curbSlots=null, _curbTried=false;
+function roadCurbs(){
+  if(_curbTried) return _curbSlots;
+  _curbTried=true;
+  if(!CURB_ON) return null;
+  try{
+    const fp=path.isAbsolute(ROAD_CURBS)?ROAD_CURBS:path.join(__dirname, ROAD_CURBS);
+    if(!fs.existsSync(fp)){
+      console.warn(`[Curb] ${fp} が無い → 縁石は立てません`
+                 + ` (node tools/make-road-atlas.js で作れます)`);
+      return null;
+    }
+    const j=JSON.parse(fs.readFileSync(fp,'utf8'));
+    _curbSlots=j.slots||null;
+    if(_curbSlots){
+      let ln=0, vt=0;
+      for(const k in _curbSlots){ ln+=_curbSlots[k].length;
+        for(const c of _curbSlots[k]) vt+=c.length; }
+      console.log(`[Curb] ${path.basename(fp)} を読み込み (輪郭${ln}本 / 頂点${vt})`);
+    }
+  }catch(e){ console.warn(`[Curb] ${ROAD_CURBS} を読めませんでした: ${e.message}`); }
+  return _curbSlots;
+}
+
 function rebuildGround(S){
   if(!S) return;
   const g=S.userData.ground||(S.userData.ground={});
-  for(const k of ['base','road','grass','wear1','wear2','marks']){
+  for(const k of ['base','road','grass','wear1','wear2','marks','curb']){
     if(g[k]){ S.remove(g[k]); g[k].geometry.dispose(); g[k].material.dispose(); g[k]=null; }
   }
   // 下地の板。フィールドの外は何も描かない (世界の果て = 背景色) ので、
@@ -3293,6 +3330,9 @@ function rebuildGround(S){
   // 積まずに従来どおりのべた塗りの道に戻る。
   const marks=[]; marks.col=[]; marks.uv=[];
   const markOn = ROAD_MARKS && !!groundTex.roadmark && !!CITY && !!CITY.roadClass;
+  // 縁石 (標示レイヤーが出ているときだけ。テクスチャ無しで縁石だけ立つと浮く)
+  const curbSlots = markOn ? roadCurbs() : null;
+  const cpos=[], cnrm=[];
   // セルごとの微妙な明暗。一面べったり同じ色だと板に見えるので、
   // 位置から決まる固定のばらつきを乗せる (毎回変わるとちらつく)。
   const jit=(r,c)=>1 + (((r*73856093 ^ c*19349663) & 255)/255 - 0.5)*2*AO_NOISE;
@@ -3306,6 +3346,10 @@ function rebuildGround(S){
         const cls=CITY.roadClass[r*GRID+c];
         const slot=RD.atlasSlot(cls, RD.roadMask(MAP, r, c, ROAD));
         pushMarkQuad(marks, CELL*GROUND_FILL, cx, cy, MARK_Z, ao, RD.atlasUV(slot, MARK_FLIP_Y));
+        // 縁石は標示の板とまったく同じ矩形に載せる (ずれると天端と帯が食い違う)
+        const cl=curbSlots && curbSlots[slot];
+        if(cl) RD.pushCurb(cpos, cnrm, cl, cx-CELL*GROUND_FILL/2, cy-CELL*GROUND_FILL/2,
+                           CELL*GROUND_FILL, CURB_PROFILE);
       }
       continue;
     }
@@ -3345,6 +3389,15 @@ function rebuildGround(S){
       {transparent:true, depthWrite:false,
        polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2});
     S.add(g.marks);
+  }
+  // 縁石。両面にしておく (輪郭の巻き方に描画が依存しないほうが事故が少ない)。
+  if(cpos.length){
+    const cg=new THREE.BufferGeometry();
+    cg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cpos),3));
+    cg.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(cnrm),3));
+    g.curb=new THREE.Mesh(cg, new THREE.MeshLambertMaterial(
+      {color:dim(0xc6c8cb), side:THREE.DoubleSide}));
+    S.add(g.curb);
   }
   rebuildLamps(S);
 }
