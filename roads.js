@@ -183,9 +183,186 @@ function pushCurb(pos, nrm, lines, x0, y0, span, P) {
   }
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// 道路の断面
+// ────────────────────────────────────────────────────────────────────────────
+// 以前は tools/make-road-atlas.js の中だけにあった (アトラスを焼くための形)。
+// 観測レンダラの床キャストと、「いま足元が歩道か車道か」の判定が同じ形を必要と
+// するのでこちらへ移した。**Python 側 (学習env) もこれと同じ式を持つこと。**
+// 数式が 3 か所に散ると、学習と本番で歩道の位置がズレても誰も気付けない。
+// ════════════════════════════════════════════════════════════════════════════
+// ── 街の寸法 (正規化 0..1 = 1セル ≒ 7m) ───────────────────────────────────────
+const RW2   = 0.33;   // 二車線: 車道の半幅 → 車道 4.6m / 歩道 1.2m x2
+const RW1   = 0.24;   // 一通:   車道の半幅 → 車道 3.4m / 歩道 1.8m x2
+// 曲がり角の内側の縁石の半径。**歩道の幅に連動させる**。
+// 固定値にすると、歩道が広い一通 (class 1) で角の歩道が円形の島に潰れる。
+// 角の歩道がセルの角と繋がる条件は R >= 歩道幅 * sqrt(2)/(1+sqrt(2)) = 0.586 倍
+// (角 (1,0) から曲率中心までの距離 = (歩道幅-R)*sqrt(2) <= R より)。0.85 倍で余裕を取る。
+const RIN_K = 0.85;
+const rIn = RW => RIN_K*(0.5-RW);
+// 外側の縁石は rIn + 車道幅 の**同心円**になる (実際の道路と同じ)。
+
+const XW_A = 0.012, XW_B = 0.012;          // 横断歩道の帯の前後マージン
+// 横断歩道の縞。日本の規格は幅 45cm / 間隔 45cm なので、1 セル 7.73m に対して
+// 周期 0.9m ≒ 0.116。**縞の本数は車道幅から割り出す** (固定の周期だと端の縞が
+// 中途半端に切れて縁石と重なる)。
+const XW_PITCH = 0.116, XW_DUTY = 0.52;
+
+// ── SDF ヘルパ ────────────────────────────────────────────────────────────────
+// 矩形の符号付き距離。負 = 内側。
+function sdBox(px,py, x0,y0,x1,y1){
+  const cx=(x0+x1)/2, cy=(y0+y1)/2, hx=(x1-x0)/2, hy=(y1-y0)/2;
+  const dx=Math.abs(px-cx)-hx, dy=Math.abs(py-cy)-hy;
+  return Math.hypot(Math.max(dx,0), Math.max(dy,0)) + Math.min(Math.max(dx,dy), 0);
+}
+// (次数の数え上げは上の maskDegree が持っている。移設時に同じ関数を持ち込んで
+//  いたので、こちらは maskDegree を指すだけにする。)
+const popcount = maskDegree;
+
+// 隅の象限。q は「dir q と dir q+1 の間」。P = セル中心にいちばん近い角、
+// (su,sv) = そこから象限の内側へ向かう符号。
+//   q=0 NE(N&E)  q=1 SE(E&S)  q=2 SW(S&W)  q=3 NW(W&N)
+function quadrants(lo, hi){
+  return [
+    {a:0,b:1, box:[hi, 0, 1, lo], pu:hi, pv:lo, su:+1, sv:-1},
+    {a:1,b:2, box:[hi,hi, 1,  1], pu:hi, pv:hi, su:+1, sv:+1},
+    {a:2,b:3, box:[ 0,hi,lo,  1], pu:lo, pv:hi, su:-1, sv:+1},
+    {a:3,b:0, box:[ 0, 0,lo, lo], pu:lo, pv:lo, su:-1, sv:-1},
+  ];
+}
+
+// 角を r で丸めた「象限」の SDF。負 = 内側。
+// a,b は 2 本の境界線までの符号付き距離 (どちらも負なら象限の内側)。
+// 角が r の円弧で落とされた形になる。これが**歩道の隅**の形そのもの。
+function sdRoundedQuad(a,b,r){
+  const ax=Math.max(a+r,0), bx=Math.max(b+r,0);
+  return Math.hypot(ax,bx) + Math.min(Math.max(a+r,b+r),0) - r;
+}
+
+// 車道領域の SDF。負 = 車道の内側。
+//
+// ── 腕の和ではなく「歩道の交わり」として作る ──
+// 以前は腕 (arm) の和を取り、隅に `max(象限ボックス, 円の外)` でフィレットを
+// 足していた。**形は正しいが SDF としては壊れていた**: 象限ボックスの壁
+// (u=hi) が稜線になり、車道の内部に値 0 の線ができる。図形は変わらないので
+// 塗り分けには出ないが、
+//   ・黄色い外側線が、その偽の線に沿って車道の中にも引かれる
+//   ・縁石の輪郭抽出 (マーチングスクエア) がその偽の線を拾う
+// という形で漏れ出す。実際 T 字と十字で法線が反転した頂点が 96 点出た。
+//
+// 正しくは「車道 = すべての歩道領域の**外側**」= 補集合の交わり (max)。
+//   繋がっていない側      → 交差点ボックスの外がまるごと歩道 (半平面)
+//   両隣が繋がっている隅  → 角を rIn(RW) で丸めた象限が歩道
+// 図形は以前と厳密に一致する (象限 ∩ 円の外 = 象限 - 角丸象限) が、
+// こちらは車道のどこでも「いちばん近い歩道までの距離」になる。
+//
+// 曲がり角 (隣り合う2方向だけが道) だけは別扱いで、**同心の円環**にする。
+//   内側の縁石 = 半径 rIn(RW) / 外側の縁石 = 半径 rIn(RW) + 車道幅、中心は共通。
+//   内外のカーブが実際の道路と同じ同心円になる。
+function roadSDF(u,v,mask,RW){
+  const lo=0.5-RW, hi=0.5+RW, n=popcount(mask);
+  if(n===0) return 1e9;                                   // 孤立 = 全面が舗装
+  if(n===2 && mask!==5 && mask!==10) return cornerSDF(u,v,mask,RW);
+  const r=rIn(RW);
+  // 軸に平行な制約はまとめて 1 個の矩形にする。半平面を素の max で畳むと
+  // 外側がチェビシェフ距離になり、凸角の外で「いちばん近い車道までの距離」を
+  // 過小評価する (縁石天端の帯が角で四角く広がる)。矩形の SDF なら外側も厳密。
+  //   繋がっている側は制約を掛けない = セルの外まで伸ばす
+  let d=sdBox(u,v, (mask&8)?-0.5:lo, (mask&1)?-0.5:lo,
+                   (mask&2)? 1.5:hi, (mask&4)? 1.5:hi);
+  for(const q of quadrants(lo,hi)){
+    if(!((mask&(1<<q.a)) && (mask&(1<<q.b)))) continue;    // 両側が道の隅だけ丸める
+    const a=(q.su>0) ? hi-u : u-lo;
+    const b=(q.sv>0) ? hi-v : v-lo;
+    d=Math.max(d, -sdRoundedQuad(a,b,r));
+  }
+  return d;
+}
+
+// 曲がり角の曲率中心。内側の縁石が「N/S 側の腕の側面」と「E/W 側の腕の側面」の
+// 両方に接する点として一意に決まる (接する条件から C = 側面 ± rIn(RW))。
+function cornerCenter(mask, RW){
+  const lo=0.5-RW, hi=0.5+RW, r=rIn(RW);
+  return [ (mask&2) ? hi+r : lo-r,            // E が道なら右寄り、W なら左寄り
+           (mask&4) ? hi+r : lo-r ];          // S が道なら下寄り、N なら上寄り
+}
+// 曲がり角の車道 = 同心円環。中心が必ずセルの角に来るので、単位セル内に現れるのは
+// ちょうど四半分だけ = 余計なクリップが要らない。
+function cornerSDF(u,v,mask,RW){
+  const [Cu,Cv]=cornerCenter(mask, RW), r=rIn(RW);
+  const d=Math.hypot(u-Cu, v-Cv);
+  return Math.max(d-(2*RW+r), r-d);
+}
+
+
+// 横断歩道。交差点 (n>=3) の各腕の、セル端と交差点ボックスの間の帯に縞を引く。
+// 縞は**進行方向に沿って伸び、道幅の方向に繰り返す** (日本の横断歩道)。
+// 最初これを 90 度取り違えて、縞が進行方向に直交して並んでいた。
+//   s = その腕の端からの奥行き (進行方向)   w = 道幅の方向
+// 縞が伸びるのは s、繰り返すのは w。
+function crosswalk(u,v,mask,RW){
+  const lo=0.5-RW, hi=0.5+RW, W=hi-lo;
+  const n=Math.max(4, Math.round(W/XW_PITCH));   // 車道幅に収まる本数
+  const p=W/n;                                   // 実際の周期 (幅を割り切る)
+  const arms=[[1, v,   u], [2, 1-u, v], [4, 1-v, u], [8, u,   v]];
+  for(const [bit, s, w] of arms){
+    if(!(mask&bit)) continue;
+    if(w<lo || w>hi) continue;                   // その腕の車道幅の中だけ
+    if(s<XW_A || s>lo-XW_B) continue;            // 帯の奥行き
+    if((((w-lo)/p)%1)*p < p*XW_DUTY) return true;
+  }
+  return false;
+}
+// ── 足元に何があるか ────────────────────────────────────────────────────────
+// 床の描画にも、歩道を優先して歩かせる判定にも、学習の報酬にも、これを使う。
+const GROUND = {
+  GRASS: 0,      // 芝 (木のセル)
+  DIRT: 1,       // 空き地
+  PAVE: 2,       // 建物の足元の舗装
+  SIDEWALK: 3,   // 歩道 ← 歩行者はここを歩きたい
+  CROSSWALK: 4,  // 横断歩道 ← 車道を渡るならここ
+  ROADWAY: 5,    // 車道 ← 歩行者は避けたい
+};
+// 歩行者にとっての好ましさ。報酬と経路コストの両方がこの並びを使う。
+// 芝や空き地は「最悪入っても大丈夫」なので車道より上に置く。
+const WALK_PREF = {
+  [GROUND.SIDEWALK]: 1.00, [GROUND.CROSSWALK]: 1.00, [GROUND.PAVE]: 0.85,
+  [GROUND.DIRT]: 0.55, [GROUND.GRASS]: 0.50, [GROUND.ROADWAY]: 0.00,
+};
+
+/**
+ * セル (r,c) の中の相対位置 (fu, fv) に何があるか。fu,fv は 0..1 で
+ * fu = +列方向 (東)、fv = +行方向 (南)。タイル画像と同じ向き。
+ *   cellType … OTHER / ROAD / BUILDING / TREE (world.js の値)
+ *   cls      … その セルの道路クラス (PATH/ONEWAY/TWOLANE)。道でなければ無視
+ *   mask     … 4 近傍マスク。道でなければ無視
+ */
+function groundKind(cellType, cls, mask, fu, fv, V) {
+  const T = V || { OTHER: 0, ROAD: 1, BUILDING: 2, TREE: 3 };
+  if (cellType === T.BUILDING) return GROUND.PAVE;
+  if (cellType === T.TREE) return GROUND.GRASS;
+  if (cellType !== T.ROAD) return GROUND.DIRT;
+  if (cls === PATH) return GROUND.SIDEWALK;           // 歩行者専用は全面が歩道
+  const RW = cls >= TWOLANE ? RW2 : RW1;
+  if (roadSDF(fu, fv, mask, RW) >= 0) return GROUND.SIDEWALK;
+  // 車道の上。交差点の取り付きだけ横断歩道が塗ってある。
+  if (maskDegree(mask) >= 3 && crosswalk(fu, fv, mask, RW)) return GROUND.CROSSWALK;
+  return GROUND.ROADWAY;
+}
+
+/** セルの中で「歩行者が居たい横位置」。道に沿って歩くときの車線ならぬ歩道の中心。 */
+function sidewalkOffset(cls) {
+  const RW = cls >= TWOLANE ? RW2 : RW1;
+  return (0.5 + (0.5 - RW) * 0.5) - 0.5;   // 車道の縁とセルの端の中間 (セル比)
+}
+
 module.exports = {
   PATH, ONEWAY, TWOLANE,
   TILE, GUT, CONTENT, COLS, ROWS, ATLAS, SLOT_BASE, SLOT_USED,
   roadMask, maskDegree, atlasSlot, atlasUV,
   CLASS_HI, CLASS_LO, PATH_MAX_DEGREE, classifyRoads, pushCurb,
+  RW2, RW1, RIN_K, rIn, XW_A, XW_B, XW_PITCH, XW_DUTY,
+  sdBox, sdRoundedQuad, quadrants, roadSDF, cornerCenter, cornerSDF, crosswalk,
+  GROUND, WALK_PREF, groundKind, sidewalkOffset,
 };
