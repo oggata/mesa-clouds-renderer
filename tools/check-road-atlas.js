@@ -18,26 +18,13 @@
 //   3. 塗りの色 — 両側とも不透明なピクセルどうしの RGB。周期パターン (破線・歩道の
 //      目地) の位相が境界で飛んでいるとここに出る。
 
-const fs=require('fs'), zlib=require('zlib'), path=require('path');
+const fs=require('fs'), path=require('path');
+const PNG=require('./png.js');
 
 const TILE=128, GUT=8, CONTENT=112, COLS=8;
 const file=process.argv[2] || path.join(__dirname,'..','textures','road','road_atlas.png');
 
-// ── PNG デコード (make-road-atlas.js が filter 0 固定で書いているので自前で戻せる) ──
-function decode(fp){
-  const buf=fs.readFileSync(fp);
-  let p=8, W=0, H=0, idat=[];
-  while(p<buf.length){
-    const len=buf.readUInt32BE(p), type=buf.toString('ascii',p+4,p+8);
-    if(type==='IHDR'){ W=buf.readUInt32BE(p+8); H=buf.readUInt32BE(p+12); }
-    if(type==='IDAT') idat.push(buf.slice(p+8,p+8+len));
-    p+=12+len;
-  }
-  const raw=zlib.inflateSync(Buffer.concat(idat));
-  return {W,H, px:(x,y)=>{ const o=y*(W*4+1)+1+x*4; return [raw[o],raw[o+1],raw[o+2],raw[o+3]]; }};
-}
-
-const img=decode(file);
+const img=PNG.decode(fs.readFileSync(file));
 const org=s=>[(s%COLS)*TILE+GUT, ((s/COLS)|0)*TILE+GUT];
 // 辺のピクセル列。dir 0=N(上端) 1=E(右端) 2=S(下端) 3=W(左端)。
 // N/S は左→右、E/W は上→下で走査するので、向かい合う辺は同じ順序で並ぶ。

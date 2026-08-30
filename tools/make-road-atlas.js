@@ -30,7 +30,9 @@
 // レイキャスタ側の両方に書くことになり、ここでもまた二重実装になる。枠は 64 あるので
 // 16 枠を惜しむ理由が無い。
 //
-// ── スロット割り当て (8x8 = 64 枠) ──
+// ── スロット割り当て ──
+// **枠割りとマスクのビット順は ../roads.js が唯一の定義**。ここは require して使う。
+// 焼く側と引く側で別々に定数を書くと、片方だけ直したときに静かにズレる。
 //   0..15   class 2 (二車線)  mask 0..15
 //   16..31  class 1 (一通)    mask 0..15
 //   32      class 0 (歩行者専用)
@@ -44,15 +46,14 @@
 
 const fs   = require('fs');
 const path = require('path');
-const zlib = require('zlib');
+const RD   = require('../roads.js');
+const PNG  = require('./png.js');
 
 // ── アトラスの寸法 ────────────────────────────────────────────────────────────
-const TILE    = 128;                 // 1 枠 (px)
-const GUT     = 8;                   // ガター (px)。ミップマップのにじみ防止
-const CONTENT = TILE - GUT*2;        // 実際に絵が入る領域 = 112
-const COLS = 8, ROWS = 8;
-const ATLAS = TILE * COLS;           // 1024 (2の冪 — WebGL1 の繰り返し要件)
-const SS    = 4;                     // スーパーサンプル倍率 (アンチエイリアス)
+// **枠割りは roads.js が唯一の定義**。焼く側と引く側で別々に定数を持つと、
+// 片方だけ直したときに静かにズレて、道が半セルずれた絵になる。
+const { TILE, GUT, CONTENT, COLS, ROWS, ATLAS } = RD;
+const SS = 4;                        // スーパーサンプル倍率 (アンチエイリアス)
 
 // ── 街の寸法 (正規化 0..1 = 1セル ≒ 7m) ───────────────────────────────────────
 const RW2   = 0.33;   // 二車線: 車道の半幅 → 車道 4.6m / 歩道 1.2m x2
@@ -252,27 +253,6 @@ function place(atlas, tile, slot){
   }
 }
 
-// ── PNG エンコーダ (依存パッケージ無し) ───────────────────────────────────────
-const CRC_T=(()=>{const t=new Int32Array(256);for(let n=0;n<256;n++){let c=n;
-  for(let k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[n]=c;}return t;})();
-function crc32(buf){let c=-1;for(let i=0;i<buf.length;i++)c=CRC_T[(c^buf[i])&0xFF]^(c>>>8);return (c^-1)>>>0;}
-function chunk(type, data){
-  const len=Buffer.alloc(4); len.writeUInt32BE(data.length,0);
-  const td=Buffer.concat([Buffer.from(type,'ascii'), data]);
-  const crc=Buffer.alloc(4); crc.writeUInt32BE(crc32(td),0);
-  return Buffer.concat([len, td, crc]);
-}
-function encodePNG(rgba, w, h){
-  const raw=Buffer.alloc(h*(w*4+1));
-  for(let y=0;y<h;y++){ raw[y*(w*4+1)]=0;                       // filter 0 (None)
-    Buffer.from(rgba.buffer, rgba.byteOffset+y*w*4, w*4).copy(raw, y*(w*4+1)+1); }
-  const ihdr=Buffer.alloc(13);
-  ihdr.writeUInt32BE(w,0); ihdr.writeUInt32BE(h,4);
-  ihdr[8]=8; ihdr[9]=6; ihdr[10]=0; ihdr[11]=0; ihdr[12]=0;     // 8bit RGBA
-  return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),
-    chunk('IHDR',ihdr), chunk('IDAT',zlib.deflateSync(raw,{level:9})), chunk('IEND',Buffer.alloc(0))]);
-}
-
 // ── 組み立て ──────────────────────────────────────────────────────────────────
 const SHAPE=['孤立','行止','行止','曲り','行止','直線','曲り','T字',
              '行止','曲り','直線','T字','曲り','T字','T字','十字'];
@@ -283,10 +263,11 @@ function main(){
   fs.mkdirSync(path.dirname(outPng), {recursive:true});
   const atlas=new Uint8Array(ATLAS*ATLAS*4);
   const slots=[];
-  for(let m=0;m<16;m++){ place(atlas, renderTile(m,2), m);    slots.push([m, 2, m]); }
-  for(let m=0;m<16;m++){ place(atlas, renderTile(m,1), 16+m); slots.push([16+m, 1, m]); }
-  place(atlas, renderTile(0,0), 32); slots.push([32, 0, 0]);
-  fs.writeFileSync(outPng, encodePNG(atlas, ATLAS, ATLAS));
+  for(const cls of [RD.TWOLANE, RD.ONEWAY]) for(let m=0;m<16;m++){
+    const s=RD.atlasSlot(cls,m); place(atlas, renderTile(m,cls), s); slots.push([s, cls, m]);
+  }
+  { const s=RD.atlasSlot(RD.PATH,0); place(atlas, renderTile(0,RD.PATH), s); slots.push([s, RD.PATH, 0]); }
+  fs.writeFileSync(outPng, PNG.encode(atlas, ATLAS, ATLAS));
 
   // プレビュー: 透明部 (車道) に下地のアスファルト色を敷き、枠線を引く
   const prev=new Uint8Array(ATLAS*ATLAS*4);
@@ -300,7 +281,7 @@ function main(){
     if(bx%TILE===0 || by%TILE===0){ prev[o]=90; prev[o+1]=150; prev[o+2]=200; }
   }
   const prevPng=outPng.replace(/\.png$/, '_preview.png');
-  fs.writeFileSync(prevPng, encodePNG(prev, ATLAS, ATLAS));
+  fs.writeFileSync(prevPng, PNG.encode(prev, ATLAS, ATLAS));
 
   console.log(`[RoadAtlas] ${path.relative(process.cwd(),outPng)}  ${ATLAS}x${ATLAS} `
             + `(${TILE}px/枠 内容${CONTENT}+ガター${GUT} / ${slots.length}枠使用 / 64枠中)`);
@@ -310,7 +291,7 @@ function main(){
   // タイルセットの本当のテストはこれ。端の車道幅・歩道幅・黄線の位置が全タイルで
   // 揃っていないと、ここで継ぎ目がズレて一目で分かる。
   const demoPng=outPng.replace(/\.png$/, "_demo.png");
-  fs.writeFileSync(demoPng, encodePNG(...renderDemo(atlas)));
+  fs.writeFileSync(demoPng, PNG.encode(...renderDemo(atlas)));
   console.log(`[RoadAtlas] ${path.relative(process.cwd(),demoPng)} (並べて繋がるかの確認)`);
   console.log('  slot  class          mask  N E S W  形');
   for(const [s,c,m] of slots){
@@ -351,8 +332,9 @@ function renderDemo(atlas){
       continue;
     }
     const cls=+ch;
-    const mask=(isRoad(r-1,c)?1:0)|(isRoad(r,c+1)?2:0)|(isRoad(r+1,c)?4:0)|(isRoad(r,c-1)?8:0);
-    const slot = cls===0 ? 32 : (cls===2?0:16)+mask;
+    // マスクは roads.js の実装をそのまま使う (server.js と同じ経路を通して検証する)
+    const mask=RD.roadMask(DEMO.map(row=>row.split("").map(ch=>ch==="."?0:1)), r, c, 1);
+    const slot = RD.atlasSlot(cls, mask);
     const sc=slot%COLS, sr=(slot/COLS)|0;
     for(let y=0;y<PX;y++)for(let x=0;x<PX;x++){
       // アトラスの「内容領域」(ガターの内側) から引く。実行時の UV と同じ計算。

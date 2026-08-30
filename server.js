@@ -166,6 +166,12 @@ const GLB = require('./glb.js');
 // 「失業 → 無一文 → 犯行 → 店の売上減 → さらに失業」の環ごと持たせる。
 const ECO = require('./economy.js');
 const { OTHER, ROAD, BUILDING, TREE } = MW;
+// 道路のクラス分け・オートタイルのマスク・アトラスの UV。
+// **MAP には触らない。** クラスは MAP と別の配列で持つ (MAP のセル種別は
+// 学習済み方策の観測そのものなので、値を増やすと方策が壊れる)。
+// 枠割りとマスクのビット順の唯一の定義でもあり、tools/make-road-atlas.js が
+// 焼くときも同じものを引いている。
+const RD = require('./roads.js');
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
 //   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
@@ -1036,11 +1042,27 @@ const GROUND_TEX  = process.env.GROUND_TEX !== '0';
 const GRASS_TEX   = process.env.GRASS_TEX   || './textures/base/grass_256.jpg';
 const ASPHALT_TEX = process.env.ASPHALT_TEX || './textures/base/asphalt_256.jpg';
 const VACANT_TEX  = process.env.VACANT_TEX  || './textures/base/other_256.jpg';
+// 路面標示のオートタイル・アトラス (node tools/make-road-atlas.js で作る)。
+// 下地のアスファルトの**上に重ねる**レイヤーで、車道の内側は透明になっている。
+// ROAD_MARKS=0 で従来どおりのべた塗りの道に戻せる。
+const ROAD_ATLAS  = process.env.ROAD_ATLAS  || './textures/road/road_atlas.png';
+const ROAD_MARKS  = process.env.ROAD_MARKS !== '0';
 const GROUND_TILE = envNum('GROUND_TILE', CELL);   // 模様1枚ぶんのワールド長 (既定=1セル)
 // 板1枚の大きさ (セルに対する比)。1.0 で隣とぴったり合って隙間が消える。
 // 0.97 だと3%ぶん下地が覗いて格子状の白い線が出る (以前の見た目。戻したいときはここ)。
 const GROUND_FILL = envNum('GROUND_FILL', 1.0);
-const groundTex = {};                              // {grass, road}
+// 路面標示を敷く高さ。下地の道 (z=.008) の上に薄く重ねる。
+// 差を詰めすぎると z ファイティングで標示がちらつき、開けすぎると grazing 角度で
+// 浮いて見える。polygonOffset も併用しているので、まずはここを動かして調整する。
+const MARK_Z = envNum('MARK_Z', 0.014);
+// アトラスの UV の上下。**ここだけは実機で確かめるまで確証が無い。**
+// loadGroundTexture は DataTexture に flipY=true を立てているが、既存の地面
+// テクスチャは継ぎ目なしの地模様なので上下が入れ替わっても見た目が変わらず、
+// この経路は一度も検証されていない。アトラスでは決定的に効く。
+// 症状は一目で分かる: **道が隣のセルと繋がらず、半セルずれた絵になる。**
+// そうなったら MARK_FLIP_Y=0 で起動する (コード変更は要らない)。
+const MARK_FLIP_Y = process.env.MARK_FLIP_Y !== '0';
+const groundTex = {};                              // {grass, road, vacant, roadmark}
 async function loadGroundTexture(key, filePath){
   if(!GROUND_TEX) return;
   const full=path.isAbsolute(filePath)?filePath:path.join(__dirname, filePath);
@@ -1077,6 +1099,8 @@ async function preloadTextures() {
     loadGroundTexture('grass', GRASS_TEX),
     loadGroundTexture('road',  ASPHALT_TEX),
     loadGroundTexture('vacant', VACANT_TEX),
+    // アトラスも同じ読み込み経路に乗せる (RGBA・2の冪チェック・ミップマップ)。
+    ROAD_MARKS ? loadGroundTexture('roadmark', ROAD_ATLAS) : null,
   ]);
 }
 
@@ -1229,7 +1253,26 @@ function pushQuad(arr, size, tx, ty, z, ao, tint){
   // 三角形2枚ぶん。頂点の並びに合わせて隅の明るさを配る
   for(const v of [a0,a1,a2, a0,a2,a3]){ const g=v*t; arr.col.push(g,g,g); }
 }
-function quadMesh(posArr, color, map){
+// 路面標示の板。pushQuad と違い UV は**ワールド座標ではなくアトラスの枠**を指す。
+// 頂点の並びは pushQuad と同じ (x0y0, x1y0, x1y1 / x0y0, x1y1, x0y1)。
+//   x は列(c)方向 = 東が +   → u0 が西、u1 が東
+//   y は行(r)方向 = 南が +   → vN が北 (行-1側)、vS が南
+// アトラスのタイルも「上端が北」で焼いてあるので、この対応が崩れると
+// 道が隣のセルと繋がらない = 間違いは絵を見た瞬間に分かる。
+function pushMarkQuad(arr, size, tx, ty, z, ao, uv){
+  const h=size/2, x0=tx-h, x1=tx+h, y0=ty-h, y1=ty+h;
+  arr.push(
+    x0,y0,z,  x1,y0,z,  x1,y1,z,
+    x0,y0,z,  x1,y1,z,  x0,y1,z
+  );
+  arr.uv.push(uv.u0,uv.vN, uv.u1,uv.vN, uv.u1,uv.vS,
+              uv.u0,uv.vN, uv.u1,uv.vS, uv.u0,uv.vS);
+  if(!ao) return;
+  const [a0,a1,a2,a3]=ao;
+  for(const v of [a0,a1,a2, a0,a2,a3]) arr.col.push(v,v,v);
+}
+
+function quadMesh(posArr, color, map, opts){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posArr), 3));
   if(posArr.col && posArr.col.length)
@@ -1237,8 +1280,8 @@ function quadMesh(posArr, color, map){
   if(posArr.uv && posArr.uv.length)
     g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(posArr.uv), 2));
   g.computeVertexNormals();   // Lambert ライティング用
-  const m=new THREE.MeshLambertMaterial(
-    {map: map||null, vertexColors: !!(posArr.col && posArr.col.length)});
+  const m=new THREE.MeshLambertMaterial(Object.assign(
+    {map: map||null, vertexColors: !!(posArr.col && posArr.col.length)}, opts||{}));
   if(color && color.isColor) m.color.copy(color); else m.color.set(color);
   return new THREE.Mesh(g, m);
 }
@@ -3221,7 +3264,7 @@ function addTreeMesh(S, r, c){
 function rebuildGround(S){
   if(!S) return;
   const g=S.userData.ground||(S.userData.ground={});
-  for(const k of ['base','road','grass','wear1','wear2']){
+  for(const k of ['base','road','grass','wear1','wear2','marks']){
     if(g[k]){ S.remove(g[k]); g[k].geometry.dispose(); g[k].material.dispose(); g[k]=null; }
   }
   // 下地の板。フィールドの外は何も描かない (世界の果て = 背景色) ので、
@@ -3246,13 +3289,26 @@ function rebuildGround(S){
   const road=[], grass=[], w1=[], w2=[];
   road.col=[]; grass.col=[]; w1.col=[]; w2.col=[];
   road.uv =[]; grass.uv =[]; w1.uv =[]; w2.uv =[];
+  // 路面標示レイヤー。アトラスが読めていない (PNG が無い / sharp 無し) ときは
+  // 積まずに従来どおりのべた塗りの道に戻る。
+  const marks=[]; marks.col=[]; marks.uv=[];
+  const markOn = ROAD_MARKS && !!groundTex.roadmark && !!CITY && !!CITY.roadClass;
   // セルごとの微妙な明暗。一面べったり同じ色だと板に見えるので、
   // 位置から決まる固定のばらつきを乗せる (毎回変わるとちらつく)。
   const jit=(r,c)=>1 + (((r*73856093 ^ c*19349663) & 255)/255 - 0.5)*2*AO_NOISE;
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
     const t=MAP[r][c], cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
     const ao=cornerAO(r,c), tint=jit(r,c);
-    if(t===ROAD){ pushQuad(road, CELL*GROUND_FILL, cx, cy, .008, ao, tint); continue; }
+    if(t===ROAD){
+      pushQuad(road, CELL*GROUND_FILL, cx, cy, .008, ao, tint);
+      if(markOn){
+        // 4近傍のマスクと道の格からアトラスの枠を決める。判定は roads.js が持つ。
+        const cls=CITY.roadClass[r*GRID+c];
+        const slot=RD.atlasSlot(cls, RD.roadMask(MAP, r, c, ROAD));
+        pushMarkQuad(marks, CELL*GROUND_FILL, cx, cy, MARK_Z, ao, RD.atlasUV(slot, MARK_FLIP_Y));
+      }
+      continue;
+    }
     // 建物と木のセルにも板を敷く。以前は敷いていなかったが、板どうしの隙間を
     // 埋めた (GROUND_FILL=1.0) 途端、**下地の板が白い正方形として浮き出た**。
     // 建物は幅がセルの 0.8 倍しかないので、足元に2割ぶんの余白が出るのも同じ理由。
@@ -3280,6 +3336,16 @@ function rebuildGround(S){
   const wearC=(hex, boost)=> new THREE.Color(dim(hex)).multiplyScalar(boost);
   if(w1.length)   { g.wear1=quadMesh(w1, groundTex.vacant?wearC(0xb5b08a,1.55):dim(0x9d9c6e), groundTex.vacant); S.add(g.wear1); }
   if(w2.length)   { g.wear2=quadMesh(w2, groundTex.vacant?wearC(0xc4ab84,1.55):dim(0xac9c72), groundTex.vacant); S.add(g.wear2); }
+  // 路面標示。車道の内側は透明なので、下の道の板 (アスファルト) がそのまま透ける。
+  //   depthWrite=false … 自分の深度を書かない。上に重なる街灯の光の輪と喧嘩しない
+  //   polygonOffset    … 下地との z ファイティング止め (MARK_Z だけでは足りない環境用)
+  //   renderOrder は既定 (0) のまま。街灯の光の輪が 1 なので、必ず標示が先に描かれる
+  if(marks.length){
+    g.marks=quadMesh(marks, dim(0xffffff), groundTex.roadmark,
+      {transparent:true, depthWrite:false,
+       polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2});
+    S.add(g.marks);
+  }
   rebuildLamps(S);
 }
 
@@ -3509,6 +3575,7 @@ function cityToJSON(){
     structs:CITY.structs.map(st=>({...st})),
     foot:Array.from(CITY.foot),
     roadUse:Array.from(CITY.roadUse),
+    roadClass:Array.from(CITY.roadClass||[]),
     demand:Object.fromEntries(CATS.map(c=>[c, Array.from(CITY.demand[c], v=>+v.toFixed(2))])),
     unmet:CITY.unmet, stats:CITY.stats, unrest:CITY.unrest||0,
     news:CITY.news.slice(-200), agents:own,
@@ -3606,6 +3673,9 @@ function freshCity(){
     structs,
     foot:new Int32Array(GRID*GRID),
     roadUse:new Int32Array(GRID*GRID),   // 道の上を歩かれた回数 (踏み跡の道版)
+    // 道の格 (0=歩行者専用 1=一通 2=二車線)。**MAP とは別レイヤー**。
+    // MAP のセル種別は方策の観測なので増やせない。ここは描画と (将来の) 車・信号だけが読む。
+    roadClass:new Int8Array(GRID*GRID),
     demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
     unmet:Object.fromEntries(CATS.map(c=>[c,0])),
     stats:{roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
@@ -3625,7 +3695,7 @@ function resetCity(keepMap){
   CITY=freshCity();
   _lastDay=null;
   for(const a of agents){ a.owns=null; a.seenMask=0; a.unmetBy=null; }
-  syncCity(); rebuildBuildings(MAP); groundDirty=true; saveCity();
+  syncCity(); rebuildBuildings(MAP); reclassRoads(); groundDirty=true; saveCity();
   console.log(`[City] 街を作り直しました (建物${CITY.structs.length}軒)`);
 }
 
@@ -3640,6 +3710,7 @@ function initCity(){
       structs:j.structs.map(st=>({...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st})),
       foot:Int32Array.from(j.foot||[]),
       roadUse:Int32Array.from(j.roadUse||[]),
+      roadClass:Int8Array.from(j.roadClass||[]),
       demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
       stats:Object.assign({roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
@@ -3650,6 +3721,9 @@ function initCity(){
     };
     if(CITY.foot.length!==GRID*GRID) CITY.foot=new Int32Array(GRID*GRID);
     if(CITY.roadUse.length!==GRID*GRID) CITY.roadUse=new Int32Array(GRID*GRID);
+    // 道の格を持たない古い保存から復元したときは長さが 0。reclassRoads が
+    // prev=null と見なして即座に引き直すので、ここでは形だけ整えておく。
+    if(CITY.roadClass.length!==GRID*GRID) CITY.roadClass=new Int8Array(GRID*GRID);
     for(const c of CATS) if(CITY.demand[c].length!==GRID*GRID) CITY.demand[c]=new Float32Array(GRID*GRID);
     const ago=Math.round((Date.now()-(j.savedAt||Date.now()))/60000);
     console.log(`[City] 復元: day=${CITY.dayBase} 建物${CITY.structs.length}軒 `
@@ -3665,6 +3739,7 @@ function initCity(){
   for(const st of CITY.structs) if(st.state==='demolishing') st.state='closed';
   syncCity();
   rebuildBuildings(MAP);
+  reclassRoads();                  // 最初の描画に間に合うようここで1回引く
   const L=levelSpec();
   console.log(`[City] 発展段階 ${cityLevel()}:${L.name} (高さ≤${L.maxH} 2x2:${L.fp2?'可':'不可'}) `
     + `経済 ${Math.round(CITY.econ)} / 建てられる業種 `
@@ -4131,6 +4206,24 @@ function decayRoads(day){
          `${n} unused road${n>1?'s':''} returned to open ground`);
   }
   return n;
+}
+
+// ── 道の格 (歩行者専用 / 一通 / 二車線) ──────────────────────────────────────
+// 通行量から引き直す。判定そのものは roads.js が持っている (3D の描画と、将来
+// 地面を観測に入れる場合のレイキャスタが同じ判定を引く必要があるため)。
+//   ★ MAP は一切書き換えない。道が増えた/減ったの判定は従来どおり
+//     promoteFootpaths / decayRoads がやり、ここはその上に格を乗せるだけ。
+function reclassRoads(){
+  if(!CITY) return 0;
+  // 長さが合わないときは prev 無しで引く = ヒステリシスを効かせず即座に確定させる。
+  // (道の格を持たない古い保存から復元した直後がこれ)
+  const prev=(CITY.roadClass && CITY.roadClass.length===GRID*GRID) ? CITY.roadClass : null;
+  const next=RD.classifyRoads(MAP, CITY.roadUse, prev, ROAD);
+  let ch=0;
+  if(prev) for(let i=0;i<next.length;i++){ if(next[i]!==prev[i]) ch++; }
+  CITY.roadClass=next;
+  if(ch) groundDirty=true;
+  return ch;
 }
 
 // ── 機能B: 足りない業種を住民が起業する ────────────────────────────────────
@@ -5611,6 +5704,7 @@ function dailyRollover(day){
   if(SOCIAL_ON) SOC.dailyDecay(SOC_STATE, agents);   // 会わない相手との関係は薄れる
   const roads=promoteFootpaths(day);
   const roadsBack=decayRoads(day);        // 使われなくなった道は空き地へ戻す
+  reclassRoads();                         // よく使われる道は太く、使われない道は路地へ
   const grown=maybeExpand(day);           // 土地が足りなければ先にフィールドを広げる
   const closed=maybeClose(day) + markVacant(day);   // 空き家/空き職場も畳む
   const gone=maybeDemolish(day) + relieveCongestion(day);
