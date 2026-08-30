@@ -351,10 +351,72 @@ function groundKind(cellType, cls, mask, fu, fv, V) {
   return GROUND.ROADWAY;
 }
 
+// ── 観測に映る地面の色 ──────────────────────────────────────────────────────
+// 床キャストが引く色。**Python 側 (学習env) と同じ値でなければならない**ので
+// ここに置く。道路セルはアトラスの画素をこのアスファルトの上に合成したものを使う
+// (アトラスは車道の内側が透明なため)。
+const FLOOR_RGB = {
+  ASPHALT: [0.265, 0.275, 0.295],   // 車道・建物の足元の下地
+  GRASS:   [0.355, 0.485, 0.275],   // 木のセル
+  DIRT:    [0.545, 0.530, 0.420],   // 空き地
+  VOID:    [0.095, 0.105, 0.120],   // 世界の果て
+};
+// 床の距離の上限 (セル)。これより遠い行は地の色のままにして、走査量を抑える。
+const FLOOR_MAX = 40;
+// 目線の高さ (セル)。地平線の位置を決める。壁の投影 bot = H/2 + (H/perp)*EYE と
+// 同じ値でなければ、床と壁の足元が段差になる。
+const FLOOR_EYE = 0.5;
+
+/**
+ * 画面の行 y (0..H-1) が指す地面までの垂直距離。
+ * 壁の足元の投影 bot = H/2 + (H/perp)*FLOOR_EYE を perp について解いたもの。
+ * **この式が学習側とズレると、観測画像の遠近が食い違う。**
+ */
+function floorDist(y, H) {
+  const p = y - H / 2;
+  return p <= 0 ? Infinity : (H * FLOOR_EYE) / p;
+}
+
+// 観測用の床テクスチャを焼く。アトラスの RGBA から、枠ごとに RC_FW 角へ縮小し、
+// **透明部 (車道) をアスファルトの上に合成して不透明にする**。
+// 毎画素で合成しないための前処理でもあるが、いちばんの理由は
+// **Python 側 (学習env) と同じ縮小規則を使わせるため**。ここが 1 画素ずれると
+// 学習と本番で観測画像が食い違う。
+//   出力画素 (i,j) = 元の [i*CONTENT/RC_FW, (i+1)*CONTENT/RC_FW) の範囲の平均。
+const RC_FW = 24;                       // 1 枠あたりの床テクスチャの一辺
+
+function bakeFloorBank(rgba, width) {
+  if (width !== ATLAS) throw new Error(`bakeFloorBank: アトラスの幅が ${width} (期待 ${ATLAS})`);
+  const asp = FLOOR_RGB.ASPHALT;
+  const nSlot = COLS * ROWS;
+  const out = new Float32Array(nSlot * RC_FW * RC_FW * 3);
+  for (let s = 0; s < nSlot; s++) {
+    const ox = (s % COLS) * TILE + GUT, oy = ((s / COLS) | 0) * TILE + GUT;
+    for (let j = 0; j < RC_FW; j++) for (let i = 0; i < RC_FW; i++) {
+      const x0 = Math.floor(i * CONTENT / RC_FW), x1 = Math.max(x0 + 1, Math.floor((i + 1) * CONTENT / RC_FW));
+      const y0 = Math.floor(j * CONTENT / RC_FW), y1 = Math.max(y0 + 1, Math.floor((j + 1) * CONTENT / RC_FW));
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+        const o = (((oy + y) * ATLAS) + (ox + x)) * 4, a = rgba[o + 3] / 255;
+        r += (rgba[o] / 255) * a + asp[0] * (1 - a);
+        g += (rgba[o + 1] / 255) * a + asp[1] * (1 - a);
+        b += (rgba[o + 2] / 255) * a + asp[2] * (1 - a);
+        n++;
+      }
+      const k = (s * RC_FW * RC_FW + j * RC_FW + i) * 3;
+      out[k] = r / n; out[k + 1] = g / n; out[k + 2] = b / n;
+    }
+  }
+  return out;
+}
+
 /** セルの中で「歩行者が居たい横位置」。道に沿って歩くときの車線ならぬ歩道の中心。 */
 function sidewalkOffset(cls) {
+  if (cls === PATH) return 0;                // 歩行者専用は全面が歩道 = 中央でよい
   const RW = cls >= TWOLANE ? RW2 : RW1;
-  return (0.5 + (0.5 - RW) * 0.5) - 0.5;   // 車道の縁とセルの端の中間 (セル比)
+  // 歩道は車道の縁 (RW) からセルの端 (0.5) まで。その中心を返す。
+  // 最初 (0.5 + (0.5-RW)*0.5) - 0.5 = 0.085 と書いて**車道の内側**を指していた。
+  return RW + (0.5 - RW) * 0.5;
 }
 
 module.exports = {
@@ -365,4 +427,5 @@ module.exports = {
   RW2, RW1, RIN_K, rIn, XW_A, XW_B, XW_PITCH, XW_DUTY,
   sdBox, sdRoundedQuad, quadrants, roadSDF, cornerCenter, cornerSDF, crosswalk,
   GROUND, WALK_PREF, groundKind, sidewalkOffset,
+  FLOOR_RGB, FLOOR_MAX, FLOOR_EYE, floorDist, RC_FW, bakeFloorBank,
 };
