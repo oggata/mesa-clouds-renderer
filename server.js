@@ -177,6 +177,9 @@ const RD = require('./roads.js');
 // three が要る server.js はテスト環境で動かせないので、ポーズの式がここに無いと
 // 「歩き方が正しいか」を実機に載せる前に確かめる手段が無くなる。
 const SK = require('./skeleton.js');
+// 車の出入口・経路・走行。住民 (ONNX 推論・欲求・屋内状態) とは別系統にする。
+// three にも server.js にも依存しない計算なので単体で検証できる。
+const TR = require('./traffic.js');
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
 //   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
@@ -2240,6 +2243,121 @@ function addWalkShader(mat){
   mat.customProgramCacheKey = ()=> 'agentSkelWalk';
 }
 
+// ── 車 ──────────────────────────────────────────────────────────────────────
+// 走らせ方 (出入口・経路・追従・交差点の譲り合い) は traffic.js が持つ。
+// ここは three のジオメトリに起こしてインスタンスへ流し込むだけ。
+//   ★ 住民とは完全に別系統。車には推論も欲求も屋内状態も要らないので、
+//     agents に混ぜず cars 配列で持つ。
+//   ★ 街の中を周回させない。外周で街の外に面した走行可能な道を「他の町との
+//     接点」とみなし、そこから湧いて別の接点で消える。
+const CARS_ON   = process.env.CARS !== '0';
+const CAR_MAX   = Math.max(0, parseInt(process.env.CAR_MAX) || 18);
+const CAR_LANE  = envNum('CAR_LANE', 0.165*CELL);   // 車線中心までの横ずらし
+const CAR_SPEED = envNum('CAR_SPEED', 3.4);         // ワールド単位/秒 (≒40km/h)
+// 車体の寸法 (ワールド単位。1 単位 ≒ 3.4m)
+const CAR_L=1.20, CAR_W=0.52, CAR_BODY_Z=[0.10,0.30], CAR_CAB_Z=[0.30,0.46], CAR_WHEEL_R=0.09;
+const CAR_COLORS=[0xd8d8d4,0x2f3a4a,0xa83a32,0x2e6ea8,0x3f7a4a,0xd8a838,0x8a8f96,0x1f2227];
+const CAR_CAP = CAR_MAX + 4;
+
+let cars=[], _carGw=null, _carGwDirty=true;
+const CarInst={ body:null, trim:null };
+
+// 車のジオメトリ。前方は +X (traffic.js の car.th と同じ向き)。
+function buildCarGeos(){
+  if(CarInst.geoBody) return;
+  const box=(lx,ly,z0,z1,dx)=>{
+    const g=new THREE.BoxGeometry(lx,ly,z1-z0);
+    g.translate(dx||0, 0, (z0+z1)/2);
+    return g;
+  };
+  const body=[
+    {geo:box(CAR_L, CAR_W, CAR_BODY_Z[0], CAR_BODY_Z[1]), color:new THREE.Color(0xffffff)},
+    {geo:box(CAR_L*0.52, CAR_W*0.86, CAR_CAB_Z[0], CAR_CAB_Z[1], -CAR_L*0.06),
+     color:new THREE.Color(0xffffff)},
+  ];
+  const trim=[];
+  // 車輪。前方 +X なので前後は ±X、左右は ±Y。
+  for(const sx of [1,-1]) for(const sy of [1,-1]){
+    const w=new THREE.CylinderGeometry(CAR_WHEEL_R, CAR_WHEEL_R, 0.07, 7);
+    w.translate(sx*CAR_L*0.32, sy*(CAR_W*0.5+0.005), CAR_WHEEL_R);
+    trim.push({geo:w, color:new THREE.Color(0x1a1c1f)});
+  }
+  // 窓 (フロントとリア)。夜に光らせたくなったらここを emissive にする。
+  for(const sx of [1,-1]){
+    const g=new THREE.BoxGeometry(0.02, CAR_W*0.72, (CAR_CAB_Z[1]-CAR_CAB_Z[0])*0.72);
+    g.translate(sx*CAR_L*0.20, 0, (CAR_CAB_Z[0]+CAR_CAB_Z[1])/2);
+    trim.push({geo:g, color:new THREE.Color(0x9fd8e8)});
+  }
+  CarInst.geoBody=mergeGeos(body);
+  CarInst.geoTrim=mergeGeos(trim);
+  SHARED_GEO.add(CarInst.geoBody); SHARED_GEO.add(CarInst.geoTrim);
+}
+
+function initCarInstances(S){
+  if(!S || !CARS_ON || CAR_MAX<=0) return;
+  buildCarGeos();
+  const bm=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
+  const tm=new THREE.MeshLambertMaterial({vertexColors:true});
+  bm.userData.shared=true; tm.userData.shared=true;
+  const body =new THREE.InstancedMesh(CarInst.geoBody, bm, CAR_CAP);
+  const trim =new THREE.InstancedMesh(CarInst.geoTrim, tm, CAR_CAP);
+  for(const m of [body,trim]){
+    m.count=0; m.frustumCulled=false;
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    S.add(m);
+  }
+  CarInst.body=body; CarInst.trim=trim;
+}
+
+// 道が変わったら出入口を引き直す (道が生えたり廃れたりするので固定できない)
+function carGateways(){
+  if(!_carGwDirty && _carGw) return _carGw;
+  _carGwDirty=false;
+  _carGw = (CITY && CITY.roadClass)
+    ? TR.gateways(MAP, CITY.roadClass, ROAD, VOID) : [];
+  return _carGw;
+}
+
+const _carMat=new THREE.Matrix4(), _carQ=new THREE.Quaternion(),
+      _carP=new THREE.Vector3(), _carS=new THREE.Vector3(), _carC=new THREE.Color();
+const _carZ=new THREE.Vector3(0,0,1);
+
+function stepTraffic(dt){
+  if(!CARS_ON || !CarInst.body || !CITY || !CITY.roadClass) return;
+  const gw=carGateways();
+  // 湧かせる。経路が引けない組み合わせもあるので、1 フレームに 1 台まで試す。
+  if(gw.length>1 && cars.length<CAR_MAX){
+    const a=gw[(Math.random()*gw.length)|0], b=gw[(Math.random()*gw.length)|0];
+    if(a!==b){
+      const p=TR.route(MAP, CITY.roadClass, a, b, ROAD);
+      if(p && p.length>=3){
+        const line=TR.laneLine(p, MAP, CITY.roadClass, ROAD, 1, CELL, CAR_LANE);
+        const car=TR.makeCar(line, CAR_SPEED*(0.85+Math.random()*0.4), (Math.random()*3)|0);
+        car.color=CAR_COLORS[(Math.random()*CAR_COLORS.length)|0];
+        car.len=0.9+Math.random()*0.35;             // 車種のばらつき (長さだけ)
+        cars.push(car);
+      }
+    }
+  }
+  cars=TR.stepCars(cars, dt);
+  // インスタンスへ流す
+  const B=CarInst.body, T=CarInst.trim;
+  let k=0;
+  for(const c of cars){
+    if(k>=CAR_CAP) break;
+    _carP.set(c.x, c.y, 0.008);
+    _carQ.setFromAxisAngle(_carZ, c.th);
+    _carS.set(c.len||1, 1, 1);
+    _carMat.compose(_carP, _carQ, _carS);
+    B.setMatrixAt(k, _carMat); T.setMatrixAt(k, _carMat);
+    B.setColorAt(k, _carC.set(c.color||0xcccccc));
+    k++;
+  }
+  B.count=T.count=k;
+  B.instanceMatrix.needsUpdate=true; T.instanceMatrix.needsUpdate=true;
+  if(B.instanceColor) B.instanceColor.needsUpdate=true;
+}
+
 // ── 住民のインスタンス描画 ───────────────────────────────────────────────────
 // 以前は住民1人 = 1メッシュで、300人なら 600 ドローコール (体+パーツ) だった。
 // 形はみな同じで、違うのは「位置・向き・体の色・歩行位相」だけなので、
@@ -3820,6 +3938,7 @@ function freshCity(){
 function resetCity(keepMap){
   if(!keepMap) MAP=makeMap(GRID, CITY_SEED);
   CITY=freshCity();
+  cars=[]; _carGwDirty=true;
   _lastDay=null;
   for(const a of agents){ a.owns=null; a.seenMask=0; a.unmetBy=null; }
   syncCity(); rebuildBuildings(MAP); reclassRoads(); groundDirty=true; saveCity();
@@ -4349,7 +4468,7 @@ function reclassRoads(){
   let ch=0;
   if(prev) for(let i=0;i<next.length;i++){ if(next[i]!==prev[i]) ch++; }
   CITY.roadClass=next;
-  if(ch) groundDirty=true;
+  if(ch){ groundDirty=true; _carGwDirty=true; }
   return ch;
 }
 
@@ -6632,6 +6751,7 @@ function doCityReset(newMap){
     disposeScene(oldScene);    // 古いシーンの GPU リソースを解放
     initTrailField(scene);     // 足跡/住民メッシュは旧シーンと一緒に破棄されている
     initAgentInstances(scene);
+    initCarInstances(scene);
     initAgents(scene);
   }
   saveCity();
@@ -9234,6 +9354,7 @@ async function renderLoop(){
       m.userData.amp=(m.userData.amp||0)*0.75 + Math.min(1, sp/WALK_FULL)*0.25;
     });
     if(PERF_LOG){ _perf.agents+=Date.now()-_t0; }
+    stepTraffic(dt);              // 車 (出入口から湧いて別の出入口で消える)
     stepStructAnims();            // 建物のせり上がり / 沈み込み
     stepRain(dt, mainCam);        // 雨 (天気が rain のときだけ)
     // 地面の板 (道路 / 摩耗) を作り直す。道が増えたとき (groundDirty) は即、
@@ -9388,6 +9509,7 @@ function startLoops(){
 
   initTrailField(scene);
   initAgentInstances(scene);
+  initCarInstances(scene);
   initAgents(scene);
 
   httpServer.listen(PORT, ()=>{
