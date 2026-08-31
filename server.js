@@ -1034,11 +1034,19 @@ const BLDG_TYPES = [
   { label:'🏫 中学校',    name:'junior',      footprint:1, height:1.4, category:'learn',   persona:'H',  fallbackColor:0x3f8f6f, textureFile:'./textures/v4/junior.jpg' },
   { label:'🏫 高校',      name:'high',        footprint:2, height:1.7, category:'learn',   persona:'I',  fallbackColor:0x3a6fb0, textureFile:'./textures/v4/high.jpg' },
   { label:'🎓 大学',      name:'university',  footprint:2, height:2.1, category:'learn',   persona:'K',  fallbackColor:0x7a4f9e, textureFile:'./textures/v4/university.jpg' },
+  // 倉庫。ネット通販の荷物がここに届き、配達員が各家庭へ運ぶ (stepDelivery)。
+  //   ★ footprint=1 なのは絵の都合ではなく**建つかどうか**の都合。fp=2 は
+  //     CITY_LEVELS の「町」(econ 2000) 以降でしか建てられず、いまの街 (村/econ~2000)
+  //     では永久に建たない = 配達員がひとりも生まれない。倉庫を 1x1 にすると
+  //     height 1.4 <= 集落の maxH なので最初から建てられる。
+  { label:'📦 倉庫',      name:'warehouse',   footprint:1, height:1.4, category:'work',    persona:'D',  fallbackColor:0x9aa0a6, textureFile:'./textures/v4/warehouse.jpg' },
 ];
 // footprint 別インデックス (型割当で使用)
 // 街の初期生成で使わない建物。警察署は「治安が悪くなったから建てた」ものであって
 // 最初から街に散らばっているものではない。混ぜたところ 9軒建って警官が114人になった。
-const NO_SPAWN = new Set(['police','elementary','junior','high','university']);
+// 倉庫も創世時には撒かない。「通販が根付いたので物流拠点ができた」という
+// 順番を見せたいので、maybeFoundWarehouse が住宅の数を見てから 1 軒建てる。
+const NO_SPAWN = new Set(['police','elementary','junior','high','university','warehouse']);
 const FP1_IDX = BLDG_TYPES.map((b,i)=>(b.footprint===1 && !NO_SPAWN.has(b.name))?i:-1).filter(i=>i>=0);
 const FP2_IDX = BLDG_TYPES.map((b,i)=>(b.footprint===2 && !NO_SPAWN.has(b.name))?i:-1).filter(i=>i>=0);
 
@@ -1613,6 +1621,11 @@ function buildScene(map){
 
 // ─── 近接フェード: キャラクターが建物/木のそばに来たら半透明にして視認性を保つ ──
 const FADE_DIST = CELL*2.3, FADE_OPACITY = 0.8;
+// カメラと追跡中の住民を結ぶ線から、この距離より近い建物も透かす。
+// 建物の半幅が CELL*0.74/2 = 0.74 なので、それより少し広く取って線に「掛かって
+// いる」建物を拾う。OCC_SIGHTLINE=0 で従来どおり (住民の近くだけ) に戻る。
+const OCC_SIGHTLINE = process.env.OCC_SIGHTLINE !== '0';
+const SIGHT_R = envNum('OCC_SIGHT_R', CELL*0.62);
 // 建物/木をセル単位のバケツに入れておく。総当たりだと住民×オブジェクトになり、
 // 1000人 × 600個 = 毎フレーム60万回で、描画より重くなる (実測 300人で4.7ms)。
 let _occGrid=null, _occStamp=-1;
@@ -1651,6 +1664,30 @@ function updateOcclusionFade(){
         const o=occluders[key];
         const dx=o.cx-ax, dy=o.cy-ay;
         if(dx*dx+dy*dy<FADE_DIST*FADE_DIST) near.add(key);
+      }
+    }
+  }
+  // ── カメラと追跡中の住民の間にある建物 ──
+  // 上の探索は「住民の**近く**」の建物しか拾わない。カメラから 10 単位離れた建物が
+  // ちょうど視線上にあると、住民は完全に隠れたまま透けもしない。これが
+  // 「建物に隠れて何をしてるか分からない」の正体。
+  //   追跡中の 1 人ぶんだけ、カメラ→住民の線分に近い建物を足す。線分は 1 本なので
+  //   総当たりでも数十件で終わる (全住民ぶんやると人数×建物数になるのでやらない)。
+  if(OCC_SIGHTLINE && camTargetIdx>0 && agents[camTargetIdx-1]){
+    const a=agents[camTargetIdx-1];
+    if(!MW.isIndoors(a)){
+      const ax=a.y*CELL+CELL*.5, ay=a.x*CELL+CELL*.5;
+      const cx=_camPos.x, cy=_camPos.y;
+      const vx=ax-cx, vy=ay-cy, vv=vx*vx+vy*vy;
+      if(vv>1e-6){
+        for(const key in occluders){
+          const o=occluders[key];
+          // 線分上への射影。0..1 の外なら線分の外側なので対象外
+          let t=((o.cx-cx)*vx+(o.cy-cy)*vy)/vv;
+          if(t<=0.05 || t>=1) continue;          // カメラのすぐ手前と住民の向こう側は除く
+          const px=cx+vx*t-o.cx, py=cy+vy*t-o.cy;
+          if(px*px+py*py < SIGHT_R*SIGHT_R) near.add(key);
+        }
       }
     }
   }
@@ -1779,6 +1816,7 @@ function updateDayNight(S){
   stepBldgLights(d);                 // 窓・入り口・看板を夜だけ光らせる
   stepLamps(S, d);                   // 街灯
   stepSignals(S, d);                 // 交差点の信号 (赤青黄の切り替え)
+  stepCarLights(d);                  // 車の前照灯 / 尾灯
   stepProps(S, d);                   // 自販機の窓
   stepWet(S, d);                     // 濡れた路面
 }
@@ -2479,6 +2517,16 @@ const CAR_L=DIM.CAR.len, CAR_W=DIM.CAR.wid;
 const CAR_BODY_Z=DIM.CAR.bodyZ, CAR_CAB_Z=DIM.CAR.cabZ, CAR_WHEEL_R=DIM.CAR.wheelR;
 const CAR_COLORS=[0xd8d8d4,0x2f3a4a,0xa83a32,0x2e6ea8,0x3f7a4a,0xd8a838,0x8a8f96,0x1f2227];
 const CAR_CAP = CAR_MAX + 4;
+// ── 前照灯 ──────────────────────────────────────────────────────────────────
+// 路面に落ちる光の板の大きさ。実際のロービームが照らすのは前方 40m ほどだが、
+// 1セル 7.7m の街でそれをやると光が交差点を丸ごと越えてしまう。街の縮尺に合わせる。
+const CAR_LIGHTS   = process.env.CAR_LIGHTS !== '0';
+const CAR_BEAM_LEN = envNum('CAR_BEAM_LEN', CELL*2.4);   // 前方へ伸ばす長さ
+const CAR_BEAM_W   = envNum('CAR_BEAM_W',   CELL*1.1);   // 板の幅 (テクスチャ側で絞る)
+const CAR_BEAM_GLOW= envNum('CAR_BEAM_GLOW', 1.0);       // 路面の光の強さ (0 で消す)
+// 夜は交通量を減らす。**前照灯を光らせるぶんの負荷をここで返す**のが主目的だが、
+// 深夜に車が昼と同じだけ走っているほうがそもそも不自然でもある。
+const CAR_NIGHT_FRAC = Math.max(0, Math.min(1, envNum('CAR_NIGHT_FRAC', 0.35)));
 
 // ── 車が街の道を使い切るための 3 つの仕掛け ──────────────────────────────────
 // 「通っていない道がたくさんある」を tools/preview-traffic.js で測ると、原因は
@@ -2544,9 +2592,62 @@ function buildCarGeos(){
     g.translate(sx*CAR_L*0.20, 0, (CAR_CAB_Z[0]+CAR_CAB_Z[1])/2);
     trim.push({geo:g, color:new THREE.Color(0x9fd8e8)});
   }
+  // ── 灯火 (前照灯 / 尾灯) ──
+  // 街灯と同じ考え方で、**本物のライトは使わない**。Lambert はライト数ぶんシェーダが
+  // 重くなるので、車が数十台も走ると llvmpipe では破綻する。代わりに
+  //   ・光る灯具 (emissive を夜だけ上げる)
+  //   ・路面に落ちる光 (加算合成の板)
+  // の2枚で見せる。どちらも InstancedMesh なので **何台走っても各1ドローコール**。
+  const lamp=[];
+  const lw=CAR_W*0.17, lh=(CAR_BODY_Z[1]-CAR_BODY_Z[0])*0.30;
+  const lz=CAR_BODY_Z[0]+(CAR_BODY_Z[1]-CAR_BODY_Z[0])*0.52;
+  for(const sy of [1,-1]){                       // 前照灯 (白) … 前方 +X
+    const g=new THREE.BoxGeometry(0.02, lw*2, lh*2);
+    g.translate(CAR_L*0.49, sy*CAR_W*0.30, lz);
+    lamp.push({geo:g, color:new THREE.Color(0xfff2d2)});
+  }
+  for(const sy of [1,-1]){                       // 尾灯 (赤) … 後方 -X
+    const g=new THREE.BoxGeometry(0.02, lw*1.6, lh*1.4);
+    g.translate(-CAR_L*0.49, sy*CAR_W*0.30, lz);
+    lamp.push({geo:g, color:new THREE.Color(0xd83a24)});
+  }
   CarInst.geoBody=mergeGeos(body);
   CarInst.geoTrim=mergeGeos(trim);
+  CarInst.geoLamp=mergeGeos(lamp);
+  // 路面を照らす光。車の前方へ伸びる板1枚。UV は「手前が明るく、先へ行くほど
+  // 広がって薄い」テクスチャを貼るためのもの。
+  const beam=new THREE.PlaneGeometry(CAR_BEAM_LEN, CAR_BEAM_W);
+  beam.translate(CAR_L*0.5+CAR_BEAM_LEN*0.5, 0, 0);   // 車の前に置く (z は行列側で持ち上げる)
+  CarInst.geoBeam=beam;
   SHARED_GEO.add(CarInst.geoBody); SHARED_GEO.add(CarInst.geoTrim);
+  SHARED_GEO.add(CarInst.geoLamp); SHARED_GEO.add(CarInst.geoBeam);
+}
+
+// 前照灯が路面に落とす光。手前が明るく、先へ行くほど広がって薄くなる板。
+// 1枚作って全部の車で使い回す。
+let _beamTex=null;
+function carBeamTexture(){
+  if(_beamTex) return _beamTex;
+  const W=64, H=32, d=new Uint8Array(W*H*4);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const u=(x+0.5)/W;                     // 0=車の直前 … 1=いちばん先
+    const v=((y+0.5)/H)*2-1;               // -1..1 (横方向)
+    // 光の輪郭。先へ行くほど広がる (半径が u に比例) 円錐の断面。
+    const half=0.22+0.78*u;
+    const t=Math.max(0, 1-Math.abs(v)/half);
+    // 手前は明るく、先で減衰。u=0 のすぐ前だけ強すぎないよう少し立ち上げる。
+    //   ★ 減衰を急にしすぎると「車の足元がぼんやり明るい」だけになって、
+    //     **前を照らしている**ように見えない。長めに残して先端で切る。
+    const along=Math.min(1, u*8) * Math.pow(1-u, 1.1);
+    const a=Math.pow(t, 1.6)*along;
+    const i=(y*W+x)*4;
+    d[i]=255; d[i+1]=244; d[i+2]=214; d[i+3]=Math.round(Math.min(1,a)*255);
+  }
+  const t=new THREE.DataTexture(d,W,H,THREE.RGBAFormat);
+  t.wrapS=t.wrapT=THREE.ClampToEdgeWrapping;
+  t.minFilter=t.magFilter=THREE.LinearFilter;
+  t.generateMipmaps=false; t.needsUpdate=true; t.userData={shared:true};
+  _beamTex=t; return _beamTex;
 }
 
 // 1台ずつの透明度。湧いた瞬間に実体が現れ、終点でぱっと消えるのが不自然なので
@@ -2589,6 +2690,36 @@ function initCarInstances(S){
     S.add(m);
   }
   CarInst.body=body; CarInst.trim=trim; CarInst.alpha=alpha;
+
+  // ── 灯火 ──
+  if(CAR_LIGHTS){
+    // 灯具。頂点カラー (前=白 / 後=赤) に emissive を掛ける。夜だけ光らせる。
+    const lm=new THREE.MeshLambertMaterial({vertexColors:true});
+    lm.emissive=new THREE.Color(0xffffff); lm.emissiveIntensity=0;
+    lm.userData.shared=true;
+    addCarFadeShader(lm);                          // 湧き/消えのフェードに追従させる
+    CarInst.geoLamp.setAttribute('aAlpha', alpha);
+    const lamp=new THREE.InstancedMesh(CarInst.geoLamp, lm, CAR_CAP);
+    lamp.count=0; lamp.frustumCulled=false;
+    lamp.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    markShadow(lamp, false, false);                 // 灯火に影は要らない
+    S.add(lamp);
+    CarInst.lamp=lamp; CarInst.lampMat=lm;
+
+    // 路面の光。加算合成なので、暗い夜だけ効いて昼は見えない。
+    //   depthWrite=false … 自分の深度を書かず、街灯の光の輪と喧嘩しない
+    //   renderOrder=1    … 路面標示より後、街灯の輪と同じ層
+    const bmMat=new THREE.MeshBasicMaterial({
+      map:carBeamTexture(), transparent:true, opacity:0, depthWrite:false,
+      blending:THREE.AdditiveBlending, fog:false });
+    bmMat.userData.shared=true;
+    const beam=new THREE.InstancedMesh(CarInst.geoBeam, bmMat, CAR_CAP);
+    beam.count=0; beam.frustumCulled=false; beam.visible=false;
+    beam.renderOrder=1;
+    beam.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    S.add(beam);
+    CarInst.beam=beam; CarInst.beamMat=bmMat;
+  }
 }
 
 // 道が変わったら出入口と行き止まりを引き直す (道が生えたり廃れたりするので
@@ -2608,6 +2739,18 @@ function carSpot(){
   if(_carEnd && _carEnd.length && Math.random()<CAR_LOCAL_P)
     return _carEnd[(Math.random()*_carEnd.length)|0];
   return _carGw.length ? _carGw[(Math.random()*_carGw.length)|0] : null;
+}
+
+// いま走らせてよい台数。**夜は減らす。**
+//   ・前照灯 (灯具 + 路面の光の板) のぶんの負荷をここで返す
+//   ・深夜に昼と同じだけ車が走っているほうがそもそも不自然
+// 上限を下げても走っている車を消しはしない。終点まで走り切って、いつもの
+// フェードで消えていくので、**じわっと交通量が減る**。
+function carMaxNow(){
+  const d=daylight();
+  const t=Math.max(0, Math.min(1, (0.55-d)/0.40));   // 0=昼 1=夜 (街灯と同じ曲線)
+  const e=t*t*(3-2*t);
+  return Math.max(1, Math.round(CAR_MAX*(1 - (1-CAR_NIGHT_FRAC)*e)));
 }
 
 // 経路の重み。最近ほかの車が通ったセルほど重くして、同じ道に固まらせない。
@@ -2640,7 +2783,7 @@ function stepTraffic(dt){
   // 間隔を空ける。毎フレーム試すと、経路が引けるかぎり湧き口に連続で置かれて
   // 車体が重なる。加えて、湧き口に車が居るあいだは湧かせない。
   const now=Date.now();
-  if(_carGw.length>1 && cars.length<CAR_MAX && now-_carSpawnAt>=CAR_SPAWN_SEC*1000){
+  if(_carGw.length>1 && cars.length<carMaxNow() && now-_carSpawnAt>=CAR_SPAWN_SEC*1000){
     const a=carSpot(), b=carSpot();
     if(a && b && (a.r!==b.r || a.c!==b.c)){
       const p=TR.route(MAP, CITY.roadClass, a, b, ROAD, 1, {cost:carCost()});
@@ -2681,6 +2824,7 @@ function stepTraffic(dt){
   cars=TR.stepCars(cars, dt, CAR_STEP_OPTS);
   // インスタンスへ流す
   const B=CarInst.body, T=CarInst.trim, A=CarInst.alpha;
+  const L=CarInst.lamp, BE=CarInst.beam;
   let k=0;
   for(const c of cars){
     if(k>=CAR_CAP) break;
@@ -2690,6 +2834,15 @@ function stepTraffic(dt){
     _carMat.compose(_carP, _carQ, _carS);
     B.setMatrixAt(k, _carMat); T.setMatrixAt(k, _carMat);
     B.setColorAt(k, _carC.set(c.color||0xcccccc));
+    if(L) L.setMatrixAt(k, _carMat);
+    if(BE){
+      // 路面の光は**車の長さの伸縮を掛けない**。車種で光の届く距離が変わるのは変。
+      // 地面すれすれに置く (標示の上、街灯の輪と同じ高さ)。
+      _carP.set(c.x, c.y, 0.021);
+      _carS.set(1,1,1);
+      _carMat.compose(_carP, _carQ, _carS);
+      BE.setMatrixAt(k, _carMat);
+    }
     if(A) A.array[k]=(c.alpha==null?1:c.alpha);
     k++;
   }
@@ -2697,6 +2850,22 @@ function stepTraffic(dt){
   B.instanceMatrix.needsUpdate=true; T.instanceMatrix.needsUpdate=true;
   if(A) A.needsUpdate=true;
   if(B.instanceColor) B.instanceColor.needsUpdate=true;
+  if(L){ L.count=k; L.instanceMatrix.needsUpdate=true; }
+  if(BE){ BE.count=k; BE.instanceMatrix.needsUpdate=true; }
+}
+
+// 夜だけ点ける。街灯と同じ曲線 (日暮れ 0.55 あたりからじわっと)。
+//   ★ 明るいうちは**板ごと visible=false** にする。加算合成で opacity=0 でも
+//     フラグメントは走るので、昼に台数ぶんの塗りを空回しさせない。
+function stepCarLights(d){
+  if(!CAR_LIGHTS) return;
+  const t=Math.max(0, Math.min(1, (0.55-d)/0.40));
+  const e=t*t*(3-2*t);
+  if(CarInst.lampMat) CarInst.lampMat.emissiveIntensity = e*2.2;
+  if(CarInst.beam){
+    CarInst.beam.visible = CAR_BEAM_GLOW>0 && e>0.02;
+    CarInst.beamMat.opacity = e*0.95*CAR_BEAM_GLOW;
+  }
 }
 
 // ── 住民のインスタンス描画 ───────────────────────────────────────────────────
@@ -2894,6 +3063,83 @@ function syncAgentInstances(){
   _drawnAgents=k;
 }
 
+// ── 荷物 (ネット通販の段ボール) ──────────────────────────────────────────────
+// 配達員が担いでいる箱と、玄関先に置かれた箱を **1本の InstancedMesh** で描く。
+// どちらも「立方体を1個どこかに置く」だけなので分ける理由が無く、
+// 車 (CarInst) や住民 (AgentInst) と同じくドローコールは 1 本に収まる。
+//   ★ 荷物は MAP を触らない。通行判定にもレイキャスタ (観測) にも出さない。
+//     観測に出すには rcTex 側にも荷物の概念が要り、学習と本番がズレる
+//     (world.js 冒頭が戒めている二重実装)。荷物は**配信の画にだけ**居る。
+const PARCEL_CAP  = envNum('PARCEL_CAP', 96);
+const PARCEL_SIZE = AGENT_H*0.30;      // 身長比 3割 ≒ 50cm 角の段ボール
+const PARCEL_COL  = 0xb98a4e;          // 段ボール色
+const ParcelInst  = { mesh:null };
+
+function initParcelInstances(S){
+  if(!S || !DELIVERY_ON) return;
+  const geo=new THREE.BoxGeometry(PARCEL_SIZE, PARCEL_SIZE, PARCEL_SIZE);
+  // ★ 色は**マテリアルに直接**置く。setColorAt (instanceColor) は
+  //   vertexColors:true を併せないと効かない — three r132 の color_fragment は
+  //   USE_COLOR のときしか vColor を乗せず、USE_INSTANCING_COLOR だけでは
+  //   素通りして真っ白になる (車と住民が vertexColors:true なのはそのため)。
+  //   荷物は全部同じ段ボール色なので、インスタンスごとに色を持つ必要がそもそも無い。
+  const mat=new THREE.MeshLambertMaterial({color:PARCEL_COL});
+  mat.userData.shared=true;
+  const m=new THREE.InstancedMesh(geo, mat, PARCEL_CAP);
+  m.count=0; m.frustumCulled=false;
+  m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  markShadow(m, true, false);
+  S.add(m);
+  ParcelInst.mesh=m;
+}
+
+const _pcP=new THREE.Vector3(), _pcQ=new THREE.Quaternion();
+const _pcS=new THREE.Vector3(1,1,1), _pcMat=new THREE.Matrix4();
+const _pcZ=new THREE.Vector3(0,0,1);
+
+// 荷物を毎フレーム描き出す。位置は
+//   ・担いでいる箱 … 配達員のメッシュ (補間済み) の胸の前
+//   ・置かれた箱   … 玄関セルの中心、地面の上
+// ★ ワールド座標はセル座標と **x/y が入れ替わる** (renderLoop と同じ
+//   tx=a.y*CELL+CELL/2, ty=a.x*CELL+CELL/2)。ここを揃えないと荷物だけ
+//   街の反対側に転置して並ぶ。
+function syncParcels(){
+  const M=ParcelInst.mesh; if(!M) return;
+  let k=0;
+  // ① 配達員が担いでいる箱
+  for(let i=0;i<agents.length && k<PARCEL_CAP;i++){
+    const a=agents[i];
+    if(!a.deliv || !a.deliv.box) continue;
+    const o=agentMeshes[i];
+    if(!o || !o.visible || !o.userData.onScreen) continue;   // 屋内/画角外は描かない
+    // 骨格の正面はモデルの +Y。rotation.z=φ のとき世界では (-sinφ, cosφ)。
+    const f=o.rotation.z;
+    const fx=-Math.sin(f), fy=Math.cos(f);
+    // 足元 = o.position.z - CELL*0.26*CHAR_SCALE。そこから胸の高さへ。
+    const foot=o.position.z - CELL*0.26*CHAR_SCALE;
+    _pcP.set(o.position.x + fx*PARCEL_SIZE*0.62,
+             o.position.y + fy*PARCEL_SIZE*0.62,
+             foot + AGENT_H*0.50);
+    _pcQ.setFromAxisAngle(_pcZ, f);
+    _pcMat.compose(_pcP, _pcQ, _pcS);
+    M.setMatrixAt(k, _pcMat);
+    k++;
+  }
+  // ② 玄関先に置かれた箱。玄関セルの中心から**建物側へ寄せて**置く
+  //    (セル中心のままだと道の真ん中に見え、誰の家に届いたのか分からない)。
+  for(const p of parcels){
+    if(k>=PARCEL_CAP) break;
+    const dr=Math.sign(p.hr-p.r)*CELL*0.32, dc=Math.sign(p.hc-p.c)*CELL*0.32;
+    _pcP.set(p.c*CELL+CELL*0.5+dc, p.r*CELL+CELL*0.5+dr, PARCEL_SIZE*0.5);
+    _pcQ.setFromAxisAngle(_pcZ, p.th||0);
+    _pcMat.compose(_pcP, _pcQ, _pcS);
+    M.setMatrixAt(k, _pcMat);
+    k++;
+  }
+  M.count=k;
+  M.instanceMatrix.needsUpdate=true;
+}
+
 // ─── RGBA → JPEG ─────────────────────────────────────────────────────────────
 async function rgbaToJpeg(rgba, width, height){
   if(sharp){
@@ -2972,8 +3218,10 @@ const SICK_HI       = 0.35;        // これを超えたら病院へ (低めの�
 const IDX_OF   = n => BLDG_NAME_TO_IDX[n];
 const FOOD_IDX = ['kiosk','ramen','gyudon','cafe','bento'].map(IDX_OF).filter(v=>v!=null);
 const HOME_IDX = ['house','apartment'].map(IDX_OF).filter(v=>v!=null);
-const WORK_IDX = ['office','tower','bank','post','cityhall','police'].map(IDX_OF).filter(v=>v!=null);
+// 倉庫も職場。ここに配属された住民が配達員になる (isCourier / stepDelivery)。
+const WORK_IDX = ['office','tower','bank','post','cityhall','police','warehouse'].map(IDX_OF).filter(v=>v!=null);
 const POLICE_IDX = IDX_OF('police');
+const WAREHOUSE_IDX = IDX_OF('warehouse');
 // 学齢別の学校。学生は平日ここへ通う。
 const SCHOOL_IDX = {
   elementary: IDX_OF('elementary'), junior: IDX_OF('junior'),
@@ -3155,7 +3403,9 @@ const EXPAND_STEP     = envNum('EXPAND_STEP', 2);        // 1回に広げる幅 
 // 拡張の主な判断は**建て込み具合**。空き区画の数で見ると、建物が増えるほど
 // 「建物に接した空き地」も増えてしまい、いつまでも広がらない。
 const EXPAND_DENSITY  = envNum('EXPAND_DENSITY', 0.28);  // 建物がフィールドのこの割合を超えたら広げる
-const EXPAND_FREE     = envNum('EXPAND_FREE', 6);        // 空き区画がこれ以下でも広げる (保険)
+const EXPAND_FREE     = envNum('EXPAND_FREE', 6);
+// 「建てたいのに置き場所が無い」が何日続いたら広げるか
+const EXPAND_STARVE   = Math.max(1, envNum('EXPAND_STARVE', 2));        // 空き区画がこれ以下でも広げる (保険)
 const EXPAND_TREES    = envNum('EXPAND_TREES', 3);       // 新しい土地の木の間引き (n セルに1本)
 // 住居/職場の定員 (人口の上限を決める = 家が建つと人が増える)
 const HOUSE_CAP       = envNum('HOUSE_CAP', 2);
@@ -3449,13 +3699,16 @@ function bldgModules(){
                exstairBase: q('exstair_base'),
                stair:     q('stair'),
                signRoof:  q('sign_roof'),
-               signBlade: q('sign_blade') };
+               signBlade: q('sign_blade'),
+               signBlade2:q('sign_blade2'),  // 積む用 (1フロアぶん)
+               roof3:     q('roof3'),        // 陸屋根のもう一種 (手すり・アンテナ)
+               plinth:    q('plinth') };     // 入り口の土間と植え込み
     };
     const out={1:pick(1), 2:pick(2)};
     if(!out[1]) throw new Error('fp1_base / fp1_floor が無い (ノード名を確認)');
     if(!out[2]) out[2]=out[1];                     // 2x2 用が無ければ 1x1 を流用
     const tri=g.parts.reduce((s,p)=>s+(p.index?p.index.length:p.position.length/3)/3,0);
-    const have=['gable','hip','roof2','awning','fence','balcony','exstair','stair','signRoof','signBlade']
+    const have=['gable','hip','roof2','roof3','awning','fence','balcony','exstair','stair','signRoof','signBlade','signBlade2','plinth']
       .filter(k=>out[1][k]).join(',') || 'なし';
     console.log(`[Bldg] ${path.basename(fp)} を読み込み (${tri}三角形 / `
               + `土台${out[1].base.h.toFixed(2)} フロア${out[1].floor.h.toFixed(2)}`
@@ -3499,8 +3752,9 @@ function structVariant(st){
     h=Math.imul(h ^ (h>>>15), 0x85EBCA6B)>>>0;
     return ((h>>>8) & 0xFFFF)/0x10000;
   };
-  const V={n:0, roof:'flat', gable:false, sign:null, balcony:false, exstair:false,
-           stair:false, awning:false, fence:false, facing:structFacing(st, hash)};
+  const V={n:0, roof:'flat', gable:false, sign:null, blades:0, balcony:false,
+           exstair:false, stair:false, awning:false, fence:false, plinth:false,
+           facing:structFacing(st, hash)};
   if(!S) return V;
   const H=structHeight(st);
   const floors=rh=>Math.max(0, Math.round((H - S.base.h - rh)/S.floor.h));
@@ -3513,8 +3767,12 @@ function structVariant(st){
   if(pitched && (S.gable || S.hip)){
     V.roof = (S.hip && S.gable) ? (rnd(4)<0.45 ? 'hip' : 'gable')
                                 : (S.hip ? 'hip' : 'gable');
-  }else if(S.roof2 && rnd(4)<0.42){
-    V.roof='flat2';                                // 陸屋根でも屋上の表情を変える
+  }else{
+    // 陸屋根も 1 種類だと同じ高さのビルが並んだとき繰り返しが目に付く。
+    // 塔屋と貯水槽 / 塔屋と室外機 / 手すりとアンテナ の 3 種から選ぶ。
+    const r4=rnd(4);
+    if(S.roof3 && r4<0.30)      V.roof='flat3';
+    else if(S.roof2 && r4<0.62) V.roof='flat2';
   }
   V.gable = (V.roof==='gable' || V.roof==='hip');  // 屋上看板が載らない屋根かどうか
   V.n=floors(roofModOf(S, V).h);                   // 屋根が変わると入る階数も変わる
@@ -3525,6 +3783,13 @@ function structVariant(st){
     else if(roofOK)       V.sign='roof';
     else if(bladeOK)      V.sign='blade';
   }
+  // 雑居ビルの袖看板。**テナントごとに縦へ何枚も並ぶ**のが日本の街の顔で、
+  // 1階に1枚だけだと「きれいなオフィスビル」にしか見えない。3階建て以上の
+  // 店が入る業種だけに、上の階へ 1〜3 枚積む。
+  V.blades = (V.sign==='blade' && S.signBlade2 && BLADE_TYPES.has(bt.name) && V.n>=2)
+           ? 1 + Math.floor(rnd(7)*Math.min(3, V.n-1)) : 0;
+  // 足元の土間と植え込み。壁がいきなり地面から生えているのを避ける。
+  V.plinth = !!S.plinth && !V.awning && rnd(8)<PLINTH_P;
   V.exstair = !!S.exstair && !!S.exstairBase && EXSTAIR_TYPES.has(bt.name)
             && V.n>=2 && V.n<=4 && rnd(2)<0.65;
   V.balcony = !!S.balcony && BLDG_BALCONY_MIN>0 && V.n>=BLDG_BALCONY_MIN;
@@ -3542,6 +3807,7 @@ function roofModOf(S, V){
   return V.roof==='gable' ? (S.gable||S.roof)
        : V.roof==='hip'   ? (S.hip  ||S.roof)
        : V.roof==='flat2' ? (S.roof2||S.roof)
+       : V.roof==='flat3' ? (S.roof3||S.roof)
        :                     S.roof;
 }
 
@@ -3552,15 +3818,16 @@ function roofModOf(S, V){
 // 正面まるごと」の絵なので、モジュール側に UV を持たせると階ごとに絵が繰り返して
 // しまう。組み上がった実寸から箱状に投影すれば、従来のテクスチャ箱と同じ見え方になる。
 // (4面とも同じ絵なので、建物ごと回してもテクスチャの向きは破綻しない)
-function buildStructGeo(fpn, H, V){
+function buildStructGeo(fpn, H, V, nb){
   const M=bldgModules(); if(!M) return null;
   const S=M[fpn]||M[1];
   const roofMod=roofModOf(S, V);
   const actual=S.base.h + V.n*S.floor.h + roofMod.h;
   const sz=Math.min(1.25, Math.max(0.80, H/actual));   // 端数は縦の伸縮で吸収
-  const key=[fpn, V.n, sz.toFixed(3), V.roof, V.sign||'-',
+  nb = nb||0;
+  const key=[fpn, V.n, sz.toFixed(3), V.roof, V.sign||'-', V.blades||0,
              V.balcony?'b':'-', V.exstair?'x':'-', V.stair?'s':'-',
-             V.awning?'a':'-', V.fence?'w':'-', V.facing].join('_');
+             V.awning?'a':'-', V.fence?'w':'-', V.plinth?'p':'-', V.facing, nb].join('_');
   if(structGeoCache[key]) return structGeoCache[key];
 
   const buf={}; for(const k of GROUP_ORDER) buf[k]={pos:[], nrm:[]};
@@ -3568,6 +3835,16 @@ function buildStructGeo(fpn, H, V){
   // 縦は縮めない (背は変えず、足元の隙間だけ広げたい)。
   const hs=DIM.BLDG.fill/DIM.BLDG.glbFill;
   const a=V.facing*Math.PI/2, ca=Math.cos(a), sa=Math.sin(a);
+  // 隣とくっつけるぶんの伸ばし量 (ワールドの ±Y / ±X ごと)。敷地の余白の分だけ
+  // 外へ出す = ちょうど境界で隣と面が合う。
+  // ★ 敷地の境まで伸ばす量は、**通り側に寄せたぶんを差し引く**。寄せを無視して
+  //   一律に伸ばすと、前に寄せた建物は前の壁が道へはみ出し、背面は隣に届かない。
+  const grow=(1-DIM.BLDG.fill)*CELL*0.5;
+  const [sox,soy]=structOffset(V);
+  const gp=(v)=>Math.max(0, grow - v), gn=(v)=>Math.max(0, grow + v);
+  const gYp=(nb&1)?gp(soy):0, gXn=(nb&2)?gn(sox):0,
+        gYn=(nb&4)?gn(soy):0, gXp=(nb&8)?gp(sox):0;
+  const halfW=fpn*CELL*DIM.BLDG.fill/2;
   let maxZ=0;
   const put=(mod, z0)=>{
     if(!mod) return;
@@ -3575,7 +3852,14 @@ function buildStructGeo(fpn, H, V){
       const src=mod.g[grp], dst=buf[grp]||buf.trim;
       for(let i=0;i<src.pos.length;i+=3){
         const x=src.pos[i]*hs, y=src.pos[i+1]*hs, z=(src.pos[i+2]+z0)*sz;
-        dst.pos.push(x*ca - y*sa, x*sa + y*ca, z);     // 正面を facing の向きへ回す
+        // 先に facing で回してから、**ワールドの軸ごとに**外へ伸ばす。
+        // 回す前に伸ばすと、建物の向きしだいで伸びる方角が変わってしまう。
+        let wx=x*ca - y*sa, wy=x*sa + y*ca;
+        if(halfW>0){
+          wx += (wx>0 ? wx/halfW*gXp : -wx/halfW*gXn);
+          wy += (wy>0 ? wy/halfW*gYp : -wy/halfW*gYn);
+        }
+        dst.pos.push(wx, wy, z);
         const nx=src.nrm[i], ny=src.nrm[i+1];
         dst.nrm.push(nx*ca - ny*sa, nx*sa + ny*ca, src.nrm[i+2]);
         if(z>maxZ) maxZ=z;
@@ -3584,7 +3868,10 @@ function buildStructGeo(fpn, H, V){
   };
   put(S.base, 0);
   if(V.stair)            put(S.stair,     0);
+  if(V.plinth)           put(S.plinth,    0);
   if(V.sign==='blade')   put(S.signBlade, 0);
+  // 上の階に積む袖看板。1階の大きいやつの上に、1フロアぶんのを重ねる。
+  for(let i=0;i<(V.blades||0);i++) put(S.signBlade2, S.base.h + i*S.floor.h);
   if(V.awning)           put(S.awning,    0);   // 庇と塀はモジュール側が絶対高さを持つ
   if(V.fence)            put(S.fence,     0);
   for(let i=0;i<V.n;i++){
@@ -3606,7 +3893,11 @@ function buildStructGeo(fpn, H, V){
   const pos=new Float32Array(total), nrm=new Float32Array(total);
   const uv =new Float32Array(total/3*2);
   const col=new Float32Array(total);         // 足元の汚し (facade だけ濃くする)
-  const bw=fpn*CELL*DIM.BLDG.fill, half=bw/2, Ht=actual*sz;
+  // UV の正規化に使う幅は**伸ばしたあとの実寸**から取る。名目の幅のままだと、
+  // 隣とくっついた面だけテクスチャが端で切れる。
+  const bwX=fpn*CELL*DIM.BLDG.fill+gXn+gXp, bwY=fpn*CELL*DIM.BLDG.fill+gYn+gYp;
+  const halfXn=fpn*CELL*DIM.BLDG.fill/2+gXn, halfYn=fpn*CELL*DIM.BLDG.fill/2+gYn;
+  const Ht=actual*sz;
   const geo=new THREE.BufferGeometry();
   let o=0;
   for(let gi=0; gi<GROUP_ORDER.length; gi++){
@@ -3616,19 +3907,34 @@ function buildStructGeo(fpn, H, V){
     if(g==='facade'){
       // 面の向きで横方向を決める。外から見て左→右に u が増えるようにする。
       // v は地面 0 → 屋上 1。
+      //
+      // ── 正面以外の面の扱い ──
+      // 箱状投影なので、放っておくと 4面すべてに正面の写真が回る。理屈の上では
+      // 不自然 (側面にも入り口の窓が並ぶ) なので、正面以外は u を写真の細い帯へ
+      // 潰して無地の壁にする仕掛けを入れてある。
+      //   **ただし既定では効かせていない。** 実際に見比べると、窓が消えたほうが
+      //   違和感が強かった (写真の窓が建物の情報量そのもので、消すと側面が
+      //   のっぺりする)。BLDG_SIDE_W=0.03 あたりで有効になる。
+      const fnx=-Math.sin(a), fny=Math.cos(a);      // 正面の法線 (facing から)
       for(let i=0;i<b.pos.length;i+=3){
         const x=b.pos[i], y=b.pos[i+1], z=b.pos[i+2];
         const nx=b.nrm[i], ny=b.nrm[i+1];
-        const u = Math.abs(nx)>=Math.abs(ny)
-          ? (nx>0 ? (y+half)/bw : (half-y)/bw)
-          : (ny>0 ? (half-x)/bw : (x+half)/bw);
+        let u = Math.abs(nx)>=Math.abs(ny)
+          ? (nx>0 ? (y+halfYn)/bwY : (bwY-halfYn-y)/bwY)
+          : (ny>0 ? (bwX-halfXn-x)/bwX : (x+halfXn)/bwX);
+        const front = (nx*fnx + ny*fny) > 0.5;
+        let side=1;
+        if(!front){
+          u = BLDG_SIDE_U0 + u*BLDG_SIDE_W;
+          side = BLDG_SIDE_DIM;                     // 正面より少しだけ落とす
+        }
         uv[(o+i)/3*2  ]=u;
         uv[(o+i)/3*2+1]=z/Ht;
         // 足元の汚し。実際の建物は雨の跳ね返りで腰から下が黒ずむ。**新品の
         // ファサード写真が地面まで同じ明るさで届いている**のが、街が CG に
         // 見える理由のひとつだった。ここは頂点カラーなので追加コストは無い。
         const t=Math.max(0, 1 - (z/Ht)/BLDG_GRIME_H);
-        const k=1 - BLDG_GRIME*t*t;
+        const k=(1 - BLDG_GRIME*t*t)*side;
         col[(o+i)/3*3  ]=k; col[(o+i)/3*3+1]=k*0.995; col[(o+i)/3*3+2]=k*0.985;
       }
     }else{
@@ -3652,8 +3958,25 @@ function buildStructGeo(fpn, H, V){
 // 屋上の色は従来の箱の屋上 (0xb0b4ac) に合わせてある。
 const TRIM_COLOR = 0xb2b5ac;
 // 足元の汚し。BLDG_GRIME が濃さ、BLDG_GRIME_H が「建物の高さの何割まで」。
+// 袖看板を縦に積む業種 (テナントが入る雑居ビル)。住宅や学校には積まない。
+const BLADE_TYPES = new Set(['office','shop','cafe','ramen','gyudon','bento',
+                             'pharmacy','bank','mall','hotel','tower']);
+const PLINTH_P    = envNum('PLINTH_P', 0.55);      // 足元の土間を付ける割合
 const BLDG_GRIME   = envNum('BLDG_GRIME', 0.26);
 const BLDG_GRIME_H = Math.max(0.02, envNum('BLDG_GRIME_H', 0.22));
+// 正面以外の面がテクスチャのどこを舐めるか (u の開始位置と幅)。狭いほど無地の壁に
+// 近づく。
+//
+// ★ **既定は「何もしない」(4面とも正面の写真)。** 一度 0.03 にして側面と背面を
+//   無地の壁にしてみたが、**窓が無くなるほうが違和感が強い**という判断で戻した。
+//   写真の窓は建物の情報量そのもので、それを消すと側面がのっぺりする — 縦樋を
+//   足しても足りなかった。箱状投影の「4面とも顔」は理屈の上では不自然でも、
+//   絵としてはこちらが良い。
+//   下の 3 つが (0, 1, 1) のとき、UV も頂点カラーも**この機能を入れる前と完全に
+//   同じ値**になる。試したくなったら BLDG_SIDE_W=0.03 で起動する。
+const BLDG_SIDE_U0  = envNum('BLDG_SIDE_U0', 0);
+const BLDG_SIDE_W   = Math.max(0, Math.min(1, envNum('BLDG_SIDE_W', 1)));
+const BLDG_SIDE_DIM = envNum('BLDG_SIDE_DIM', 1);      // 側面・背面の暗さ (1 = 落とさない)
 // 三角屋根の屋根材。業種ごとに変えて、並んだ家が全部同じ色にならないようにする。
 const ROOF_PALETTE=[0x8a5a4a,0x4e5a63,0x6d6a55,0x7a4f43,0x55606a,0x8a7a5a,0x5f6b56,0x6a5450];
 function structGlbMats(st){
@@ -3720,9 +4043,25 @@ function structMats(st){
     Math.min(1,m.color.r*tr), Math.min(1,m.color.g*tg), Math.min(1,m.color.b*tb)));
   return mats;
 }
+// 建物ごとの高さのばらつき。**同じ業種は完全に同じ高さだった** ので、住宅が
+// 並ぶとパラペットが定規で引いたように揃っていた (31業種に対して高さは9種類しか
+// 無い)。座標から決まる固定の倍率を掛けて、通りのスカイラインに凹凸を作る。
+//
+// ★ **段階にする。** buildStructGeo のジオメトリキャッシュのキーに伸縮率
+//   (sz) が入っているので、連続値で振るとキャッシュが建物の数だけ際限なく増える。
+//   5 段階に量子化すれば、同じ業種の建物は高々 5 通りの形を使い回す。
+const BLDG_H_VARY  = envNum('BLDG_H_VARY', 0.12);   // ±何割振るか。0 で従来どおり揃う
+const BLDG_H_STEPS = Math.max(2, Math.round(envNum('BLDG_H_STEPS', 5)));
+function structHeightK(st){
+  if(BLDG_H_VARY<=0) return 1;
+  let h=(Math.imul(st.r|0, 2654435761) ^ Math.imul(st.c|0, 40503))>>>0;
+  h=Math.imul(h ^ (h>>>15), 0x85EBCA6B)>>>0;
+  const k=(h>>>9)%BLDG_H_STEPS;
+  return 1 + (k/(BLDG_H_STEPS-1)*2 - 1)*BLDG_H_VARY;
+}
 function structHeight(st){
   const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
-  return st.state==='construction' ? CELL*0.3 : bt.height*CELL;
+  return st.state==='construction' ? CELL*0.3 : bt.height*CELL*structHeightK(st);
 }
 function removeStructMesh(S, st){
   const key=st.r+'_'+st.c+'_b', o=occluders[key];
@@ -3737,15 +4076,88 @@ function removeStructMesh(S, st){
   delete occluders[key];
   _occStamp=-1;                       // バケツを作り直す
 }
+
+// 取り壊しのあとも隣の壁を戻す (くっついていた面が剥き出しのままにならない)。
+function afterStructRemoved(S, st){ refreshNeighborWalls(S, st); }
+// ── 街路壁 ──────────────────────────────────────────────────────────────────
+// 隣も建物のセルなら、そちら側の壁を敷地の境まで伸ばして**隣とくっつける**。
+// これが無いと 5.7m 角の建物が 2.0m の隙間を空けて等間隔に並び、街区が
+// 「碁盤に置いた積み木」に見える。日本の街区は建物が接して連続した壁になり、
+// たまに 1m ほどの隙間が空く — その見え方に寄せる。
+//
+//   ★ **隣が後から建つ問題。** 建てた時点の隣接で形が決まるので、隣が翌日
+//     建つと最初の建物は隣と接しないままになる。addStructMesh の最後で
+//     4 近傍の建物も作り直して追従させる (再入しないよう深さで止める)。
+//   ★ ジオメトリのキャッシュキーに 4 ビットぶんが増える (最大 16 倍)。建物の数
+//     以上には増えないので実害は無い。
+const PARTY_WALL = process.env.PARTY_WALL !== '0';
+function structNeighbors(st){
+  if(!PARTY_WALL || !CITY) return 0;
+  const fp=st.fp;
+  // 世界の +Y(行+) / -X(列-) / -Y(行-) / +X(列+) の順。facing と同じ並びにして
+  // おくと、buildStructGeo 側で「正面かどうか」と突き合わせやすい。
+  const at=(r,c)=>{
+    if(r<0||r>=GRID||c<0||c>=GRID) return false;
+    return MAP[r][c]===BUILDING;
+  };
+  let m=0;
+  for(let i=0;i<fp;i++){
+    if(at(st.r+fp,   st.c+i)) m|=1;
+    if(at(st.r+i,    st.c-1)) m|=2;
+    if(at(st.r-1,    st.c+i)) m|=4;
+    if(at(st.r+i,    st.c+fp)) m|=8;
+  }
+  return m;
+}
+
+// 建物を敷地のどこに置くか。
+//   ★ **通り側に寄せる。** セルの中央に置くと正面の余白と背面の余白が同じになり、
+//     街区が「碁盤に等間隔で置いた積み木」に見える。実際の建物は通りに面を揃えて
+//     建ち、余白は裏に回る。占有率 0.74 なので片側 1.0m の余裕があり、そのうち
+//     BLDG_SETBACK ぶんを前に使う = 通りに面が揃い、裏に路地ができる。
+//   ★ 動かすのは**見た目だけ**。住民の経路も玄関セル (doorCell) も MAP のまま。
+const BLDG_SETBACK = Math.max(0, Math.min(1, envNum('BLDG_SETBACK', 0.75)));
+// 敷地の中心からのずれ。**buildStructGeo と addStructMesh の両方が読む** ので
+// facing だけから決まる形にしてある (片方だけ直すと、寄せたぶん街路壁がズレる)。
+function structOffset(V){
+  if(BLDG_SETBACK<=0) return [0,0];
+  const slack=(1-DIM.BLDG.fill)*CELL*0.5*BLDG_SETBACK;   // 前に出せる量
+  const a=V.facing*Math.PI/2;
+  return [-Math.sin(a)*slack, Math.cos(a)*slack];        // 正面の向きへ
+}
+
+// 隣が建った / 消えたときに、まわりの建物の壁を作り直して追従させる。
+//   ★ 再入しない。作り直しの中でまた近傍を呼ぶと無限に広がるので、深さで止める。
+//     1 段だけ潜れば「自分の隣」までは正しくなる (その隣の隣は形が変わらない)。
+let _wallDepth=0;
+function refreshNeighborWalls(S, st){
+  if(!PARTY_WALL || _wallDepth>0 || !CITY || !CITY.structs) return;
+  _wallDepth++;
+  try{
+    const fp=st.fp;
+    for(const o of CITY.structs){
+      if(o===st || o.state==='gone') continue;
+      // 4 近傍に接しているか (辺が触れているものだけ)
+      const touch = (o.r+o.fp===st.r || st.r+fp===o.r) ? (o.c < st.c+fp && st.c < o.c+o.fp)
+                  : (o.c+o.fp===st.c || st.c+fp===o.c) ? (o.r < st.r+fp && st.r < o.r+o.fp)
+                  : false;
+      if(touch) addStructMesh(S, o);
+    }
+  } finally { _wallDepth--; }
+}
+
 function addStructMesh(S, st){
   if(!S || st.state==='gone') return;
   removeStructMesh(S, st);
   const span=st.fp, bw=span*CELL*0.8, h=structHeight(st);
-  const cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
+  let cx=st.c*CELL+span*CELL*0.5, cy=st.r*CELL+span*CELL*0.5;
   let mesh=null, hVis=h, zRest=h/2;
   // 工事中はどのみち灰色の低い箱なので GLB を組まない
   if(st.state!=='construction' && bldgModules()){
-    const geo=buildStructGeo(span, h, structVariant(st));
+    const V=structVariant(st);
+    const [ox,oy]=structOffset(V);
+    cx+=ox; cy+=oy;
+    const geo=buildStructGeo(span, h, V, structNeighbors(st));
     if(geo){
       mesh=new THREE.Mesh(geo, structGlbMats(st));
       hVis=geo.userData.hVis; zRest=0;             // GLB は底面が z=0 に揃っている
@@ -3759,6 +4171,7 @@ function addStructMesh(S, st){
   mesh.position.set(cx,cy,zRest);
   // 建物は落とすし受ける (隣のビルの影が壁に落ちる)。ここが街の影の主役。
   markShadow(mesh, true, true);
+  refreshNeighborWalls(S, st);
   mesh.userData.hVis=hVis; mesh.userData.zRest=zRest;
   if(st.state==='open' && Array.isArray(mesh.material) && mesh.material.length===GROUP_ORDER.length){
     const facade=mesh.material[0], sign=mesh.material[GROUP_ORDER.indexOf('sign')];
@@ -4087,6 +4500,7 @@ function rebuildGround(S){
   rebuildLamps(S);
   rebuildSignals(S);            // 交差点の信号 (道が変わると交差点も変わる)
   rebuildProps(S);              // 自販機・ガードレール・自転車など
+  rebuildLitter(S);             // 治安が悪いほど道に散らかるゴミ袋
   rebuildStreetTrees(S);        // 道沿いと建物の隙間の木 (InstancedMesh 2 本)
 }
 
@@ -4433,6 +4847,113 @@ function stepProps(S, d){
   if(!P || !P.glow) return;
   const t=Math.max(0, Math.min(1, (0.55-d)/0.40));
   P.glow.material.emissiveIntensity = (t*t*(3-2*t))*1.9;
+}
+
+// ── ゴミ袋 (治安の可視化) ────────────────────────────────────────────────────
+// `CITY.unrest` (= 追い詰められている住民の割合) が上がるほど、道にゴミ袋が
+// 散らかっていく。**数字でしか分からなかった治安を、絵で分かるようにする**のが目的。
+// いままで unrest は「警察署を建てるかどうか」にしか使われておらず、視聴者から見ると
+// 街が荒れていく過程がどこにも出ていなかった。
+//
+//   ★ 段階を追って荒れる。袋が「出る / 出ない」の 2 値だと、ある日いきなり街が
+//     ゴミだらけになる。unrest に応じて **置かれるセルの割合・1か所の袋の数・
+//     道路側へのはみ出し** の 3 つが同時に増えるので、じわじわ悪化して見える。
+//   ★ 位置は座標のハッシュで固定。毎回振り直すとゴミが street を飛び回る。
+//   ★ **1 メッシュ = 1 ドローコール。** 袋が何個あっても変わらない。
+//   ★ 当たり判定は無く、観測 (方策の入力) にも入らない。住民も車も素通りする。
+const LITTER_ON    = process.env.LITTER !== '0';
+// unrest がこの値まで来たら「街じゅうゴミだらけ」。
+//   ★ 立ち上がりを早くしておくこと。**警察署が建つ閾値は unrest=0.03** で、そこで
+//     ゴミ袋が 1 個では「目に見えて治安が悪い」にならない。0.12 にすると 0.03 で
+//     荒れ 25% (袋 8個ほど)、0.06 で 50%、0.12 で街じゅうになる。
+const LITTER_FULL  = Math.max(0.01, envNum('LITTER_FULL', 0.12));
+const LITTER_MAX_P = Math.max(0, Math.min(1, envNum('LITTER_MAX_P', 0.55)));  // 最大でも道の何割に置くか
+const LITTER_STEPS = Math.max(2, Math.round(envNum('LITTER_STEPS', 8)));      // 荒れ具合の段階数
+// 見た目の確認用。治安が悪い街をその場で作れないので固定できるようにする。
+const UNREST_FORCE = (()=>{ const v=parseFloat(process.env.UNREST);
+  return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : null; })();
+
+// 0..1 に正規化した荒れ具合。**段階に丸める** — 生の値で持つと、unrest が少し動く
+// たびに地面を作り直すことになる。
+function litterLevel(){
+  const u = UNREST_FORCE!=null ? UNREST_FORCE : ((CITY && CITY.unrest) || 0);
+  const n = Math.max(0, Math.min(1, u/LITTER_FULL));
+  return Math.round(n*LITTER_STEPS)/LITTER_STEPS;
+}
+
+// 袋の色。**暗い色を主体にする。** 最初は日本の指定袋どおり半透明の白を多くしたが、
+// 舗装が明るいグレーなので**同化してほとんど見えなかった**。ここは実物の再現より
+// 「治安が悪いと一目で分かる」を優先して、黒と濃紺を主体にする。
+// (実際、事業系の可燃ごみは黒袋なので、まとまって出ている絵としては不自然でもない)
+const LITTER_COL = [0x24242a, 0x24242a, 0x2b2f38, 0x3c5068, 0x40463c, 0xb9bdb2];
+function rebuildLitter(S){
+  if(!S) return;
+  const L=S.userData.litter||(S.userData.litter={});
+  if(L.mesh){ S.remove(L.mesh); L.mesh.geometry.dispose(); L.mesh.material.dispose(); L.mesh=null; }
+  const lv=litterLevel();
+  L.level=lv;
+  if(!LITTER_ON || lv<=0 || !CITY) return;
+  const wu=m=>m/DIM.mPerWu;
+  const pos=[], nrm=[], col=[];
+  const hash=(r,c,k)=>{ let h=(Math.imul(r+1,73856093)^Math.imul(c+1,19349663)^Math.imul(k+1,83492791))>>>0;
+    h=Math.imul(h^(h>>>13),0x85EBCA6B)>>>0; return ((h>>>8)&0xFFFF)/0x10000; };
+  const isRoad=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID&&MAP[r][c]===ROAD;
+  const put=(x0,x1,y0,y1,z0,z1,hex)=>{
+    const before=pos.length;
+    pushBox(pos,nrm, x0,x1, y0,y1, z0,z1);
+    const cc=new THREE.Color(hex);
+    for(let i=before;i<pos.length;i+=3) col.push(cc.r, cc.g, cc.b);
+  };
+  let bags=0;
+  for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    if(!isRoad(r,c)) continue;
+    if(hash(r,c,1) >= lv*LITTER_MAX_P) continue;      // 置くセルの割合が unrest で増える
+    // 道の縁を探す。見つからなければ車道の真ん中なので、荒れているときだけ置く
+    let dr=0, dc=0, edge=false;
+    for(const [a,b] of [[0,-1],[0,1],[-1,0],[1,0]]) if(!isRoad(r+a,c+b)){ dr=a; dc=b; edge=true; break; }
+    if(!edge && lv<0.5) continue;
+    const bx=c*CELL+CELL*0.5 + dc*CELL*0.36;
+    const by=r*CELL+CELL*0.5 + dr*CELL*0.36;
+    // 1 か所の袋の数と、道路側へのはみ出しも unrest で増える
+    const n = 1 + Math.floor(hash(r,c,2)*(1+3*lv));
+    const spread = CELL*(0.07 + 0.20*lv);
+    for(let i=0;i<n;i++){
+      const ox=(hash(r,c,10+i)-0.5)*2*spread, oy=(hash(r,c,20+i)-0.5)*2*spread;
+      const x=bx+ox, y=by+oy;
+      const sc=0.85+hash(r,c,30+i)*0.5;
+      const w=wu(0.26)*sc, h=wu(0.44)*sc;             // 袋の本体 (幅の半分 / 高さ)
+      // **積む。** 平らに並べるだけだと、寄りの画でしか気づけない小さな点が散る
+      // だけになる。集積所は実際に山になるし、山になっていれば遠景でも分かる。
+      const z0 = (i>=2 && hash(r,c,90+i)<0.55) ? h*0.82 : 0;
+      const hex=LITTER_COL[(hash(r,c,40+i)*LITTER_COL.length)|0];
+      put(x-w, x+w, y-w, y+w, z0, z0+h, hex);         // 本体
+      const nw=w*0.34;                                 // 口を縛った首
+      put(x-nw, x+nw, y-nw, y+nw, z0+h, z0+h+wu(0.13)*sc, hex);
+      bags++;
+    }
+    // 破れて散らばった中身。荒れているほど増える
+    const scraps = Math.floor(hash(r,c,3)*4*lv);
+    for(let i=0;i<scraps;i++){
+      const ox=(hash(r,c,50+i)-0.5)*2*spread*2.0, oy=(hash(r,c,60+i)-0.5)*2*spread*2.0;
+      const x=bx+ox, y=by+oy, sw=wu(0.07+hash(r,c,70+i)*0.06);
+      put(x-sw, x+sw, y-sw*0.6, y+sw*0.6, wu(0.005), wu(0.03), LITTER_COL[(hash(r,c,80+i)*3)|0]);
+    }
+  }
+  if(!pos.length) return;
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos),3));
+  g.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(nrm),3));
+  g.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(col),3));
+  L.mesh=new THREE.Mesh(g, new THREE.MeshLambertMaterial({vertexColors:true}));
+  // 影は落とす。落とさないと地面に貼った絵に見えて、置いてあるように見えない。
+  // 深度パスに増えるのは 1 ドローコールだけ。
+  markShadow(L.mesh, true, false);
+  S.add(L.mesh);
+  if(L.logged!==lv){
+    L.logged=lv;
+    console.log(`[Litter] 不穏度 ${((CITY&&CITY.unrest)||0).toFixed(3)}`
+      + ` → 荒れ ${(lv*100).toFixed(0)}% / ゴミ袋 ${bags}個`);
+  }
 }
 
 // ── 電線 ──────────────────────────────────────────────────────────────────
@@ -4850,7 +5371,7 @@ function freshCity(){
     demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
     unmet:Object.fromEntries(CATS.map(c=>[c,0])),
     stats:{roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
-           crimes:0,jobsLost:0},
+           crimes:0,jobsLost:0,delivered:0},
     unrest:0,
     news:[], savedAgents:{}, diag:freshDiag(),
     waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
@@ -4886,7 +5407,7 @@ function initCity(){
       demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
       stats:Object.assign({roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
-                          crimes:0,jobsLost:0}, j.stats||{}),
+                          crimes:0,jobsLost:0,delivered:0}, j.stats||{}),
       unrest:j.unrest||0,
       news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
       waiting:j.waiting||[], recs:j.recs||[],
@@ -5121,6 +5642,12 @@ function shouldLeaveBuilding(a){
   if(n==='sleep') return a.home ? !(br===a.home[0] && bc===a.home[1])
                                 : !HOME_IDX.includes(t);   // 家なしは住居なら留まる
   if(n==='work')  {
+    // 配達員の職場は「街の中」。倉庫に着いても留まらせない
+    // (留めると勤務時間じゅう倉庫の中に居て、荷物が一つも届かない)。
+    //   ★ ただし**配達に出る時間帯だけ**。無条件に外へ出すと、勤務時間ではあるが
+    //     配達時間外 (DELIV_FROM/TO を狭めた場合) に「倉庫を出る→職場へ向かう→
+    //     倉庫に入る→また出る」を延々繰り返す。
+    if(isCourier(a) && onDeliveryDuty(a)) return true;
     const w=a.school||a.work;
     return !(w && br===w[0] && bc===w[1]);
   }
@@ -5176,6 +5703,18 @@ function describeActivity(a){
   const atWork = a.work && Math.abs(r-a.work[0])<=1 && Math.abs(c-a.work[1])<=1;
   const h=gameHour();
 
+  // 配達中は業務がそのまま行動。生活の欲求より先に見せる
+  // (勤務時間中の配達員は needOf が 'work' なので、下の判定だと全員「職場で働いている」になる)。
+  if(a.deliv){
+    const D=a.deliv;
+    if(D.phase==='load')    return '📦 倉庫で荷物を積んでいる';
+    if(D.phase==='drop')    return '📦 玄関先に荷物を置いている';
+    if(D.phase==='toHome'){
+      const st=D.target;
+      return `📦 荷物を ${st?BLDG_TYPES[st.typeIdx].label:'配達先'} へ運んでいる`;
+    }
+    return '🚶 倉庫へ荷物を取りに戻っている';
+  }
   if((a.sick||0)>0 && near(CARE_IDX)) return '🏥 病院・薬局で治療を受けている';
   if(t!=null && FOOD_IDX.includes(t)) return `${BLDG_TYPES[t].label} で食事をしている`;
   if(t!=null && BUY_IDX.includes(t))  return `${BLDG_TYPES[t].label} で買い物をしている`;
@@ -5673,7 +6212,7 @@ function maybeFound(day){
   // 詰まってきたら建てない。フィールドが最大 (30x30) に達すると拡張で逃げられなくなるので、
   // ここで止めないと単調に密集し続ける (本番で40日目に発生)。
   const dens=fieldDensity(), walk=walkability();
-  if(dens>=BUILD_MAX_DENS || walk<WALK_MIN){
+  if(buildingPaused()){
     console.log(`[City] 建設を見送り: 建て込み ${(dens*100).toFixed(0)}% (上限${(BUILD_MAX_DENS*100)|0}%)`
       + ` / 通行性 ${walk.toFixed(2)} (下限${WALK_MIN})`);
     return 0;
@@ -5682,18 +6221,31 @@ function maybeFound(day){
   const hcap=housingCapacity(), wcap=workplaceCapacity();
   let workers=0; for(const a of agents) if(!a.owns) workers++;
 
+  // ★ **「建てたいのに建てられない」を数える。**
+  //   建設が止まる条件 (密度/通行性) を通っても、残りの空き区画が全部
+  //   wouldChoke / openRatio で弾かれると 1 軒も建たない。実測: 通行性 0.563 で
+  //   建設は止まっていないのに空き区画20が全部弾かれ、人口26で固定された。
+  //   この「置き場所が無い」状態こそ土地が足りない合図なので、maybeExpand が
+  //   これを見て街を広げる。密度や通行性という**代理の指標ではなく、実際に
+  //   失敗した事実**で判断する。
+  let wanted=false;
   if(pop >= hcap*HOME_PRESSURE && foundableTypes('home').length){
+    wanted=true;
     if(foundCategory('home', day)){
+      CITY.starved=0;
       console.log(`[City] 住居が不足 (人口${pop}/定員${hcap}) → 住むところを建てた`);
       return 1;
     }
   }
   if(workers >= wcap*WORK_PRESSURE && foundableTypes('work').length){
+    wanted=true;
     if(foundCategory('work', day)){
+      CITY.starved=0;
       console.log(`[City] 働き口が不足 (勤め人${workers}/定員${wcap}) → 働くところを建てた`);
       return 1;
     }
   }
+  if(wanted) CITY.starved=(CITY.starved||0)+1;
   // 商売: 需要がいちばん濃い場所のスコアで発火を決める
   let best=null;
   const parts=[];
@@ -5732,13 +6284,31 @@ function fieldDensity(){
   return n/(fieldSize()*fieldSize());
 }
 
+// 建設が止まっているか (maybeFound の入口と同じ条件)。拡張の逃げ道の判定に使う。
+function buildingPaused(){
+  return fieldDensity()>=BUILD_MAX_DENS || walkability()<WALK_MIN;
+}
+
 function maybeExpand(day){
   if(!CITY || CITY.size>=GRID) return 0;
   const free=buildableLots(), dens=fieldDensity();
-  if(dens<EXPAND_DENSITY && free>EXPAND_FREE) return 0;
+  // ★ **膠着の逃げ道。** 拡張の条件は「建て込んできたら」だけだったので、
+  //   通行性で建設が止まったのに密度が低い、という状態から抜けられなかった。
+  //   実測: 通行性 0.548 (下限0.55) で建設停止、建て込み 24% (拡張は28%から) で
+  //   拡張もせず、フィールド 10x10 のまま人口32で永久に固定された。土地は
+  //   30x30 まであり、空き区画も18あったのに、である。
+  //   建設が止まっていて、まだ広げられるなら**広げる**。開けた土地が増えれば
+  //   通行性が上がり、建設が再開する = 自力で抜け出せる。
+  //   ・建設が閾値で止まっている
+  //   ・閾値は通っているのに「置き場所が無い」日が続いている (CITY.starved)
+  //   どちらも「土地が足りない」ので広げる。広げれば開けた土地が増えて通行性が
+  //   上がり、置ける区画も生まれるので、街は自力で膠着から抜け出せる。
+  const stuck = buildingPaused() || (CITY.starved||0) >= EXPAND_STARVE;
+  if(!stuck && dens<EXPAND_DENSITY && free>EXPAND_FREE) return 0;
   const base=makeMap(GRID, CITY.seed);        // 元の地形 (種から決定的に再生成できる)
   const oldLo=fieldLo(), oldHi=fieldHi();
   CITY.size=Math.min(GRID, CITY.size+EXPAND_STEP);
+  CITY.starved=0;
   const lo=fieldLo(), hi=fieldHi();
   let trees=0;
   for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++){
@@ -5751,12 +6321,178 @@ function maybeExpand(day){
   groundDirty=true;
   rebuildBuildings(MAP);
   console.log(`[City] フィールド拡張 ${oldHi-oldLo+1} → ${CITY.size}`
-    + ` (建て込み ${(dens*100).toFixed(0)}% / 空き区画${free} / 木+${trees})`);
+    + ` (建て込み ${(dens*100).toFixed(0)}% / 空き区画${free} / 木+${trees}`
+    + `${stuck?' / 建設が止まっていたので拡張':''})`);
   news('expand', `🌱 街の範囲が広がった (${CITY.size}×${CITY.size})`,
        `The land expanded to ${CITY.size}x${CITY.size}`);
   showCityEvent(Math.round((lo+hi)/2), Math.round((lo+hi)/2),
     `The land expanded to ${CITY.size}x${CITY.size}`, 9, null, {wide:true});
   return 1;
+}
+
+// ── 景気の波 ────────────────────────────────────────────────────────────────
+// 転出を入れると人口は動くようになるが、放っておくと**同じ周期で行ったり来たり**
+// する定常振動に落ち着きやすい。外から緩い波を掛けて、好況の年と不況の年を作る。
+//   ★ 収入 (給料の原資) に掛ける。需要や人口に直接触ると、原因と結果が混ざって
+//     何が効いているのか分からなくなる。景気は**お金の巡り**にだけ効かせる。
+//   ★ 位相は街の種から決める。再起動しても同じ街なら同じ波になる。
+const BOOM_ON     = process.env.BOOM !== '0';
+const BOOM_DAYS   = Math.max(4, envNum('BOOM_DAYS', 42));   // 1周期の日数
+const BOOM_AMP    = Math.max(0, Math.min(0.9, envNum('BOOM_AMP', 0.35)));  // 振れ幅 (±)
+function boomFactor(day){
+  if(!BOOM_ON) return 1;
+  const seed=((CITY&&CITY.seed)||0)%BOOM_DAYS;
+  // 波を2本重ねて、単純な正弦の繰り返しに見えないようにする
+  const t=(day+seed)/BOOM_DAYS*Math.PI*2;
+  const w=Math.sin(t)*0.75 + Math.sin(t*0.37+1.3)*0.25;
+  return 1 + BOOM_AMP*w;
+}
+function boomLabel(day){
+  const b=boomFactor(day);
+  return b>=1.18 ? '好況' : b<=0.82 ? '不況' : '平常';
+}
+
+// ── 職場の撤退 ──────────────────────────────────────────────────────────────
+// **赤字を理由に職場を潰してはいけない。** 一度やって街が崩壊した記録が
+// maybeBankrupt に残っている (職場が減る → 失業 → 誰も払えない → 店も潰れる →
+// さらに職場が減る、の暴走。実測 失業34%・無一文316人・店3軒)。
+//
+// なので「収支」ではなく**外から降ってくる事象**として扱い、暴走しないよう
+// 三重に縛る:
+//   1. 雇用に余力があるときだけ (求人が余っている = 失業が出ても吸収できる)
+//   2. 最低軒数を必ず残す
+//   3. 間隔を空ける (連鎖しない)
+// これで「大きな職場がひとつ撤退して失業者が出る」という揺さぶりだけが入る。
+const EXIT_ON        = process.env.WORK_EXIT !== '0';
+const EXIT_EVERY      = Math.max(5, envNum('WORK_EXIT_DAYS', 25));  // 最短の間隔(日)
+const EXIT_P          = Math.max(0, Math.min(1, envNum('WORK_EXIT_P', 0.35)));
+const EXIT_MIN_WORK   = Math.max(2, envNum('WORK_EXIT_MIN', 3));    // 残す職場の数
+const EXIT_SLACK      = envNum('WORK_EXIT_SLACK', 1.35);            // 雇用の余力の下限
+
+function maybeWorkExit(day){
+  if(!EXIT_ON || !CITY || !ECON_ON) return 0;
+  if(day - (CITY.lastWorkExit||-999) < EXIT_EVERY) return 0;
+  if(Math.random() >= EXIT_P) return 0;
+  const works=openStructsOf(WORK_IDX);
+  if(works.length<=EXIT_MIN_WORK) return 0;
+  // 雇用に余力があるときだけ。ここを外すと過去の暴走が再現する。
+  const cap=workplaceCapacity();
+  let workers=0; for(const a of agents) if(!a.owns) workers++;
+  if(cap < workers*EXIT_SLACK) return 0;
+  // いちばん大きい職場が撤退する = 失業のインパクトが出る
+  works.sort((a,b)=>(b.fp*b.fp)-(a.fp*a.fp));
+  const st=works[0];
+  CITY.lastWorkExit=day;
+  const label=BLDG_TYPES[st.typeIdx].label;
+  closeShop(st, day, false);
+  news('close', `🏭 ${label} (${st.r},${st.c}) が撤退した`,
+       `The ${enOf(st.typeIdx)} pulled out of town`);
+  return 1;
+}
+
+// ── 住民を1人抜く ───────────────────────────────────────────────────────────
+// **これまで住民を配列から抜く手段が無かった** (増える一方だった)。素朴に splice
+// すると、配列の index に紐づいている物が全部ずれる:
+//     camTargetIdx … カメラの追跡対象。ずれると突然別人を映し始める
+//     agentMeshes  … 並行配列。ずれると位置と姿が入れ替わる
+//     _slotColor   … インスタンスの色キャッシュ
+// そこで **末尾と入れ替えて縮める (swap-remove)**。動くのは 2 スロットだけなので、
+// 直すべき紐づきもその 2 つで済む。
+//   ★ 足跡は agent.ti (spawnAgent が配るスロット番号) で引いていて配列の index
+//     とは独立なので、ここでは触らなくてよい。**入れ替えた人の足跡が別人の物に
+//     なる事故が起きない**のはこのおかげ。
+function removeAgentAt(i){
+  const last=agents.length-1;
+  if(i<0 || i>last) return null;
+  const gone=agents[i];
+  // カメラ: camTargetIdx は 1 始まり (0=俯瞰)。
+  if(camTargetIdx===i+1)      camTargetIdx=0;           // 映していた本人が居なくなった → 俯瞰へ
+  else if(camTargetIdx===last+1) camTargetIdx=i+1;      // 末尾の人が i へ移った
+  if(i!==last){
+    agents[i]=agents[last];
+    agentMeshes[i]=agentMeshes[last];
+  }
+  agents.pop(); agentMeshes.pop();
+  // 入れ替えた 2 スロットの色キャッシュを無効化する (別人の色が残る)
+  _slotColor[i]=-1; _slotColor[last]=-1;
+  // 去った人の足跡を消して、スロットを返す (返さないと次の転入と衝突する)
+  clearTrailOf(gone);
+  freeTrailSlot(gone.ti);
+  return gone;
+}
+
+// ── 転出 ────────────────────────────────────────────────────────────────────
+// **人口が減る経路がひとつも無かった。** 転入だけがあり、住宅は建つ一方、
+// 建設は密度と通行性で止まる。止まったら密度が下がる道も無い (住んでいる家は
+// 壊せない) ので、人口はぴたりと収束して二度と動かない。実際 105 日回して 30 で
+// 固まったという報告があった。
+//
+// 転出を入れると、**既にある仕組みが初めて繋がる**:
+//     人口↑ → 家が建つ → 密度↑ → 建設が止まる
+//       → 職が足りない / 治安が悪い → 転出 → 家が空く
+//       → markVacant が畳む (実装済み) → 密度↓ → また建つ → 人口↑
+// 収束点ではなく行ったり来たりになり、失業・不穏度・閉店が**人口という結果に
+// 効く**ようになる (これまでどれも人口に影響しなかった)。
+const MOVEOUT_ON      = process.env.MOVEOUT !== '0';
+const MOVEOUT_MAX     = envNum('MOVEOUT_MAX', 6);        // 1日に出ていく上限
+const MOVEOUT_JOBLESS = envNum('MOVEOUT_JOBLESS', 6);    // 何日無職なら出ていくか
+const MOVEOUT_DESPER  = envNum('MOVEOUT_DESPER', 0.75);  // 追い詰められ度がこれ以上
+const MOVEOUT_UNREST  = envNum('MOVEOUT_UNREST', 0.6);   // 不穏度に応じて上乗せする割合
+const MOVEOUT_MIN_POP = Math.max(2, envNum('MOVEOUT_MIN_POP', 6));  // ここまでは減らさない
+
+// 出ていく順の点数。高いほど先に出る。
+//   ★ 視聴者の住民 (!join で入った人) は最後まで残す。自分のキャラが黙って消える
+//     のは配信として厳しいので、点数を大きく下げたうえで、出るときは必ず名前を
+//     出して知らせる。MOVEOUT_VIEWER=0 にすると完全に対象外にできる。
+const MOVEOUT_VIEWER = envNum('MOVEOUT_VIEWER', 0.25);
+// 転入の引き。働き口が無い街への転入をどこまで絞るか / 不穏度がこの値で転入ゼロ
+const MOVEIN_NOJOB  = Math.max(0, Math.min(1, envNum('MOVEIN_NOJOB', 0.25)));
+const MOVEIN_UNREST = Math.max(0.01, envNum('MOVEIN_UNREST', 0.10));
+function moveOutScore(a){
+  if(a.jail>0) return -1;                                // 収監中は出られない
+  let sc=0;
+  const jl=a.jobless||0;
+  if(jl>=MOVEOUT_JOBLESS) sc += 1 + (jl-MOVEOUT_JOBLESS)*0.1;
+  if((a.desper||0)>=MOVEOUT_DESPER) sc += 1.2;
+  if(!a.home) sc += 1.5;                                 // 住むところが無い
+  if(sc<=0) return -1;
+  if(a.viewer) sc *= MOVEOUT_VIEWER;
+  return sc;
+}
+
+function shrinkPopulation(day){
+  if(!MOVEOUT_ON || !scene || !CITY) return 0;
+  if(agents.length<=MOVEOUT_MIN_POP) return 0;
+  const cand=[];
+  for(let i=0;i<agents.length;i++){
+    const sc=moveOutScore(agents[i]);
+    if(sc>0) cand.push({i, sc, a:agents[i]});
+  }
+  if(!cand.length) return 0;
+  // 治安が悪い日は出ていく人が増える (荒れた街から人が去る)
+  const u=(CITY.unrest||0);
+  const boost=1 + MOVEOUT_UNREST*Math.min(1, u/0.12);
+  const n=Math.min(cand.length, MOVEOUT_MAX, agents.length-MOVEOUT_MIN_POP,
+                   Math.max(1, Math.round(cand.length*0.5*boost)));
+  cand.sort((x,y)=>y.sc-x.sc);
+  // index の大きい順に抜く (swap-remove で前の要素がずれないように)
+  const pick=cand.slice(0,n).sort((x,y)=>y.i-x.i);
+  const left=[];
+  for(const p of pick){
+    const gone=removeAgentAt(p.i);
+    if(gone) left.push(gone);
+  }
+  if(!left.length) return 0;
+  assignHomes();
+  CITY.pop=agents.length;
+  const names=left.filter(a=>a.viewer).map(a=>a.name);
+  const why = u>=0.06 ? '街が荒れて' : '仕事が見つからず';
+  news('pop', `📦 ${why} ${left.length}人が街を出ていった (人口 ${agents.length})`,
+       `${left.length} left town (pop ${agents.length})`);
+  // 視聴者の住民が出たときは必ず名前を出す (黙って消さない)
+  if(names.length) news('pop', `👋 ${names.join(', ')} が街を去りました`,
+                        `${names.join(', ')} left town`);
+  return left.length;
 }
 
 // ── 転入 ────────────────────────────────────────────────────────────────────
@@ -5767,7 +6503,24 @@ function growPopulation(day){
   const cap=Math.min(NUM_AGENTS, housingCapacity());
   const room=cap-agents.length;
   if(room<=0) return 0;
-  const n=Math.max(1, Math.min(room, MOVEIN_MAX, Math.ceil(agents.length*POP_GROWTH)));
+  // ★ **転入も街の様子で増減させる。** ここが「空きがあれば必ず上限まで来る」
+  //   ままだと、転出を足しても転入が常に勝って一方的に増えるだけになる
+  //   (実測: 転出1〜3人/日に対して転入は毎日上限の8人で、32日で140人まで直線的に
+  //   増えた)。人が来るかどうかは、住むところの空きだけでなく
+  //     ・景気     … 不況の街にはわざわざ来ない
+  //     ・働き口   … 職が無い街には来ない
+  //     ・治安     … 荒れた街には来ない
+  //   で決まるはず。これで不況 + 高い不穏度のときに**転入 < 転出**が成立し、
+  //   人口が減る局面が生まれる。
+  const bf=boomFactor(day);
+  let workers=0; for(const a of agents) if(!a.owns) workers++;
+  const jobSlack=workplaceCapacity()-workers;                    // 余っている働き口
+  const jobF=jobSlack<=0 ? MOVEIN_NOJOB : 1;
+  const unrestF=Math.max(0, 1 - (CITY.unrest||0)/MOVEIN_UNREST);
+  const attract=Math.max(0, bf*jobF*unrestF);
+  const want=Math.ceil(agents.length*POP_GROWTH*attract);
+  if(want<=0) return 0;
+  const n=Math.max(1, Math.min(room, MOVEIN_MAX, want));
   const base=agents.length;
   const moved=[];
   for(let k=0;k<n;k++){
@@ -5809,6 +6562,11 @@ function finishConstruction(){
     // 工事の箱と入れ替わりに、本物の建物が地面からせり上がる
     showCityEvent(st.r, st.c, `${enLabel} was built` + (owner?` by ${owner.name}`:''),
                   null, {st, kind:'rise'});
+    // 倉庫が開いたら、その場で配達員を雇う。
+    //   ★ assignHomes に任せると**永久に人が入らない**。あちらは `if(a.work) continue;`
+    //     で既に職のある人を素通りするので、全員が就職済みの街に新しい職場が建っても
+    //     誰も移ってこない (実測: 倉庫が開いて丸2日、配達員 0人のままだった)。
+    if(WAREHOUSE_IDX!=null && st.typeIdx===WAREHOUSE_IDX) staffWarehouses();
   }
 }
 
@@ -6018,6 +6776,7 @@ function finishDemolish(st){
   removeStructMesh(scene, st);
   st.state='gone';
   CITY.structs=CITY.structs.filter(x=>x.state!=='gone');
+  afterStructRemoved(scene, st);   // くっついていた隣の壁を戻す
   syncCity(); rebuildBuildings(MAP); groundDirty=true;
 }
 
@@ -6518,8 +7277,13 @@ function economyDay(day){
         st.revenue=(st.revenue||0)-Math.max(0,take);
         return Math.max(0, take);
       }
-      // 勤め人。売上が細ければ満額もらえない (最低でも半分は街が支える)
-      const pool=Math.max(amt*0.5, Math.min(amt, (st.revenue||0)));
+      // 勤め人。売上が細ければ満額もらえない (最低でも半分は街が支える)。
+      // ★ 景気の波はここに掛ける。**お金の巡りにだけ**効かせて、需要や人口には
+      //   直接触らない (原因と結果が混ざると何が効いているのか読めなくなる)。
+      //   不況では下支えも薄くなる = 生活が苦しくなり、転出の圧力が上がる。
+      const bf=boomFactor(gameDay());
+      const floor=amt*0.5*Math.min(1, bf);
+      const pool=Math.max(floor, Math.min(amt*bf, (st.revenue||0)));
       st.revenue=(st.revenue||0)-Math.min(st.revenue||0, pool);
       return pool;
     },
@@ -6535,7 +7299,12 @@ function economyDay(day){
       hudNewsDirty=true;
     },
   });
-  if(CITY) CITY.unrest=ECO.unrest(ECO_STATE, agents);
+  if(CITY){
+    const before=litterLevel();
+    CITY.unrest=ECO.unrest(ECO_STATE, agents);
+    // 荒れ具合の段階が変わったら、地面の作り直しを待たずに絵へ反映する
+    if(litterLevel()!==before) groundDirty=true;
+  }
 }
 
 // ── 建物の収支と倒産 ────────────────────────────────────────────────────────
@@ -6767,6 +7536,264 @@ function stepPolice(){
   }
 }
 
+// ── 配達員 ──────────────────────────────────────────────────────────────────
+// 倉庫 (warehouse) に勤めている住民が配達員。ネット通販の荷物を倉庫で受け取り、
+// 担いで各家庭へ歩いて運び、玄関先に置いて倉庫へ戻る — をひたすら繰り返す。
+//
+// ── なぜ既存の生活シミュレーションに混ぜず、専用の状態機械にしたのか ──
+// 住民の行き先は needOf() → pickLifeGoal() が決めており、勤務時間中の行き先は
+// 「職場 (a.work)」の 1 点しかない。倉庫を職場にするだけだと配達員は倉庫に入って
+// 一日を終える (shouldLeaveBuilding が n==='work' で屋内に留めるため)。
+// 「倉庫と家を往復する」は生活の欲求ではなく**業務**なので、警官 (stepPolice) と
+// 同じく専用のループを 1Hz で回し、そこから既存のナビ (enterNavigateTo) を叩く。
+//
+// ── 建物には入らない ──
+// 配達先で MW.enterBuilding してしまうと配達員が屋内 = 非表示になり、担いだ荷物も
+// 消える。玄関セル (MW.doorCell) を目的地にして、そこで止める。stepAll の到着処理は
+// a.deliv が立っている間だけ入館をスキップする。
+//
+// ── 位相 ──
+//   toDepot → load → toHome → drop → toDepot ...
+//   load / drop は「積み込み / 置いている」あいだの数秒の静止。ここで足を止めないと
+//   倉庫に着いた瞬間に向きを変えて戻るので、何をしているのか画で分からない。
+const DELIVERY_ON    = process.env.DELIVERY !== '0';
+const DELIV_FROM     = envNum('DELIV_FROM', 9);      // 配達を始めるゲーム内時刻
+const DELIV_TO       = envNum('DELIV_TO', 17);       // 配達を終える時刻 (勤務時間に合わせる)
+const DELIV_LOAD_SEC = envNum('DELIV_LOAD_SEC', 3);  // 倉庫での積み込みにかかる実時間
+const DELIV_DROP_SEC = envNum('DELIV_DROP_SEC', 3);  // 玄関先に置くのにかかる実時間
+const DELIV_PARCEL_SEC = envNum('DELIV_PARCEL_SEC', 90); // 置いた荷物が残る実時間 (住人が取り込むまで)
+const DELIV_STUCK_SEC  = envNum('DELIV_STUCK_SEC', 90);  // これだけ経っても着かなければ 1 巡を捨てる
+const DELIV_RETRY_SEC  = envNum('DELIV_RETRY_SEC', 4);   // 経路が引けなかったときの再挑戦間隔
+
+// 倉庫に勤めている住民か
+const isCourier = a => {
+  if(!DELIVERY_ON || WAREHOUSE_IDX==null) return false;
+  const w=a.work; if(!w) return false;
+  const st=structAt(w[0], w[1]);
+  return !!(st && st.state==='open' && st.typeIdx===WAREHOUSE_IDX);
+};
+const warehouseCount = () => WAREHOUSE_IDX==null ? 0
+  : (CITY?CITY.structs:[]).filter(st=>st.state==='open' && st.typeIdx===WAREHOUSE_IDX).length;
+
+// いま配達して良いか。
+//   ★ 判定の主は **needOf(a)==='work'**。時刻や曜日を自前で見るのではなく
+//     生活シミュレーションの結論をそのまま使う。こうしておくと、
+//     腹が減った・眠い・病気になった配達員は自動的に業務を降りて自分の用事へ行く
+//     (needOf の優先順位が 病気 > 睡眠 > 空腹 > 勤務 なので)。
+//     ここを時刻だけで書いていた版は、空腹が飽和したまま夕方まで荷物を運び続けた。
+//   DELIV_FROM/TO は「勤務時間のうち配達に充てる帯」を更に狭めたいときのつまみ。
+const onDeliveryDuty = a =>
+  needOf(a)==='work' && gameHour()>=DELIV_FROM && gameHour()<DELIV_TO
+  && !(ECON_ON && ECO.inJail(a));
+
+// 置かれた荷物。玄関先に転がって、しばらくすると住人が取り込んだことにして消す。
+//   {r,c} はセル座標。荷物は MAP を触らない = 通行の邪魔をしない。
+let parcels = [];
+let _delivStats = { delivered:0, runs:0, failed:0 };
+
+// 荷物を届ける先の家を選ぶ。
+//   「最後に届けてからの経過」を主、「倉庫からの近さ」を従にする。近さだけで選ぶと
+//   倉庫の隣の家へ往復するだけになり、配達が街に散らばらない。
+function pickDropTarget(a){
+  const depot=a.work;
+  const now=Date.now();
+  let best=null, bestSc=-Infinity;
+  for(const st of openStructsOf(HOME_IDX)){
+    // すでに荷物が置いてある玄関には二重に届けない
+    if(parcels.some(p=>p.hr===st.r && p.hc===st.c)) continue;
+    // 他の配達員がいま向かっている家も避ける (同じ玄関に 2 人で行かない)
+    if(agents.some(o=>o!==a && o.deliv && o.deliv.target===st)) continue;
+    const d=Math.hypot(st.r-depot[0], st.c-depot[1]);
+    const ago=Math.min((now-(st.deliveredAt||0))/1000, 3600);
+    const sc=ago - d*8 + Math.random()*40;
+    if(sc>bestSc){ bestSc=sc; best=st; }
+  }
+  return best;
+}
+
+// 建物 (br,bc) の玄関まで歩かせる。玄関 = 通行可の隣接セルなので、建物には入らない。
+//   hold=true にして到着時に mode='hold' で止める (そのまま徘徊に戻ると業務が途切れる)。
+function delivWalkTo(a, br, bc){
+  const door=MW.doorCell(MAP, WORLD, br, bc);
+  if(!door) return false;
+  // すでに玄関に立っているなら歩く必要がない。到着状態にして次の位相へ進ませる。
+  if(Math.floor(a.x)===door[0] && Math.floor(a.y)===door[1]){
+    a.path=null; a.pathIdx=0; a.navDest=[door[0],door[1]];
+    a.mode='hold'; a.rally=true;
+    return true;
+  }
+  return enterNavigateTo(a, door[0], door[1], null, true)==='ok';
+}
+
+// いまの位相の行き先へ (再) 出発する。経路が引けなければ false。
+function delivGo(a){
+  const D=a.deliv;
+  const dst = (D.phase==='toHome' && D.target) ? [D.target.r, D.target.c] : a.work;
+  D.since=Date.now();
+  if(delivWalkTo(a, dst[0], dst[1])){ D.retryAt=0; return true; }
+  D.retryAt=Date.now()+DELIV_RETRY_SEC*1000;
+  return false;
+}
+
+// 配達の 1 巡を始める (まず倉庫へ荷物を取りに行く)
+function delivStartRun(a){
+  a.deliv={ phase:'toDepot', box:false, target:null, since:Date.now(), retryAt:0, waitUntil:0 };
+  _delivStats.runs++;
+  delivGo(a);
+}
+
+// 業務終了 / 中断。荷物は倉庫へ返したことにして手ぶらに戻し、生活へ返す。
+//   ★ rally を必ず落とすこと。立てたまま返すと、次に建物へ着いたとき mode='hold' に
+//     入って**そこで永久に止まる** (stepAll は hold を素通りする)。
+function delivEndRun(a){
+  if(!a.deliv) return;
+  a.deliv=null;
+  a.rally=false;
+  if(a.mode==='hold') a.mode='wander';
+  if(!MW.isIndoors(a)) enterWander(a);
+}
+
+function stepDelivery(){
+  if(!DELIVERY_ON || WAREHOUSE_IDX==null || !CITY) return;
+  const now=Date.now();
+  for(const a of agents){
+    if(!isCourier(a) || !onDeliveryDuty(a)){ if(a.deliv) delivEndRun(a); continue; }
+    // 屋内に居るあいだは何もしない (shouldLeaveBuilding が勤務時間に外へ出す)
+    if(MW.isIndoors(a)) continue;
+    if(!a.deliv){ delivStartRun(a); continue; }
+    const D=a.deliv;
+
+    // ① 待ち (積み込み / 荷降ろし) 中は足を止める
+    if(D.waitUntil){
+      if(now < D.waitUntil) continue;
+      D.waitUntil=0;
+      if(D.phase==='load'){
+        // 荷物を担いで配達先へ。行き先が消えていたら手ぶらで倉庫へ戻る。
+        D.phase='toHome';
+        if(!D.target || D.target.state!=='open'){
+          D.box=false; D.phase='toDepot'; D.target=null; _delivStats.failed++;
+        }
+        delivGo(a);
+      }else if(D.phase==='drop'){
+        D.phase='toDepot'; D.target=null;
+        delivGo(a);
+      }
+      continue;
+    }
+
+    // ② 経路が引けなかった → 少し置いて引き直す
+    if(D.retryAt){
+      if(now>=D.retryAt) delivGo(a);
+      continue;
+    }
+
+    // ③ いつまでも着かない (道が消えた / 囲まれた) → 1 巡を捨ててやり直す
+    if(now-D.since > DELIV_STUCK_SEC*1000){ _delivStats.failed++; delivEndRun(a); continue; }
+
+    // ④ ナビが自分から徘徊へ落ちた (経路の引き直しに失敗した等) → 引き直す
+    if(a.mode!=='hold' && a.mode!=='navigate'){ delivGo(a); continue; }
+    if(a.mode!=='hold') continue;          // まだ歩いている途中
+
+    // ⑤ 到着した
+    if(D.phase==='toDepot'){
+      // 倉庫に着いた。荷物を 1 個担ぐ。届け先が無ければ少し待って探し直す。
+      const st=pickDropTarget(a);
+      if(!st){ D.since=now; D.retryAt=now+DELIV_RETRY_SEC*1000; continue; }
+      D.target=st; D.box=true; D.phase='load'; D.waitUntil=now+DELIV_LOAD_SEC*1000;
+    }else if(D.phase==='toHome'){
+      // 玄関に着いた。荷物を置く。
+      D.phase='drop'; D.waitUntil=now+DELIV_DROP_SEC*1000; D.box=false;
+      const st=D.target;
+      if(st){
+        st.deliveredAt=now;
+        // 置き場所は**玄関セル**。配達員の現在地を丸めると、到着判定に 0.8 セルの
+        // 余裕があるぶん隣のセルに落ちて「家から離れた道端に置かれている」ように見える。
+        const door=a.navDest || [Math.floor(a.x), Math.floor(a.y)];
+        parcels.push({ r:door[0], c:door[1], hr:st.r, hc:st.c,
+                       until:now+DELIV_PARCEL_SEC*1000, th:Math.random()*Math.PI*2 });
+        while(parcels.length>PARCEL_CAP) parcels.shift();   // 描ける数を超えたら古いものから消す
+        _delivStats.delivered++;
+        CITY.stats.delivered=(CITY.stats.delivered||0)+1;
+        if(_delivStats.delivered===1)
+          news('deliver', `📦 ${a.name} が最初の荷物を ${BLDG_TYPES[st.typeIdx].label} に届けた`,
+               `${a.name} made the town's first parcel delivery`);
+      }
+    }else{
+      // load/drop の待ちが外から潰された等。安全側に倒して倉庫へ戻る。
+      D.phase='toDepot'; D.box=false; D.target=null; delivGo(a);
+    }
+  }
+  // 置きっぱなしの荷物は住人が取り込んだことにして消す
+  if(parcels.length){
+    const keep=parcels.filter(p=>p.until>now);
+    if(keep.length!==parcels.length) parcels=keep;
+  }
+}
+
+// 倉庫に配達員を配属する。
+//   ★ なぜ assignHomes とは別に要るのか ──
+//     assignHomes は「職の無い人を空いている職場へ入れる」だけで、既に働いている人は
+//     `if(a.work) continue;` で素通りする。全員に職がある街に倉庫が建っても、
+//     誰かが失業するまで配属は起きない = 配達員が生まれない。ここで**転職**させる。
+//   選ぶ相手は「倉庫にいちばん近い家に住んでいる勤め人」。通勤が短い人ほど朝いちばんに
+//   倉庫へ着けるので、配達が始まるのが早い。無職の人が居ればそちらを先に拾う。
+const DELIV_CREW = envNum('DELIV_CREW', 2);      // 倉庫1軒あたりの配達員の人数
+function staffWarehouses(){
+  if(!DELIVERY_ON || WAREHOUSE_IDX==null || !CITY) return 0;
+  let hired=0;
+  for(const wh of openStructsOf([WAREHOUSE_IDX])){
+    const cap=Math.min(DELIV_CREW, ECON_ON ? workCapOf(wh) : WORK_CAP);
+    let need=cap - agents.filter(a=>a.work && a.work[0]===wh.r && a.work[1]===wh.c).length;
+    if(need<=0) continue;
+    // 店主 (自分の店がある) と学生は引き抜かない。生活の筋が壊れる。
+    const distOf=a=>a.home?Math.hypot(a.home[0]-wh.r, a.home[1]-wh.c):999;
+    const pool=agents
+      .filter(a=>!a.owns && !isStudent(a) && !(a.work && a.work[0]===wh.r && a.work[1]===wh.c))
+      .sort((x,y)=>((y.jobless>=0)-(x.jobless>=0)) || (distOf(x)-distOf(y)));
+    for(const a of pool){
+      if(need<=0) break;
+      const wasJobless = a.jobless>=0;
+      a.work=[wh.r, wh.c];
+      if(ECON_ON && wasJobless){ a.jobless=-1; ECO_STATE.stats.jobsFound++; }
+      // 業務中の状態は職場が変わった時点で無効。次の stepDelivery が引き直す。
+      if(a.deliv) delivEndRun(a);
+      need--; hired++;
+      news('job', `📦 ${a.name} が配達員になった`,
+           `${a.name} took a job delivering parcels`);
+    }
+  }
+  return hired;
+}
+
+// ── 倉庫を建てる ────────────────────────────────────────────────────────────
+// 「通販の荷物が届くようになったので物流拠点ができた」という順番にしたいので、
+// 街に住宅がある程度そろってから 1 軒目を建てる。人口に応じて増やす。
+const WAREHOUSE_MIN_HOMES = envNum('WAREHOUSE_MIN_HOMES', 4);   // 住宅がこれだけ建ったら
+const WAREHOUSE_PER_POP   = envNum('WAREHOUSE_PER_POP', 60);    // 人口これごとに 1 軒まで
+const WAREHOUSE_MAX       = envNum('WAREHOUSE_MAX', 3);
+function maybeFoundWarehouse(day){
+  if(!DELIVERY_ON || WAREHOUSE_IDX==null || !CITY) return false;
+  if(!typeAllowed(WAREHOUSE_IDX)) return false;
+  const homes=openStructsOf(HOME_IDX);
+  if(homes.length < WAREHOUSE_MIN_HOMES) return false;
+  const have=warehouseCount();
+  const want=Math.min(WAREHOUSE_MAX, 1+Math.floor(agents.length/WAREHOUSE_PER_POP));
+  if(have>=want) return false;
+  // 配達先 (住宅) の重心に近いほうが往復が短い = 配達員が実際に働ける。
+  //   ただし住宅の**真ん中**に置くと家々の隙間しか空いておらず site が取れないので、
+  //   距離の逆数ではなく「近いほど加点」のゆるい重みにする。
+  const site=pickSite(day, BLDG_TYPES[WAREHOUSE_IDX].footprint, (r,c)=>{
+    let sc=0;
+    for(const st of homes) sc += 1/(3+Math.hypot(st.r-r, st.c-c));
+    return sc;
+  });
+  if(!site) return false;
+  foundShop('work', site, WAREHOUSE_IDX, null, day);   // 物流拠点なので店主は付けない
+  news('found', `📦 通販の荷物が増えたので倉庫が建てられた`,
+       `A delivery warehouse is going up - the town orders too much online`);
+  return true;
+}
+
 // その建物で働いていた人を失業させる。閉店・解体の両方から呼ぶ。
 //   すぐ別の職場に付け替えると「店が潰れた」ことが本人に何も起きないので、
 //   JOB_SEARCH_DAYS のあいだ無職にする。この間に貯金が尽きると追い詰められる。
@@ -6890,8 +7917,15 @@ function dailyRollover(day){
   // 職を見つけられなかった (実測: 1000人全員が無職・街が崩壊した)。
   if(ECON_ON) assignHomes();
   if(ECON_ON) economyDay(day);                  // 給料 / 追い詰められ度 / 疑いの減衰
+  // ★ 転出は economyDay の**後**。無職の日数と追い詰められ度が今日ぶん更新されて
+  //   から見ないと、1日ずれた古い状態で出ていく人を選ぶことになる。
+  const leftTown=shrinkPopulation(day);         // 職も治安も駄目なら人は出ていく
+  if(leftTown) assignHomes();                   // 空いた家/職場を残った人へ配り直す
+  const exited=maybeWorkExit(day);              // まれに大きな職場が撤退する
   if(ECON_ON && CRIME_ON) maybeFoundPolice(day);// 治安が悪ければ警察署を建てる
   maybeFoundSchool(day);                        // 学生が居るのに学校が無ければ建てる
+  maybeFoundWarehouse(day);                     // 通販の荷物をさばく倉庫 (配達員の職場)
+  staffWarehouses();                            // 倉庫の欠員を補充する (辞めた/引っ越した配達員のぶん)
   const bankrupt=bankruptSweep(day);            // 採算の合わない建物を畳む (種類を問わない)
   // 発展段階が上がったか (経済活動の累計で決まる)
   const lv=cityLevel();
@@ -6937,7 +7971,7 @@ function dailyRollover(day){
   const open=CITY.structs.filter(s=>s.state==='open').length;
   let _road=0,_open=0;
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){ if(MAP[r][c]===ROAD)_road++; else if(MAP[r][c]===OTHER)_open++; }
-  console.log(`[City] ═══ Day ${day+1} ═══ 道+${roads}-${roadsBack} 建設+${opened} 閉店+${closed} 取壊+${gone} 転入+${moved}`
+  console.log(`[City] ═══ Day ${day+1} ═══ 人口${agents.length}(転入+${moved} 転出-${leftTown}) 景気${boomLabel(day)} 道+${roads}-${roadsBack} 建設+${opened} 閉店+${closed} 取壊+${gone} 転入+${moved}`
     + ` | 道${_road}/空き地${_open} (道率${(_road/Math.max(1,_road+_open)*100).toFixed(0)}%) 空き区画${buildableLots()}`
     + `${grown?` 拡張→${CITY.size}`:''}`
     + ` | 人口${agents.length} 建物${CITY.structs.length}軒(営業${open}) ${levelSpec().name}(経済${Math.round(CITY.econ)})`
@@ -7351,7 +8385,7 @@ function spawnAgent(S, i){
   const b=randB(null), g=randB(b);
   const a={aid:`${def.id}#${i}`, name:agentDisplayName(i,def),
     x:b[0]+0.5, y:b[1]+0.5, th:Math.random()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
-    trips:0, viols:0, steps:0, stall:0, def, ti:agents.length, active:true,
+    trips:0, viols:0, steps:0, stall:0, def, ti:allocTrailSlot(), active:true,
     visited:new Set(), explored:0, visMem:new Map(),
     // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
     mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
@@ -7366,6 +8400,7 @@ function spawnAgent(S, i){
     rel:{}, talk:null, talkIcon:null,// 人間関係 / 立ち話の状態 (social.js が管理)
     cash:null, desper:null, wanted:null, jobless:null, crimes:null, jail:null, // economy.js が管理
     chase:null, chaseAt:0,           // 警官が追いかけている相手 (stepPolice)
+    deliv:null,                      // 配達員の業務状態 (stepDelivery が管理)
     school:null,                     // 学生の通学先 (assignHomes が割り当てる)
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
@@ -7404,6 +8439,7 @@ function initAgents(S){
   for(const a of agents){ a.needIcon=null; a.talkIcon=null; }   // 古いシーンの板を掴んだままにしない
   clearTrails();
   agents=[];agentMeshes=[];
+  _tiFree.length=0; _tiNext=0;          // 足跡スロットの採番もやり直す
   // 最初の人口。村から始める場合は START_POP から、以降は住居が建つたびに増える。
   // 保存された街を復元するときはその人口から再開する。
   const startPop=Math.max(1, Math.min(NUM_AGENTS,
@@ -7473,6 +8509,32 @@ function initTrailField(S){
 }
 
 // 全住民の足跡を消す (シーン作り直し / リセット時)
+// ── 足跡スロットの割り当て ──────────────────────────────────────────────────
+// agent.ti は足跡のリングバッファ上の場所。**以前は spawnAgent が agents.length を
+// そのまま使っていた**が、転出で配列が縮むようになると、新しく来た住民が既に
+// 住んでいる人と同じスロットを引く = **2人が同じ足跡を書き潰す**。
+// 空いた番号を貯めて使い回す。
+const _tiFree=[];
+let _tiNext=0;
+function allocTrailSlot(){
+  if(_tiFree.length) return _tiFree.pop();
+  return _tiNext<Trail.cursor.length ? _tiNext++ : (Trail.cursor.length-1);
+}
+function freeTrailSlot(ti){
+  if(ti==null || ti<0 || ti>=Trail.cursor.length) return;
+  if(!_tiFree.includes(ti)) _tiFree.push(ti);
+}
+
+// 1人ぶんの足跡だけ消す。転出した住民の点が地面に残り続けるのを防ぐ。
+function clearTrailOf(agent){
+  if(!Trail.pos || !agent || agent.ti==null) return;
+  const i=agent.ti;
+  if(i<0 || i>=Trail.cursor.length) return;
+  Trail.pos.fill(0, i*MAX_TRAIL*4*3, (i+1)*MAX_TRAIL*4*3);
+  Trail.cursor[i]=0;
+  Trail.mesh.geometry.attributes.position.needsUpdate=true;
+}
+
 function clearTrails(){
   if(!Trail.pos) return;
   Trail.pos.fill(0); Trail.cursor.fill(0);
@@ -7661,7 +8723,9 @@ async function stepAll(){
       if(stepNavigate(a)){
         onArrive(a, a.navDest);
         // 到着 = 玄関に着いた。建物の中へ入る (滞在は屋内状態が担う)。
-        if(WORLD.solidBuildings && a.navDest) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
+        //   ★ 配達員だけは入らない。玄関先に荷物を置くのが仕事で、屋内に入ると
+        //     本人も担いだ荷物も見えなくなる (stepDelivery)。
+        if(WORLD.solidBuildings && a.navDest && !a.deliv) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
         if(a.rally) a.mode='hold';   // rally: 集合点に到着したら静止 (解除は /rally?off=1)
         else if(!MW.isIndoors(a)) enterWander(a);
       }
@@ -7715,6 +8779,7 @@ function doCityReset(newMap){
     initTrailField(scene);     // 足跡/住民メッシュは旧シーンと一緒に破棄されている
     initAgentInstances(scene);
     initCarInstances(scene);
+    initParcelInstances(scene);
     initAgents(scene);
   }
   saveCity();
@@ -8063,6 +9128,26 @@ const _camPos0 = new THREE.Vector3(), _camAim0 = new THREE.Vector3();
 let _camPrevTarget = -1, _camLastT = 0;
 const CAM_LAG   = envNum('CAM_LAG', 3.2);      // 大きいほど速く追いつく (∞ で従来の完全固定)
 const CAM_SHAKE = envNum('CAM_SHAKE', 0.012);  // 手持ちの揺れ幅 (セル比)
+
+// ── 上空背後からの追跡 (chase) ──────────────────────────────────────────────
+// 既存の追跡カメラは**ワールドの -Y に固定**で、住民の向きを追わない。斜め上から
+// 見下ろす「俯瞰寄りの寄り」で、これはこれで街の様子が分かるので残す。
+// ただし 2 つ弱点がある:
+//   ・カメラの高さが 5.88 で、いちばん高い建物 (6.60) より**低い**
+//   ・向きが固定なので、住民が北へ歩くと常に背中しか映らず、南へ歩くと顔だけ映る
+// そこで「住民の真後ろ・建物より高い位置から追う」ショットを足して、切替時に選ぶ。
+//   ★ 高さだけでは遮蔽は消えない (視線は斜めに降りるので、手前の建物には当たる)。
+//     カメラと住民の間にある建物を透かす処理を updateOcclusionFade に足してある。
+const CHASE_CHANCE = Math.max(0, Math.min(1, envNum('CHASE_CHANCE', 0.5)));
+// 後方 6.0 / 高さ 7.6 で見下ろし 52 度。高さは**いちばん高い建物 (6.60) より上**に
+// 取る。角度をこれ以上立てると真上から見た絵になり、住民が何をしているのか
+// かえって分からなくなる (最初 5.0/8.5 = 60 度で組んだら被写体が画面の下端に沈んだ)。
+const CHASE_BACK   = envNum('CHASE_BACK', 6.0);    // 真後ろへの距離 (ワールド単位)
+const CHASE_HIGH   = envNum('CHASE_HIGH', 7.6);    // 高さ。建物の最高 6.60 より上に出す
+const CHASE_AHEAD  = envNum('CHASE_AHEAD', 0.55);  // 視点を住民の何セル先に置くか (構図)
+const CHASE_TURN   = envNum('CHASE_TURN', 1.1);    // 向きの追従の速さ。速いと曲がるたびに振り回される
+let camChase = false;
+const _chaseDir = new THREE.Vector2(0, 1);         // なめらかにした「住民の向き」
 
 // ターゲット切替が起きた瞬間に呼び、たまに一人称視点ショットにする。
 // FPV はエージェント対象のときのみ (俯瞰では無効)。
@@ -9334,11 +10419,15 @@ async function ytcPoll(){
   }
 }
 
-// 一人称にするかを決める。**屋内の住民は選ばない**。
+// 次のショットを決める。**屋内の住民は一人称にしない**。
 //   建物の中に居るときの目線は壁しか映らず、何をしているのか分からない画になる。
+//   一人称にならなかったときは、上空背後 (chase) と従来の俯瞰寄り (follow) から選ぶ。
 function rollFPV() {
   const a = camTargetIdx > 0 ? agents[camTargetIdx - 1] : null;
   camFPV = !!a && !MW.isIndoors(a) && (Math.random() < FPV_CHANCE);
+  camChase = !!a && !camFPV && (Math.random() < CHASE_CHANCE);
+  // ショットが変わった瞬間に向きを合わせておく (前のショットの向きから回り込まない)
+  if (camChase && a) _chaseDir.set(Math.sin(a.th), Math.cos(a.th));
 }
 
 // 次に映すターゲットを決める (モード別)。camTargetIdx を更新する。
@@ -9450,6 +10539,43 @@ function updateTrackingCamera(cam) {
       cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
       cam.lookAt(tx + dwx*(fwd+4), ty + dwy*(fwd+4), eyeZ*0.85);   // 進行方向やや下向き
       _camLookAt.set(tx + dwx*(fwd+4), ty + dwy*(fwd+4), 0);
+    } else if (camChase) {
+      // ── 上空背後からの追跡 ──
+      // 住民の**進行方向の真後ろ**、建物より高い位置から追う。何をしに行くのかが
+      // 画に入るので、追跡ショットとしてはこちらのほうが分かりやすい。
+      //   ★ 向きは強くなまして使う。生の a.th をそのまま使うと、住民が曲がるたびに
+      //     カメラが振り回されて酔う画になる (住民は 1tick で 40 度まで回る)。
+      cam.up.set(0, 0, 1);                       // 水平線を水平に保つ
+      const hx = Math.sin(a.th), hy = Math.cos(a.th);
+      const k = Math.min(1, dtCam * CHASE_TURN);
+      _chaseDir.x += (hx - _chaseDir.x) * k;
+      _chaseDir.y += (hy - _chaseDir.y) * k;
+      if (_chaseDir.lengthSq() < 1e-6) _chaseDir.set(hx, hy);
+      _chaseDir.normalize();
+      const wx = tx - _chaseDir.x * CHASE_BACK;
+      const wy = ty - _chaseDir.y * CHASE_BACK;
+      const wz = CHASE_HIGH;
+      // 位置の遅れは follow と同じ仕掛け。ショットの切り替わりだけは飛ばす。
+      const cut = camTargetIdx !== _camPrevTarget;
+      _camPrevTarget = camTargetIdx;
+      if (cut || _camPos0.lengthSq() === 0) { _camPos0.set(wx, wy, wz); _camAim0.set(tx, ty, 0); }
+      else {
+        const p = Math.min(1, dtCam * CAM_LAG);
+        _camPos0.x += (wx - _camPos0.x) * p;
+        _camPos0.y += (wy - _camPos0.y) * p;
+        _camPos0.z += (wz - _camPos0.z) * p;
+        const ak = Math.min(1, dtCam * CAM_LAG * 1.6);
+        _camAim0.x += (tx - _camAim0.x) * ak;
+        _camAim0.y += (ty - _camAim0.y) * ak;
+      }
+      const T = Date.now() / 1000, A = CELL * CAM_SHAKE;
+      cam.position.set(_camPos0.x + Math.sin(T * 0.73) * A,
+                       _camPos0.y + Math.sin(T * 0.61 + 2.1) * A,
+                       _camPos0.z + Math.sin(T * 0.47 + 1.3) * A * 0.7);
+      // 少し前を見る = 住民が画面の下寄りに来て、これから向かう先が広く入る
+      cam.lookAt(_camAim0.x + _chaseDir.x * CELL * CHASE_AHEAD,
+                 _camAim0.y + _chaseDir.y * CELL * CHASE_AHEAD, CELL * 0.30);
+      _camLookAt.set(tx, ty, 0);
     } else {
       // ── 追跡カメラ (斜め後方から) ── CAM_DIST でプレイヤーまでの距離を調整 (小さいほど寄る)
       //
@@ -9773,6 +10899,43 @@ tick(); setInterval(tick, ${ms});
     return;
   }
 
+  // ── /delivery : 倉庫と配達員の状況 ──
+  //   「配達員が何人居て、いま何を運んでいるか」を 1 発で見るための窓。
+  //   配達が止まったとき (倉庫が無い / 誰も倉庫に配属されていない / 経路が引けない)
+  //   のどれで止まっているかが、ここを見れば切り分けられる。
+  if(urlPath==='/delivery'){
+    res.setHeader('Content-Type','application/json');
+    const couriers=agents.filter(isCourier);
+    const byPhase={toDepot:0, load:0, toHome:0, drop:0, idle:0};
+    for(const a of couriers) byPhase[a.deliv?a.deliv.phase:'idle']++;
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, enabled:DELIVERY_ON,
+      day:gameDay(), hour:+gameHour().toFixed(1), weekend:isWeekend(),
+      onDuty: !isWeekend() && gameHour()>=DELIV_FROM && gameHour()<DELIV_TO,
+      hours:{from:DELIV_FROM, to:DELIV_TO},
+      warehouses:(CITY?CITY.structs:[])
+        .filter(st=>WAREHOUSE_IDX!=null && st.typeIdx===WAREHOUSE_IDX)
+        .map(st=>({cell:[st.r,st.c], state:st.state})),
+      couriers:couriers.length,
+      carrying:couriers.filter(a=>a.deliv&&a.deliv.box).length,
+      byPhase,
+      parcelsOnGround:parcels.length,
+      // 置かれている荷物: cell=玄関のセル / home=届け先の建物 / leftSec=消えるまで
+      parcels:parcels.map(x=>({cell:[x.r,x.c], home:[x.hr,x.hc],
+                               leftSec:Math.max(0,Math.round((x.until-Date.now())/1000))})),
+      totals:_delivStats,
+      homes:openStructsOf(HOME_IDX).length,
+      // need/onDuty も返す。phase=null の配達員が「サボっている」のか
+      // 「腹が減って飯を食いに行った」のかは、これが無いと区別できない。
+      detail:couriers.map(a=>({name:a.name||a.def.name, aid:a.aid,
+        pos:[+a.x.toFixed(1),+a.y.toFixed(1)], indoors:MW.isIndoors(a),
+        need:needOf(a), onDuty:onDeliveryDuty(a),
+        phase:a.deliv?a.deliv.phase:null, box:!!(a.deliv&&a.deliv.box),
+        target:a.deliv&&a.deliv.target?[a.deliv.target.r, a.deliv.target.c]:null,
+        activity:describeActivity(a)}))}));
+    return;
+  }
+
   // ── /nav?verify=N : A* が旧実装 (線形走査 Dijkstra) と同じ最短コストを返すか照合 ──
   //   経路そのものは同コストなら別ルートでも良いので、コストだけ比べる。
   if(urlPath==='/nav'){
@@ -9986,6 +11149,7 @@ tick(); setInterval(tick, ${ms});
     //   /city?force=found     … いま需要が最大の場所に着工させる
     //   /city?force=close     … 来客が最少の店を閉店させる
     //   /city?force=demolish  … 閉店中の店を1軒その場で取り壊す (沈むアニメ)
+    //   /city?force=warehouse … 倉庫を1軒建てる (配達員が生まれる。/delivery で確認)
     const force=q.get('force');
     if(force){
       const day=gameDay();
@@ -9997,6 +11161,14 @@ tick(); setInterval(tick, ${ms});
         for(const cat of cats){
           const st=foundCategory(cat, day);
           if(st){ done=`found ${BLDG_TYPES[st.typeIdx].name} at ${st.r},${st.c}`; break; }
+        }
+      }else if(force==='warehouse'){
+        // 倉庫は日次 (maybeFoundWarehouse) にしか建たないので、配達の絵を確かめたいときの近道。
+        if(maybeFoundWarehouse(day)){
+          const st=CITY.structs.filter(x=>x.typeIdx===WAREHOUSE_IDX).pop();
+          done=`found warehouse at ${st.r},${st.c}`;
+        }else{
+          done=null;
         }
       }else if(force==='declutter'){
         // すでに詰まってしまった街を手当てする。道をいちばん塞いでいる建物から
@@ -10058,6 +11230,14 @@ tick(); setInterval(tick, ${ms});
         next:CITY_LEVELS[cityLevel()+1]?{name:CITY_LEVELS[cityLevel()+1].name,
           econ:CITY_LEVELS[cityLevel()+1].econ}:null},
       population:{now:agents.length, cap:housingCapacity(), max:NUM_AGENTS,
+        // 屋内/屋外の内訳。**負荷はほぼ屋外の人数で決まる** (屋内は stepAll が
+        // 即 continue し、描画もされない) ので、人口を増やすときはここを見る。
+        indoors:agents.reduce((n,a)=>n+(MW.isIndoors(a)?1:0),0),
+        // 人口が動く要因。収束したときにどれが効いていないのか切り分けるため。
+        boom:+boomFactor(gameDay()).toFixed(3), boomState:boomLabel(gameDay()),
+        cars:{now:cars.length, max:carMaxNow(), maxDay:CAR_MAX},
+        jobless:agents.reduce((n,a)=>n+((a.jobless||0)>=MOVEOUT_JOBLESS?1:0),0),
+        wantOut:agents.reduce((n,a)=>n+(moveOutScore(a)>0?1:0),0),
         resetAt:POP_MAX, resetPending:_popResetAt ? Math.max(0, Math.round((_popResetAt-Date.now())/1000)) : null,
         workCap:workplaceCapacity(),
         homeless:agents.reduce((n,a)=>n+(a.home?0:1),0),
@@ -10094,7 +11274,7 @@ tick(); setInterval(tick, ${ms});
       //   (屋内の目線は壁しか映らないので fpv=true かつ indoors=true にはならない)
       camera:(()=>{
         const a=camTargetIdx>0?agents[camTargetIdx-1]:null;
-        return {target:a?a.name:'overview', fpv:camFPV,
+        return {target:a?a.name:'overview', fpv:camFPV, chase:camChase,
                 indoors:a?MW.isIndoors(a):null,
                 event:!!camEventCur};
       })(),
@@ -10368,15 +11548,50 @@ async function renderLoop(){
       m.position.x+=(tx-px)*Math.min(1,dt*14);
       m.position.y+=(ty-py)*Math.min(1,dt*14);
       m.position.z=CELL*.26*CHAR_SCALE;   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
-      const tar=-a.th+Math.PI*.5;
+      // 体は **実際に進んでいる向き** へ向ける。
+      //
+      // ── ① 骨格の正面は +Y であって +X ではない ──
+      // skeleton.js は X=左右 (肩が x=±0.105)、**Y=正面** (`foot.y=+0.075`
+      // 「つま先(前に出ている)」)、Z=上。歩行アニメが脚を X 軸まわりに振る
+      // (= Y-Z 面で振る) のもこの取り決めに合っている。
+      //   rotation.z=φ を掛けるとモデルの +Y は世界の **(-sinφ, cosφ)** を向く。
+      //   世界での移動方向は (sin th, cos th) なので、合わせるには
+      //       φ = atan2(-dx, dy)      (止まっているときは φ = -a.th)
+      //   が正しい。**元の式 (-th+π/2) も、その次に書いた atan2(dy,dx) も、
+      //   どちらも常に 90 度横を向いていた**。住民はずっと横向きに歩いていた。
+      //   ★ 前回これを見逃したのは、確認に使った CRAB_DEBUG が「正面=+X」という
+      //     同じ誤った前提で測っていたから。metric が実装と同じ間違いをしていると
+      //     いくら測っても 0 度と出る。下の metric は +Y を正面として測る。
+      //
+      // ── ② 進んだ向きから取る ──
+      // a.th をそのまま使うと、pullToSidewalk が歩道へ**横に寄せている**あいだ、
+      // 向きは道なりのまま体だけ横へ滑る (a.x/a.y だけ動かして a.th を触らないため)。
+      //   ★ **見た目だけ**。a.th は書き換えないので、経路も通行判定も一人称カメラ
+      //     (視線は a.th のまま) も一切変わらない。
+      const dxw=m.position.x-px, dyw=m.position.y-py;
+      const moved=Math.hypot(dxw, dyw);
+      const tar = moved>CELL*0.004 ? Math.atan2(-dxw, dyw) : -a.th;
       let dr=tar-m.rotation.z;
       while(dr>Math.PI)dr-=Math.PI*2;while(dr<-Math.PI)dr+=Math.PI*2;
       m.rotation.z+=dr*Math.min(1,dt*14);
       // 歩行: 実際に進んだ距離で位相を進める (歩幅と速さが自然に一致する)。
       // 立ち止まると振幅が 0 に落ちて脚も止まる。
-      const sp=Math.hypot(m.position.x-px, m.position.y-py);
+      const sp=moved;
       m.userData.ph=(m.userData.ph||0)+sp*WALK_RATE;
       m.userData.amp=(m.userData.amp||0)*0.75 + Math.min(1, sp/WALK_FULL)*0.25;
+      if(process.env.CRAB_DEBUG==='1' && sp>CELL*0.004){
+        // 体の向きと実際に進んだ向きのズレ (度)。
+        // ★ **体が向いている先はモデルの +Y** なので (-sinφ, cosφ)。ここを +X で
+        //   測ると、実装が 90 度間違っていても 0 度と出てしまう (実際そうなった)。
+        const fx=-Math.sin(m.rotation.z), fy=Math.cos(m.rotation.z);
+        const tx2=(m.position.x-px)/sp, ty2=(m.position.y-py)/sp;
+        let e=Math.acos(Math.max(-1, Math.min(1, fx*tx2+fy*ty2)))*180/Math.PI;
+        global.__crab=global.__crab||{n:0,sum:0,max:0,over30:0,over60:0};
+        const C=global.__crab; C.n++; C.sum+=e; if(e>C.max)C.max=e;
+        if(e>30)C.over30++; if(e>60)C.over60++;
+        if(C.n%1500===0) console.log('[Crab] 標本'+C.n+' 平均ズレ'+(C.sum/C.n).toFixed(1)+'度 最大'
+          +C.max.toFixed(0)+'度 / 30度超'+(C.over30/C.n*100).toFixed(1)+'% / 60度超'+(C.over60/C.n*100).toFixed(1)+'%');
+      }
     });
     if(PERF_LOG){ _perf.agents+=Date.now()-_t0; }
     stepTraffic(dt);              // 車 (出入口から湧いて別の出入口で消える)
@@ -10394,6 +11609,7 @@ async function renderLoop(){
     updateCullFrustum(mainCam);
     const _tS=PERF_LOG?Date.now():0;
     syncAgentInstances();
+    syncParcels();                // 担いでいる荷物 / 玄関先に置かれた荷物
     if(PERF_LOG){ _perf.agents+=Date.now()-_tS; }
     const _t1=PERF_LOG?Date.now():0;
     updateOcclusionFade();
@@ -10407,6 +11623,11 @@ async function renderLoop(){
     const _t2=PERF_LOG?Date.now():0;
     renderer.autoClear=false;
     renderer.clear();
+    // ★ three は info を **shadowMap.render() の後** にリセットする。既定のまま
+    //   info.render.calls を読むと **影の深度パスが丸ごと数から漏れる**。影を入れて
+    //   から描画が 1.4〜2.0 倍になっているのに、ログの描画呼が動かなかったのはこれ。
+    //   autoReset を切って自分でリセットすれば、影のパスも含んだ数になる。
+    if(PERF_LOG){ renderer.info.autoReset=false; renderer.info.reset(); }
     renderer.render(scene, mainCam);
     // 3D パスぶんのドローコール/三角数。住民 (InstancedMesh 2本) と建物 (1軒あたり
     // マテリアル数ぶん) のどちらが呼び出しを食っているかを切り分けるため。
@@ -10465,7 +11686,7 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepPolice(); retargetOnNeedChange(); }, 1000);
+  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepPolice(); stepDelivery(); retargetOnNeedChange(); }, 1000);
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
     setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子
@@ -10535,6 +11756,7 @@ function startLoops(){
   initTrailField(scene);
   initAgentInstances(scene);
   initCarInstances(scene);
+  initParcelInstances(scene);
   initAgents(scene);
 
   httpServer.listen(PORT, ()=>{

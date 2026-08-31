@@ -124,13 +124,24 @@ function box(m, mat, x0,x1, y0,y1, z0,z1, faces){
 function makeBase(fp){
   const m = {}, h = WIDTH(fp)/2;
   box(m,'facade', -h,h, 0,H_BASE, -h,h, 'xXzZ');   // 上下の面は隣で隠れる
+  downpipe(m, h, H_BASE);
   return m;
+}
+
+// 縦樋 (雨どい)。背面と側面には窓が無いので、これが無いと**のっぺりした
+// コンクリートの箱**になる。角に細い縦線が1本入るだけで壁に奥行きが出る。
+// base と floor の両方に入れて、階を積んでも1本に繋がるようにする。
+const PIPE_R = 0.026;
+function downpipe(m, h, ht){
+  const x = h - PIPE_R*2.2;                        // 背面の右角
+  box(m,'trim', x-PIPE_R, x+PIPE_R, 0, ht, h, h+PIPE_R*1.6, 'xXZ');
 }
 
 // ── 繰り返す1フロア ─────────────────────────────────────────────────────────
 function makeFloor(fp){
   const m = {}, h = WIDTH(fp)/2;
   box(m,'facade', -h,h, 0,H_FLR, -h,h, 'xXzZ');
+  downpipe(m, h, H_FLR);
   return m;
 }
 
@@ -299,6 +310,59 @@ function makeSignBlade(fp){
   return m;
 }
 
+// ── 積む袖看板 ──────────────────────────────────────────────────────────────
+// 1 フロアぶんの小さい袖看板。**雑居ビルはテナントごとに縦へ何枚も並ぶ**のが
+// 日本の街の顔で、1階に1枚だけだと「きれいなオフィスビル」にしか見えない。
+// server.js が階数ぶん積む (fp{n}_sign_blade は従来どおり1階の大きいやつ)。
+function makeSignBlade2(fp){
+  const m = {}, W = WIDTH(fp), h = W/2, bx = h*0.62;
+  const y0 = H_FLR*0.12, y1 = H_FLR*0.86;
+  box(m,'sign', bx-0.028, bx+0.028, y0, y1, -h-0.26, -h-0.03);
+  box(m,'trim', bx-0.018, bx+0.018, y1-0.05, y1-0.01, -h-0.16, -h);   // 取付金具
+  return m;
+}
+
+// ── 陸屋根 その3 ────────────────────────────────────────────────────────────
+// パラペット + 手すり + アンテナ + 階段室。同じ高さのビルが並んだとき、屋上の
+// 表情が 2 種類しか無いと繰り返しが目に付く。
+function makeRoof3(fp){
+  const m = {}, W = WIDTH(fp), h = W/2;
+  box(m,'trim', -h-0.03,h+0.03, 0,0.11, -h-0.03,h+0.03, 'xXYzZ');        // 低いパラペット
+  // 手すり (パラペットの上に細い柱と横棒)
+  const rp = 0.022, rh = 0.11+0.16;
+  for(let i=0;i<4;i++){
+    const t = -h + (i+0.5)*(W/4);
+    box(m,'trim', t-rp, t+rp, 0.11, rh, -h-rp, -h+rp);
+    box(m,'trim', t-rp, t+rp, 0.11, rh,  h-rp,  h+rp);
+  }
+  box(m,'trim', -h,h, rh-0.02, rh, -h-rp, -h+rp);                        // 横棒 (前)
+  box(m,'trim', -h,h, rh-0.02, rh,  h-rp,  h+rp);                        // 横棒 (後)
+  // 階段室 (手前の右寄り)。roof/roof2 とは違う角に置く
+  box(m,'trim', W*0.06, W*0.34, 0.11, 0.29, -W*0.30, -W*0.04, 'xXYzZ');
+  // アンテナ (細い支柱 + 横棒3本)。遠景でシルエットが立つ
+  const ax = -W*0.26, az = W*0.20, ar = 0.014;
+  box(m,'trim', ax-ar, ax+ar, 0.11, 0.62, az-ar, az+ar);
+  for(let i=0;i<3;i++){
+    const y = 0.40 + i*0.09, w = 0.10 - i*0.02;
+    box(m,'trim', ax-w, ax+w, y-0.008, y+0.008, az-0.008, az+0.008);
+  }
+  return m;
+}
+
+// ── 足元 ────────────────────────────────────────────────────────────────────
+// 入り口の土間と植え込み。**建物の壁がいきなり地面から生えている**のが模型に
+// 見える理由のひとつで、実際は必ず一段の土間か縁石で地面と縁が切れている。
+// 正面 (-Z) 側にだけ付ける。
+function makePlinth(fp){
+  const m = {}, W = WIDTH(fp), h = W/2;
+  const d = 0.30, t = 0.045;                       // 土間の出と厚み
+  box(m,'trim', -h*0.72, h*0.72, 0, t, -h-d, -h, 'xXYzZ');       // 入り口前の土間
+  // 植え込み (左寄り)。箱の縁 + 中の土
+  const px0 = -h-0.02, px1 = -h*0.74, pd = 0.24, ph = 0.16;
+  box(m,'trim', px0, px1, 0, ph, -h-pd, -h, 'xXYzZ');
+  return m;
+}
+
 // ── 巻き順の自己検査 ────────────────────────────────────────────────────────
 // 三角形の法線が「モジュールの中心を向いている」ものを探す。裏返った面は
 // 背面カリングで消えて**手前の面が抜け、奥の面だけが透けて見える**ので、
@@ -433,6 +497,9 @@ for(const fp of [1,2]){
   mods.push({ name:`fp${fp}_fence`,      mod: makeFence(fp) });
   mods.push({ name:`fp${fp}_sign_roof`,  mod: makeSignRoof(fp) });
   mods.push({ name:`fp${fp}_sign_blade`, mod: makeSignBlade(fp) });
+  mods.push({ name:`fp${fp}_sign_blade2`, mod: makeSignBlade2(fp) });
+  mods.push({ name:`fp${fp}_roof3`,      mod: makeRoof3(fp) });
+  mods.push({ name:`fp${fp}_plinth`,     mod: makePlinth(fp) });
 }
 const { bytes, json } = writeGlb(out, mods);
 const tris = json.accessors.filter((_,i)=>i%2===0).reduce((s,a)=>s+a.count,0)/3;
