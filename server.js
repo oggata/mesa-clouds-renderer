@@ -149,6 +149,29 @@ const SHADOW_ON   = process.env.SHADOWS !== '0';
 const SHADOW_MAP  = Math.max(256, envNum('SHADOW_MAP', 1024));
 const SHADOW_SOFT = process.env.SHADOW_SOFT === '1';
 const SHADOW_SPAN = envNum('SHADOW_SPAN', 16);     // 追跡ショットで覆う半径
+// SHADOW_WIDE … 俯瞰 (camTargetIdx===0) で影を落とすか。'full'(既定) / 'off'。
+//   俯瞰の影カメラは街の一辺ぶんを覆うので、街が育つほど影パスに入る建物が増える。
+//   重いのが分かっていて画より CPU を取りたいときだけ 'off' にする。
+//
+// ── ここで測ったこと (139軒・30x30・1600x900・15fps・俯瞰) ──
+//   full : 描画呼1030  三角92k  描画7.6ms
+//   off  : 描画呼 322  三角45k  描画4.3ms
+//   俯瞰の描画呼の約7割が影パス。建物は GROUP_ORDER の4マテリアル群なので、
+//   1軒あたり4呼が本パスにも影パスにもそのまま乗る。
+//
+// ── なぜ「カメラ近傍のキャスタだけ castShadow=true にする」を採らなかったか ──
+// three は影パスでも**視錐台カリングをすでにやっている**
+// (WebGLShadowMap.renderObject の `_frustum.intersectsObject(object)`)。
+// 影カメラの箱の外の建物は、こちらが何もしなくても最初から描かれていない。
+// ★ そして**箱を小さくしても効かない**。影カメラは光源方向を向いた正射影なので、
+//   箱は「光の方向に伸びた筒」であり、地面に落ちる覆い範囲は span/sin(太陽高度)。
+//   実測でも半径 37→26 に絞って 描画呼 1030→998 (3%) しか減らなかった。
+//   そのため中途半端な 'cap' モードは**入れていない** (効かないつまみは害)。
+//
+// ── 追跡ショットでは影を切っても速くならない ──
+//   実測 (139軒・924x520): 影あり 描画呼393/描画3.6ms、影なし 描画呼239/描画3.7ms。
+//   SHADOW_SPAN=16 が既に効いていて、影パスは 1フレームの支配項ではない。
+const SHADOW_WIDE = process.env.SHADOW_WIDE === 'off' ? 'off' : 'full';
 const SHADOW_BIAS = envNum('SHADOW_BIAS', -0.0016);
 const SHADOW_DIST = envNum('SHADOW_DIST', 90);     // 光源を焦点からどれだけ引くか
 // ── 画質 ────────────────────────────────────────────────────────────────────
@@ -1072,6 +1095,22 @@ const nightCache = {};
 // buildScene ごとに作り直し、disposeScene で破棄する。
 let buildingMatCache = {};
 
+// ── 3D 用テクスチャの解像度 ─────────────────────────────────────────────────
+// TEX_SCALE … 建物テクスチャを読み込む時点で縮める倍率 (1=原寸)。
+//
+// ★ **JPEG の圧縮率を上げても実行時には一切効かない。** ここで raw RGBA に
+//   デコードして DataTexture を作るので、メモリも GPU も**ピクセル寸法だけ**で
+//   決まる。ファイルの中身が何バイトだったかは読み終わった瞬間に関係なくなる。
+//   実測: textures/v4 は31枚で 0.36MB しかないが、展開すると 3.79Mpx = 14.4MB。
+//   さらに夜マスク (buildNightMask) が同寸でもう1枚作るので、合計 約29MB。
+//   軽くしたいなら**寸法を落とす**しかない。TEX_SCALE=0.5 で 29MB → 7.2MB。
+//
+// ★ **観測 (DINOv2) には影響しない。** レイキャスタ側は loadRaycastTextures が
+//   ファイルから直接読んで必ず 64x64 に落としており (rcTex)、こちらの texCache とは
+//   ローダが別。3D の見た目だけが変わるので、README の「学習と本番で同じ
+//   テクスチャ」という前提は壊れない。
+const TEX_SCALE = Math.max(0.1, Math.min(1, envNum('TEX_SCALE', 1)));
+
 async function loadTextureFile(filePath) {
   if (!filePath || texCache.hasOwnProperty(filePath)) return;
   const fullPath = path.join(__dirname, filePath);
@@ -1079,7 +1118,14 @@ async function loadTextureFile(filePath) {
   try {
     // 元PNGの縦横比を保持したまま読み込む (箱の側面比に合わせて撮影した写真がそのまま貼れる)。
     // NPOT テクスチャは WebGL1(headless-gl) でも Linear+ClampToEdge+mipmap無しなら使用可。
-    const { data, info } = await sharp(fullPath)
+    let pipe = sharp(fullPath);
+    if (TEX_SCALE < 1) {
+      const m = await sharp(fullPath).metadata();
+      pipe = pipe.resize(Math.max(8, Math.round(m.width  * TEX_SCALE)),
+                         Math.max(8, Math.round(m.height * TEX_SCALE)),
+                         { fit: 'fill' });
+    }
+    const { data, info } = await pipe
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
@@ -1119,7 +1165,9 @@ async function buildNightMask(filePath, fullPath, data, info){
   try{
     const W=info.width, H=info.height, N=W*H, ch=info.channels;
     const sig=Math.max(2, Math.min(W,H)/NIGHT_BLUR);
-    const blur=await sharp(fullPath).greyscale().blur(sig).raw().toBuffer();
+    // ★ ブラー元も data と**同じ寸法**に揃える。TEX_SCALE で縮めたときに
+    //   ここだけ原寸で読むと blur[i] の添字がずれ、夜の明かりが盛大に流れる。
+    const blur=await sharp(fullPath).resize(W,H,{fit:'fill'}).greyscale().blur(sig).raw().toBuffer();
     const bs=Math.max(1, Math.round(blur.length/N));      // 1ch のはずだが念のため
     const sc=new Float32Array(N);
     for(let i=0;i<N;i++){
@@ -1424,7 +1472,9 @@ function pushMarkQuad(arr, size, tx, ty, z, ao, uv){
   for(const v of [a0,a1,a2, a0,a2,a3]) arr.col.push(v,v,v);
 }
 
-function quadMesh(posArr, color, map, opts){
+// 板の配列 → ジオメトリ。チャンクごとにメッシュを作るとき、マテリアルは
+// チャンク間で使い回したいので、ジオメトリ生成だけを切り出してある。
+function quadGeo(posArr){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posArr), 3));
   if(posArr.col && posArr.col.length)
@@ -1432,10 +1482,16 @@ function quadMesh(posArr, color, map, opts){
   if(posArr.uv && posArr.uv.length)
     g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(posArr.uv), 2));
   g.computeVertexNormals();   // Lambert ライティング用
+  return g;
+}
+function quadMat(posArr, color, map, opts){
   const m=new THREE.MeshLambertMaterial(Object.assign(
     {map: map||null, vertexColors: !!(posArr.col && posArr.col.length)}, opts||{}));
   if(color && color.isColor) m.color.copy(color); else m.color.set(color);
-  return new THREE.Mesh(g, m);
+  return m;
+}
+function quadMesh(posArr, color, map, opts){
+  return new THREE.Mesh(quadGeo(posArr), quadMat(posArr, color, map, opts));
 }
 
 // 複数の非インデックス geometry を1つに連結 (position 必須, uv は任意)。
@@ -1530,6 +1586,11 @@ function buildScene(map){
   boxGeoByH = {};
   structGeoCache = {};
   litStructs.clear();          // 前のシーンのメッシュを夜の点灯リストに残さない
+  // 建物バッチも旧シーンのメッシュを指しているので捨てる (次フレームで作り直す)
+  bldgBatches.clear(); _batchOf.clear(); _batchDirty=new Set(); _batchAllDirty=true;
+  // 地形の木も登録し直す (addTreeMesh が下で呼ばれて積み直される)
+  mapTrees.length=0; mapTreeIdx.clear();
+  MapTreeInst.list=[]; MapTreeInst.byChunk=null; _treeGhosts.length=0; _mapTreeDirty=true;
   syncCity();          // CITY.structs -> BUILDING_TYPES / cellStruct を作り直す
 
   const S=new THREE.Scene();
@@ -1629,6 +1690,9 @@ const SIGHT_R = envNum('OCC_SIGHT_R', CELL*0.62);
 // 建物/木をセル単位のバケツに入れておく。総当たりだと住民×オブジェクトになり、
 // 1000人 × 600個 = 毎フレーム60万回で、描画より重くなる (実測 300人で4.7ms)。
 let _occGrid=null, _occStamp=-1;
+// いま透かしている建物のキー。updateOcclusionFade が差分だけ触るために持つ。
+const _fadedKeys=new Set();
+
 function occluderGrid(){
   const keys=Object.keys(occluders);
   if(_occGrid && _occStamp===keys.length) return _occGrid;   // 数が変わらなければ使い回す
@@ -1671,8 +1735,12 @@ function updateOcclusionFade(){
   // 上の探索は「住民の**近く**」の建物しか拾わない。カメラから 10 単位離れた建物が
   // ちょうど視線上にあると、住民は完全に隠れたまま透けもしない。これが
   // 「建物に隠れて何をしてるか分からない」の正体。
-  //   追跡中の 1 人ぶんだけ、カメラ→住民の線分に近い建物を足す。線分は 1 本なので
-  //   総当たりでも数十件で終わる (全住民ぶんやると人数×建物数になるのでやらない)。
+  //   追跡中の 1 人ぶんだけ、カメラ→住民の線分に近い建物を足す。
+  //   ★ 以前はここで `for(const key in occluders)` と**全建物を総なめ**していた。
+  //     「線分は1本なので総当たりでも数十件で終わる」というコメントが付いていたが、
+  //     数十件で終わるのは*拾う数*であって*見る数*ではない。実測: 建物139軒で
+  //     フェード0.1ms → 2187軒で2.6ms と、建物数にそのまま比例していた。
+  //     上の近傍探索と同じバケツグリッドを使い、**線分が通るセルの周りだけ**見る。
   if(OCC_SIGHTLINE && camTargetIdx>0 && agents[camTargetIdx-1]){
     const a=agents[camTargetIdx-1];
     if(!MW.isIndoors(a)){
@@ -1680,21 +1748,62 @@ function updateOcclusionFade(){
       const cx=_camPos.x, cy=_camPos.y;
       const vx=ax-cx, vy=ay-cy, vv=vx*vx+vy*vy;
       if(vv>1e-6){
-        for(const key in occluders){
-          const o=occluders[key];
-          // 線分上への射影。0..1 の外なら線分の外側なので対象外
-          let t=((o.cx-cx)*vx+(o.cy-cy)*vy)/vv;
-          if(t<=0.05 || t>=1) continue;          // カメラのすぐ手前と住民の向こう側は除く
-          const px=cx+vx*t-o.cx, py=cy+vy*t-o.cy;
-          if(px*px+py*py < SIGHT_R*SIGHT_R) near.add(key);
+        // 線分をセル幅で刻み、各点の周り SR セルぶんのバケツだけ当たる。
+        // 同じバケツを何度も見ないよう、見たバケツ番号を控えておく。
+        const len=Math.sqrt(vv);
+        const SR=Math.ceil(SIGHT_R/CELL);
+        const steps=Math.max(1, Math.ceil(len/CELL));
+        const seen=new Set();
+        for(let i=0;i<=steps;i++){
+          const t=i/steps;
+          if(t<=0.05 || t>=1) continue;
+          const sx=cx+vx*t, sy=cy+vy*t;
+          const cr=Math.floor(sy/CELL), cc=Math.floor(sx/CELL);
+          for(let dr=-SR;dr<=SR;dr++)for(let dc=-SR;dc<=SR;dc++){
+            const bk=(cr+dr)*GRID+(cc+dc);
+            if(seen.has(bk)) continue;
+            seen.add(bk);
+            const arr=grid.get(bk); if(!arr) continue;
+            for(const key of arr){
+              if(near.has(key)) continue;
+              const o=occluders[key];
+              // 線分上への射影。0..1 の外なら線分の外側なので対象外
+              const tt=((o.cx-cx)*vx+(o.cy-cy)*vy)/vv;
+              if(tt<=0.05 || tt>=1) continue;   // カメラのすぐ手前と住民の向こう側は除く
+              const px=cx+vx*tt-o.cx, py=cy+vy*tt-o.cy;
+              if(px*px+py*py < SIGHT_R*SIGHT_R) near.add(key);
+            }
+          }
         }
       }
     }
   }
-  for(const key in occluders){
-    const o=occluders[key], should=near.has(key);
-    if(should===o.faded) continue;
+  // ★ ここも以前は毎フレーム全建物を `for...in` で舐めていた。中身は
+  //   `should===o.faded` で即 continue する軽い処理だが、2000軒を超えると
+  //   ループそのものが効いてくる (V8 の for...in は Map の走査より重い)。
+  //   いま透けている集合 (_fadedKeys) を持っておき、**状態が変わるものだけ**触る。
+  //   near も _fadedKeys も普段は数件なので、建物が何軒あっても一定コストになる。
+  const changed=[];
+  for(const key of near) if(!_fadedKeys.has(key)) changed.push(key);
+  for(const key of _fadedKeys) if(!near.has(key)) changed.push(key);
+  for(const key of changed){
+    const o=occluders[key];
+    // 取り壊されて occluders から消えた建物が _fadedKeys に残ることがある
+    if(!o){ _fadedKeys.delete(key); batchSetHidden(key.slice(0,-2), false); continue; }
+    const should=near.has(key);
     o.faded=should;
+    if(should) _fadedKeys.add(key); else _fadedKeys.delete(key);
+    // ★ バッチ化しているときは、透ける軒だけバッチから抜いて個別メッシュに戻す。
+    //   バッチのマテリアルは全軒共有なので、そこで opacity を触ると
+    //   チャンクじゅうの建物がまとめて透けてしまう。
+    if(o.tree){                       // 木はインスタンスなので専用処理
+      treeSetFaded(scene, key.slice(0,-2), should);
+      continue;
+    }
+    if(key.endsWith('_b') && _batchMode){
+      const sk=key.slice(0,-2);
+      if(batchSetHidden(sk, should)) o.mesh.visible = should;
+    }
     const mats=Array.isArray(o.mesh.material)?o.mesh.material:[o.mesh.material];
     // 深度書き込みは切らない。
     //   建物が中身の詰まった箱だったころは depthWrite=false でも問題なかったが、
@@ -1778,14 +1887,17 @@ function updateDayNight(S){
   L.sun.target.updateMatrixWorld();
   if(SHADOW_ON && L.sun.shadow){
     // 俯瞰 (camTargetIdx===0) では街の一辺、追跡では SHADOW_SPAN の箱。
-    const span = camTargetIdx===0 ? fieldSize()*CELL*0.62 : SHADOW_SPAN;
+    //   俯瞰の箱は街の大きさに比例するので、育った街ほど影パスに入る建物が増える。
+    //   SHADOW_WIDE=off でそれを切れる (上の解説を参照)。
+    const wide = camTargetIdx===0;
+    const span = wide ? fieldSize()*CELL*0.62 : SHADOW_SPAN;
     const sc=L.sun.shadow.camera;
     if(sc.right!==span){
       sc.left=-span; sc.right=span; sc.top=span; sc.bottom=-span;
       sc.updateProjectionMatrix();
     }
     // 夜は影を切る。太陽が地平の下にあるのに影だけ出ると、月明かりにしては濃すぎる。
-    L.sun.castShadow = d>0.12;
+    L.sun.castShadow = d>0.12 && !(wide && SHADOW_WIDE==='off');
   }
   // 空の太陽。**本当の高度**を使うので、地平の下に沈めば見えなくなる。
   const disc=S.userData.sunDisc;
@@ -1829,8 +1941,10 @@ function updateDayNight(S){
 const _wetBase=new THREE.Color(), _wetTmp=new THREE.Color();
 function stepWet(S, d){
   const g=S && S.userData && S.userData.ground;
-  if(!g || !g.road || !g.road.material) return;
-  const m=g.road.material;
+  // 道のマテリアルは全チャンクで共有の 1 本 (rebuildGround の g.mats)。
+  // ここを 1 本動かせば、道の板が何チャンクに割れていても一斉に濡れる。
+  if(!g || !g.roadMat) return;
+  const m=g.roadMat;
   if(!m.userData.dryColor) m.userData.dryColor=m.color.clone();
   const k=wetness();
   _wetTmp.copy(m.userData.dryColor).multiplyScalar(1-0.30*k);
@@ -3406,6 +3520,21 @@ const EXPAND_DENSITY  = envNum('EXPAND_DENSITY', 0.28);  // 建物がフィー�
 const EXPAND_FREE     = envNum('EXPAND_FREE', 6);
 // 「建てたいのに置き場所が無い」が何日続いたら広げるか
 const EXPAND_STARVE   = Math.max(1, envNum('EXPAND_STARVE', 2));        // 空き区画がこれ以下でも広げる (保険)
+// 地面を何セル角のチャンクに割るか。0 (既定) = 割らない (レイヤーごとに1枚)。
+//
+// ── 実測した結果、既定はオフにしてある ──
+// 「地面が1枚の巨大メッシュだからカリングが効かない」という読みで入れたが、
+// 測ると**割ったほうが遅かった** (GRID=120・2187軒・924x520):
+//     俯瞰   : 割らない 描画91.2ms/描画呼15631 → 16セル角 描画157.0ms/描画呼21307
+//     追跡   : 割らない 描画 7.9ms/描画呼  438 → 16セル角 描画  9.0ms/描画呼  482
+// 三角は追跡で 494k→385k と 2 割減るのだが、**追跡カメラは地面を遠くまで
+// 見通すので大半のチャンクは正当に画角内**で、減った三角より増えた描画呼のほうが
+// 高くついた。俯瞰に至っては全チャンクが見えるので純粋な追加コストになる。
+//
+// ★ ただし GPU の無い環境 (xvfb + ソフトウェアラスタライズ) では、三角と塗り面積の
+//   ほうが描画呼よりはるかに高い。そこではこの取引が逆転する可能性があるので、
+//   実装は残してつまみにしてある。本番で PERF_LOG を見ながら試す価値はある。
+const GROUND_CHUNK    = Math.max(0, envNum('GROUND_CHUNK', 0));
 const EXPAND_TREES    = envNum('EXPAND_TREES', 3);       // 新しい土地の木の間引き (n セルに1本)
 // 住居/職場の定員 (人口の上限を決める = 家が建つと人が増える)
 const HOUSE_CAP       = envNum('HOUSE_CAP', 2);
@@ -4066,6 +4195,7 @@ function structHeight(st){
 function removeStructMesh(S, st){
   const key=st.r+'_'+st.c+'_b', o=occluders[key];
   structAnims.delete(st.r+'_'+st.c);   // 差し替え前のメッシュを動かし続けない
+  markBatchDirty(st);
   if(!o) return;
   if(S) S.remove(o.mesh);
   litStructs.delete(o.mesh);
@@ -4184,6 +4314,9 @@ function addStructMesh(S, st){
   S.add(mesh);
   occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false};
   _occStamp=-1;                       // バケツを作り直す
+  // バッチ化しているときは、この軒を含むバッチを作り直す。
+  // 個別メッシュはバッチが出来上がった時点で syncBatchVisibility が隠す。
+  markBatchDirty(st);
 }
 
 // ── 雨粒 ────────────────────────────────────────────────────────────────────
@@ -4345,23 +4478,134 @@ function makeTreeAssets(){
   };
 }
 
+// ── 地形の木 ────────────────────────────────────────────────────────────────
+// 以前は 1 本 = 幹+葉の**2 メッシュ**を個別に作っていた。GRID=120 の街では
+// 木が約 2,000 本 = **約 4,000 メッシュ**になり、シーン 6,574 メッシュの過半を
+// 占めていた (建物は 2,187)。建物の描画呼をいくら畳んでも、ここが残ると頭打ちになる。
+//
+// 木は建物と違って**インスタンス化の代償がゼロ**。上のコメントが言うとおり
+// 「全部同じ形・同じ色」で、大きさも向きも振っていないため、共有して困る属性が
+// 何も無い。街路樹 (rebuildStreetTrees) は既に InstancedMesh 2 本なので、
+// 同じ形にそろえる。**何本生えても 2 メッシュ**。
+//
+// 透ける木だけは個別に描く必要があるので、インスタンスを潰して (scale 0)
+// 使い回しのメッシュ (ゴースト) を代わりに置く。建物バッチと同じ考え方。
+const mapTrees=[];                 // {r,c,cx,cy} 生えている順
+const mapTreeIdx=new Map();        // "r_c" -> mapTrees の index
+let _mapTreeDirty=false;
+const TREE_CHUNK=Math.max(4, envNum('TREE_CHUNK', 32));   // 木を何セル角で束ねるか
+const MapTreeInst={list:[], byChunk:null, zTrunk:0, zLeaf:0};
+
+// 呼び出し側 (buildScene / maybeExpand) はそのまま。ここでは登録するだけ。
 function addTreeMesh(S, r, c){
-  const T=S && S.userData && S.userData.tree;
-  if(!T) return;
+  const key=r+'_'+c;
+  if(mapTreeIdx.has(key)) return;
   const cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
-  // 木は全部同じ形・同じ色で揃える。
-  //   一度 1本ずつ大きさ・緑の濃さ・向きを振ってみたが、幹も葉も「箱」なので
-  //   回すと立方体が菱形に見えて、揃っているときより不自然だった。戻してある。
-  // GLB のジオメトリは底面が z=0 に揃えてあるのでそのまま地面に置く。
-  // 箱のときは中心が原点なので、従来どおり持ち上げる。
+  mapTreeIdx.set(key, mapTrees.length);
+  mapTrees.push({r,c,cx,cy});
+  // 透過判定 (updateOcclusionFade) は木も対象。1本 = 1 エントリにする
+  // (以前は _t1/_t2 の 2 エントリだった。同じ場所を 2 回見る意味が無い)。
+  occluders[key+'_t']={mesh:null, cx, cy, faded:false, tree:true};
+  _mapTreeDirty=true;
+}
+
+const _mtP=new THREE.Vector3(), _mtQ=new THREE.Quaternion();
+const _mtS=new THREE.Vector3(1,1,1), _mtMat=new THREE.Matrix4();
+
+// ★ **チャンクに割る。** 全部を 1 本の InstancedMesh にすると描画呼は最小になるが、
+//   バウンディング球が街全体を覆うので three が剔れず、**寄りの画でも全部の木を
+//   描く**ことになる。実測 (GRID=120 追跡): 分割なしで 三角458k→814k、描画9→19ms と
+//   かえって遅くなった。
+//   ★ 建物のバッチと違い、木は**業種の次元が無い**ので割っても断片化しない。
+//     16 チャンクなら「幹+葉 × 16 = 32 メッシュ」で、カリングも描画呼も両立する。
+function rebuildMapTrees(S){
+  if(!S) return;
+  const T=S.userData.tree;
+  for(const im of MapTreeInst.list||[]){ S.remove(im); im.dispose(); }
+  MapTreeInst.list=[];
+  if(!T || !T.trunkGeo || !T.coneGeo || !mapTrees.length) return;
+  // GLB は底面が z=0。箱で代替しているときは中心が原点なので持ち上げる。
   const zTrunk = T.glb ? 0 : CELL*.2;
   const zLeaf  = T.glb ? 0 : CELL*.58;
-  const trunk=new THREE.Mesh(T.trunkGeo, T.trunkMat.clone());
-  trunk.position.set(cx,cy,zTrunk); markShadow(trunk,true,false); S.add(trunk);
-  const cone=new THREE.Mesh(T.coneGeo, T.coneMat.clone());
-  cone.position.set(cx,cy,zLeaf); markShadow(cone,true,false); S.add(cone);
-  occluders[r+'_'+c+'_t1']={mesh:trunk,cx,cy,faded:false};
-  occluders[r+'_'+c+'_t2']={mesh:cone,cx,cy,faded:false};
+  MapTreeInst.zTrunk=zTrunk; MapTreeInst.zLeaf=zLeaf;
+  const ch=TREE_CHUNK, nCh=Math.ceil(GRID/ch);
+  const groups=new Map();
+  for(const t of mapTrees){
+    const ck=((t.r/ch)|0)*nCh + ((t.c/ch)|0);
+    let a=groups.get(ck); if(!a) groups.set(ck, a=[]);
+    t.ck=ck; t.ii=a.length;            // treeSetFaded がこの2つで引く
+    a.push(t);
+  }
+  MapTreeInst.byChunk=new Map();
+  for(const [ck, list] of groups){
+    const mk=(geo, mat, z)=>{
+      const im=new THREE.InstancedMesh(geo, mat, list.length);
+      im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);   // 透過で潰すので書き換える
+      list.forEach((t,i)=>{
+        _mtP.set(t.cx, t.cy, z); _mtS.set(1,1,1);
+        im.setMatrixAt(i, _mtMat.compose(_mtP, _mtQ.identity(), _mtS));
+      });
+      im.instanceMatrix.needsUpdate=true;
+      markShadow(im, true, false);
+      S.add(im);
+      MapTreeInst.list.push(im);
+      return im;
+    };
+    MapTreeInst.byChunk.set(ck, {trunk:mk(T.trunkGeo, T.trunkMat, zTrunk),
+                                 leaf: mk(T.coneGeo,  T.coneMat,  zLeaf)});
+  }
+  // 木が生え直すとインスタンスの index が変わるので、ゴーストは全部戻す
+  for(const g of _treeGhosts){ S.remove(g.trunk); S.remove(g.cone);
+                               g.trunk.material.dispose(); g.cone.material.dispose(); }
+  _treeGhosts.length=0;
+}
+
+function stepMapTrees(S){
+  if(!_mapTreeDirty) return;
+  _mapTreeDirty=false;
+  rebuildMapTrees(S);
+}
+
+// ── 透ける木 (ゴースト) ────────────────────────────────────────────────────
+// 透けるのはカメラ周りの数本だけなので、使い回しのメッシュを少数だけ持つ。
+const _treeGhosts=[];                  // {trunk, cone, key|null}
+function treeGhost(S){
+  for(const g of _treeGhosts) if(!g.key) return g;
+  const T=S && S.userData && S.userData.tree; if(!T) return null;
+  const mkm=m=>{ const x=m.clone(); x.transparent=true; x.opacity=FADE_OPACITY; return x; };
+  const g={ trunk:new THREE.Mesh(T.trunkGeo, mkm(T.trunkMat)),
+            cone: new THREE.Mesh(T.coneGeo,  mkm(T.coneMat)), key:null };
+  g.trunk.visible=g.cone.visible=false;
+  markShadow(g.trunk,false,false); markShadow(g.cone,false,false);
+  S.add(g.trunk); S.add(g.cone);
+  _treeGhosts.push(g);
+  return g;
+}
+
+// 木 1 本を透かす / 戻す
+function treeSetFaded(S, cellKey, faded){
+  const i=mapTreeIdx.get(cellKey); if(i==null) return;
+  const t=mapTrees[i];
+  const pair=MapTreeInst.byChunk && MapTreeInst.byChunk.get(t.ck); if(!pair) return;
+  const {trunk, leaf}=pair; if(!trunk||!leaf) return;
+  // インスタンスを潰す / 戻す
+  const k=faded?0:1;
+  _mtP.set(t.cx, t.cy, MapTreeInst.zTrunk); _mtS.set(k,k,k);
+  trunk.setMatrixAt(t.ii, _mtMat.compose(_mtP, _mtQ.identity(), _mtS));
+  _mtP.set(t.cx, t.cy, MapTreeInst.zLeaf);
+  leaf.setMatrixAt(t.ii, _mtMat.compose(_mtP, _mtQ.identity(), _mtS));
+  trunk.instanceMatrix.needsUpdate=true; leaf.instanceMatrix.needsUpdate=true;
+  if(faded){
+    const g=treeGhost(S); if(!g) return;
+    g.key=cellKey;
+    g.trunk.position.set(t.cx, t.cy, MapTreeInst.zTrunk);
+    g.cone .position.set(t.cx, t.cy, MapTreeInst.zLeaf);
+    g.trunk.visible=g.cone.visible=true;
+  }else{
+    for(const g of _treeGhosts) if(g.key===cellKey){
+      g.key=null; g.trunk.visible=g.cone.visible=false;
+    }
+  }
 }
 
 // 道路 / 草地 / 摩耗した地面の板。踏み跡が溜まると草地→踏み固め→土に変わる。
@@ -4395,9 +4639,19 @@ function roadCurbs(){
 function rebuildGround(S){
   if(!S) return;
   const g=S.userData.ground||(S.userData.ground={});
-  for(const k of ['base','road','grass','wear1','wear2','marks','curb']){
-    if(g[k]){ S.remove(g[k]); g[k].geometry.dispose(); g[k].material.dispose(); g[k]=null; }
-  }
+  // ── 地面はチャンクに割って持つ ────────────────────────────────────────────
+  // 以前はレイヤーごとに**フィールド全面を1枚のメッシュ**にマージしていた。
+  // 1メッシュ = 1バウンディング球なので three の視錐台カリングが効かず、
+  // カメラがどこを向いていても全面が毎フレーム描かれていた。
+  //   実測: 30x30 で三角62k → 120x120 で三角449k (寄りの画でも全部描いている)。
+  // GROUND_CHUNK セル角に割ると、各チャンクが独立して剔られるようになる。
+  // 描画呼はチャンク数ぶん増えるが、呼び出しは安く三角は桁で減るので割に合う。
+  //   ★ マテリアルはレイヤーごとに1本をチャンク間で共有する (g.mats)。
+  //     チャンクごとに作ると同じ設定のマテリアルが数百本でき、無駄。
+  if(g.chunks) for(const m of g.chunks){ S.remove(m); m.geometry.dispose(); }
+  if(g.mats)   for(const m of g.mats) m.dispose();
+  g.chunks=[]; g.mats=[];
+  if(g.base){ S.remove(g.base); g.base.geometry.dispose(); g.base.material.dispose(); g.base=null; }
   // 下地の板。フィールドの外は何も描かない (世界の果て = 背景色) ので、
   // 街が広がると島が大きくなっていくように見える。
   const fs=fieldSize()*CELL, fx=fieldCenterW();
@@ -4417,20 +4671,33 @@ function rebuildGround(S){
       t2=Math.max(WEAR_2, vals[Math.min(vals.length-1, Math.floor(vals.length*WEAR_TOP2))]);
     }
   }
-  const road=[], grass=[], w1=[], w2=[];
-  road.col=[]; grass.col=[]; w1.col=[]; w2.col=[];
-  road.uv =[]; grass.uv =[]; w1.uv =[]; w2.uv =[];
+  // チャンクごとの蓄積バッファ。触られたチャンクだけ Map に生える。
+  // GROUND_CHUNK=0 は「割らない」= 全セルがチャンク0に入る (分割前と同じ1枚)
+  const CH=GROUND_CHUNK>0 ? GROUND_CHUNK : GRID;
+  const nCh=Math.ceil(GRID/CH);
+  const _mk =()=>{ const a=[]; a.col=[]; a.uv=[]; return a; };
+  const chunkBufs=new Map();
+  const chunkBuf=(r,c)=>{
+    const ci=((r/CH)|0)*nCh + ((c/CH)|0);
+    let b=chunkBufs.get(ci);
+    if(!b) chunkBufs.set(ci, b={road:_mk(), grass:_mk(), w1:_mk(), w2:_mk(),
+                                marks:_mk(), cpos:[], cnrm:[]});
+    return b;
+  };
   // 路面標示レイヤー。アトラスが読めていない (PNG が無い / sharp 無し) ときは
   // 積まずに従来どおりのべた塗りの道に戻る。
-  const marks=[]; marks.col=[]; marks.uv=[];
   const markOn = ROAD_MARKS && !!groundTex.roadmark && !!CITY && !!CITY.roadClass;
   // 縁石 (標示レイヤーが出ているときだけ。テクスチャ無しで縁石だけ立つと浮く)
   const curbSlots = markOn ? roadCurbs() : null;
-  const cpos=[], cnrm=[];
   // セルごとの微妙な明暗。一面べったり同じ色だと板に見えるので、
   // 位置から決まる固定のばらつきを乗せる (毎回変わるとちらつく)。
   const jit=(r,c)=>1 + (((r*73856093 ^ c*19349663) & 255)/255 - 0.5)*2*AO_NOISE;
   for(let r=0;r<GRID;r++)for(let c=0;c<GRID;c++){
+    // このセルが属するチャンクの蓄積先。以下の本体は分割前と同じ名前で書けるよう
+    // ここで束ね直しておく (本体を触らずに済ませるため)。
+    const _b=chunkBuf(r,c);
+    const road=_b.road, grass=_b.grass, w1=_b.w1, w2=_b.w2,
+          marks=_b.marks, cpos=_b.cpos, cnrm=_b.cnrm;
     const t=MAP[r][c], cx=c*CELL+CELL*.5, cy=r*CELL+CELL*.5;
     const ao=cornerAO(r,c), tint=jit(r,c);
     if(t===ROAD){
@@ -4469,33 +4736,50 @@ function rebuildGround(S){
   const dim = c => { const x=new THREE.Color(c); x.multiplyScalar(wet); return x.getHex(); };
   // テクスチャがあるときは色を白にする (色は写真にそのまま掛かるため)。
   // AO の頂点カラーと雨の濡れはこれまでどおり乗る。
-  if(road.length) { g.road =quadMesh(road,  dim(groundTex.road ?0xffffff:0xb3b8bd), groundTex.road);  markShadow(g.road,false,true);  S.add(g.road); }
-  if(grass.length){ g.grass=quadMesh(grass, dim(groundTex.grass?0xffffff:0x8cbf58), groundTex.grass); markShadow(g.grass,false,true); S.add(g.grass); }
-  // 空き地 (踏み固め → 土)。テクスチャは共通で、色だけ段階で変える。
-  // other_256.jpg は平均が暗いので、色は 1.0 を超える値で持ち上げてある
-  // (three の material.color はクランプされないので 1 超えでよい)。
-  // material.color は three ではクランプされないので、1 を超える値で持ち上げられる
+  // ── レイヤーごとのマテリアル (全チャンクで共有) ──
+  //   vertexColors の有無を見るために代表のバッファが要る。中身は空でも
+  //   .col/.uv が生えていれば判定できるので、素の器を渡す。
+  const _spec=(()=>{ const a=[]; a.col=[]; a.uv=[]; return a; })();
   const wearC=(hex, boost)=> new THREE.Color(dim(hex)).multiplyScalar(boost);
-  if(w1.length)   { g.wear1=quadMesh(w1, groundTex.vacant?wearC(0xb5b08a,1.55):dim(0x9d9c6e), groundTex.vacant); S.add(g.wear1); }
-  if(w2.length)   { g.wear2=quadMesh(w2, groundTex.vacant?wearC(0xc4ab84,1.55):dim(0xac9c72), groundTex.vacant); S.add(g.wear2); }
-  // 路面標示。車道の内側は透明なので、下の道の板 (アスファルト) がそのまま透ける。
-  //   depthWrite=false … 自分の深度を書かない。上に重なる街灯の光の輪と喧嘩しない
-  //   polygonOffset    … 下地との z ファイティング止め (MARK_Z だけでは足りない環境用)
-  //   renderOrder は既定 (0) のまま。街灯の光の輪が 1 なので、必ず標示が先に描かれる
-  if(marks.length){
-    g.marks=quadMesh(marks, dim(0xffffff), groundTex.roadmark,
-      {transparent:true, depthWrite:false,
-       polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2});
-    S.add(g.marks);
-  }
-  // 縁石。両面にしておく (輪郭の巻き方に描画が依存しないほうが事故が少ない)。
-  if(cpos.length){
-    const cg=new THREE.BufferGeometry();
-    cg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cpos),3));
-    cg.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(cnrm),3));
-    g.curb=new THREE.Mesh(cg, new THREE.MeshLambertMaterial(
-      {color:dim(0xc6c8cb), side:THREE.DoubleSide}));
-    S.add(g.curb);
+  const M={
+    road : quadMat(_spec, dim(groundTex.road ?0xffffff:0xb3b8bd), groundTex.road),
+    grass: quadMat(_spec, dim(groundTex.grass?0xffffff:0x8cbf58), groundTex.grass),
+    // 空き地 (踏み固め → 土)。テクスチャは共通で、色だけ段階で変える。
+    // other_256.jpg は平均が暗いので、色は 1.0 を超える値で持ち上げてある
+    // (three の material.color はクランプされないので 1 超えでよい)。
+    w1   : quadMat(_spec, groundTex.vacant?wearC(0xb5b08a,1.55):dim(0x9d9c6e), groundTex.vacant),
+    w2   : quadMat(_spec, groundTex.vacant?wearC(0xc4ab84,1.55):dim(0xac9c72), groundTex.vacant),
+    // 路面標示。車道の内側は透明なので、下の道の板 (アスファルト) がそのまま透ける。
+    //   depthWrite=false … 自分の深度を書かない。上に重なる街灯の光の輪と喧嘩しない
+    //   polygonOffset    … 下地との z ファイティング止め (MARK_Z だけでは足りない環境用)
+    //   renderOrder は既定 (0) のまま。街灯の光の輪が 1 なので、必ず標示が先に描かれる
+    marks: quadMat(_spec, dim(0xffffff), groundTex.roadmark,
+             {transparent:true, depthWrite:false,
+              polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2}),
+    // 縁石。両面にしておく (輪郭の巻き方に描画が依存しないほうが事故が少ない)。
+    curb : new THREE.MeshLambertMaterial({color:dim(0xc6c8cb), side:THREE.DoubleSide}),
+  };
+  for(const k in M) g.mats.push(M[k]);
+  g.roadMat=M.road;      // stepWet が毎フレーム色を動かす (濡れた路面)
+
+  // ── チャンクごとにメッシュ化 ──
+  //   ここで初めて「独立して視錐台から剔られる単位」になる。
+  const addChunk=(mesh, cast, recv)=>{
+    if(recv!=null) markShadow(mesh, cast, recv);
+    S.add(mesh); g.chunks.push(mesh);
+  };
+  for(const b of chunkBufs.values()){
+    if(b.road.length)  addChunk(new THREE.Mesh(quadGeo(b.road),  M.road ), false, true);
+    if(b.grass.length) addChunk(new THREE.Mesh(quadGeo(b.grass), M.grass), false, true);
+    if(b.w1.length)    addChunk(new THREE.Mesh(quadGeo(b.w1),    M.w1   ));
+    if(b.w2.length)    addChunk(new THREE.Mesh(quadGeo(b.w2),    M.w2   ));
+    if(b.marks.length) addChunk(new THREE.Mesh(quadGeo(b.marks), M.marks));
+    if(b.cpos.length){
+      const cg=new THREE.BufferGeometry();
+      cg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(b.cpos),3));
+      cg.setAttribute('normal',   new THREE.BufferAttribute(new Float32Array(b.cnrm),3));
+      addChunk(new THREE.Mesh(cg, M.curb));
+    }
   }
   rebuildLamps(S);
   rebuildSignals(S);            // 交差点の信号 (道が変わると交差点も変わる)
@@ -5186,7 +5470,10 @@ function animateStruct(st, kind, onDone){
   const u=o.mesh.userData, z0=u.zRest||0, h=u.hVis||structHeight(st);
   const dur=(kind==='rise'?ANIM_RISE_SEC:ANIM_SINK_SEC)*1000;
   if(kind==='rise') o.mesh.position.z = z0-h;
-  structAnims.set(st.r+'_'+st.c, {mesh:o.mesh, kind, t0:Date.now(), dur, h, z0, onDone});
+  // アニメ中は形も位置も動くのでバッチに入れておけない。抜いて個別で描く。
+  if(batchSetHidden(st.r+'_'+st.c, true) && _batchMode) o.mesh.visible=true;
+  structAnims.set(st.r+'_'+st.c, {mesh:o.mesh, kind, t0:Date.now(), dur, h, z0, onDone,
+                                  st});
 }
 
 // 毎フレーム呼ぶ。終わったら onDone (取り壊しの後始末はここで走る)。
@@ -5197,8 +5484,278 @@ function stepStructAnims(){
     const p=Math.min(1, (now-a.t0)/a.dur);
     const e=1-Math.pow(1-p, 3);                  // ease-out (最後にふわっと止まる)
     a.mesh.position.z = (a.kind==='rise') ? (a.z0 - a.h + e*a.h) : (a.z0 - e*a.h);
-    if(p>=1){ structAnims.delete(k); if(a.onDone) a.onDone(); }
+    if(p>=1){
+      structAnims.delete(k);
+      if(a.st) markBatchDirty(a.st);   // 止まった位置でバッチに焼き直す
+      if(a.onDone) a.onDone();
+    }
   }
+}
+
+// ── 建物のチャンク・バッチ ──────────────────────────────────────────────────
+// 建物は 1 軒 = 1 メッシュ × 4 マテリアル群なので、**1軒で描画呼 4 本**を
+// 本パスにも影パスにも積む。実測 (GRID=120 / 2187軒) では俯瞰で 16,022 呼、
+// 描画 92.5ms とここだけで破綻していた。
+//
+// ── なぜ InstancedMesh ではないのか ──
+// インスタンス化はジオメトリとマテリアルの共有が前提だが、この街は
+//   ・ジオメトリ … 屋根/看板/ベランダ等の組合せで 2187軒に対し 1857種 (意図的なばらつき)
+//   ・マテリアル … structTint の建物ごとの色ゆらぎ / 業種ごとの屋根色 / 夜の emissiveMap
+// と、どちらも建物ごとに違う。共有すると街が単調になる。
+// **バッチ(融合)なら共有が要らない**。融合後のジオメトリはそのチャンク専用なので、
+// 建物ごとの色は頂点カラーに焼き込める。見た目を保ったまま描画呼だけ落とせる。
+//
+// ── カメラが動いてもバッチを作り直さない ──
+// 素朴にやると「カメラ近傍だけ個別メッシュ」にしたくなるが、カメラは数秒ごとに
+// 街の反対側へ飛ぶので、そのたびに融合をやり直すと**滑らかな負荷が定期的な
+// カクつきに化ける**。ここでは:
+//   ・個別メッシュは**全軒ぶん残したまま visible=false** にする
+//     (three の projectObject は visible===false で即 return するので走査は無料)
+//   ・透ける/アニメ中の数軒だけ visible=true に戻し、**バッチ側の当該頂点を
+//     1点に潰して**縮退三角形にする (ラスタライザが捨てるので実質ゼロコスト)
+// 融合のやり直しは「建物が建った/閉じた/壊れた」ときだけ = 従来と同じ頻度。
+//
+// ── 実測 (GRID=120 / 2187軒 / 木約2000本 / 924x520) ────────────────────────
+//               俯瞰                    追跡
+//   バッチ無し : 描画67ms / 描画呼10716   描画12ms / 描画呼885
+//   バッチ有り : 描画27ms / 描画呼 3132   描画 6ms / 描画呼382
+//
+// ★ **木のインスタンス化 (rebuildMapTrees) とセットで初めて効く。**
+//   木を個別メッシュのままバッチだけ入れた時点では 92→82ms (11%) しか縮まなかった。
+//   シーン 6,574 メッシュのうち約 4,000 が木で、そちらが床になっていたため。
+//   逆に木だけ直しても 92→66ms で止まる。両方入れて初めて 92→27ms になる。
+//   「片方だけ測って効果が薄いから捨てる」と、この 3.4 倍を取り逃す。
+const BLDG_BATCH       = process.env.BLDG_BATCH !== '0';
+const BLDG_BATCH_CHUNK = Math.max(4, envNum('BLDG_BATCH_CHUNK', 32));  // 何セル角で束ねるか
+
+const bldgBatches = new Map();     // key -> {mesh, slots:Map(structKey->{ranges,saved})}
+const _batchOf    = new Map();     // structKey -> batch key (どのバッチに入っているか)
+let   _batchDirty = new Set();     // 作り直しが要るバッチ key
+let   _batchAllDirty = false;
+
+const structKeyOf = st => st.r+'_'+st.c;
+function bldgBatchKey(st){
+  const ch=BLDG_BATCH_CHUNK;
+  return `${(st.r/ch)|0}_${(st.c/ch)|0}_${st.typeIdx}_${st.state==='closed'?'c':'o'}`;
+}
+
+// バッチに入れてよい建物か。工事中とアニメ中は形が変わるので個別のまま。
+function batchable(st){
+  return BLDG_BATCH && st && (st.state==='open' || st.state==='closed')
+      && !structAnims.has(structKeyOf(st));
+}
+
+// 建物 st に関わるバッチを作り直し対象にする
+function markBatchDirty(st){
+  if(!BLDG_BATCH || !st) return;
+  _batchDirty.add(bldgBatchKey(st));
+  const prev=_batchOf.get(structKeyOf(st));
+  if(prev) _batchDirty.add(prev);
+}
+
+function disposeBatch(S, key){
+  const b=bldgBatches.get(key); if(!b) return;
+  if(S) S.remove(b.mesh);
+  litStructs.delete(b.mesh);
+  b.mesh.geometry.dispose();
+  for(const m of b.mesh.material) if(m && !m.userData.shared) m.dispose();
+  for(const sk of b.slots.keys()) if(_batchOf.get(sk)===key) _batchOf.delete(sk);
+  bldgBatches.delete(key);
+}
+
+// 1 バッチぶんを融合して作る。
+//   マテリアルの色は**頂点カラーに焼き込む** (Lambert は color × vertexColor × map
+//   なので、material.color を 1 にして頂点側へ移せば見た目が変わらない)。
+function buildBatch(S, key, members){
+  disposeBatch(S, key);
+  if(!members.length) return;
+  const G=GROUP_ORDER.length;
+  // 群ごとに頂点を集める。融合ジオメトリは [群0の全軒][群1の全軒]… の順に並べ、
+  // 群の境界で addGroup する = 1バッチ 4 描画呼。
+  const per=[]; for(let g=0;g<G;g++) per.push({pos:[], nrm:[], uv:[], col:[]});
+  const slots=new Map();
+  let matRef=null;
+  for(const st of members){
+    const o=occluders[structKeyOf(st)+'_b']; if(!o||!o.mesh) continue;
+    const mesh=o.mesh, geo=mesh.geometry;
+    const mats=Array.isArray(mesh.material)?mesh.material:[mesh.material];
+    if(!matRef) matRef=mats;
+    const P=geo.attributes.position, N=geo.attributes.normal;
+    const U=geo.attributes.uv, C=geo.attributes.color;
+    const ox=mesh.position.x, oy=mesh.position.y, oz=mesh.position.z;
+    const ranges=[];
+    for(const grp of (geo.groups.length?geo.groups:[{start:0,count:P.count,materialIndex:0}])){
+      const g=Math.min(G-1, grp.materialIndex||0);
+      const d=per[g];
+      const start=d.pos.length/3;
+      const mc=mats[g] ? mats[g].color : null;
+      const cr=mc?mc.r:1, cg=mc?mc.g:1, cb=mc?mc.b:1;
+      for(let i=grp.start;i<grp.start+grp.count;i++){
+        d.pos.push(P.getX(i)+ox, P.getY(i)+oy, P.getZ(i)+oz);
+        d.nrm.push(N?N.getX(i):0, N?N.getY(i):0, N?N.getZ(i):1);
+        d.uv.push(U?U.getX(i):0, U?U.getY(i):0);
+        // 頂点カラー × マテリアル色。ここで焼くので材質は全軒で共有できる。
+        const vr=C?C.getX(i):1, vg=C?C.getY(i):1, vb=C?C.getZ(i):1;
+        d.col.push(vr*cr, vg*cg, vb*cb);
+      }
+      ranges.push([g, start, grp.count]);
+    }
+    slots.set(structKeyOf(st), {ranges, saved:null});
+  }
+  if(!matRef) return;
+  // 群を1本のバッファに連結
+  let total=0; for(let g=0;g<G;g++) total+=per[g].pos.length/3;
+  const pos=new Float32Array(total*3), nrm=new Float32Array(total*3);
+  const uv =new Float32Array(total*2), col=new Float32Array(total*3);
+  const geo=new THREE.BufferGeometry();
+  const base=[];                       // 群 g の開始頂点
+  let vo=0;
+  for(let g=0;g<G;g++){
+    base[g]=vo;
+    const d=per[g];
+    pos.set(d.pos, vo*3); nrm.set(d.nrm, vo*3);
+    uv.set(d.uv, vo*2);   col.set(d.col, vo*3);
+    const n=d.pos.length/3;
+    if(n) geo.addGroup(vo, n, g);
+    vo+=n;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  geo.setAttribute('normal',   new THREE.BufferAttribute(nrm,3));
+  geo.setAttribute('uv',       new THREE.BufferAttribute(uv,2));
+  geo.setAttribute('color',    new THREE.BufferAttribute(col,3));
+  // slots の範囲を「群内の相対」から「融合後の絶対」へ直す
+  for(const s of slots.values())
+    for(const r of s.ranges) r[1]+=base[r[0]];
+  // バッチ用マテリアル: 色は頂点へ移したので白。map/emissiveMap は代表から借りる。
+  const mats=[];
+  for(let g=0;g<G;g++){
+    const src=matRef[g];
+    const m=new THREE.MeshLambertMaterial({
+      map: src&&src.map ? src.map : null, vertexColors:true, color:0xffffff});
+    if(src && src.emissiveMap){ m.emissive=new THREE.Color(0xffffff);
+                                m.emissiveMap=src.emissiveMap; m.emissiveIntensity=0; }
+    else if(src && src.emissive){ m.emissive=src.emissive.clone(); m.emissiveIntensity=0; }
+    mats.push(m);
+  }
+  const mesh=new THREE.Mesh(geo, mats);
+  markShadow(mesh, true, true);
+  mesh.userData.batch=true;
+  // 夜の点灯。個別メッシュと同じ仕組み (userData.lit を stepBldgLights が読む) に
+  // 乗せる。閉店中のバッチは登録しない = 夜も暗いまま (「あの店は閉まっている」)。
+  //   建物ごとの点き始めのずれ (±0.06) はバッチ単位に丸まる。ここだけは
+  //   融合の代償だが、チャンクごとにずれるので「街が一斉に点く」ようには見えない。
+  if(key.endsWith('_o')){
+    const hash=[...key].reduce((a,ch)=>(a*31+ch.charCodeAt(0))>>>0, 7);
+    mesh.userData.lit={ facade: mats[0].emissiveMap?mats[0]:null,
+                        sign:   mats[GROUP_ORDER.indexOf('sign')].emissive
+                                ? mats[GROUP_ORDER.indexOf('sign')] : null,
+                        phase:((((hash>>16)&255)/255)-0.5)*0.12 };
+    litStructs.add(mesh);
+  }
+  S.add(mesh);
+  bldgBatches.set(key, {mesh, slots});
+  for(const sk of slots.keys()) _batchOf.set(sk, key);
+}
+
+// バッチ内の 1 軒を潰す / 戻す。潰した軒は個別メッシュが描く。
+function batchSetHidden(structKey, hidden){
+  const bk=_batchOf.get(structKey); if(!bk) return false;
+  const b=bldgBatches.get(bk); if(!b) return false;
+  const slot=b.slots.get(structKey); if(!slot) return false;
+  if(hidden === !!slot.saved) return false;            // 変化なし
+  const P=b.mesh.geometry.attributes.position, arr=P.array;
+  if(hidden){
+    let n=0; for(const r of slot.ranges) n+=r[2]*3;
+    const saved=new Float32Array(n);
+    let o=0;
+    for(const r of slot.ranges){
+      const s=r[1]*3, len=r[2]*3;
+      saved.set(arr.subarray(s, s+len), o); o+=len;
+      // 全頂点を 1 点に寄せる = 面積ゼロの三角形。ラスタライザが捨てる。
+      const px=arr[s], py=arr[s+1], pz=arr[s+2];
+      for(let i=s;i<s+len;i+=3){ arr[i]=px; arr[i+1]=py; arr[i+2]=pz; }
+    }
+    slot.saved=saved;
+  }else{
+    let o=0;
+    for(const r of slot.ranges){
+      const s=r[1]*3, len=r[2]*3;
+      arr.set(slot.saved.subarray(o, o+len), s); o+=len;
+    }
+    slot.saved=null;
+  }
+  P.needsUpdate=true;
+  return true;
+}
+
+// 汚れたバッチを作り直す (1 フレームに 1 バッチまで。まとめてやるとそこで跳ねる)
+function stepBldgBatches(S){
+  if(!BLDG_BATCH || !S || !CITY) return;
+  if(_batchAllDirty){
+    _batchAllDirty=false;
+    for(const k of [...bldgBatches.keys()]) disposeBatch(S, k);
+    _batchDirty=new Set();
+    const groups=new Map();
+    for(const st of CITY.structs){
+      if(!batchable(st)) continue;
+      const k=bldgBatchKey(st);
+      let a=groups.get(k); if(!a) groups.set(k, a=[]);
+      a.push(st);
+    }
+    for(const [k,members] of groups) buildBatch(S, k, members);
+    syncBatchVisibility();
+    return;
+  }
+  if(!_batchDirty.size) return;
+  const k=_batchDirty.values().next().value;
+  _batchDirty.delete(k);
+  const members=CITY.structs.filter(st=>batchable(st) && bldgBatchKey(st)===k);
+  buildBatch(S, k, members);
+  syncBatchVisibility();
+}
+
+// ── バッチを使うのは俯瞰のときだけ ─────────────────────────────────────────
+// ★ 実測でこうなった (GRID=120 / 2187軒 / 924x520):
+//     俯瞰 : 個別 描画92.5ms/描画呼16022 → バッチ 描画51ms/描画呼8277  ◎
+//     追跡 : 個別 描画 9.0ms/描画呼  464 → バッチ 描画19ms/描画呼1542  ×
+//   追跡で悪化するのは、バッチが**建物ごとの視錐台カリングを潰す**から。
+//   three は個別メッシュなら1軒ずつ剔ってくれるが、バッチは一部でも見えれば
+//   チャンクまるごと描く。
+//   ではチャンクを小さくすれば良いかというと駄目で、バッチは (チャンク×業種) に
+//   割れるため、8セル角まで刻むと**1バッチ1〜2軒**になり、1バッチ4描画呼
+//   (マテリアル群のぶん) を払うので個別と変わらなくなる。実測 描画18ms/描画呼1138。
+//
+// 粗くすると描画呼が減るがカリングが死に、細かくすると分裂して減らない。
+// 両立しないので**両方の表現を常駐させ、カメラで切り替える**。
+//   俯瞰 = どうせ全部見えるのでカリングは無価値 → バッチが勝つ
+//   追跡 = カリングが効くので個別が勝つ
+// 切り替えはメッシュの visible を倒すだけ (three は visible===false で即 return)。
+let _batchMode=null;                 // いまバッチで描いているか (null=未初期化)
+
+function drawnByBatch(sk){
+  const bk=_batchOf.get(sk); if(!bk) return false;
+  const b=bldgBatches.get(bk); if(!b) return false;
+  const slot=b.slots.get(sk);
+  return !!slot && !slot.saved;      // slot.saved があるうちは潰してある
+}
+function syncBatchVisibility(){
+  if(!BLDG_BATCH || !CITY) return;
+  const on=!!_batchMode;
+  for(const b of bldgBatches.values()) b.mesh.visible=on;
+  for(const st of CITY.structs){
+    const sk=structKeyOf(st), o=occluders[sk+'_b'];
+    if(!o || !o.mesh) continue;
+    // バッチ運転中はバッチが描いている軒だけ隠す。個別運転中は全部出す。
+    o.mesh.visible = on ? !drawnByBatch(sk) : true;
+  }
+}
+// カメラが俯瞰⇄追跡をまたいだら表現を入れ替える (またいだ瞬間だけ O(N))
+function updateBatchMode(){
+  if(!BLDG_BATCH) return;
+  const want = (camTargetIdx===0);
+  if(want===_batchMode) return;
+  _batchMode=want;
+  syncBatchVisibility();
 }
 
 // ── 街のイベントをカメラで見せる ────────────────────────────────────────────
@@ -11596,6 +12153,9 @@ async function renderLoop(){
     if(PERF_LOG){ _perf.agents+=Date.now()-_t0; }
     stepTraffic(dt);              // 車 (出入口から湧いて別の出入口で消える)
     stepStructAnims();            // 建物のせり上がり / 沈み込み
+    stepMapTrees(scene);          // 地形の木 (InstancedMesh 2本。生えたときだけ作り直す)
+    stepBldgBatches(scene);       // 建物のチャンク・バッチ (汚れたものを1つずつ作り直す)
+    updateBatchMode();            // 俯瞰ならバッチ、追跡なら個別メッシュで描く
     stepRain(dt, mainCam);        // 雨 (天気が rain のときだけ)
     // 地面の板 (道路 / 摩耗) を作り直す。道が増えたとき (groundDirty) は即、
     // 踏み跡の濃淡は上位%で決まるので 20 秒ごとにゆっくり追従させる。
