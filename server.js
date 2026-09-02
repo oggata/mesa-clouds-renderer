@@ -11336,7 +11336,10 @@ const YTC = {
   replyMinSec:  envNum('YT_CHAT_REPLY_MIN_SEC', 6),     // 連投の間隔
   replyMaxDay:  envNum('YT_CHAT_REPLY_MAX_DAY', 100),   // 1日の上限 (クォータの歯止め)
   replyUnit:    envNum('YT_CHAT_REPLY_UNIT_COST', 50),
-  replyAt:0, replies:0, repliesDay:0, replyErrors:0, lastReply:null,
+  //   ★ 失敗の理由は **lastError と別に持つ**。lastError は取り込み側 (gRPC/poll) が
+  //     毎回上書きするので、返信が失敗しても "gRPC stream ended" に塗り潰されて
+  //     原因が分からなくなる。
+  replyAt:0, replies:0, repliesDay:0, replyErrors:0, lastReply:null, replyError:null,
   units:0, calls:{}, unitDay:'',            // 消費ユニットの自前カウント (太平洋時間の日付で区切る)
   primed:false, bytes:0, lastDataAt:0,      // 履歴を捨てたか / 受信バイト / 最後にデータが来た時刻
   reconnects:0,                             // gRPC の張り直し回数 (正常終了ぶん)
@@ -11467,8 +11470,8 @@ async function ytcReply(text, who, force){
     const tok=await ytcAccessToken();
     if(!tok){
       YTC.replyErrors++;
-      YTC.lastError='返信には OAuth が要る (YT_OAUTH_* か YT_CHAT_TOKEN を設定)';
-      console.warn(`[YTChat] ${YTC.lastError}`);
+      YTC.replyError='返信には OAuth が要る (YT_OAUTH_* か YT_CHAT_TOKEN を設定)';
+      console.warn(`[YTChat] ${YTC.replyError}`);
       return false;
     }
     ytcCharge('liveChat/messages.insert', YTC.replyUnit);
@@ -11487,8 +11490,14 @@ async function ytcReply(text, who, force){
     return true;
   }catch(e){
     YTC.replyErrors++;
-    YTC.lastError=`返信に失敗: ${String(e.message).slice(0,120)}`;
-    console.warn(`[YTChat] ${YTC.lastError}`);
+    const m=String(e.message);
+    // 403 は**ほぼスコープ不足**。readonly のトークンでは insert が通らない。
+    const hint = /\b403\b|insufficient|forbidden/i.test(m)
+      ? ' → スコープ不足の可能性 (youtube.force-ssl が要る。'
+        + 'tools/yt-chat-setup.js auth --paste --reply で取り直す)'
+      : /invalid_grant/i.test(m) ? ' → リフレッシュトークンが失効しています' : '';
+    YTC.replyError=`返信に失敗: ${m.slice(0,140)}${hint}`;
+    console.warn(`[YTChat] ${YTC.replyError}`);
     return false;
   }
 }
@@ -12677,7 +12686,7 @@ tick(); setInterval(tick, ${ms});
         searchCallsToday:YTC._searchCalls, unitsToday:YTC.units,
         reply:{mode:YTC.reply||'off', sentToday:YTC.repliesDay, sentTotal:YTC.replies,
                maxPerDay:YTC.replyMaxDay, minSec:YTC.replyMinSec,
-               errors:YTC.replyErrors, last:YTC.lastReply,
+               errors:YTC.replyErrors, last:YTC.lastReply, lastError:YTC.replyError,
                hint:YTC.reply?null:'YT_CHAT_REPLY=dry で文面確認 / =1 で実際に投稿 (OAuth 必須)'},
         lastError:YTC.lastError||null,
         watch: YTC.video ? `https://www.youtube.com/watch?v=${YTC.video}` : null}));
