@@ -408,6 +408,64 @@ const NUM_AGENTS = (Number.isFinite(_numAgentsEnv) && _numAgentsEnv > 0)
   : 1000;
 console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`);
 
+// ─── 名前プール / ペルソナプール ──────────────────────────────────────────────
+// personas.json の 15体は **行動モデルの単位** (data/persona_multi.onnx が id ごとの
+// 性格ベクトルを持っている)。住民はそれよりずっと多いので、以前は 15体を i%15 で
+// 使い回していた = **16人目は1人目と名前も色も性格も同じ人**だった。
+//   name_pool.json    … 名前 300 (日本語 / 英語 / 性別)
+//   persona_pool.json … ペルソナ 50 (称号 / 職業 / 年齢帯 / 性別 / 詳細 / パラメータ)
+// この2つを掛け合わせて 1人ずつ作る。表示名は **称号+名前** ("学生リリ")。
+// 行動そのものは各ペルソナの policy (= personas.json の id) 経由で選ぶので、
+// .onnx を増やさずに「どういう人か」だけを 15 → 50×300 通りに増やせる。
+// どちらかのファイルが無ければ、従来どおり personas.json の巡回に戻る。
+function loadPoolFile(envKey, file, key, label){
+  const fp = process.env[envKey] || path.join(__dirname, file);
+  try{
+    if(!fs.existsSync(fp)){ console.warn(`[Pool] ${fp} が見つからない → ${label}なし`); return []; }
+    const j = JSON.parse(fs.readFileSync(fp,'utf8'));
+    const arr = Array.isArray(j) ? j : j[key];
+    if(Array.isArray(arr) && arr.length) return arr;
+    console.warn(`[Pool] ${fp} に ${key} 配列が無い → ${label}なし`);
+  }catch(e){ console.warn(`[Pool] ${fp} 読み込み失敗: ${e.message} → ${label}なし`); }
+  return [];
+}
+const PERSONA_BY_ID = Object.fromEntries(PERSONA_DEFS.map(p=>[p.id,p]));
+const NAME_POOL = loadPoolFile('NAME_POOL_FILE','name_pool.json','names','名前プール')
+  .map(n=>({ ja:String(n.ja||n.en||'?'), en:String(n.en||n.ja||'?'),
+             g:(n.g==='m'||n.g==='f') ? n.g : 'n' }));      // n = どちらの性別でも引ける名前
+// ここも personas.json と同じ**ホワイトリスト**。persona_pool.json に項目を足したら
+// ここにも書かないと黙って捨てられる。
+const CHAR_POOL = loadPoolFile('PERSONA_POOL_FILE','persona_pool.json','personas','ペルソナプール')
+  .map((p,i)=>{
+    const base = PERSONA_BY_ID[p.policy] || PERSONA_DEFS[i % PERSONA_DEFS.length];
+    const col  = (typeof p.color==='number') ? p.color
+               : parseInt(String(p.color||'').replace('#',''),16);
+    const c01  = (v,d)=> Number.isFinite(+v) ? Math.max(0,Math.min(1,+v)) : d;
+    return {
+      id:      String(p.id || `p${i}`),
+      titleJa: p.titleJa || p.title || '',  title: p.title || p.titleJa || '',
+      jobJa:   p.jobJa   || p.job   || '',  job:   p.job   || p.jobJa   || '',
+      ageMin:  Number.isFinite(+p.ageMin) ? +p.ageMin : 20,
+      ageMax:  Number.isFinite(+p.ageMax) ? +p.ageMax : 60,
+      gender:  (p.gender==='m'||p.gender==='f') ? p.gender : 'any',
+      policy:  base.id,                                   // 行動モデル (personas.json の id)
+      color:   Number.isFinite(col) ? col : base.color,
+      enterprise:  c01(p.enterprise,  base.enterprise),
+      sociability: c01(p.sociability, base.sociability),
+      honesty:     c01(p.honesty,     base.honesty),
+      jitter:      c01(p.jitter, 0.1),                    // 同じペルソナでも人によって少し違う
+      schoolLevel: p.schoolLevel || null,
+      weight:  (Number.isFinite(+p.weight) && +p.weight>0) ? +p.weight : 1,
+      descJa:  p.descJa || p.desc   || base.descJa || '',
+      desc:    p.desc   || p.descJa || base.desc   || '',
+    };
+  });
+const POOL_ON = NAME_POOL.length>0 && CHAR_POOL.length>0;
+const POOL_W  = CHAR_POOL.reduce((s,p)=>s+p.weight, 0);
+console.log(POOL_ON
+  ? `[Pool] 名前${NAME_POOL.length} × ペルソナ${CHAR_POOL.length} で住民を作る (行動モデルは ${PERSONA_DEFS.length}種)`
+  : `[Pool] プール未使用 → personas.json の ${PERSONA_DEFS.length}体を巡回する`);
+
 // ─── マップ生成 ───────────────────────────────────────────────────────────────
 // world.js に移動。旧実装は道路削除率が 0.30+rng*0.25 で、学習側 (0.25+rng*0.25)
 // とズレていた — 本番のほうが道路が少なく街が詰まっていた。golden vector は
@@ -3496,8 +3554,11 @@ const SCHOOL_ALL = Object.values(SCHOOL_IDX).filter(v=>v!=null);
 // どのペルソナがどの学校に通うか。ここに無い住民は通学しない (働く)。
 //   personas.json の schoolLevel でも上書きできる。
 const SCHOOL_OF_PERSONA = { L:'elementary', F:'elementary', H:'junior', I:'high', N:'high', K:'university' };
+//   プール運用では persona_pool.json の schoolLevel だけを見る。行動モデル (policy) は
+//   大人でも H/I/N を借りることがあるので、id から学齢を引くと消防士が高校へ通う。
 const schoolLevelOf = a =>
-  (a.def && a.def.schoolLevel) || SCHOOL_OF_PERSONA[a.def && a.def.id] || null;
+  (a.def && a.def.schoolLevel) ||
+  (POOL_ON ? null : SCHOOL_OF_PERSONA[a.def && a.def.id]) || null;
 const CARE_IDX = ['hospital','pharmacy'].map(IDX_OF).filter(v=>v!=null);        // 病気
 const BUY_IDX  = ['conbini','supermarket','shop','mall'].map(IDX_OF).filter(v=>v!=null); // 買い物
 // 店も雇用の場にする (economy.js)。ここが閉まると本当に人が職を失う。
@@ -6124,6 +6185,9 @@ function cityToJSON(){
     demand:Object.fromEntries(CATS.map(c=>[c, Array.from(CITY.demand[c], v=>+v.toFixed(2))])),
     unmet:CITY.unmet, stats:CITY.stats, unrest:CITY.unrest||0,
     news:CITY.news.slice(-200), agents:own,
+    // 住民の身元 [aid, ペルソナ番号, 名前番号]。1人 3要素なので 1000人でも数十KB。
+    // これがあると再起動しても「学生リリ」が同じ人として戻る (上の agents は aid キー)。
+    residents: POOL_ON ? agents.map(a=>[a.aid, a.def.pool, a.def.nameIdx]) : undefined,
     waiting:CITY.waiting||[], recs:CITY.recs||[],
   };
 }
@@ -6226,7 +6290,7 @@ function freshCity(){
     stats:{roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
            crimes:0,jobsLost:0,delivered:0},
     unrest:0,
-    news:[], savedAgents:{}, diag:freshDiag(),
+    news:[], savedAgents:{}, residents:null, diag:freshDiag(),
     waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
     recs:[],                         // 視聴者のおすすめ (どこまで広まったか)
   };
@@ -6262,7 +6326,7 @@ function initCity(){
       stats:Object.assign({roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
                           crimes:0,jobsLost:0,delivered:0}, j.stats||{}),
       unrest:j.unrest||0,
-      news:j.news||[], savedAgents:j.agents||{}, diag:freshDiag(),
+      news:j.news||[], savedAgents:j.agents||{}, residents:j.residents||null, diag:freshDiag(),
       waiting:j.waiting||[], recs:j.recs||[],
     };
     if(CITY.foot.length!==GRID*GRID) CITY.foot=new Int32Array(GRID*GRID);
@@ -7377,7 +7441,7 @@ function growPopulation(day){
   const base=agents.length;
   const moved=[];
   for(let k=0;k<n;k++){
-    const a=spawnAgent(scene, base+k);
+    const a=spawnAgent(scene);
     // 入居待ちの視聴者がいれば先に迎える (家が建つのを待っていた人が優先)
     const w=(CITY.waiting||[]).shift();
     if(w){ a.name=w.name; a.viewer=true; a.by=w.by; moved.push(w.name); }
@@ -9270,21 +9334,100 @@ function disposeMesh(m){
   });
 }
 
-// 表示名。ペルソナを使い回すので、同じ名前の住民には通し番号を振る。
-//   HUD_LANG=ja なら personas.json の nameJa を使う。無ければ英語名に落ちる
-//   (自分でペルソナを足したときに名前が消えないように)。
+// 表示名。HUD_LANG=ja なら日本語 (称号+名前 = "学生リリ")、でなければ英語
+// ("Student Lily")。プールを使わない設定では personas.json の name/nameJa。
 function personaName(def){ return (JA_HUD && def.nameJa) ? def.nameJa : def.name; }
-function agentDisplayName(i, def){
+function agentDisplayName(seq, def){
   const base=personaName(def);
-  return (NUM_AGENTS>PERSONA_DEFS.length)
-    ? `${base} #${Math.floor(i/PERSONA_DEFS.length)+1}` : base;
+  // プール運用では称号+名前で 50×300 通りあるので通し番号は要らない。
+  // 旧来の巡回運用のときだけ「探検家レックス #2」のように世代番号を振る。
+  return (!POOL_ON && NUM_AGENTS>PERSONA_DEFS.length)
+    ? `${base} #${Math.floor(seq/PERSONA_DEFS.length)+1}` : base;
 }
 
-// 住民を1人ぶん作る (転入でも使う)。i は通し番号で、aid と表示名を決める。
-function spawnAgent(S, i){
-  const def=PERSONA_DEFS[i % PERSONA_DEFS.length];
+// ── 住民の身元 (ペルソナプール × 名前プール) ────────────────────────────────
+// 1人は **(pi, ni) の2つの番号だけ**で決まる。年齢・性別・パラメータのばらつきも
+// (pi,ni) から作った乱数で出すので、保存はこの2つで足りるし、再起動しても
+// 「学生リリ」は同じ性格の同じ人として戻ってくる。
+function _idRng(pi, ni){
+  let s=(pi*100003 + ni*10007 + 12345)|0;
+  return function(){
+    s = s + 0x6D2B79F5 | 0;
+    let t = Math.imul(s ^ s>>>15, 1 | s);
+    t = t + Math.imul(t ^ t>>>7, 61 | t) ^ t;
+    return ((t ^ t>>>14) >>> 0) / 4294967296;
+  };
+}
+const _jitter=(v,d,rng)=> Math.max(0, Math.min(1, v + (rng()*2-1)*d));
+function makeDef(pi, ni){
+  const p=CHAR_POOL[pi % CHAR_POOL.length], nm=NAME_POOL[ni % NAME_POOL.length];
+  const rng=_idRng(pi, ni);
+  // gender が any のペルソナは、引いた名前の性別に従う (どちらでもいい名前なら抽選)。
+  const gender = p.gender!=='any' ? p.gender : (nm.g!=='n' ? nm.g : (rng()<0.5?'m':'f'));
+  const hi=Math.max(p.ageMin, p.ageMax);
+  const age=p.ageMin + Math.floor(rng()*(hi-p.ageMin+1));
+  return {
+    id: p.policy,                 // 行動モデル (persona_multi.onnx の性格ベクトル)
+    pool: pi, nameIdx: ni, poolId: p.id,
+    name:   `${p.title} ${nm.en}`.trim(),   // 英語表示名 "Student Lily"
+    nameJa: `${p.titleJa}${nm.ja}`,         // 日本語表示名 "学生リリ"
+    given: nm.en, givenJa: nm.ja,           // 称号を外した名前 (!focus lily で引けるように)
+    title: p.title, titleJa: p.titleJa,
+    job:   p.job,   jobJa:   p.jobJa,
+    age, gender,
+    color: p.color, hex: '#'+p.color.toString(16).padStart(6,'0'),
+    desc: p.desc, descJa: p.descJa,
+    // 同じペルソナでも人によって少しずつ違う (±jitter)
+    enterprise:  +_jitter(p.enterprise,  p.jitter, rng).toFixed(3),
+    sociability: +_jitter(p.sociability, p.jitter, rng).toFixed(3),
+    honesty:     +_jitter(p.honesty,     p.jitter, rng).toFixed(3),
+    schoolLevel: p.schoolLevel,
+  };
+}
+// 名前は袋から引く。300人ぶん引き切るまで同じ名前は二度出ない。
+const _nameBag={m:[], f:[]};
+function drawNameIdx(g){
+  const bag=_nameBag[g];
+  if(!bag.length){
+    for(let i=0;i<NAME_POOL.length;i++) if(NAME_POOL[i].g===g || NAME_POOL[i].g==='n') bag.push(i);
+    for(let i=bag.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); const t=bag[i]; bag[i]=bag[j]; bag[j]=t; }
+  }
+  return bag.length ? bag.pop() : 0;
+}
+function pickPoolIdx(){
+  let r=Math.random()*POOL_W;
+  for(let i=0;i<CHAR_POOL.length;i++){ r-=CHAR_POOL[i].weight; if(r<=0) return i; }
+  return CHAR_POOL.length-1;
+}
+// 新しい住民の身元をひとつ引く。表示名が今いる人と丸かぶりしたら引き直す。
+function newDef(){
+  let def=null;
+  for(let k=0;k<8;k++){
+    const pi=pickPoolIdx(), pg=CHAR_POOL[pi].gender;
+    def=makeDef(pi, drawNameIdx(pg==='any' ? (Math.random()<0.5?'m':'f') : pg));
+    if(!agents.some(a=>a.name===personaName(def))) break;
+  }
+  return def;
+}
+
+// 住民を1人ぶん作る (転入でも使う)。
+//   ident 無し        … 新しく引く (プールがあれば称号+名前、無ければ従来の巡回)
+//   ident={aid,pi,ni} … 保存された住民をそのまま戻す
+// ★ aid は **通し番号で採番する**。以前は呼び出し側が agents.length を渡していたので、
+//   転出で配列が縮んだあとの転入が、**まだ街にいる人と同じ aid / 同じ表示名**になった。
+//   aid は人間関係・店・保存データのキーなので、2人ぶんの人生が混ざる。
+let _aidSeq=0;
+function spawnAgent(S, ident){
+  let def;
+  if(POOL_ON && ident && Number.isFinite(ident.pi) && Number.isFinite(ident.ni)) def=makeDef(ident.pi, ident.ni);
+  else if(POOL_ON) def=newDef();
+  else def=PERSONA_DEFS[_aidSeq % PERSONA_DEFS.length];
+  const seq=_aidSeq++;
+  const aid=(ident && ident.aid) ? String(ident.aid) : `${def.id}#${seq}`;
+  const m=/#(\d+)$/.exec(aid);                 // 復元した aid より先の番号から採番を続ける
+  if(m) _aidSeq=Math.max(_aidSeq, +m[1]+1);
   const b=randB(null), g=randB(b);
-  const a={aid:`${def.id}#${i}`, name:agentDisplayName(i,def),
+  const a={aid, name:agentDisplayName(seq,def),
     x:b[0]+0.5, y:b[1]+0.5, th:Math.random()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
     trips:0, viols:0, steps:0, stall:0, def, ti:allocTrailSlot(), active:true,
     visited:new Set(), explored:0, visMem:new Map(),
@@ -9341,11 +9484,18 @@ function initAgents(S){
   clearTrails();
   agents=[];agentMeshes=[];
   _tiFree.length=0; _tiNext=0;          // 足跡スロットの採番もやり直す
+  _aidSeq=0; _nameBag.m.length=0; _nameBag.f.length=0;   // aid の採番と名前の袋も配り直す
   // 最初の人口。村から始める場合は START_POP から、以降は住居が建つたびに増える。
   // 保存された街を復元するときはその人口から再開する。
+  //   saved があれば **誰が住んでいたか (aid/ペルソナ/名前)** ごと戻す。これが無いと
+  //   aid が振り直しになって、下の savedAgents (店・人間関係・所持金) が繋がらない。
+  const saved=(CITY && Array.isArray(CITY.residents) && CITY.residents.length) ? CITY.residents : null;
   const startPop=Math.max(1, Math.min(NUM_AGENTS,
-    (CITY && CITY.pop) ? CITY.pop : (START_VILLAGE ? START_POP : NUM_AGENTS)));
-  for(let i=0;i<startPop;i++) spawnAgent(S, i);
+    saved ? saved.length : ((CITY && CITY.pop) ? CITY.pop : (START_VILLAGE ? START_POP : NUM_AGENTS))));
+  for(let i=0;i<startPop;i++){
+    const sv=saved && saved[i];
+    spawnAgent(S, sv ? {aid:sv[0], pi:sv[1], ni:sv[2]} : null);
+  }
   // 保存されていた「訪問済みタイプ」と「自分の店」を先に復元する。
   // assignHomes は owns を見て職場を決めるので、順序を逆にすると店主が職を失う。
   if(CITY && CITY.savedAgents){
@@ -9372,7 +9522,9 @@ function initAgents(S){
   for(const a of agents) settleAgent(a);
   if(CITY) CITY.pop=agents.length;
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
-  console.log(`[Sim] ${agents.length} agents initialized (personas=${PERSONA_DEFS.length})`);
+  console.log(`[Sim] ${agents.length} agents initialized`
+    + (POOL_ON ? ` (ペルソナ${CHAR_POOL.length} × 名前${NAME_POOL.length}${saved?` / ${Math.min(saved.length,startPop)}人を復元`:''})`
+               : ` (personas=${PERSONA_DEFS.length})`));
 }
 
 // ── 足跡 (トレイル) ─────────────────────────────────────────────────────────
@@ -10105,7 +10257,8 @@ function findAgentByQuery(q){
   // ★ 表示名が日本語になっていても、**英語名でも引けるようにする**。
   //   視聴者は !focus rex のようにローマ字で打つことがあるし、日本語表示に
   //   切り替えた瞬間に既存の指名が全部通らなくなるのは避けたい。
-  const names=a=>[a.name, a.def&&a.def.name, a.def&&a.def.nameJa]
+  const names=a=>[a.name, a.def&&a.def.name, a.def&&a.def.nameJa,
+                  a.def&&a.def.given, a.def&&a.def.givenJa]   // 称号を外した名前でも引ける
                    .filter(Boolean).map(x=>String(x).toLowerCase());
   let i=agents.findIndex(a=>a.aid.toLowerCase()===low);                       // aid 完全一致
   if(i<0) i=agents.findIndex(a=>names(a).some(n=>n===low));                   // 表示名/英語名 完全一致
@@ -10251,7 +10404,7 @@ function viewerJoin(who, arg){
 
   const cap=Math.min(NUM_AGENTS, housingCapacity());
   if(agents.length<cap && scene){              // 空き家がある → すぐ引っ越してくる
-    const a=spawnAgent(scene, agents.length);
+    const a=spawnAgent(scene);
     a.name=name; a.viewer=true; a.by=who;
     assignHomes(); settleAgent(a);
     CITY.pop=agents.length;
@@ -10578,6 +10731,7 @@ function toolResident(args){
   const rel=Object.entries(a.rel||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,4)
     .map(([id,e])=>`${nameOfAid(id)||id}(親しさ${e.s.toFixed(1)})`);
   return {name:a.name, persona:(JA_HUD&&a.def.descJa)||a.def.desc||a.def.id, viewer:!!a.viewer,
+    job:(JA_HUD&&a.def.jobJa)||a.def.job||null, age:a.def.age!=null?a.def.age:null,
     home:home?`${jaOf(home.typeIdx)}(${home.r},${home.c})`:null,
     work:work?`${jaOf(work.typeIdx)}(${work.r},${work.c})`:null,
     owns:owns?`${jaOf(owns.typeIdx)}(${owns.r},${owns.c})`:null,
@@ -12426,7 +12580,13 @@ tick(); setInterval(tick, ${ms});
       residents:agents.map(a=>{
         const need=needOf(a);
         return {
-          id:a.aid, name:a.name||a.def.name, personaType:a.def.id, personaDesc:a.def.desc, color:a.def.hex,
+          id:a.aid, name:a.name||a.def.name, personaType:a.def.id, color:a.def.hex,
+          // 「どういう人か」。プール運用では称号+職業+年齢+性別が入る。
+          title:(JA_HUD&&a.def.titleJa)||a.def.title||null,
+          job:(JA_HUD&&a.def.jobJa)||a.def.job||null,
+          age:a.def.age!=null?a.def.age:null,
+          gender:a.def.gender||null,
+          personaDesc:(JA_HUD&&a.def.descJa)||a.def.desc||'',
           need, needEmoji:NEED_EMOJI[need]||null, needLabel:need?(NEED_LABEL_JA[need]||need):'元気',
           activity: describeActivity(a),
           pos:[+a.x.toFixed(1),+a.y.toFixed(1)]
@@ -12765,7 +12925,11 @@ function statsLoop(){
   const camName = camEventCur ? camEventCur.banner
                 : camTargetIdx === 0 ? 'overview'
                 : (agents[camTargetIdx-1]?.name || '-');
-  const msg=JSON.stringify({type:'stats', camName,
+  // 表示名はプールで毎回変わるので、吹き出しの引き当ては行動モデルの id で行う。
+  //   街のできごとを映している間 (camEventCur) は誰も追っていないので出さない。
+  const camPersona = (!camEventCur && camTargetIdx>0 && agents[camTargetIdx-1])
+    ? agents[camTargetIdx-1].def.id : null;
+  const msg=JSON.stringify({type:'stats', camName, camPersona,
     day:gameDay()+1, news:latestNews(5).reverse().map(n=>({day:n.day+1, kind:n.kind, text:n.text})),
     agents:agents.map(a=>({id:a.def.id,trips:a.trips,viols:a.viols,explored:a.explored}))});
   for(const ws of clients){if(ws.readyState===WebSocket.OPEN)ws.send(msg);}

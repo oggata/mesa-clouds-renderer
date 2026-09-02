@@ -59,7 +59,7 @@ tbody tr:hover{background:rgba(0,210,160,0.04);}
   </header>
 
   <div id="toolbar">
-    <input id="search" type="text" placeholder="名前 / ID / ペルソナタイプで検索…">
+    <input id="search" type="text" placeholder="名前 / ID / 称号 / 職業で検索…">
     <select id="need-filter">
       <option value="">状態: すべて</option>
       <option value="eat">🍚 お腹が空いている</option>
@@ -77,8 +77,10 @@ tbody tr:hover{background:rgba(0,210,160,0.04);}
       <thead>
         <tr>
           <th>ID</th>
-          <th>仮の名前</th>
-          <th>ペルソナタイプ</th>
+          <th>名前</th>
+          <th>職業</th>
+          <th>年齢</th>
+          <th>どういう人か</th>
           <th>状態</th>
           <th>今していること</th>
         </tr>
@@ -101,6 +103,7 @@ const countBadge = document.getElementById('count-badge');
 
 let residents = [];
 const NEED_SEVERITY = { sick:'crit', sleep:'crit', eat:'warn', work:'calm', shop:'warn', bored:'warn' };
+const GENDER = { m:' ♂', f:' ♀' };
 
 function render(){
   const q = searchEl.value.trim().toLowerCase();
@@ -109,7 +112,8 @@ function render(){
     if(needFilter==='none' && r.need) return false;
     if(needFilter && needFilter!=='none' && r.need!==needFilter) return false;
     if(!q) return true;
-    return r.id.toLowerCase().includes(q) || r.name.toLowerCase().includes(q) || r.personaType.toLowerCase().includes(q);
+    const hay = [r.id, r.name, r.title, r.job, r.personaType].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
   });
 
   rowsEl.innerHTML = filtered.map(r=>{
@@ -118,7 +122,9 @@ function render(){
     return `<tr>
       <td class="id">${r.id}</td>
       <td class="name"><span class="swatch" style="background:${r.color}"></span>${r.name}</td>
-      <td>${r.personaType} <span class="id">${r.personaDesc||''}</span></td>
+      <td>${r.job||'-'}</td>
+      <td class="id">${r.age!=null?r.age:'-'}${GENDER[r.gender]||''}</td>
+      <td>${r.personaDesc||''}</td>
       <td><span class="need ${sev}">${needLabel}</span></td>
       <td class="activity">${r.activity}</td>
     </tr>`;
