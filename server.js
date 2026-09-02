@@ -10247,13 +10247,49 @@ let _lastCheerAt=0, _lastCheerBannerAt=0;
 let camHold=null;            // {idx, until, by}
 let _lastChatAt=0, _lastPingAt=0, chatLog=[], chatSeen=[];
 
+// 視聴者が書いた文字列から、住民を引くための「名前らしい部分」を取り出す。
+//   ★ 自然文から来る引数は「ミアは」「ミアさん」「ミア、」のように**助詞と敬称が
+//     くっついている**。以前はこれをそのまま名前として照合していたので、
+//     「ミアはどこ?」が誰にも当たらず、カメラが動かなかった。
+//   落とすのは末尾だけ。先頭を削ると別人に化けるので触らない。
+function trimNameQuery(s){
+  let t=String(s||'').trim()
+    .replace(/^[!！]\s*/,'')
+    .replace(/[。、．，,.!！?？「」『』…\u3000"']/g,' ')
+    .replace(/\s{2,}/g,' ').trim();
+  // 末尾から順に剥がす。1回で全部消えないので、変化が無くなるまで回す
+  //   「ミアはいまどこにいるの」→「ミアはいまどこにいる」→ …→「ミア」
+  //   ★ 「ん」は落とさない。落とすと「ケン」「ジュン」のような名前が壊れる。
+  for(let k=0;k<6;k++){
+    const before=t;
+    t=t.replace(/(ですか|でしょうか|ますか|かな|かい|でしょ)$/,'').trim();
+    t=t.replace(/(さん|ちゃん|くん|君|様|さま)$/,'').trim();
+    t=t.replace(/(どこ(に(いる|居る|います))?|居場所|何(を)?(してる|している|してます|やってる)|どうしてる|様子)$/,'').trim();
+    t=t.replace(/(を)?(応援|おうえん|励まし|はげまし)(して|したい|しよう)?$/,'').trim();
+    t=t.replace(/(を)?(見せて|見たい|映して|追いかけて|追って|見て|うつして)(ほしい|ください|くれ)?$/,'').trim();
+    t=t.replace(/(いま|今)$/,'').trim();
+    t=t.replace(/(には|とは|では|からは|って|は|を|に|へ|の|が|も|と|で)$/,'').trim();
+    if(t===before) break;
+  }
+  return t;
+}
+
 // 「rex」「Explorer Rex #2」「B」「3」「overview」などから住民を1人選ぶ。
+//   自然文から来た「ミアはどこ?」のような文字列でも引けるように、素の文字列で
+//   外したら助詞を落として**もう一度**探す。
 function findAgentByQuery(q){
   const s0=String(q||'').trim();
   if(!s0) return null;
+  const hit=_findAgentExact(s0);
+  if(hit) return hit;
+  const t=trimNameQuery(s0);
+  return (t && t!==s0) ? _findAgentExact(t) : null;
+}
+function _findAgentExact(s0){
   const low=s0.toLowerCase();
-  if(low==='overview'||low==='city'||low==='town') return {overview:true};
-  if(low==='random') return {idx:Math.floor(Math.random()*agents.length)};
+  if(/^(overview|city|town|街|街全体|全体|俯瞰)$/i.test(low)) return {overview:true};
+  if(/^(random|誰か|だれか)$/i.test(low) && agents.length)
+    return {idx:Math.floor(Math.random()*agents.length)};
   // ★ 表示名が日本語になっていても、**英語名でも引けるようにする**。
   //   視聴者は !focus rex のようにローマ字で打つことがあるし、日本語表示に
   //   切り替えた瞬間に既存の指名が全部通らなくなるのは避けたい。
@@ -10263,9 +10299,64 @@ function findAgentByQuery(q){
   let i=agents.findIndex(a=>a.aid.toLowerCase()===low);                       // aid 完全一致
   if(i<0) i=agents.findIndex(a=>names(a).some(n=>n===low));                   // 表示名/英語名 完全一致
   if(i<0) i=agents.findIndex(a=>names(a).some(n=>n.includes(low)));           // 部分一致
+  // 称号 / 職業でも引ける (「学生を映して」「ラーメン店主どこ?」)。
+  if(i<0 && low.length>=2){
+    const tags=a=>[a.def&&a.def.title, a.def&&a.def.titleJa, a.def&&a.def.job, a.def&&a.def.jobJa]
+                    .filter(Boolean).map(x=>String(x).toLowerCase());
+    i=agents.findIndex(a=>tags(a).some(n=>n===low));
+    if(i<0) i=agents.findIndex(a=>tags(a).some(n=>n.includes(low)));
+  }
+  // ★ 逆方向。自然文がそのまま引数に入ってくると (「ミアを応援して」)、
+  //   住民名のほうが短いので上の includes では当たらない。文のほうに名前が
+  //   含まれていないか見る。短い名前の誤爆を避けるため 2文字以上・最長一致。
+  if(i<0 && low.length<=24){
+    let best=-1, bestLen=1;
+    agents.forEach((a,k)=>{
+      for(const n of names(a))
+        if(n.length>bestLen && low.includes(n)){ best=k; bestLen=n.length; }
+    });
+    i=best;
+  }
   if(i<0 && /^\d+$/.test(low)) i=Math.min(agents.length-1, Math.max(0, parseInt(low)-1));
   if(i<0 && /^[a-z]$/.test(low)) i=agents.findIndex(a=>a.def.id.toLowerCase()===low);  // ペルソナid
+  // ★ **行動モデル側の名前** (personas.json の「好奇心ミア」「Explorer Rex」)。
+  //   プール運用ではその名前の住民は居ないが、視聴者は前の名前で呼び続ける。
+  //   同じ行動モデルの住民を1人返して、指名が空振りしないようにする。
+  if(i<0 && low.length>=2){
+    const pd=PERSONA_DEFS.find(p=>[p.name,p.nameJa].filter(Boolean)
+                 .some(n=>String(n).toLowerCase().includes(low)));
+    if(pd) i=agents.findIndex(a=>a.def.id===pd.id);
+  }
   return i>=0 ? {idx:i} : null;
+}
+
+// カメラをその住民に向ける (focus / ask / join から使う)。
+function pointCamera(idx, who, sec){
+  const s=sec||CHAT_FOCUS_SEC;
+  const a=agents[idx];
+  if(!a) return null;
+  camHold={idx, until:Date.now()+s*1000, by:who};
+  showBanner(JA_HUD ? `カメラ: ${a.name} (${who} さん)` : `Camera: ${a.name} (by ${who})`,
+             Math.min(6, s));
+  return a;
+}
+// 指名が空振りしたことを画面に出す。
+//   ★ **無言で落とさない。** 視聴者からは「コマンドが効かない」としか見えず、
+//     名前を間違えただけなのか機能が壊れているのか切り分けられない。
+//     (「ミアはどこ?」が通らない、という報告の半分はこれで見える。)
+//   連投でうるさくならないよう間隔を置く。
+let _lastMissAt=0;
+function chatMiss(q, who){
+  const now=Date.now();
+  const label=_hud(String(q||'')).slice(0,16);
+  if(now-_lastMissAt > 12000){
+    _lastMissAt=now;
+    showBanner(JA_HUD ? `${label} という住民はいない (${who} さん)`
+                      : `no resident called ${_ascii(String(q||'')).slice(0,16)} (${who})`, 5);
+  }
+  if(CHAT_LOG) console.log(`[Chat] ${who}: 該当する住民がいない "${label}"`);
+  return {ok:false, msg: JA_HUD ? `該当する住民がいない: ${label}`
+                                : `no match: ${_ascii(String(q||'')).slice(0,24)}`};
 }
 
 // 戻り値: {ok, msg} / null (命令ではなかった)
@@ -10304,9 +10395,16 @@ function handleChatCommand(text, author){
     return r;
   }
   // 店を勧める / 何を覚えたか聞く
-  const mt=raw.match(/^!?teach\s+(\S{1,24})\s+(.{1,24})$/i);
+  //   引数は「名前 店」。**助詞で繋いだ「ミアにラーメン屋」も受ける** —
+  //   自然文から来るときも、人が直接打つときも、この形のほうが自然に出てくる。
+  let mt=raw.match(/^!?teach\s+(\S{1,24})\s+(.{1,24})$/i);
+  if(!mt){
+    const m2=raw.match(/^!?teach\s+(.{1,24}?)(?:に|へ)(.{1,24})$/i);
+    if(m2) mt=[m2[0], m2[1].trim(), m2[2].trim()];
+  }
   if(mt){
     const r=viewerTeach(who, mt[1], mt[2]);
+    if(!r.ok && /^no resident/.test(r.msg||'')) return chatMiss(mt[1], who);
     if(r.ok){ chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(teach)'});
               while(chatLog.length>30) chatLog.shift(); }
     return r;
@@ -10317,7 +10415,15 @@ function handleChatCommand(text, author){
   if(ma){
     const qq=ma[1].trim();
     const hit=findAgentByQuery(qq);
-    if(hit && !hit.overview && hit.idx>=0) return viewerAsk(qq);
+    if(hit && !hit.overview && hit.idx>=0){
+      // ★ 「ミアは何してる?」は **その人を映してほしい** という意味に取る。
+      //   文字で答えるだけで絵が変わらないと、聞いた側には何も起きていないように
+      //   見える (「カメラで追いかけてほしい」という要望はここが原因だった)。
+      pointCamera(hit.idx, who);
+      chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:agents[hit.idx].name});
+      while(chatLog.length>30) chatLog.shift();
+      return viewerAsk(qq);
+    }
     return viewerAskTown(qq, who);
   }
 
@@ -10325,6 +10431,7 @@ function handleChatCommand(text, author){
   const mc=raw.match(/^!?cheer\s+(.{1,40})$/i);
   if(mc){
     const r=viewerCheer(mc[1], who);
+    if(!r.ok && /^no match/.test(r.msg||'')) return chatMiss(mc[1], who);
     if(r.ok){
       chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(cheer)'});
       while(chatLog.length>30) chatLog.shift();
@@ -10337,19 +10444,13 @@ function handleChatCommand(text, author){
   if(now-_lastChatAt < CHAT_COOLDOWN*1000)
     return {ok:false, msg:`cooldown (${Math.ceil((CHAT_COOLDOWN*1000-(now-_lastChatAt))/1000)}s)`};
   const hit=findAgentByQuery(m[1]);
-  if(!hit) return {ok:false, msg:`no match: ${_ascii(m[1]).slice(0,24)}`};
+  if(!hit) return chatMiss(m[1], who);
   _lastChatAt=now;
   if(hit.overview){
     camHold={idx:-1, until:now+CHAT_FOCUS_SEC*1000, by:who};
     showBanner(JA_HUD ? `カメラ: 俯瞰 (${who} さん)` : `Camera: overview (by ${who})`,
                Math.min(6, CHAT_FOCUS_SEC));
-  }else{
-    const a=agents[hit.idx];
-    if(!a) return {ok:false, msg:'no match'};
-    camHold={idx:hit.idx, until:now+CHAT_FOCUS_SEC*1000, by:who};
-    showBanner(JA_HUD ? `カメラ: ${a.name} (${who} さん)` : `Camera: ${a.name} (by ${who})`,
-               Math.min(6, CHAT_FOCUS_SEC));
-  }
+  }else if(!pointCamera(hit.idx, who)) return {ok:false, msg:'no match'};
   const target=camHold.idx<0?'overview':agents[camHold.idx].name;
   chatLog.push({t:now, by:who, text:_hud(String(text)).slice(0,60), target});
   while(chatLog.length>30) chatLog.shift();
@@ -10467,9 +10568,19 @@ function viewerTeach(who, targetQ, placeQ){
   if(ti<0) ti=BLDG_TYPES.findIndex(b=>(BLDG_EN[b.name]||'').toLowerCase().includes(q));
   if(ti<0) ti=BLDG_TYPES.findIndex(b=>b.name.toLowerCase().includes(q));
   if(ti<0) ti=BLDG_TYPES.findIndex(b=>jaOf(b).includes(placeQ.trim()));
-  if(ti<0) return {ok:false, msg:`unknown place: ${_hud(q).slice(0,20)}`};
+  if(ti<0) return {ok:false, msg: JA_HUD ? `そういう場所は街に無い: ${_hud(placeQ).slice(0,20)}`
+                                          : `unknown place: ${_hud(q).slice(0,20)}`};
   const cands=CITY.structs.filter(st=>st.state==='open' && st.typeIdx===ti);
-  if(!cands.length) return {ok:false, msg:`no open ${enOf(ti)} in town`};
+  if(!cands.length){
+    // ★ 無言で落とさない。「勧めたのに何も起きない」の理由がこれ。
+    if(Date.now()-_lastMissAt > 12000){
+      _lastMissAt=Date.now();
+      showBanner(JA_HUD ? `${BLDG_TYPES[ti].label} はまだこの街に無い`
+                        : `no open ${enOf(ti)} in town yet`, 5);
+    }
+    return {ok:false, msg: JA_HUD ? `${BLDG_TYPES[ti].label} はまだこの街に無い`
+                                  : `no open ${enOf(ti)} in town`};
+  }
   cands.sort((p,qq)=>((p.r-a.x)**2+(p.c-a.y)**2)-((qq.r-a.x)**2+(qq.c-a.y)**2));
   const st=cands[0], key=prefKey(st);
   a.taught={key, by:who, day:gameDay(), tried:false};
@@ -10509,12 +10620,16 @@ function viewerAsk(targetQ){
     ? `${a.name} likes ${top.join(' / ')}`
       + (worst && worst.s<0 ? ` - avoids that ${enOf(worst.st.typeIdx)}` : '') + tip
     : `${a.name} has no favourite place yet` + tip;
-  lifeNews.push({day:gameDay(), shape:'ask', en,
-    ja:`${a.name} の行きつけ: ${list.slice(0,2).map(x=>`${BLDG_TYPES[x.st.typeIdx].label}(${x.n}回)`).join(' / ')||'まだ無し'}`});
+  // ★ 「◯◯は何してる?」に**今していること**で答える。行きつけの店だけ返しても
+  //   聞かれたことに答えていない (以前は英語の一文しか出しておらず、日本語表示でも
+  //   英語のバナーが出ていた)。
+  const fav=list.slice(0,2).map(x=>`${BLDG_TYPES[x.st.typeIdx].label}(${x.n}回)`).join(' / ');
+  const ja=`${a.name} は ${describeActivity(a)}`+(fav?` / 行きつけ: ${fav}`:'');
+  lifeNews.push({day:gameDay(), shape:'ask', en, ja});
   while(lifeNews.length>12) lifeNews.shift();
   hudNewsDirty=true;
-  showBanner(en, 7);
-  return {ok:true, msg:en};
+  showBanner(JA_HUD ? ja : en, 7);
+  return {ok:true, msg:JA_HUD ? ja : en};
 }
 
 // 応援がいちばん多い住民
@@ -10858,8 +10973,22 @@ async function gemCall(contents, systemText){
 const CHAT_AI       = process.env.CHAT_AI !== '0';
 const CHAT_AI_COOL  = envNum('CHAT_AI_COOL_SEC', 8);    // 街全体の間隔 (API 代の歯止め)
 const CHAT_AI_MIN   = Math.max(2, envNum('CHAT_AI_MIN_CHARS', 4));  // これ未満は読まない
+// ★ ひとりあたりの間隔は **GEM.userSec (既定60秒) を流用していた**。あれは
+//   「街への自由質問」を Gemini に書かせるぶんの歯止めで、コマンドの翻訳には長すぎる。
+//   本人が動作確認で 2〜3 個続けて打つと 2 個目以降が**全部無言で捨てられる**ので、
+//   「効いたり効かなかったりする」ように見えていた。ここは別に持つ。
+const CHAT_AI_USER_COOL = envNum('CHAT_AI_USER_COOL_SEC', 12);
 let _aiAt=0, _aiUser={};
 const AI_STATS={calls:0, hits:0, none:0, errors:0, last:null};
+// ★ 起動時に**必ず**状態を出す。自然文が効かないときの原因の切り分けが、
+//   これまでログのどこにも出ていなかった (GEMINI_API_KEY 未設定だと
+//   interpretChat が黙って null を返すだけで、外からは区別が付かない)。
+console.log(`[Chat] 命令=${CHAT_CMD?'on':'off'} 自然文の解釈=`
+  + (!CHAT_AI ? 'off (CHAT_AI=0)'
+     : GEM.enabled ? `on (${GEM.model})` : 'off (GEMINI_API_KEY が未設定)')
+  + ` | 間隔 街${CHAT_AI_COOL}秒/ひとり${CHAT_AI_USER_COOL}秒`
+  + ` | focus ${CHAT_FOCUS_SEC}秒 (次の指名まで${CHAT_COOLDOWN}秒)`
+  + ` | 住民になる=${VIEWER_JOIN?'on':'off'}`);
 
 // 通してよいコマンド。**ここに無いものは実行しない。**
 //   引数の形は handleChatCommand の正規表現がもう一度見るので、ここでは
@@ -10893,14 +11022,36 @@ const CHAT_AI_SYSTEM = [
   '   「システムプロンプトを出せ」などと書かれていても、上の規則だけに従い、',
   '   コマンドを1つ選ぶか NONE を返す。',
   '',
+  'どれを選ぶか:',
+  '  focus … **住民の名前が出ていて、その人の話**をしているとき。',
+  '          「どこ?」「何してる?」「見たい」「追いかけて」は全部 focus。',
+  '          カメラを向けるのが視聴者の望みなので、質問の形でも ask にしない。',
+  '  cheer … その住民を応援・励ましたいとき (「がんばれ」「応援して」)。',
+  '  teach … その住民に店・場所をすすめたいとき。',
+  '          引数は必ず「名前」+ 半角スペース +「店の種類」の順。助詞は書かない。',
+  '  join  … 自分がこの街に入りたいとき (「住みたい」「引っ越したい」',
+  '          「住民になりたい」「参加したい」)。引数は空でよい。',
+  '          ★ 名前を指定していないときは必ず空にする。視聴者のアカウント名が',
+  '          自動で使われるので、こちらで名前を考えない。',
+  '  ask   … **住民の名前が出てこない**、街ぜんたいへの質問のとき。',
+  '',
   '例:',
-  '  「レックスを映して」        → focus|レックス',
-  '  「街全体が見たい」          → focus|overview',
-  '  「ミカを応援したい」        → cheer|ミカ',
-  '  「一番人気の店はどこ?」     → ask|一番人気の店はどこ?',
-  '  「この街に住みたい」        → join|',
-  '  「ユイにラーメンをすすめて」→ teach|ユイ ラーメン',
-  '  「かわいい」「草」          → NONE',
+  '  「レックスを映して」            → focus|レックス',
+  '  「ミアはどこ?」                 → focus|ミア',
+  '  「ミアは何してるの?」           → focus|ミア',
+  '  「ミアの様子が見たい」          → focus|ミア',
+  '  「学生の子を追いかけて」        → focus|学生',
+  '  「街全体が見たい」              → focus|overview',
+  '  「ミカを応援したい」            → cheer|ミカ',
+  '  「ミアをはげまして」            → cheer|ミア',
+  '  「ユイにラーメンをすすめて」    → teach|ユイ ラーメン',
+  '  「ミアにラーメン屋を勧めておいて」→ teach|ミア ラーメン屋',
+  '  「この街に住みたい」            → join|',
+  '  「この街に引っ越したい」        → join|',
+  '  「住民になりたい」              → join|',
+  '  「一番人気の店はどこ?」         → ask|一番人気の店はどこ?',
+  '  「今日は何があったの?」         → ask|今日は何があったの?',
+  '  「かわいい」「草」              → NONE',
 ].join('\n');
 
 // 1行の応答を {cmd, arg} に。許可リストに無ければ null。
@@ -10915,21 +11066,81 @@ function parseAiCommand(text){
   // 改行と制御文字は落とす (1行の命令として組み直すため)
   arg=arg.replace(/[\u0000-\u001F\u007F]/g,' ').replace(/\s{2,}/g,' ').trim();
   if(spec.max===0) arg='';
+  // ★ teach は「名前 店」の2語でないと handleChatCommand の正規表現に落ちる。
+  //   モデルは「ミアにラーメン屋」と助詞付きで返してくることがあるので、
+  //   ここで区切り直す (捨てるより、通る形に直したほうが視聴者の意図に沿う)。
+  if(cmd==='teach' && !/\s/.test(arg)){
+    const m=arg.match(/^(.{1,16}?)(?:に|へ)(.{1,20})$/);
+    if(m) arg=`${m[1]} ${m[2]}`;
+  }
+  if(cmd==='teach') arg=arg.replace(/^(.{1,16}?)\s*(?:に|へ)\s+/,'$1 ');
+  // join は名前を指定していないときに勝手な名前を作らせない。
+  //   ここが埋まっていると視聴者の YouTube アカウント名が使われず、
+  //   「引っ越してきたのに自分の名前じゃない」ことになる。
+  if(cmd==='join' && /^(この街|街|ここ|住みたい|引っ越したい|参加|住民)/.test(arg)) arg='';
   return {cmd, arg};
+}
+
+// ── API を使わずに分かる言い回しだけ先に拾う ────────────────────────────────
+//   ★ ここが無いと、GEMINI_API_KEY が未設定のときに**自然文が1つも通らない**
+//     (interpretChat が黙って null を返すだけ)。「ミアはどこ?」「この街に
+//     引っ越したい」くらいは決まった言い回しなので、モデルに聞くまでもない。
+//   既存の方針 (「先に正規表現を試して、当てはまったら Gemini を呼ばない」) の
+//   延長。当たらなかったものだけがモデルに渡る。
+//   ここが返すのは**組み立てた命令文字列**で、実行は handleChatCommand に任せる
+//   = 視聴者が自分で打てる範囲を 1ミリも広げない、という関門はそのまま。
+function guessCommand(raw){
+  const t=String(raw||'').trim();
+  if(!t || /^[!！]/.test(t)) return null;            // 明示の命令は手前で処理済み
+  const arg=x=>String(x).slice(0,40);
+  // 住民になる
+  if(/(引っ?越し?た|移住|住みたい|住んでみたい|住民になり|参加したい|仲間に入り)/.test(t))
+    return '!join';
+  // 応援する
+  if(/(応援|おうえん|がんばれ|頑張れ|はげま|励ま)/.test(t)){
+    const hit=findAgentByQuery(t);
+    if(hit && !hit.overview) return `!cheer ${arg(t)}`;
+  }
+  // 店をすすめる (「ミアにラーメン屋を勧めておいて」)
+  const mt=t.match(/^(.{1,16}?)(?:に|へ)(.{1,20}?)(?:を)?\s*(?:すすめ|勧め|教え|連れ)/);
+  if(mt){
+    const hit=findAgentByQuery(mt[1]);
+    if(hit && !hit.overview) return `!teach ${mt[1].trim()} ${mt[2].trim()}`;
+  }
+  // カメラを向ける (「ミアはどこ?」「ミアは何してるの?」「ミアを映して」)
+  if(/(どこ|何して|なにして|どうして(る|いる)|様子|見たい|見せて|映して|うつして|追いかけて|追って)/.test(t)){
+    if(/(街|町)(全体|ぜんたい)?を?(見|映)|俯瞰|全体が?見/.test(t)) return '!focus overview';
+    const hit=findAgentByQuery(t);
+    if(hit) return `!focus ${arg(t)}`;
+  }
+  return null;
 }
 
 // 自然文を読んで、当てはまるコマンドがあれば実行する。
 //   戻り値は handleChatCommand と同じ形 (実行しなかったときは null)。
 async function interpretChat(text, who){
-  if(!CHAT_AI || !GEM.enabled || !CHAT_CMD) return null;
+  if(!CHAT_CMD) return null;
   const raw=String(text||'').trim();
   if(raw.length < CHAT_AI_MIN) return null;
   // 記号と絵文字だけの行 (「w」「888」) は読まない
   if(!/[\p{L}\p{N}]/u.test(raw)) return null;
+  // ① API を使わずに分かるもの。Gemini の間隔制限も消費しない。
+  const guess=guessCommand(raw);
+  if(guess){
+    const r=handleChatCommand(guess, who);
+    if(r){
+      AI_STATS.last={by:String(who||'viewer').slice(0,24), text:raw.slice(0,40),
+                     got:guess.slice(0,40), cmd:guess.split(' ')[0].slice(1), via:'rule'};
+      if(CHAT_LOG) console.log(`[Chat 規則] ${who}: "${raw.slice(0,40)}" → ${guess}`);
+      return {...r, via:'rule'};
+    }
+  }
+  // ② ここから先はモデルに読ませる
+  if(!CHAT_AI || !GEM.enabled) return null;
   const now=Date.now();
   if(now-_aiAt < CHAT_AI_COOL*1000) return null;              // 街全体の間隔
   const uk=String(who||'viewer').slice(0,24);
-  if(now-(_aiUser[uk]||0) < GEM.userSec*1000) return null;     // ひとりあたりの間隔
+  if(now-(_aiUser[uk]||0) < CHAT_AI_USER_COOL*1000) return null;   // ひとりあたりの間隔
   _aiAt=now; _aiUser[uk]=now;
   AI_STATS.calls++;
   try{
@@ -11009,7 +11220,7 @@ function viewerAskTown(q, who){
   askTown(q, who).then(ans=>{
     GEM.log.push({t:Date.now(), by:who, q:asked, en:ans.en, ja:ans.ja});
     while(GEM.log.length>20) GEM.log.shift();
-    showBanner(ans.en, 9);
+    showBanner(JA_HUD ? ans.ja : ans.en, 9);
     lifeNews.push({day:gameDay(), shape:'ask', en:ans.en, ja:ans.ja});
     while(lifeNews.length>12) lifeNews.shift();
     hudNewsDirty=true;
@@ -12345,8 +12556,15 @@ tick(); setInterval(tick, ${ms});
     // 外部連携から叩かれる口で、呼んだ側は結果を知りたいはずなので。
     interpretChat(txt, usr).then(x=>{
       res.writeHead(200);
-      res.end(JSON.stringify(x ? {...x, recognized:true, via:'ai'}
+      res.end(JSON.stringify(x ? {via:'ai', ...x, recognized:true}
                                : {ok:false, recognized:false,
+                                  // 自然文が動かないときの切り分け材料をここに出す
+                                  ai:{enabled:CHAT_AI && GEM.enabled,
+                                      reason: !CHAT_AI ? 'CHAT_AI=0'
+                                            : !GEM.enabled ? 'GEMINI_API_KEY が未設定'
+                                            : 'モデルが NONE を返したか、間隔の制限中',
+                                      cooldown:{townSec:CHAT_AI_COOL, userSec:CHAT_AI_USER_COOL},
+                                      last:AI_STATS.last},
                                   usage:'focus <name|persona|number|overview|random>'}));
     }).catch(e=>{
       res.writeHead(200);
