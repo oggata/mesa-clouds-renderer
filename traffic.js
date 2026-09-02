@@ -26,12 +26,19 @@ function drivable(map, roadClass, r, c, roadVal, minClass) {
 }
 
 /**
- * 他の町との接点。走行可能な道が街の外 (範囲外 or VOID) に面しているセル。
+ * 他の町との接点。走行可能な道が街の外に面しているセル。
  * dr,dc は外を向く方向 = 車が入ってくる向きの逆。
+ *
+ * ★ 「街の外」の判定は差し替えられるようにしてある (isOutside)。
+ *   既定は「範囲外 または VOID」だが、**街が育つと道が VOID に接しなくなる**。
+ *   開拓済みのフィールドが広がって、道のまわりが空き地になるため。実際これで
+ *   出入口が 0 になり、車が1台も湧かなくなった。呼び側が「開拓済みの範囲の外」を
+ *   渡せるようにして、街の広さと接点の定義を切り離す。
  */
-function gateways(map, roadClass, roadVal, voidVal, minClass = 1) {
+function gateways(map, roadClass, roadVal, voidVal, minClass = 1, isOutside) {
   const n = map.length, out = [];
-  const outside = (r, c) => r < 0 || r >= n || c < 0 || c >= n || map[r][c] === voidVal;
+  const outside = isOutside ||
+    ((r, c) => r < 0 || r >= n || c < 0 || c >= n || map[r][c] === voidVal);
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
     if (!drivable(map, roadClass, r, c, roadVal, minClass)) continue;
     for (const [dr, dc] of D4) if (outside(r + dr, c + dc)) { out.push({ r, c, dr, dc }); break; }
