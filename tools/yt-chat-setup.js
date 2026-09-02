@@ -10,6 +10,11 @@
  *      node tools/yt-chat-setup.js auth --client-id=xxx --client-secret=yyy
  *      → 読むだけなら↑で足りる。**チャットに返信する (YT_CHAT_REPLY=1) なら --reply を付ける**
  *      node tools/yt-chat-setup.js auth --client-id=xxx --client-secret=yyy --reply
+ *      → OAuth クライアントが「テレビとリミット入力デバイス」型でないとき (Invalid client
+ *        type) は **--local** を付ける。ブラウザで許可して 127.0.0.1 に戻す方式なので、
+ *        「デスクトップアプリ」型のクライアントでもそのまま取れる:
+ *          node tools/yt-chat-setup.js auth --local --reply
+ *        ブラウザのある端末で実行すること (取れたトークンは本番サーバに写せる)。
  *        読み取り専用スコープ (youtube.readonly) では liveChatMessages.insert が
  *        403 になる。--reply は書き込みもできる youtube.force-ssl を要求する
  *        (読み取りも含むので、これ1つで取り込みと返信の両方に使える)。
@@ -213,7 +218,20 @@ async function auth() {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ client_id: id, scope }) });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) die(`device/code 失敗: ${d.error_description || d.error || r.status}\n  (OAuth クライアントの種類が「テレビとリミット入力デバイス」か確認)`);
+  if (!r.ok) {
+    const why = d.error_description || d.error || r.status;
+    // 「テレビとリミット入力デバイス」以外のクライアント (デスクトップアプリ /
+    // ウェブアプリケーション) は device フローを使えない。作り直さなくても、
+    // ループバック方式なら同じクライアントでトークンを取れる。
+    const invalidType = /invalid.?client.?type/i.test(String(why));
+    die(`device/code 失敗: ${why}\n`
+      + (invalidType
+        ? '  このクライアントは「テレビとリミット入力デバイス」型ではありません。\n'
+        + '  → **--local を付けて実行し直す**とループバック方式で取れます (種類を変えなくてよい):\n'
+        + `      node tools/yt-chat-setup.js auth --local${args.reply ? ' --reply' : ''}\n`
+        + '    ブラウザのある端末で実行すること (取れたトークンは別のサーバに持って行けます)。'
+        : '  (OAuth クライアントの種類が「テレビとリミット入力デバイス」か確認)'));
+  }
 
   console.log('\n────────────────────────────────────────');
   console.log(`  1. ブラウザで開く: ${d.verification_url}`);
@@ -245,6 +263,72 @@ async function auth() {
     console.log(`       --client-id=${id} --client-secret=… --refresh=…\n`);
     return;
   }
+}
+
+// ── auth --local: ループバック方式 (デスクトップアプリ型のクライアント向け) ──
+//   device フローは「テレビとリミット入力デバイス」型でしか使えない。ふつうに作られる
+//   「デスクトップアプリ」型では Invalid client type で弾かれる。そちらはこの方式で取る。
+//   127.0.0.1 の一時サーバで認可コードを受けるので、**ブラウザのある端末**で動かすこと。
+//   取れたリフレッシュトークンは端末に紐づかないので、本番サーバの .env に写して使える。
+async function authLocal() {
+  const id = args['client-id'], secret = args['client-secret'];
+  if (!id || !secret) die('--client-id と --client-secret が要る (.env の YT_OAUTH_CLIENT_ID / _SECRET でもよい)');
+  const http = require('http');
+  const crypto = require('crypto');
+  const scope = args.reply ? SCOPE_WRITE : SCOPE_READ;
+  const port = Number(args.port) || 8788;
+  const redirect = `http://127.0.0.1:${port}`;
+  const state = crypto.randomBytes(16).toString('hex');
+
+  const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  u.searchParams.set('client_id', id);
+  u.searchParams.set('redirect_uri', redirect);
+  u.searchParams.set('response_type', 'code');
+  u.searchParams.set('scope', scope);
+  u.searchParams.set('access_type', 'offline');   // リフレッシュトークンをもらう
+  u.searchParams.set('prompt', 'consent');        // 2回目以降も確実にもらう
+  u.searchParams.set('state', state);
+
+  console.log(`\nスコープ: ${scope}`
+    + (args.reply ? '  (読み取り + チャットへの投稿)' : '  (読み取りのみ。返信するなら --reply)'));
+  console.log('────────────────────────────────────────');
+  console.log('  1. このURLをブラウザで開く:\n');
+  console.log(`     ${u}\n`);
+  console.log(`  2. 配信しているチャンネルの Google アカウントで許可する`);
+  console.log(`  3. 許可すると ${redirect} に戻ってくる (このスクリプトが受け取ります)`);
+  console.log('────────────────────────────────────────');
+  console.log('\n待っています… (Ctrl+C で中止)');
+
+  const code = await new Promise((resolve, reject) => {
+    const srv = http.createServer((req, res) => {
+      const q = new URL(req.url, redirect).searchParams;
+      const done = (msg) => { res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+                              res.end(`<meta charset="utf-8"><body style="font-family:sans-serif;padding:2em">${msg}</body>`); };
+      if (q.get('error')) { done('✗ 拒否されました。ターミナルに戻ってください。');
+                            srv.close(); return reject(new Error(`認可を拒否: ${q.get('error')}`)); }
+      if (!q.get('code')) { done('...'); return; }
+      if (q.get('state') !== state) { done('✗ state が一致しません。もう一度実行してください。');
+                                      srv.close(); return reject(new Error('state 不一致 (取り違え防止)')); }
+      done('✓ 受け取りました。ターミナルに戻ってください。このタブは閉じて構いません。');
+      srv.close(); resolve(q.get('code'));
+    });
+    srv.on('error', e => reject(new Error(`127.0.0.1:${port} を開けません: ${e.message} (--port=別の番号 で変えられます)`)));
+    srv.listen(port, '127.0.0.1');     // 外からは繋がらない
+  });
+
+  const t = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ code, client_id: id, client_secret: secret,
+      redirect_uri: redirect, grant_type: 'authorization_code' }) });
+  const j = await t.json().catch(() => ({}));
+  if (!j.refresh_token) die(`トークンの交換に失敗: ${j.error_description || j.error || t.status}`);
+  console.log('\n✓ 取得できました。**この値は秘密**なので .env に入れて共有しないこと:\n');
+  console.log(`  YT_OAUTH_CLIENT_ID=${id}`);
+  console.log('  YT_OAUTH_CLIENT_SECRET=(いま渡した値)');
+  console.log(`  YT_OAUTH_REFRESH_TOKEN=${j.refresh_token}`);
+  if (args.reply) console.log('\n  → 返信も使えるスコープです。サーバ側は YT_CHAT_REPLY=dry で文面を確認してから =1 に。');
+  else console.log('\n  → 読み取り専用です。チャットに返信させるなら --reply を付けて取り直すこと。');
+  console.log('\n  (本番が別のサーバなら、この3つをそちらの .env に写せばそのまま使えます)\n');
 }
 
 // ── find: いま配信中の動画IDを探す ─────────────────────────────────────────
@@ -304,7 +388,7 @@ async function find() {
 }
 
 (async () => {
-  if (cmd === 'auth') await auth();
+  if (cmd === 'auth') await (args.local ? authLocal() : auth());
   else if (cmd === 'find') await find();
   else await check();
 })().catch(e => die(e.message));

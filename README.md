@@ -1016,6 +1016,20 @@ node tools/yt-chat-setup.js auth --reply
 
 `force-ssl` は読み取りも含むので、これ1つで取り込みと返信の両方に使える。
 
+**`Invalid client type.` で弾かれたら `--local` を付ける。** 上のコマンドはデバイスフロー
+（TV方式）で、これは OAuth クライアントが「テレビとリミット入力デバイス」型のときしか
+使えない。ふつうに作られる「デスクトップアプリ」型では通らないので、その場合は
+127.0.0.1 に戻すループバック方式を使う（クライアントを作り直さなくてよい）:
+
+```bash
+node tools/yt-chat-setup.js auth --local --reply
+```
+
+表示された URL をブラウザで開いて許可すると、スクリプトが立てた 127.0.0.1 の一時サーバが
+認可コードを受け取ってリフレッシュトークンに交換する。**ブラウザのある端末で実行する**こと
+（本番が headless なら手元の PC で取って、出てきた3つを本番の `.env` に写せばよい。
+トークンは端末に紐づかない）。ポートが埋まっていれば `--port=8799` のように変えられる。
+
 **引数は `.env` からも読む。** `YT_OAUTH_CLIENT_ID` / `YT_OAUTH_CLIENT_SECRET` /
 `YT_OAUTH_REFRESH_TOKEN` / `YT_API_KEY` / `YT_VIDEO_ID` / `YT_CHANNEL_ID` が入っていれば、
 対応する `--client-id` などを省略できる（明示した引数のほうが優先）。
