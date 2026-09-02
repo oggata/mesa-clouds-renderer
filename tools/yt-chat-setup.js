@@ -15,6 +15,9 @@
  *        「デスクトップアプリ」型のクライアントでもそのまま取れる:
  *          node tools/yt-chat-setup.js auth --local --reply
  *        ブラウザのある端末で実行すること (取れたトークンは本番サーバに写せる)。
+ *      → **VPS などブラウザを開けないマシン**では --paste。手元の PC で許可して、
+ *        飛ばされた先の URL (127.0.0.1 で「接続できません」になるやつ) を貼るだけ:
+ *          node tools/yt-chat-setup.js auth --paste --reply
  *        読み取り専用スコープ (youtube.readonly) では liveChatMessages.insert が
  *        403 になる。--reply は書き込みもできる youtube.force-ssl を要求する
  *        (読み取りも含むので、これ1つで取り込みと返信の両方に使える)。
@@ -270,16 +273,15 @@ async function auth() {
 //   「デスクトップアプリ」型では Invalid client type で弾かれる。そちらはこの方式で取る。
 //   127.0.0.1 の一時サーバで認可コードを受けるので、**ブラウザのある端末**で動かすこと。
 //   取れたリフレッシュトークンは端末に紐づかないので、本番サーバの .env に写して使える。
-async function authLocal() {
+// 同意URLと、後で使う値をまとめて作る (--local と --paste で共通)
+function buildAuthUrl() {
   const id = args['client-id'], secret = args['client-secret'];
   if (!id || !secret) die('--client-id と --client-secret が要る (.env の YT_OAUTH_CLIENT_ID / _SECRET でもよい)');
-  const http = require('http');
   const crypto = require('crypto');
   const scope = args.reply ? SCOPE_WRITE : SCOPE_READ;
   const port = Number(args.port) || 8788;
   const redirect = `http://127.0.0.1:${port}`;
   const state = crypto.randomBytes(16).toString('hex');
-
   const u = new URL('https://accounts.google.com/o/oauth2/v2/auth');
   u.searchParams.set('client_id', id);
   u.searchParams.set('redirect_uri', redirect);
@@ -288,15 +290,76 @@ async function authLocal() {
   u.searchParams.set('access_type', 'offline');   // リフレッシュトークンをもらう
   u.searchParams.set('prompt', 'consent');        // 2回目以降も確実にもらう
   u.searchParams.set('state', state);
-
   console.log(`\nスコープ: ${scope}`
     + (args.reply ? '  (読み取り + チャットへの投稿)' : '  (読み取りのみ。返信するなら --reply)'));
+  return { id, secret, redirect, state, url: u, port };
+}
+
+// 認可コードをリフレッシュトークンに交換して表示する (--local と --paste で共通)
+async function exchangeAndPrint(code, id, secret, redirect) {
+  const t = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ code, client_id: id, client_secret: secret,
+      redirect_uri: redirect, grant_type: 'authorization_code' }) });
+  const j = await t.json().catch(() => ({}));
+  if (!j.refresh_token) die(`トークンの交換に失敗: ${j.error_description || j.error || t.status}`
+    + (/invalid_grant/i.test(String(j.error)) ? '\n  (code は1回きり・数分で切れます。取り直してください)' : ''));
+  console.log('\n✓ 取得できました。**この値は秘密**なので .env に入れて共有しないこと:\n');
+  console.log(`  YT_OAUTH_CLIENT_ID=${id}`);
+  console.log('  YT_OAUTH_CLIENT_SECRET=(いま渡した値)');
+  console.log(`  YT_OAUTH_REFRESH_TOKEN=${j.refresh_token}`);
+  if (args.reply) console.log('\n  → 返信も使えるスコープです。サーバ側は YT_CHAT_REPLY=dry で文面を確認してから =1 に。');
+  else console.log('\n  → 読み取り専用です。チャットに返信させるなら --reply を付けて取り直すこと。');
+  console.log('\n  (本番が別のサーバなら、この3つをそちらの .env に写せばそのまま使えます)\n');
+}
+
+// ── auth --paste: ブラウザの無いサーバ (VPS) 向け ────────────────────────────
+//   --local は 127.0.0.1 に戻ってくるのを待つので、**そのマシンにブラウザが要る**。
+//   VPS では開けない。ただし戻り先の URL には認可コードがそのまま入っているので、
+//   手元の PC のブラウザで許可 → 「接続できません」になった URL を丸ごと貼れば済む。
+//   (Google は 2022 年に手入力用の OOB を廃止したので、この形が現実的な代替)
+async function authPaste() {
+  const { id, secret, redirect, state, url } = buildAuthUrl();
   console.log('────────────────────────────────────────');
-  console.log('  1. このURLをブラウザで開く:\n');
+  console.log('  1. **手元のPCの**ブラウザで、このURLを開く:\n');
+  console.log(`     ${url}\n`);
+  console.log('  2. 配信しているチャンネルの Google アカウントで許可する');
+  console.log(`  3. 許可すると ${redirect}/?code=… に飛ばされ、`);
+  console.log('     「このサイトにアクセスできません」になります。**それで正常です**。');
+  console.log('  4. そのときの **アドレスバーの URL を丸ごとコピー** して下に貼り付ける');
+  console.log('────────────────────────────────────────\n');
+
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const line = await new Promise(r => rl.question('飛ばされた URL (または code の値) を貼り付けて Enter: ', a => { rl.close(); r(a); }));
+
+  let code = String(line || '').trim();
+  // URL の形 (または key=value の並び) なら必ず分解する。
+  //   ★ 以前は 'code=' を含むときだけ分解していたので、code の無い URL
+  //     (?state=… だけ) を貼ると **URL 全体を認可コードとして送って**しまい、
+  //     「OAuth client was not found」という無関係なエラーになっていた。
+  if (/^https?:\/\//i.test(code) || /[?&]?(code|state|error|scope)=/.test(code)) {
+    const q = new URL(code.startsWith('http') ? code : `http://127.0.0.1/?${code.replace(/^\?/, '')}`).searchParams;
+    if (q.get('error')) die(`許可されませんでした: ${q.get('error')}`);
+    if (q.get('state') && q.get('state') !== state)
+      die('state が一致しません。このスクリプトが出した URL を開いたか確認してください');
+    code = q.get('code') || '';
+  }
+  if (!code) die('URL に code が入っていません。?code=… の付いた URL を貼り付けてください');
+  await exchangeAndPrint(code, id, secret, redirect);
+}
+
+async function authLocal() {
+  const { id, secret, redirect, state, url: u, port } = buildAuthUrl();
+  const http = require('http');
+  console.log('────────────────────────────────────────');
+  console.log('  1. このURLを **このマシンの** ブラウザで開く:\n');
   console.log(`     ${u}\n`);
   console.log(`  2. 配信しているチャンネルの Google アカウントで許可する`);
   console.log(`  3. 許可すると ${redirect} に戻ってくる (このスクリプトが受け取ります)`);
   console.log('────────────────────────────────────────');
+  console.log('\n  ※ ここでブラウザを開けないマシン (VPS など) では待っても戻ってきません。');
+  console.log('     その場合は Ctrl+C で止めて --paste を使ってください。');
   console.log('\n待っています… (Ctrl+C で中止)');
 
   const code = await new Promise((resolve, reject) => {
@@ -316,19 +379,7 @@ async function authLocal() {
     srv.listen(port, '127.0.0.1');     // 外からは繋がらない
   });
 
-  const t = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ code, client_id: id, client_secret: secret,
-      redirect_uri: redirect, grant_type: 'authorization_code' }) });
-  const j = await t.json().catch(() => ({}));
-  if (!j.refresh_token) die(`トークンの交換に失敗: ${j.error_description || j.error || t.status}`);
-  console.log('\n✓ 取得できました。**この値は秘密**なので .env に入れて共有しないこと:\n');
-  console.log(`  YT_OAUTH_CLIENT_ID=${id}`);
-  console.log('  YT_OAUTH_CLIENT_SECRET=(いま渡した値)');
-  console.log(`  YT_OAUTH_REFRESH_TOKEN=${j.refresh_token}`);
-  if (args.reply) console.log('\n  → 返信も使えるスコープです。サーバ側は YT_CHAT_REPLY=dry で文面を確認してから =1 に。');
-  else console.log('\n  → 読み取り専用です。チャットに返信させるなら --reply を付けて取り直すこと。');
-  console.log('\n  (本番が別のサーバなら、この3つをそちらの .env に写せばそのまま使えます)\n');
+  await exchangeAndPrint(code, id, secret, redirect);
 }
 
 // ── find: いま配信中の動画IDを探す ─────────────────────────────────────────
@@ -388,7 +439,7 @@ async function find() {
 }
 
 (async () => {
-  if (cmd === 'auth') await (args.local ? authLocal() : auth());
+  if (cmd === 'auth') await (args.paste ? authPaste() : args.local ? authLocal() : auth());
   else if (cmd === 'find') await find();
   else await check();
 })().catch(e => die(e.message));

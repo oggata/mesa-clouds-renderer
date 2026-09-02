@@ -10393,7 +10393,10 @@ function handleChatCommand(text, author){
     chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(ping)'});
     while(chatLog.length>30) chatLog.shift();
     console.log(`[Chat] ${who}: ping → 画面に "chat OK" を表示`);
-    return {ok:true, msg:`pong to ${who}`};
+    // 返信が有効なら、チャット欄にもそのまま返る (経路が生きているかの確認用)
+    return {ok:true, msg:`pong to ${who}`,
+      reply: JA_HUD ? `test 届きました。チャットへの返信は生きています`
+                    : `test received - chat replies are working`};
   }
 
   // 視聴者が住民になる
@@ -11382,8 +11385,20 @@ async function ytcAccessToken(){
   const r=await fetch('https://oauth2.googleapis.com/token',
     {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
   const j=await r.json().catch(()=>({}));
-  if(!r.ok || !j.access_token)
-    throw new Error(`アクセストークンの更新に失敗: ${r.status} ${j.error_description||j.error||''}`);
+  if(!r.ok || !j.access_token){
+    // ★ invalid_grant は「リフレッシュトークンが失効した / 取り消された」。
+    //   いちばん多いのは **OAuth 同意画面が「テスト」のまま**で、そこで発行された
+    //   トークンが7日で切れる件。番号だけ出しても原因に辿り着けないので書いておく。
+    const err=String(j.error||'');
+    const hint = /invalid_grant/i.test(err)
+      ? ' → リフレッシュトークンが失効しています。OAuth 同意画面が「テスト」のままだと'
+        + ' 発行から7日で切れます。同意画面を「本番」に公開してから'
+        + ' tools/yt-chat-setup.js auth --local --reply で取り直してください'
+      : /invalid_client/i.test(err)
+      ? ' → YT_OAUTH_CLIENT_ID / _SECRET を確認してください'
+      : '';
+    throw new Error(`アクセストークンの更新に失敗: ${r.status} ${j.error_description||err||''}${hint}`);
+  }
   YTC._access=j.access_token;
   YTC._accessExp=Date.now()+((j.expires_in||3600)*1000);
   console.log(`[YTChat] アクセストークンを更新 (${Math.round((j.expires_in||3600)/60)}分有効)`);
@@ -11411,12 +11426,26 @@ async function ytcFetch(path, params){
 //   画面 (バナー) には従来どおり出したうえで、**同じ内容**をチャット欄にも投稿する。
 //   バナーは数秒で消えるので、指示した本人が見逃すと何が起きたのか分からない。
 //   投稿は公開の書き込みなので、既定 off / OAuth 必須 / 連投と1日の上限つき。
-async function ytcReply(text, who){
-  if(!YTC.reply || !YTC.enabled) return false;
-  const body=String(text||'').trim();
-  if(!body) return false;
+// 返信を見送ったときは**理由をログに出す**。黙って false を返していたので、
+// 「チャットに返ってこない」の原因 (off / 間隔 / 上限) が外から区別できなかった。
+// 毎回出すとうるさいので同じ理由は60秒に1回だけ。
+let _replySkipAt={};
+function replySkip(why){
   const now=Date.now();
-  if(now-YTC.replyAt < YTC.replyMinSec*1000) return false;      // 連投の抑制
+  if(now-(_replySkipAt[why]||0) > 60000){
+    _replySkipAt[why]=now;
+    console.log(`[YTChat] 返信しませんでした: ${why}`);
+  }
+  return false;
+}
+async function ytcReply(text, who, force){
+  if(!YTC.enabled) return replySkip('YT_CHAT=1 になっていない');
+  if(!YTC.reply)   return replySkip('YT_CHAT_REPLY が未設定 (=dry で文面確認 / =1 で投稿)');
+  const body=String(text||'').trim();
+  if(!body) return replySkip('返す文が空');
+  const now=Date.now();
+  if(!force && now-YTC.replyAt < YTC.replyMinSec*1000)
+    return replySkip(`前の返信から ${YTC.replyMinSec}秒 経っていない (YT_CHAT_REPLY_MIN_SEC)`);
   if(YTC.repliesDay >= YTC.replyMaxDay){
     if(YTC.repliesDay === YTC.replyMaxDay){                     // 1回だけ知らせる
       YTC.repliesDay++;
@@ -12653,6 +12682,29 @@ tick(); setInterval(tick, ${ms});
         lastError:YTC.lastError||null,
         watch: YTC.video ? `https://www.youtube.com/watch?v=${YTC.video}` : null}));
     };
+    // ── /yt?say=test : チャット欄に1本投げてみる (返信経路の疎通確認) ──
+    //   チャットに書いて待つより速いし、**失敗の理由がそのまま返る**。
+    //   CHAT_TOKEN を設定してあれば合言葉が要る (公開の書き込みなので)。
+    if(q.has('say')){
+      if(CHAT_TOKEN && q.get('token')!==CHAT_TOKEN){
+        res.writeHead(403); res.end(JSON.stringify({ok:false,error:'bad token'})); return;
+      }
+      const say=String(q.get('say')||'').slice(0,150);
+      YTC.lastError=null;
+      ytcReply(say, null, true).then(sent=>{
+        res.writeHead(200);
+        res.end(JSON.stringify({ok:sent, mode:YTC.reply||'off', sent,
+          text:say, chatId:YTC.chatId?'あり':'なし',
+          error:YTC.lastError||null,
+          hint: sent ? (YTC.reply==='dry' ? 'dry なので実際には投稿していません (ログに文面が出ます)'
+                                          : 'チャット欄を確認してください')
+                     : 'ログの「[YTChat] 返信しませんでした: …」に理由が出ます'}));
+      }).catch(e=>{
+        res.writeHead(200);
+        res.end(JSON.stringify({ok:false, error:String(e.message).slice(0,200)}));
+      });
+      return;
+    }
     if(q.get('refind')==='1'){
       ytcInvalidateVideo('/yt?refind=1 による手動の探し直し');
       ytcResolveChatId().then(done).catch(e=>{ YTC.lastError=e.message; done(); });
