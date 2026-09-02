@@ -7388,7 +7388,7 @@ function growPopulation(day){
   if(moved.length){
     news('pop', `🏠 入居待ちだった ${moved.join(', ')} が引っ越してきた (人口 ${agents.length})`,
          `${moved.join(', ')} finally moved in (pop ${agents.length})`);
-    showBanner(`${moved[0]} moved in`, 6);
+    showBanner(JA_HUD ? `${moved[0]} が引っ越してきた` : `${moved[0]} moved in`, 6);
   }
   const others=n-moved.length;
   if(others>0)
@@ -10119,7 +10119,11 @@ function findAgentByQuery(q){
 function handleChatCommand(text, author){
   if(!CHAT_CMD) return null;
   const raw=String(text||'').trim();
-  const who=_ascii(String(author||'viewer')).slice(0,18) || 'viewer';
+  // ★ 投稿者名は **表示言語に合わせて**落とす。ここで無条件に ASCII へ落として
+  //   いたので、**日本語の YouTube アカウント名が丸ごと消えて 'viewer' に
+  //   なっていた** (「たなか太郎」で !join すると住民の名前が viewer になる)。
+  //   viewerNameFor 側だけ日本語を通しても、手前のここで消えていては届かない。
+  const who=_hud(String(author||'viewer')).slice(0,18) || 'viewer';
   const now=Date.now();
 
   // 疎通確認。「チャットが届いているか」を配信画面だけで確かめられるようにする。
@@ -10127,12 +10131,12 @@ function handleChatCommand(text, author){
   if(/^!?(test|ping|hello)\b/i.test(raw)){
     if(now-_lastPingAt < 4000) return {ok:false, msg:'ping cooldown'};
     _lastPingAt=now;
-    showBanner(`chat OK - ${who}`, 6);
+    showBanner(JA_HUD ? `チャット届いた - ${who}` : `chat OK - ${who}`, 6);
     lifeNews.push({day:gameDay(), en:`chat received from ${who}`, shape:'ping',
                    ja:`${who} からのチャットが届いた`});
     while(lifeNews.length>12) lifeNews.shift();
     hudNewsDirty=true;
-    chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(ping)'});
+    chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(ping)'});
     while(chatLog.length>30) chatLog.shift();
     console.log(`[Chat] ${who}: ping → 画面に "chat OK" を表示`);
     return {ok:true, msg:`pong to ${who}`};
@@ -10142,7 +10146,7 @@ function handleChatCommand(text, author){
   const mj=raw.match(/^!?join\b\s*(.{0,20})$/i);
   if(mj){
     const r=viewerJoin(who, (mj[1]||'').trim());
-    chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(join)'});
+    chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(join)'});
     while(chatLog.length>30) chatLog.shift();
     return r;
   }
@@ -10150,7 +10154,7 @@ function handleChatCommand(text, author){
   const mt=raw.match(/^!?teach\s+(\S{1,24})\s+(.{1,24})$/i);
   if(mt){
     const r=viewerTeach(who, mt[1], mt[2]);
-    if(r.ok){ chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(teach)'});
+    if(r.ok){ chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(teach)'});
               while(chatLog.length>30) chatLog.shift(); }
     return r;
   }
@@ -10169,7 +10173,7 @@ function handleChatCommand(text, author){
   if(mc){
     const r=viewerCheer(mc[1], who);
     if(r.ok){
-      chatLog.push({t:now, by:who, text:_ascii(raw).slice(0,60), target:'(cheer)'});
+      chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(cheer)'});
       while(chatLog.length>30) chatLog.shift();
     }
     return r;
@@ -10194,15 +10198,27 @@ function handleChatCommand(text, author){
                Math.min(6, CHAT_FOCUS_SEC));
   }
   const target=camHold.idx<0?'overview':agents[camHold.idx].name;
-  chatLog.push({t:now, by:who, text:_ascii(String(text)).slice(0,60), target});
+  chatLog.push({t:now, by:who, text:_hud(String(text)).slice(0,60), target});
   while(chatLog.length>30) chatLog.shift();
   console.log(`[Chat] ${who}: focus -> ${target} (${CHAT_FOCUS_SEC}s)`);
   return {ok:true, msg:`focus ${target} for ${CHAT_FOCUS_SEC}s`};
 }
 
-// 視聴者名を住民の表示名にできる形に整える。ASCII のみ・長さ制限・重複回避。
+// 視聴者名を住民の表示名にできる形に整える。長さ制限・重複回避。
+//   ★ 以前は**必ず ASCII に落としていた**。「配信画面は ASCII しか描けない」という
+//     前提だったが、日本語フォントを同梱したのでその制約は無くなった。
+//     HUD_LANG=ja のときは、ひらがな・カタカナ・漢字も名前として通す
+//     (`!join ミナト` が「名前が短すぎる」で弾かれていた)。
+//     絵文字だけは落とす — 描けないので豆腐になる。
 function viewerNameFor(who){
-  let base=_ascii(who).replace(/[^A-Za-z0-9 _.#-]/g,'').trim().slice(0,16);
+  let base;
+  if(JA_HUD){
+    base=_noEmoji(who)
+      .replace(/[^A-Za-z0-9 _.#\-\u3040-\u30FF\u4E00-\u9FFF\u30FC]/gu,'')
+      .trim().slice(0,16);
+  }else{
+    base=_ascii(who).replace(/[^A-Za-z0-9 _.#-]/g,'').trim().slice(0,16);
+  }
   if(base.length<2) return null;
   if(NG_WORDS.some(w=>base.toLowerCase().includes(w))) return null;
   let name=base, n=2;
@@ -10217,12 +10233,12 @@ function viewerNameFor(who){
 //   ローマ字を自分で指定できる逃げ道を用意しておく。
 function viewerJoin(who, arg){
   if(!VIEWER_JOIN || !CITY) return {ok:false, msg:'join disabled'};
-  const mine=a=>a.viewer && (a.by===who || a.name===_ascii(who).slice(0,16));
+  const mine=a=>a.viewer && (a.by===who || a.name===_hud(who).slice(0,16));
   const exist=agents.find(mine);
   if(exist){                                   // もう住んでいる → その人を映す
     const idx=agents.indexOf(exist);
     camHold={idx, until:Date.now()+CHAT_FOCUS_SEC*1000, by:who};
-    showBanner(`${exist.name} already lives here`, 5);
+    showBanner(JA_HUD ? `${exist.name} はもう住んでいます` : `${exist.name} already lives here`, 5);
     return {ok:true, msg:`already a resident: ${exist.name}`};
   }
   const name=viewerNameFor(arg||who);
@@ -10241,15 +10257,16 @@ function viewerJoin(who, arg){
     CITY.pop=agents.length;
     news('pop', `🏠 ${name} がこの街に引っ越してきた (視聴者)`,
          `${name} moved into this town`);
-    showBanner(`${name} moved in`, 6);
-    if(a.home) showCityEvent(a.home[0], a.home[1], `${name} moved into this town`, 8);
+    showBanner(JA_HUD ? `${name} が引っ越してきた` : `${name} moved in`, 6);
+    if(a.home) showCityEvent(a.home[0], a.home[1],
+      JA_HUD ? `${name} がこの街に引っ越してきた` : `${name} moved into this town`, 8);
     console.log(`[Chat] ${who}: join → 住民 ${name} が誕生 (人口 ${agents.length})`);
     return {ok:true, msg:`welcome, ${name}`};
   }
   CITY.waiting.push({name, by:who, t:Date.now()});   // 家が無い → 建つまで待つ
   news('pop', `🧳 ${name} が入居待ち (住居の空き待ち ${CITY.waiting.length}人)`,
        `${name} is waiting for a home (${CITY.waiting.length} in queue)`);
-  showBanner(`${name} is waiting for a home`, 6);
+  showBanner(JA_HUD ? `${name} は住むところの空きを待っています` : `${name} is waiting for a home`, 6);
   return {ok:true, msg:`${name} queued (no housing yet)`};
 }
 
@@ -10272,7 +10289,7 @@ function viewerCheer(query, who){
   hudNewsDirty=true;
   if(now-_lastCheerBannerAt > 20000){           // バナーは出しすぎない
     _lastCheerBannerAt=now;
-    showBanner(`${a.name} cheered by ${who}`, 5);
+    showBanner(JA_HUD ? `${who} が ${a.name} を応援した` : `${a.name} cheered by ${who}`, 5);
   }
   console.log(`[Chat] ${who}: cheer → ${a.name} (通算${a.cheers})`);
   return {ok:true, msg:`cheered ${a.name} (${a.cheers})`};
@@ -10287,10 +10304,17 @@ function viewerTeach(who, targetQ, placeQ){
   if(!a) return {ok:false, msg:'no resident'};
   // 業種名 (ramen / cafe …) か英語表示名から探す。その住民に**いちばん近い**同業を勧める。
   const q=String(placeQ||'').trim().toLowerCase();
+  // ★ **日本語でも引けるようにする。** 視聴者は「ラーメン」と書く。ここが英語名
+  //   (ramen / Ramen Shop) しか見ていなかったので、日本語表示にしたのに
+  //   「ラーメンをすすめて」が通らなかった。label は絵文字付き ('🍜 ラーメン屋')
+  //   なので、先頭の絵文字を落としてから比べる。
+  const jaOf = b => String(b.label||'').replace(/^\S+\s*/,'');
   let ti=BLDG_TYPES.findIndex(b=>b.name.toLowerCase()===q);
+  if(ti<0) ti=BLDG_TYPES.findIndex(b=>jaOf(b)===placeQ.trim());
   if(ti<0) ti=BLDG_TYPES.findIndex(b=>(BLDG_EN[b.name]||'').toLowerCase().includes(q));
   if(ti<0) ti=BLDG_TYPES.findIndex(b=>b.name.toLowerCase().includes(q));
-  if(ti<0) return {ok:false, msg:`unknown place: ${_ascii(q).slice(0,20)}`};
+  if(ti<0) ti=BLDG_TYPES.findIndex(b=>jaOf(b).includes(placeQ.trim()));
+  if(ti<0) return {ok:false, msg:`unknown place: ${_hud(q).slice(0,20)}`};
   const cands=CITY.structs.filter(st=>st.state==='open' && st.typeIdx===ti);
   if(!cands.length) return {ok:false, msg:`no open ${enOf(ti)} in town`};
   cands.sort((p,qq)=>((p.r-a.x)**2+(p.c-a.y)**2)-((qq.r-a.x)**2+(qq.c-a.y)**2));
@@ -10303,7 +10327,8 @@ function viewerTeach(who, targetQ, placeQ){
   while(CITY.recs.length>50) CITY.recs.shift();
   news('teach', `💡 ${who} が ${a.name} に ${BLDG_TYPES[ti].label} (${st.r},${st.c}) を勧めた`,
        `${who} recommended a ${enOf(ti)} to ${a.name}`);
-  showBanner(`${who} told ${a.name} about a ${enOf(ti)}`, 6);
+  showBanner(JA_HUD ? `${who} が ${a.name} に ${BLDG_TYPES[ti].label} をすすめた`
+                    : `${who} told ${a.name} about a ${enOf(ti)}`, 6);
   console.log(`[Chat] ${who}: teach → ${a.name} に ${BLDG_TYPES[ti].name}`);
   return {ok:true, msg:`told ${a.name} about a ${enOf(ti)} (they will decide for themselves)`};
 }
