@@ -3045,21 +3045,6 @@ function stepTraffic(dt){
   // 間隔を空ける。毎フレーム試すと、経路が引けるかぎり湧き口に連続で置かれて
   // 車体が重なる。加えて、湧き口に車が居るあいだは湧かせない。
   const now=Date.now();
-  if(process.env.CAR_DEBUG==='1' && !global.__cd){
-    global.__cd=1;
-    console.log('[CarDebug] CARS_ON='+CARS_ON+' body='+!!CarInst.body
-      +' roadClass='+!!(CITY&&CITY.roadClass)+' 出入口='+_carGw.length
-      +' 行き止まり='+(_carEnd?_carEnd.length:'null')+' 上限='+carMaxNow());
-    // 実際に経路が引けるか 5 回試す
-    let ok=0, ng=0;
-    for(let i=0;i<5;i++){
-      const a=carSpot(), b=carSpot();
-      if(!a||!b||(a.r===b.r&&a.c===b.c)){ ng++; continue; }
-      const p=TR.route(MAP, CITY.roadClass, a, b, ROAD, 1, {cost:carCost()});
-      if(p && p.length>=3) ok++; else ng++;
-    }
-    console.log('[CarDebug] 経路が引けた '+ok+'/5');
-  }
   // ★ 「出入口が2つ以上」ではなく「**発着点が2つ以上**」で判定する。
   //   出入口が消えた街でも、行き止まりどうしを結べば車は走れる。
   const spots=(_carGw?_carGw.length:0)+(_carEnd?_carEnd.length:0);
