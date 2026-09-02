@@ -1006,6 +1006,22 @@ id から学齢を引くと消防士が高校に通ってしまう）。
   APIキーでは通らない。`YT_OAUTH_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN`）。
   OAuth が無いまま `1` を指定した場合は起動時に警告して off に落とす
 
+**スコープに注意。** 取り込みだけなら `youtube.readonly` で足りるが、**投稿には
+`youtube.force-ssl` が要る**（readonly のトークンでは insert が 403）。
+`tools/yt-chat-setup.js auth` は既定で readonly を取るので、返信を使うなら `--reply` を付ける:
+
+```bash
+node tools/yt-chat-setup.js auth --reply
+```
+
+`force-ssl` は読み取りも含むので、これ1つで取り込みと返信の両方に使える。
+
+**引数は `.env` からも読む。** `YT_OAUTH_CLIENT_ID` / `YT_OAUTH_CLIENT_SECRET` /
+`YT_OAUTH_REFRESH_TOKEN` / `YT_API_KEY` / `YT_VIDEO_ID` / `YT_CHANNEL_ID` が入っていれば、
+対応する `--client-id` などを省略できる（明示した引数のほうが優先）。
+APIキーやクライアントシークレットをコマンドラインに並べると、**シェルの履歴と `ps` の
+一覧に平文で残る**ため。`ENV_FILE` で読む場所を変えられる。
+
 歯止めは3つ。**連投の間隔**（既定6秒）、**1日の上限**（既定100件）、そして
 `liveChatMessages.insert` が 50 units と高いこと自体（1日 10,000 のうち45秒ポーリングで
 約1,000 使うので、返信100件で 5,000）。上限に達したら1回だけログに出して、その日は返さない。

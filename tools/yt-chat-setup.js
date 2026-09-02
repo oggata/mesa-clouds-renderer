@@ -8,6 +8,11 @@
  *
  *   2) OAuth が要るときのリフレッシュトークン取得 (TV/限定入力デバイス方式)
  *      node tools/yt-chat-setup.js auth --client-id=xxx --client-secret=yyy
+ *      → 読むだけなら↑で足りる。**チャットに返信する (YT_CHAT_REPLY=1) なら --reply を付ける**
+ *      node tools/yt-chat-setup.js auth --client-id=xxx --client-secret=yyy --reply
+ *        読み取り専用スコープ (youtube.readonly) では liveChatMessages.insert が
+ *        403 になる。--reply は書き込みもできる youtube.force-ssl を要求する
+ *        (読み取りも含むので、これ1つで取り込みと返信の両方に使える)。
  *
  *   3) 取れたトークンで実際に読めるか確認
  *      node tools/yt-chat-setup.js check --video=VIDEO_ID \
@@ -21,21 +26,69 @@
  * 【秘密情報について】このスクリプトは受け取った値を**この端末の標準出力にしか出さない**。
  * どこにも送信しないし、ファイルにも書かない。表示された値は .env などに自分で控えること
  * (.gitignore で .env は除外済み)。
+ *
+ * ★ 引数は **.env からも読む**。APIキーやクライアントシークレットをコマンドラインに
+ *   並べると、シェルの履歴と `ps` の一覧に平文で残る。.env に入っていれば省略できる:
+ *     --client-id     ← YT_OAUTH_CLIENT_ID
+ *     --client-secret ← YT_OAUTH_CLIENT_SECRET
+ *     --refresh       ← YT_OAUTH_REFRESH_TOKEN
+ *     --key           ← YT_API_KEY
+ *     --video         ← YT_VIDEO_ID
+ *     --channel       ← YT_CHANNEL_ID
+ *   明示した引数のほうが .env より優先される。ENV_FILE で場所を変えられる。
+ *   これで返信用のトークン取得は引数ゼロで済む:
+ *     node tools/yt-chat-setup.js auth --reply
  */
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
 const API = process.env.YT_CHAT_API_BASE || 'https://www.googleapis.com/youtube/v3';
-const SCOPE = 'https://www.googleapis.com/auth/youtube.readonly';
+// 読むだけなら readonly。チャットに投稿する (返信機能) には force-ssl が要る。
+//   force-ssl は読み取りも含むので、返信を使うならこちら1つで足りる。
+const SCOPE_READ  = 'https://www.googleapis.com/auth/youtube.readonly';
+const SCOPE_WRITE = 'https://www.googleapis.com/auth/youtube.force-ssl';
 
 const args = {};
 for (const a of process.argv.slice(2)) {
   const m = a.match(/^--([^=]+)=?(.*)$/);
   if (m) args[m[1]] = m[2] || true;
 }
+
+// ── .env の読み込み (server.js と同じ書式・同じ規則) ─────────────────────────
+//   秘密情報をコマンドラインに置かないための逃げ道。既にある環境変数は上書きしない。
+(function loadDotEnv() {
+  const fp = process.env.ENV_FILE || path.join(__dirname, '..', '.env');
+  try {
+    if (!fs.existsSync(fp)) return;
+    for (let line of fs.readFileSync(fp, 'utf8').split(/\r?\n/)) {
+      line = line.replace(/^\s*export\s+/, '');
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!m) continue;
+      let v = m[2].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      else v = v.replace(/\s+#.*$/, '').trim();
+      if (process.env[m[1]] === undefined) process.env[m[1]] = v;
+    }
+  } catch (e) { console.warn(`(.env を読めませんでした: ${e.message})`); }
+})();
+
+// 引数が無ければ環境変数から補う。**引数のほうが優先**。
+const FROM_ENV = {
+  'client-id': 'YT_OAUTH_CLIENT_ID', 'client-secret': 'YT_OAUTH_CLIENT_SECRET',
+  refresh: 'YT_OAUTH_REFRESH_TOKEN', key: 'YT_API_KEY',
+  video: 'YT_VIDEO_ID', channel: 'YT_CHANNEL_ID',
+};
+const filled = [];
+for (const [k, envKey] of Object.entries(FROM_ENV)) {
+  if (!args[k] && process.env[envKey]) { args[k] = process.env[envKey]; filled.push(envKey); }
+}
 const cmd = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : 'check';
 const die = (msg) => { console.error(`\n✗ ${msg}\n`); process.exit(1); };
 // 秘密情報は伏せて出す。端末のログやスクショから漏れるのを避けるため。
 const mask = (v) => { const s = String(v || ''); return s.length <= 8 ? '****' : `${s.slice(0, 4)}…${s.slice(-4)}`; };
+if (filled.length) console.log(`(.env から補完: ${filled.join(' ')})`);
 
 async function accessTokenFromRefresh() {
   if (!args['client-id'] || !args['client-secret'] || !args.refresh) return '';
@@ -149,11 +202,16 @@ async function probeStream(liveChatId, token) {
 // ── auth: TV/限定入力デバイス方式でリフレッシュトークンを取る ────────────────
 async function auth() {
   const id = args['client-id'], secret = args['client-secret'];
-  if (!id || !secret) die('--client-id と --client-secret が要る (種類は「テレビとリミット入力デバイス」)');
+  if (!id || !secret) die('--client-id と --client-secret が要る (種類は「テレビとリミット入力デバイス」)\n'
+    + '  コマンドラインに置きたくなければ .env に入れておけば省略できる:\n'
+    + '    YT_OAUTH_CLIENT_ID=... / YT_OAUTH_CLIENT_SECRET=...');
 
+  const scope = args.reply ? SCOPE_WRITE : SCOPE_READ;
+  console.log(`\nスコープ: ${scope}`
+    + (args.reply ? '  (読み取り + チャットへの投稿)' : '  (読み取りのみ。返信するなら --reply を付け直す)'));
   const r = await fetch('https://oauth2.googleapis.com/device/code', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ client_id: id, scope: SCOPE }) });
+    body: new URLSearchParams({ client_id: id, scope }) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) die(`device/code 失敗: ${d.error_description || d.error || r.status}\n  (OAuth クライアントの種類が「テレビとリミット入力デバイス」か確認)`);
 
@@ -180,6 +238,8 @@ async function auth() {
     console.log(`  YT_OAUTH_CLIENT_ID=${id}`);
     console.log('  YT_OAUTH_CLIENT_SECRET=(いま渡した値)');
     console.log(`  YT_OAUTH_REFRESH_TOKEN=${j.refresh_token}`);   // ここだけは実値 (取得の唯一の機会のため)
+    if (args.reply) console.log('\n  → 返信も使えるスコープです。サーバ側は YT_CHAT_REPLY=dry で文面を確認してから =1 に。');
+    else console.log('\n  → 読み取り専用です。チャットに返信させるなら --reply を付けて取り直すこと。');
     console.log('\n確認:');
     console.log(`  node tools/yt-chat-setup.js check --video=VIDEO_ID \\`);
     console.log(`       --client-id=${id} --client-secret=… --refresh=…\n`);
