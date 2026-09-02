@@ -2256,9 +2256,16 @@ function updateTalkBubbles(cam){
 const HUD_ON        = process.env.HUD !== '0';
 // 配信画面に焼き込む文字は **ASCII だけ**。本番 (Linux) に日本語フォントが無いと
 // 豆腐になるため。表示領域も控えめにして街を隠さないようにする。
-const HUD_DAY_W     = 250, HUD_DAY_H = 54;
-const HUD_TICKER_H  = 30;
-const HUD_SPEED     = envNum('HUD_SPEED', 90);      // ティッカーの流れる速さ (px/秒)
+// ★ 配信画面の文字と板の大きさは **ここ1つ**で決める。個々の font-size と板の寸法に
+//   直接数値を書いていたので、「全体的に小さくしたい」と思っても触る場所が
+//   日付板・ティッカー・カメラ表示・会話ログ・バナーの5か所に散っていた。
+//   下の HUD_* / TALK_LOG_* の既定値は **倍率をかける前**の値。
+const HUD_SCALE     = Math.max(0.4, Math.min(2, parseFloat(process.env.HUD_SCALE) || 0.8));
+const _hs           = v => Math.max(1, Math.round(v*HUD_SCALE));   // 大きさ (px)
+const HUD_DAY_W     = _hs(250), HUD_DAY_H = _hs(54);
+const HUD_TICKER_H  = _hs(30);
+// 文字が小さくなるとティッカーは同じ px/秒でも「速く」読めてしまうので、速さも一緒に縮める
+const HUD_SPEED     = envNum('HUD_SPEED', 90) * HUD_SCALE;   // ティッカーの流れる速さ (px/秒)
 // 絵文字フォントを最後に足しておかないと 💊 や 🏛 が豆腐になる (欲求アイコンと同じ理由)。
 // 配信画面には ASCII だけを描く (_ascii)。絵文字も日本語も落ちる。
 //   sharp(librsvg) はカラー絵文字を確実には描けず、日本語は本番 (Linux) に
@@ -2340,10 +2347,10 @@ async function refreshHudDay(){
   hudDayText=txt;
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_DAY_W}" height="${HUD_DAY_H}">`
-    +`<rect width="${HUD_DAY_W}" height="${HUD_DAY_H}" rx="6" fill="#050b10" fill-opacity="0.58"/>`
-    +`<text x="12" y="24" font-size="17" font-weight="bold" fill="#00d2a0"`
+    +`<rect width="${HUD_DAY_W}" height="${HUD_DAY_H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.58"/>`
+    +`<text x="${_hs(12)}" y="${_hs(24)}" font-size="${_hs(17)}" font-weight="bold" fill="#00d2a0"`
     +` font-family="${HUD_FACE}">${_esc(_hud(l1))}</text>`
-    +`<text x="12" y="43" font-size="13" fill="#9fd8c8"`
+    +`<text x="${_hs(12)}" y="${_hs(43)}" font-size="${_hs(13)}" fill="#9fd8c8"`
     +` font-family="${HUD_FACE}">${_esc(_hud(l2))}</text></svg>`);
   if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
   hudDay=hudPlane(HUD_DAY_W, HUD_DAY_H, tex);
@@ -2372,10 +2379,10 @@ async function refreshHudTicker(){
                         : (JA_HUD ? 'この街にはまだ記録がありません' : 'No records yet in this town');
   // 文字幅の見積り。**全角は2倍で数える** (ASCII 前提のままだと日本語で板が狭すぎて
   // 文字が途中で切れる)。
-  const w=Math.min(6000, Math.max(WIDTH, Math.ceil(40 + _tw(txt)*8.6)));
+  const w=Math.min(6000, Math.max(WIDTH, Math.ceil(_hs(40) + _tw(txt)*8.6*HUD_SCALE)));
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${HUD_TICKER_H}">`
-    +`<text x="16" y="21" font-size="16" fill="#dfeee9"`
+    +`<text x="${_hs(16)}" y="${_hs(21)}" font-size="${_hs(16)}" fill="#dfeee9"`
     +` font-family="${HUD_FACE_T}">${_esc(_hud(txt))}</text></svg>`);
   if(hudTicker){ hudScene.remove(hudTicker); hudTicker.material.map.dispose(); hudTicker.material.dispose(); hudTicker.geometry.dispose(); }
   hudTickerW=w;
@@ -2388,7 +2395,7 @@ async function refreshHudTicker(){
 // ── いま何を映しているか (右上に常時表示) ──────────────────────────────────
 //   誰を追っているのか分からないまま眺めることになるのを避ける。
 //   チャットで指名された場合は誰の指名かも出す。
-const HUD_CAM_W = 300, HUD_CAM_H = 46;
+const HUD_CAM_W = _hs(300), HUD_CAM_H = _hs(46);
 let hudCam2=null, hudCamText='', hudCamBusy=false, hudCamAt=0;
 
 // 追跡中の住民の「いま何をしているか」を短く (ASCII)。
@@ -2450,11 +2457,11 @@ async function refreshHudCam(){
   hudCamText=txt;
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_CAM_W}" height="${HUD_CAM_H}">`
-    +`<rect width="${HUD_CAM_W}" height="${HUD_CAM_H}" rx="6" fill="#050b10" fill-opacity="0.58"/>`
-    +`<rect x="${HUD_CAM_W-3}" y="0" width="3" height="${HUD_CAM_H}" fill="#00d2a0"/>`
-    +`<text x="${HUD_CAM_W-14}" y="20" font-size="14" font-weight="bold" fill="#00d2a0"`
+    +`<rect width="${HUD_CAM_W}" height="${HUD_CAM_H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.58"/>`
+    +`<rect x="${HUD_CAM_W-_hs(3)}" y="0" width="${_hs(3)}" height="${HUD_CAM_H}" fill="#00d2a0"/>`
+    +`<text x="${HUD_CAM_W-_hs(14)}" y="${_hs(20)}" font-size="${_hs(14)}" font-weight="bold" fill="#00d2a0"`
     +` text-anchor="end" font-family="${HUD_FACE}">${_esc(_hud(l1))}</text>`
-    +`<text x="${HUD_CAM_W-14}" y="37" font-size="12" fill="#9fd8c8"`
+    +`<text x="${HUD_CAM_W-_hs(14)}" y="${_hs(37)}" font-size="${_hs(12)}" fill="#9fd8c8"`
     +` text-anchor="end" font-family="${HUD_FACE_T}">${_esc(_hud(l2))}</text></svg>`);
   if(hudCam2){ hudScene.remove(hudCam2); hudCam2.material.map.dispose(); hudCam2.material.dispose(); hudCam2.geometry.dispose(); }
   hudCam2=hudPlane(HUD_CAM_W, HUD_CAM_H, tex);
@@ -2469,11 +2476,11 @@ async function refreshHudCam(){
 const TALK_LOG_ON   = process.env.TALK_LOG !== '0';
 const TALK_LOG_N    = Math.max(2, Math.min(12, envNum('TALK_LOG_LINES', 6)));  // 覚えておく会話の数
 const TALK_LOG_ROWS = Math.max(3, Math.min(14, envNum('TALK_LOG_ROWS', 8)));   // 表示する行数 (折り返し後)
-const TALK_LOG_W    = envNum('TALK_LOG_W', 250);   // 街を隠さないよう控えめに
-const TALK_LOG_FS   = envNum('TALK_LOG_FONT', 10);
+const TALK_LOG_W    = _hs(envNum('TALK_LOG_W', 250));   // 街を隠さないよう控えめに
+const TALK_LOG_FS   = _hs(envNum('TALK_LOG_FONT', 10));
 const TALK_LOG_LH   = Math.round(TALK_LOG_FS*1.34);   // 行の高さ
-const TALK_LOG_PAD  = 9;
-const TALK_LOG_H    = TALK_LOG_ROWS*TALK_LOG_LH + 11;
+const TALK_LOG_PAD  = _hs(9);
+const TALK_LOG_H    = TALK_LOG_ROWS*TALK_LOG_LH + _hs(11);
 // 等幅フォントの1文字幅は約 0.6em。幅を変えても折り返し位置がズレないよう、
 // 文字数ではなく「板の幅」から桁数を出す。
 const TALK_LOG_COLS = Math.max(12,
@@ -2538,7 +2545,7 @@ async function refreshTalkLog(){
   }).join('');
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${TALK_LOG_W}" height="${TALK_LOG_H}">`
-    +`<rect width="${TALK_LOG_W}" height="${TALK_LOG_H}" rx="5" fill="#050b10" fill-opacity="0.68"/>`
+    +`<rect width="${TALK_LOG_W}" height="${TALK_LOG_H}" rx="${_hs(5)}" fill="#050b10" fill-opacity="0.68"/>`
     +`<rect x="0" y="0" width="2" height="${TALK_LOG_H}" fill="#00d2a0" fill-opacity="0.8"/>`
     +rows+`</svg>`);
   if(hudTalkLog){ hudScene.remove(hudTalkLog); hudTalkLog.material.map.dispose();
@@ -2557,12 +2564,13 @@ let hudBanner=null, hudBannerT0=0, hudBannerUntil=0, hudBannerBusy=false;
 
 async function setBanner(text, secs){
   if(!hudScene) return;
-  const w=Math.min(WIDTH-40, Math.max(240, Math.ceil(44 + text.length*11.5))), h=48;
+  const w=Math.min(WIDTH-40, Math.max(_hs(240),
+            Math.ceil(_hs(44) + text.length*11.5*HUD_SCALE))), h=_hs(48);
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">`
-    +`<rect width="${w}" height="${h}" rx="6" fill="#050b10" fill-opacity="0.74"/>`
-    +`<rect x="0" y="0" width="3" height="${h}" fill="#00d2a0"/>`
-    +`<text x="18" y="31" font-size="21" fill="#eaf6f2"`
+    +`<rect width="${w}" height="${h}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.74"/>`
+    +`<rect x="0" y="0" width="${_hs(3)}" height="${h}" fill="#00d2a0"/>`
+    +`<text x="${_hs(18)}" y="${_hs(31)}" font-size="${_hs(21)}" fill="#eaf6f2"`
     +` font-family="${HUD_FACE_T}">${_esc(_hud(text))}</text></svg>`);
   if(hudBanner){ hudScene.remove(hudBanner); hudBanner.material.map.dispose(); hudBanner.material.dispose(); hudBanner.geometry.dispose(); }
   hudBanner=hudPlane(w, h, tex);
@@ -10356,7 +10364,9 @@ function chatMiss(q, who){
   }
   if(CHAT_LOG) console.log(`[Chat] ${who}: 該当する住民がいない "${label}"`);
   return {ok:false, msg: JA_HUD ? `該当する住民がいない: ${label}`
-                                : `no match: ${_ascii(String(q||'')).slice(0,24)}`};
+                                : `no match: ${_ascii(String(q||'')).slice(0,24)}`,
+          reply: JA_HUD ? `「${label}」という住民は見つかりませんでした`
+                        : `no resident called "${_ascii(String(q||'')).slice(0,16)}"`};
 }
 
 // 戻り値: {ok, msg} / null (命令ではなかった)
@@ -10455,7 +10465,10 @@ function handleChatCommand(text, author){
   chatLog.push({t:now, by:who, text:_hud(String(text)).slice(0,60), target});
   while(chatLog.length>30) chatLog.shift();
   console.log(`[Chat] ${who}: focus -> ${target} (${CHAT_FOCUS_SEC}s)`);
-  return {ok:true, msg:`focus ${target} for ${CHAT_FOCUS_SEC}s`};
+  return {ok:true, msg:`focus ${target} for ${CHAT_FOCUS_SEC}s`,
+    reply: hit.overview
+      ? (JA_HUD ? `街全体を ${CHAT_FOCUS_SEC}秒 映します` : `showing the whole town for ${CHAT_FOCUS_SEC}s`)
+      : (JA_HUD ? `${target} を ${CHAT_FOCUS_SEC}秒 映します` : `following ${target} for ${CHAT_FOCUS_SEC}s`)};
 }
 
 // 視聴者名を住民の表示名にできる形に整える。長さ制限・重複回避。
@@ -10493,12 +10506,16 @@ function viewerJoin(who, arg){
     const idx=agents.indexOf(exist);
     camHold={idx, until:Date.now()+CHAT_FOCUS_SEC*1000, by:who};
     showBanner(JA_HUD ? `${exist.name} はもう住んでいます` : `${exist.name} already lives here`, 5);
-    return {ok:true, msg:`already a resident: ${exist.name}`};
+    return {ok:true, msg:`already a resident: ${exist.name}`,
+      reply: JA_HUD ? `${exist.name} さんはもう住んでいます。いまその人を映しています`
+                    : `${exist.name} already lives here - showing them now`};
   }
   const name=viewerNameFor(arg||who);
   if(!name) return {ok:false,
     msg:'name needs 2+ letters/numbers (try: !join YourName)'};
-  if(CITY.waiting.some(w=>w.name===name)) return {ok:false, msg:'already waiting'};
+  if(CITY.waiting.some(w=>w.name===name)) return {ok:false, msg:'already waiting',
+    reply: JA_HUD ? `${name} さんはもう入居待ちの列に並んでいます`
+                  : `${name} is already on the waiting list`};
   const viewers=agents.reduce((n,a)=>n+(a.viewer?1:0),0);
   const limit=Math.max(5, Math.round(NUM_AGENTS*VIEWER_MAX_FRAC));
   if(viewers+CITY.waiting.length>=limit) return {ok:false, msg:`viewer residents are full (${limit})`};
@@ -10515,13 +10532,17 @@ function viewerJoin(who, arg){
     if(a.home) showCityEvent(a.home[0], a.home[1],
       JA_HUD ? `${name} がこの街に引っ越してきた` : `${name} moved into this town`, 8);
     console.log(`[Chat] ${who}: join → 住民 ${name} が誕生 (人口 ${agents.length})`);
-    return {ok:true, msg:`welcome, ${name}`};
+    return {ok:true, msg:`welcome, ${name}`,
+      reply: JA_HUD ? `${name} さんがこの街に引っ越してきました (人口 ${agents.length})`
+                    : `${name} moved into the town (pop ${agents.length})`};
   }
   CITY.waiting.push({name, by:who, t:Date.now()});   // 家が無い → 建つまで待つ
   news('pop', `🧳 ${name} が入居待ち (住居の空き待ち ${CITY.waiting.length}人)`,
        `${name} is waiting for a home (${CITY.waiting.length} in queue)`);
   showBanner(JA_HUD ? `${name} は住むところの空きを待っています` : `${name} is waiting for a home`, 6);
-  return {ok:true, msg:`${name} queued (no housing yet)`};
+  return {ok:true, msg:`${name} queued (no housing yet)`,
+    reply: JA_HUD ? `${name} さんを入居待ちに入れました。家が建ったら引っ越してきます`
+                  : `${name} is on the waiting list - will move in once a home is built`};
 }
 
 // !cheer: 住民を応援する。退屈が晴れる = 「人と関わった」のと同じ扱いなので、
@@ -10546,7 +10567,9 @@ function viewerCheer(query, who){
     showBanner(JA_HUD ? `${who} が ${a.name} を応援した` : `${a.name} cheered by ${who}`, 5);
   }
   console.log(`[Chat] ${who}: cheer → ${a.name} (通算${a.cheers})`);
-  return {ok:true, msg:`cheered ${a.name} (${a.cheers})`};
+  return {ok:true, msg:`cheered ${a.name} (${a.cheers})`,
+    reply: JA_HUD ? `${a.name} を応援しました (通算${a.cheers}回)`
+                  : `cheered ${a.name} (${a.cheers} total)`};
 }
 
 // !teach <住民> <業種>: 店を勧める。**命令ではない**ので、定着するかは本人の経験しだい。
@@ -10579,7 +10602,9 @@ function viewerTeach(who, targetQ, placeQ){
                         : `no open ${enOf(ti)} in town yet`, 5);
     }
     return {ok:false, msg: JA_HUD ? `${BLDG_TYPES[ti].label} はまだこの街に無い`
-                                  : `no open ${enOf(ti)} in town`};
+                                  : `no open ${enOf(ti)} in town`,
+            reply: JA_HUD ? `${BLDG_TYPES[ti].label} はまだこの街にありません`
+                          : `there is no open ${enOf(ti)} in town yet`};
   }
   cands.sort((p,qq)=>((p.r-a.x)**2+(p.c-a.y)**2)-((qq.r-a.x)**2+(qq.c-a.y)**2));
   const st=cands[0], key=prefKey(st);
@@ -10594,7 +10619,9 @@ function viewerTeach(who, targetQ, placeQ){
   showBanner(JA_HUD ? `${who} が ${a.name} に ${BLDG_TYPES[ti].label} をすすめた`
                     : `${who} told ${a.name} about a ${enOf(ti)}`, 6);
   console.log(`[Chat] ${who}: teach → ${a.name} に ${BLDG_TYPES[ti].name}`);
-  return {ok:true, msg:`told ${a.name} about a ${enOf(ti)} (they will decide for themselves)`};
+  return {ok:true, msg:`told ${a.name} about a ${enOf(ti)} (they will decide for themselves)`,
+    reply: JA_HUD ? `${a.name} に ${BLDG_TYPES[ti].label} を教えました (行くかどうかは本人しだい)`
+                  : `told ${a.name} about a ${enOf(ti)} - they will decide for themselves`};
 }
 
 // !ask <住民>: その住民が何を覚えたかを見せる。学習は見えないと意味がない。
@@ -10629,7 +10656,7 @@ function viewerAsk(targetQ){
   while(lifeNews.length>12) lifeNews.shift();
   hudNewsDirty=true;
   showBanner(JA_HUD ? ja : en, 7);
-  return {ok:true, msg:JA_HUD ? ja : en};
+  return {ok:true, msg:JA_HUD ? ja : en, reply:JA_HUD ? ja : en};
 }
 
 // 応援がいちばん多い住民
@@ -11112,6 +11139,11 @@ function guessCommand(raw){
     if(/(街|町)(全体|ぜんたい)?を?(見|映)|俯瞰|全体が?見/.test(t)) return '!focus overview';
     const hit=findAgentByQuery(t);
     if(hit) return `!focus ${arg(t)}`;
+    // 「映して」「追いかけて」のようにカメラを指す言い方なら、名前が引けなくても
+    // focus に落とす → 「そんな住民はいない」と返せる。ここで黙ると、
+    // 名前を間違えた人には**何も反応が無い**ように見える。
+    // 「どこ?」「何してる?」は質問なので落とさない (Gemini があれば街への質問に回る)。
+    if(/(見せて|映して|うつして|追いかけて|追って)/.test(t)) return `!focus ${arg(t)}`;
   }
   return null;
 }
@@ -11288,6 +11320,20 @@ const YTC = {
   //   ユニットを食うので、素直にポーリングしたほうが安くて速い。
   //   YT_CHAT_MODE=stream で明示的に試すことはできる。
   mode: (['grpc','stream','poll','auto'].includes(process.env.YT_CHAT_MODE)?process.env.YT_CHAT_MODE:'auto'),
+  // ── 返信 (liveChatMessages.insert) ────────────────────────────────────────
+  //   画面のバナーは数秒で流れてしまうので、同じ内容をチャットにも書き戻す。
+  //   ★ **既定は off。** 有効にすると配信のチャット欄に自動で投稿する = 公開の書き込み。
+  //     YT_CHAT_REPLY=dry … 投稿せずログに出すだけ (文面の確認用)
+  //     YT_CHAT_REPLY=1   … 実際に投稿する
+  //   投稿には OAuth が要る (APIキーだけでは不可)。無ければ自動で off。
+  //   insert は list より高い (公式表で 50 units)。1日の枠 10,000 のうち、
+  //   45秒ポーリングで約 1,000 使うので、返信は 100件/日 くらいが上限の目安。
+  reply:     (process.env.YT_CHAT_REPLY==='1' || process.env.YT_CHAT_REPLY==='dry')
+               ? process.env.YT_CHAT_REPLY : '',
+  replyMinSec:  envNum('YT_CHAT_REPLY_MIN_SEC', 6),     // 連投の間隔
+  replyMaxDay:  envNum('YT_CHAT_REPLY_MAX_DAY', 100),   // 1日の上限 (クォータの歯止め)
+  replyUnit:    envNum('YT_CHAT_REPLY_UNIT_COST', 50),
+  replyAt:0, replies:0, repliesDay:0, replyErrors:0, lastReply:null,
   units:0, calls:{}, unitDay:'',            // 消費ユニットの自前カウント (太平洋時間の日付で区切る)
   primed:false, bytes:0, lastDataAt:0,      // 履歴を捨てたか / 受信バイト / 最後にデータが来た時刻
   reconnects:0,                             // gRPC の張り直し回数 (正常終了ぶん)
@@ -11308,6 +11354,7 @@ function ytcCharge(path, override){
   if(d!==YTC.unitDay){                       // 日付が変わった → リセット
     if(YTC.units) console.log(`[YTChat] ${YTC.unitDay} の消費: 約${YTC.units} units`);
     YTC.unitDay=d; YTC.units=0; YTC.calls={}; YTC.pausedUntil=0; YTC._searchCalls=0;
+    YTC.repliesDay=0;
   }
   const cost = (override!=null) ? override
              : path==='search' ? 100
@@ -11359,6 +11406,65 @@ async function ytcFetch(path, params){
   }
   return j;
 }
+
+// ── チャットに返事を書き戻す ────────────────────────────────────────────────
+//   画面 (バナー) には従来どおり出したうえで、**同じ内容**をチャット欄にも投稿する。
+//   バナーは数秒で消えるので、指示した本人が見逃すと何が起きたのか分からない。
+//   投稿は公開の書き込みなので、既定 off / OAuth 必須 / 連投と1日の上限つき。
+async function ytcReply(text, who){
+  if(!YTC.reply || !YTC.enabled) return false;
+  const body=String(text||'').trim();
+  if(!body) return false;
+  const now=Date.now();
+  if(now-YTC.replyAt < YTC.replyMinSec*1000) return false;      // 連投の抑制
+  if(YTC.repliesDay >= YTC.replyMaxDay){
+    if(YTC.repliesDay === YTC.replyMaxDay){                     // 1回だけ知らせる
+      YTC.repliesDay++;
+      console.warn(`[YTChat] 返信の1日の上限 ${YTC.replyMaxDay} 件に達したので今日はもう返さない`);
+    }
+    return false;
+  }
+  // YouTube のライブチャットに返信の紐づけは無いので、宛名を頭に付ける
+  const at = who ? `@${String(who).slice(0,24)} ` : '';
+  const msg = (at+body).slice(0, 190);            // 上限は200文字。余裕を見て切る
+  YTC.replyAt=now; YTC.repliesDay++; YTC.lastReply={t:now, to:who||null, text:msg};
+  if(YTC.reply==='dry'){
+    YTC.replies++;
+    console.log(`[YTChat 返信(dry)] ${msg}`);
+    return true;
+  }
+  try{
+    if(!YTC.chatId) await ytcResolveChatId();
+    const tok=await ytcAccessToken();
+    if(!tok){
+      YTC.replyErrors++;
+      YTC.lastError='返信には OAuth が要る (YT_OAUTH_* か YT_CHAT_TOKEN を設定)';
+      console.warn(`[YTChat] ${YTC.lastError}`);
+      return false;
+    }
+    ytcCharge('liveChat/messages.insert', YTC.replyUnit);
+    const u=new URL(`${YTC.base}/liveChat/messages`);
+    u.searchParams.set('part','snippet');
+    const r=await fetch(u, {method:'POST',
+      headers:{Authorization:`Bearer ${tok}`, 'Content-Type':'application/json'},
+      body:JSON.stringify({snippet:{liveChatId:YTC.chatId, type:'textMessageEvent',
+                                    textMessageDetails:{messageText:msg}}})});
+    if(!r.ok){
+      const j=await r.json().catch(()=>({}));
+      throw new Error(`${r.status} ${(j.error&&j.error.message)||''}`.trim());
+    }
+    YTC.replies++;
+    if(CHAT_LOG) console.log(`[YTChat 返信] ${msg}`);
+    return true;
+  }catch(e){
+    YTC.replyErrors++;
+    YTC.lastError=`返信に失敗: ${String(e.message).slice(0,120)}`;
+    console.warn(`[YTChat] ${YTC.lastError}`);
+    return false;
+  }
+}
+// 命令の結果を1行の返事にする。画面のバナーと同じ内容 (reply) を優先する。
+const replyTextOf = r => (r && (r.reply || r.msg)) ? String(r.reply || r.msg) : '';
 
 // ── 配信中の動画IDを自動で追いかける ────────────────────────────────────────
 // 配信を立て直すと動画IDが変わる。以前は YT_VIDEO_ID を手で書き換えるまで
@@ -11702,11 +11808,19 @@ function ytcConsume(j){
     while(chatSeen.length>20) chatSeen.shift();
     if(CHAT_LOG) console.log(`[Chat<-] ${String(who).slice(0,24)}: ${String(text).slice(0,80)}`);
     const r=handleChatCommand(text, who);
-    if(r && r.ok) YTC.cmds++;
+    if(r){
+      if(r.ok) YTC.cmds++;
+      // 画面のバナーは数秒で流れる。同じ内容をチャットにも書き戻す (既定 off)。
+      ytcReply(replyTextOf(r), who).catch(()=>{});
+    }
     // 命令の形になっていなかったものだけ Gemini に読ませる。
     //   ★ await しない。チャットの取り込みは配信の流れを止めてはいけないし、
     //     API が遅い/落ちているときに後続のメッセージが詰まる。
-    else if(!r) interpretChat(text, who).then(x=>{ if(x && x.ok) YTC.cmds++; })
+    else interpretChat(text, who).then(x=>{
+                                          if(!x) return;
+                                          if(x.ok) YTC.cmds++;
+                                          return ytcReply(replyTextOf(x), who);
+                                        })
                                         .catch(()=>{});
   }
 }
@@ -12532,6 +12646,10 @@ tick(); setInterval(tick, ${ms});
         video:YTC.video||null, channel:YTC.channel||null, chatId:YTC.chatId||null,
         autoFind:YTC.autoFind, mode:YTC.mode,
         searchCallsToday:YTC._searchCalls, unitsToday:YTC.units,
+        reply:{mode:YTC.reply||'off', sentToday:YTC.repliesDay, sentTotal:YTC.replies,
+               maxPerDay:YTC.replyMaxDay, minSec:YTC.replyMinSec,
+               errors:YTC.replyErrors, last:YTC.lastReply,
+               hint:YTC.reply?null:'YT_CHAT_REPLY=dry で文面確認 / =1 で実際に投稿 (OAuth 必須)'},
         lastError:YTC.lastError||null,
         watch: YTC.video ? `https://www.youtube.com/watch?v=${YTC.video}` : null}));
     };
@@ -12551,10 +12669,14 @@ tick(); setInterval(tick, ${ms});
     }
     const txt=q.get('text')||'', usr=q.get('user')||'viewer';
     const r=handleChatCommand(txt, usr);
-    if(r){ res.writeHead(200); res.end(JSON.stringify({...r, recognized:true})); return; }
+    if(r){
+      if(q.get('reply')==='1') ytcReply(replyTextOf(r), usr).catch(()=>{});
+      res.writeHead(200); res.end(JSON.stringify({...r, recognized:true})); return;
+    }
     // 命令の形でなければ Gemini に読ませる。**ここは待つ** — /chat は動作確認や
     // 外部連携から叩かれる口で、呼んだ側は結果を知りたいはずなので。
     interpretChat(txt, usr).then(x=>{
+      if(x && q.get('reply')==='1') ytcReply(replyTextOf(x), usr).catch(()=>{});
       res.writeHead(200);
       res.end(JSON.stringify(x ? {via:'ai', ...x, recognized:true}
                                : {ok:false, recognized:false,
@@ -13180,6 +13302,18 @@ function startLoops(){
     }else{
       YTC.startedAt=Date.now();
       YTC.unitDay=ptDayKey();
+      // 返信は公開の書き込みなので、状態を必ずログに出す
+      const canPost = YTC.token || (YTC.refresh && YTC.clientId && YTC.clientSecret);
+      // dry は投稿しないので OAuth は要らない (文面の確認だけできるようにしておく)
+      if(YTC.reply==='1' && !canPost){
+        console.warn('[YTChat] YT_CHAT_REPLY を設定しましたが OAuth がありません → 返信は無効'
+          + ' (APIキーだけでは投稿できません。YT_OAUTH_CLIENT_ID / _SECRET / _REFRESH_TOKEN が要ります)');
+        YTC.reply='';
+      }
+      console.log(`[YTChat] チャットへの返信: `
+        + (YTC.reply==='1' ? `**投稿する** (最短${YTC.replyMinSec}秒間隔 / 1日${YTC.replyMaxDay}件まで)`
+         : YTC.reply==='dry' ? 'dry (投稿せずログに文面だけ出す)'
+         : 'off (YT_CHAT_REPLY=dry で文面確認 / =1 で投稿)'));
       setInterval(()=>{
         if(YTC.units) console.log(`[YTChat] 本日 (${YTC.unitDay} PT) の消費: 約${YTC.units} units / 10,000`
           + ` — ${Object.entries(YTC.calls).map(([k,v])=>`${k}×${v}`).join(' ')}`);
