@@ -160,7 +160,8 @@ const CAM_STALL_SWITCH = parseInt(process.env.CAM_STALL_SWITCH) || 20;
 //   **早め切替** のほうで、追跡中の相手が少し止まったり建物に入ったりするたびに
 //   即座に別人へ移っていた。住民は頻繁に建物へ出入りするので、20秒どころか
 //   数秒で切り替わる。切り替えた直後だけは、多少止まっても粘る時間を設ける。
-const CAM_MIN_HOLD_MS  = parseInt(process.env.CAM_MIN_HOLD_MS)  || 12000;
+// 1 ショットの最短の持ち時間。短いと落ち着かない画になるので長めに取る。
+const CAM_MIN_HOLD_MS  = parseInt(process.env.CAM_MIN_HOLD_MS)  || 18000;
 // 建物に入られたときはもう少し早めに諦める (壁を映し続けても仕方がない)
 const CAM_INDOOR_HOLD_MS = parseInt(process.env.CAM_INDOOR_HOLD_MS) || 5000;
 // FPV_CHANCE: ターゲット切替時に、そのキャラの一人称視点(目線)ショットになる確率 (0..1, 既定0.25)。
@@ -5305,6 +5306,10 @@ function rebuildGround(S){
 // ジオメトリとマテリアルは木のセルの木と共用するので、ここでは破棄しない。
 const STREET_TREE_ON = process.env.STREET_TREES !== '0';
 const TREE_STEP      = Math.max(2, envNum('TREE_STEP', 4));   // 道沿いに何セルおきか
+// 街路樹を「視線の邪魔」として扱うときの太さ (高さに対する比)。針葉樹の樹冠は
+// おおよそ高さの 3 割。ここを大きくすると、カメラが木を避けて回り込みすぎる。
+const TREE_OCC_R     = envNum('TREE_OCC_R', 0.30);
+const _treeOcc = new Map();   // セル番号 → その中に立っている木 [{x,y,r,h}]
 const GAP_TREE_P     = envNum('GAP_TREE_P', 0.42);            // 建物の隙間に植える確率
 const STREET_TREE_CAP= 900;
 
@@ -5353,6 +5358,19 @@ function rebuildStreetTrees(S){
   }
   if(!spots.length) return;
 
+  // ★ 視線を遮るものとして登録する。**街路樹は MAP のセルではない**ので
+  //   world.js の blocksSight では拾えず、追跡カメラが木の陰の住民を映し続けて
+  //   いた (実際そうなった)。配置の式をカメラ側に写すと必ずズレるので、
+  //   ここで実座標をそのまま渡す。セルごとのバケツに入れて、視線の通り道の
+  //   セルだけ見れば済むようにしておく。
+  _treeOcc.clear();
+  for(const [x,y,,ht] of spots){
+    const c=Math.floor(x/CELL), r=Math.floor(y/CELL);
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    const k=r*GRID+c;
+    let arr=_treeOcc.get(k); if(!arr) _treeOcc.set(k, arr=[]);
+    arr.push({x, y, r:ht*TREE_OCC_R, h:ht});
+  }
   const base=A.glb ? DIM.TREE.h : CELL*0.9;   // 幹/葉ジオメトリが作られたときの高さ
   const mk=(geo,mat,zOff)=>{
     const im=new THREE.InstancedMesh(geo, mat, spots.length);
@@ -9260,7 +9278,11 @@ const UNSTICK_MODE = (process.env.UNSTICK_MODE==='release') ? 'release' : 'steer
 // stepAll() で pursuit へ安全フォールバックする。
 //const MOVE_MODE = (process.env.MOVE_MODE==='pursuit') ? 'pursuit' : 'pursuit';
 const MOVE_MODE = 'pursuit';
-const PURSUIT_SUB = parseFloat(process.env.PURSUIT_SUB)||5;   // pursuit の per-tick 分割 (小=速い)。5→0.5セル/8°/tick
+// pursuit の per-tick 分割 (大きいほど**遅い**)。1意思決定ぶんの変位を何 tick に
+// 分けて消化するか。5 だと 0.25セル/tick で、見ている側が目で追うには速すぎた。
+// 8 で 0.625 倍 = 落ち着いて歩く速さになる。**歩行アニメの位相は「実際に進んだ
+// 距離」で進むので、遅くすれば歩幅もひとりでに合う** (脚だけ空回りしない)。
+const PURSUIT_SUB = parseFloat(process.env.PURSUIT_SUB)||8;
 console.log(`[Move] mode=${MOVE_MODE} (missing model → pursuit fallback)`);
 
 // policy と pursuit で「1tickあたりの歩幅」が違う点を起動時に明示する。
@@ -10472,8 +10494,12 @@ const _camLookAt = new THREE.Vector3();
 // 追跡カメラの「遅れ」の状態。目標値ではなく、実際に置いた位置を持ち回る。
 const _camPos0 = new THREE.Vector3(), _camAim0 = new THREE.Vector3();
 let _camPrevTarget = -1, _camLastT = 0;
+let _camHighWant = 0;   // 目標の高さ (遮蔽から逃げるときだけ上がる)
+let _camGlide = false;  // 近くの人へ渡した = 切らずにカメラを滑らせる
 const CAM_LAG   = envNum('CAM_LAG', 3.2);      // 大きいほど速く追いつく (∞ で従来の完全固定)
-const CAM_SHAKE = envNum('CAM_SHAKE', 0.012);  // 手持ちの揺れ幅 (セル比)
+// 手持ちの揺れ幅 (セル比)。追跡が安定した以上、ここが強いと「動きすぎ」の
+// 原因そのものになる。0 で完全固定。
+const CAM_SHAKE = envNum('CAM_SHAKE', 0.004);
 
 // ── 上空背後からの追跡 (chase) ──────────────────────────────────────────────
 // 既存の追跡カメラは**ワールドの -Y に固定**で、住民の向きを追わない。斜め上から
@@ -10484,16 +10510,95 @@ const CAM_SHAKE = envNum('CAM_SHAKE', 0.012);  // 手持ちの揺れ幅 (セル�
 // そこで「住民の真後ろ・建物より高い位置から追う」ショットを足して、切替時に選ぶ。
 //   ★ 高さだけでは遮蔽は消えない (視線は斜めに降りるので、手前の建物には当たる)。
 //     カメラと住民の間にある建物を透かす処理を updateOcclusionFade に足してある。
-const CHASE_CHANCE = Math.max(0, Math.min(1, envNum('CHASE_CHANCE', 0.5)));
-// 後方 6.0 / 高さ 7.6 で見下ろし 52 度。高さは**いちばん高い建物 (6.60) より上**に
-// 取る。角度をこれ以上立てると真上から見た絵になり、住民が何をしているのか
-// かえって分からなくなる (最初 5.0/8.5 = 60 度で組んだら被写体が画面の下端に沈んだ)。
-const CHASE_BACK   = envNum('CHASE_BACK', 6.0);    // 真後ろへの距離 (ワールド単位)
-const CHASE_HIGH   = envNum('CHASE_HIGH', 7.6);    // 高さ。建物の最高 6.60 より上に出す
-const CHASE_AHEAD  = envNum('CHASE_AHEAD', 0.55);  // 視点を住民の何セル先に置くか (構図)
-const CHASE_TURN   = envNum('CHASE_TURN', 1.1);    // 向きの追従の速さ。速いと曲がるたびに振り回される
-let camChase = false;
-const _chaseDir = new THREE.Vector2(0, 1);         // なめらかにした「住民の向き」
+// ── 追跡ショットの構え ──────────────────────────────────────────────────────
+// 以前は「住民の真後ろに回り込む」ショットだった。何をしに行くのかは分かるが、
+// **住民が曲がるたびにカメラが振り回される**。住民は 1tick で最大 40 度回るので、
+// なましても振り子のように揺れて、見ていて疲れる画になっていた。
+//
+// 方針を変える。カメラは被写体の周りの**固定した方位**に立ち、進行方向には
+// 一切追従しない。方位を変えるのは「建物に視線を遮られたとき」だけで、そのときも
+// いちばん近い通る方位へゆっくり回す。結果:
+//   ・ふだんカメラは回らない (被写体だけが画の中で向きを変える)
+//   ・建物の陰に入ったら、建物の無い側へ回り込む
+// 次のターゲットを探す範囲 (セル)。この中に居る人へ渡すときはカメラを切らない。
+const CAM_NEXT_R     = envNum('CAM_NEXT_R', 6);
+const CAM_ORBIT_DIST = envNum('CAM_ORBIT_DIST', 2.2);   // 被写体までの水平距離 (ワールド単位)
+const CAM_ORBIT_HIGH = envNum('CAM_ORBIT_HIGH', 1.5);   // 通常の高さ (見下ろし 34 度)
+// どの方位からも見えないときに逃げる高さ。建物のいちばん高いもの (6.6) より上。
+const CAM_ORBIT_LIFT = envNum('CAM_ORBIT_LIFT', 7.4);
+const CAM_ORBIT_SLEW = envNum('CAM_ORBIT_SLEW', 0.55);  // 方位の最大回転速度 (rad/秒)
+const CAM_ORBIT_DIRS = Math.max(4, Math.round(envNum('CAM_ORBIT_DIRS', 16))); // 候補の方位数
+// 遮られてから回り込みを始めるまでの秒数。0 だと電柱や街路樹の陰を横切るたびに
+// カメラが動き出してしまう。
+const CAM_BLOCK_WAIT = envNum('CAM_BLOCK_WAIT', 0.5);
+// どこからも見えない状態がこれだけ続いたら、その人を諦めて次の人へ渡す。
+const CAM_LOST_SEC   = envNum('CAM_LOST_SEC', 4);
+// 被写体の注視点の高さ (足元からどれだけ上を見るか)。頭のあたりを画の中心に置く。
+const CAM_AIM_Z      = envNum('CAM_AIM_Z', CELL*0.66*CHAR_SCALE*0.75);
+
+let _camAz = Math.PI*0.5;      // いまのカメラ方位 (rad)
+let _camAzWant = _camAz;       // 向かいたい方位
+let _camBlockT = 0;            // 遮られている時間 (秒)
+let _camLostT  = 0;            // どの方位からも見えない時間 (秒)
+let _camHigh = CAM_ORBIT_HIGH; // いまの高さ (逃げるときだけ上がる)
+
+// カメラ位置 (cx,cy,cz) から被写体 (tx,ty,tz) への視線が建物に遮られるか。
+//   高さも見る。**2D だけで判定すると、平屋の裏に回っただけで「遮られた」に
+//   なって、カメラが意味もなく回り続ける。**
+function sightBlocked(cx, cy, cz, tx, ty, tz){
+  const dx=tx-cx, dy=ty-cy, dz=tz-cz;
+  const dist=Math.hypot(dx,dy);
+  if(dist<1e-6) return false;
+  const steps=Math.max(2, Math.ceil(dist/(CELL*0.35)));
+  for(let i=1;i<steps;i++){
+    const u=i/steps;
+    const wx=cx+dx*u, wy=cy+dy*u, wz=cz+dz*u;
+    const c=Math.floor(wx/CELL), r=Math.floor(wy/CELL);
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    // 何が視線を止めるかは world.js の blocksSight が持っている (建物と、
+    // ALIGNED では木)。**木を数えないと、住民が樅の木の陰に入っても
+    // カメラが回り込まない** (実際そうなった)。
+    const cell=MAP[r][c];
+    if(!MW.blocksSight(WORLD, cell)) continue;
+    let h;
+    if(cell===BUILDING){
+      const st=structAt(r,c);
+      // 建物の実高。工事中の低い箱まで壁扱いすると、回り込む必要が無いのに回る。
+      h = st ? structHeight(st) : CELL;
+    }else h = DIM.TREE.h;               // 木のセルに生える木
+    if(h>=wz) return true;
+  }
+  // 街路樹 (MAP に載らない装飾) も遮る。視線が通ったセルのバケツだけ見る。
+  if(_treeOcc.size) for(let i=1;i<steps;i++){
+    const u=i/steps;
+    const wx=cx+dx*u, wy=cy+dy*u, wz=cz+dz*u;
+    const c=Math.floor(wx/CELL), r=Math.floor(wy/CELL);
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    const arr=_treeOcc.get(r*GRID+c); if(!arr) continue;
+    for(const t of arr){
+      if(t.h < wz) continue;
+      const ddx=t.x-wx, ddy=t.y-wy;
+      if(ddx*ddx+ddy*ddy <= t.r*t.r) return true;
+    }
+  }
+  return false;
+}
+
+const angWrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+// いまの方位からいちばん近い「通る方位」。どこからも見えなければ null。
+function clearAzimuth(tx, ty, curAz, high){
+  const tz=CAM_AIM_Z;
+  let best=null, bestD=Infinity;
+  for(let i=0;i<CAM_ORBIT_DIRS;i++){
+    const az=i/CAM_ORBIT_DIRS*Math.PI*2;
+    const cx=tx+Math.cos(az)*CAM_ORBIT_DIST, cy=ty+Math.sin(az)*CAM_ORBIT_DIST;
+    if(sightBlocked(cx, cy, high, tx, ty, tz)) continue;
+    const d=Math.abs(angWrap(az-curAz));
+    if(d<bestD){ bestD=d; best=az; }
+  }
+  return best;
+}
+
 
 // ターゲット切替が起きた瞬間に呼び、たまに一人称視点ショットにする。
 // FPV はエージェント対象のときのみ (俯瞰では無効)。
@@ -12281,9 +12386,16 @@ async function ytcPoll(){
 function rollFPV() {
   const a = camTargetIdx > 0 ? agents[camTargetIdx - 1] : null;
   camFPV = !!a && !MW.isIndoors(a) && (Math.random() < FPV_CHANCE);
-  camChase = !!a && !camFPV && (Math.random() < CHASE_CHANCE);
-  // ショットが変わった瞬間に向きを合わせておく (前のショットの向きから回り込まない)
-  if (camChase && a) _chaseDir.set(Math.sin(a.th), Math.cos(a.th));
+  // 追跡ショットは 1 種類だけになった (固定方位のオービット)。ショットが
+  // 変わった瞬間に、その場から見える方位へ構え直しておく。
+  if (a && !camFPV) {
+    const tx=a.y*CELL+CELL*.5, ty=a.x*CELL+CELL*.5;
+    const az=clearAzimuth(tx, ty, _camAz, CAM_ORBIT_HIGH);
+    _camAzWant = (az != null) ? az : _camAz;
+    _camAz = _camAzWant;                       // 切替時だけは即座に構える
+    _camHigh = _camHighWant = (az != null) ? CAM_ORBIT_HIGH : CAM_ORBIT_LIFT;
+    _camBlockT = 0;
+  }
 }
 
 // 次に映すターゲットを決める (モード別)。camTargetIdx を更新する。
@@ -12325,7 +12437,23 @@ function pickCameraTarget() {
       // できれば今と違う人を選ぶ (同じ人ばかり映さない)
       const others = pool0.filter(i => i !== camTargetIdx - 1);
       const pool = others.length ? others : pool0;
-      camTargetIdx = pool[Math.floor(Math.random() * pool.length)] + 1;
+      // ★ **近くの人へ渡す。** 街の反対側へ飛ぶと毎回まっさらな画から始まるが、
+      //   隣を歩いている人へ渡せば、カメラを切らずに振るだけで済む = 画がつながる。
+      //   近くに誰も居なければ従来どおりランダム (無理に近い人を探して同じ 2 人を
+      //   往復するより、たまに飛ぶほうがよい)。
+      let near = null;
+      if (cur) {
+        const R2 = CAM_NEXT_R * CAM_NEXT_R;
+        const c = pool.filter(i => {
+          const d = (agents[i].x - cur.x) ** 2 + (agents[i].y - cur.y) ** 2;
+          return d <= R2;
+        });
+        if (c.length) near = c;
+      }
+      const from = near || pool;
+      camTargetIdx = from[Math.floor(Math.random() * from.length)] + 1;
+      // 近い相手ならカメラを切らずに滑らせる (updateTrackingCamera が見る)
+      _camGlide = !!near;
     } else {
       // 誰も動いていない → ランダム (俯瞰 or いずれかのエージェント)
       camTargetIdx = Math.floor(Math.random() * (agents.length + 1));
@@ -12340,6 +12468,40 @@ function pickCameraTarget() {
       rollFPV();
     }
   }
+}
+
+// ── 追跡中の住民の足元に置く輪 ────────────────────────────────────────────
+// 「どの人を追っているのか分からない」への対処。HUD に名前は出ているが、画の中の
+// どれがその人かは結び付かない。足元に輪を置けば一目で分かる。
+//   ★ 加算合成の板 1 枚 = 1 ドローコール。住民の本体には一切触らない。
+//   ★ 一人称ショットでは出さない (自分の足元は映らないので意味が無い)。
+const CAM_MARK = process.env.CAM_MARK !== '0';
+// 住民の体の半径は約 0.04 ワールド単位。輪はその 3〜4 倍で「足元の輪」に見える。
+// CELL*0.22 (=0.44) にしたら体の 10 倍あって道を覆い、輪のほうが主役になった。
+const CAM_MARK_R = envNum('CAM_MARK_R', CELL*0.075);
+let _camMark = null;
+function stepCamMark(S, a, show){
+  if(!CAM_MARK || !S) return;
+  if(!_camMark){
+    // 内径/外径のリング。Z 上向きの平面に最初から寝ているので回転は要らない。
+    const g=new THREE.RingGeometry(CAM_MARK_R*0.72, CAM_MARK_R, 28);
+    _camMark=new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+      color:0x00e0b0, transparent:true, opacity:0.7, depthWrite:false,
+      blending:THREE.AdditiveBlending, fog:false, side:THREE.DoubleSide }));
+    _camMark.renderOrder=2;
+    _camMark.frustumCulled=false;
+    S.add(_camMark);
+  }
+  _camMark.visible = !!show && !!a;
+  if(!_camMark.visible) return;
+  const m=agentMeshes[camTargetIdx-1];
+  // 描画位置 (補間後) に合わせる。実座標だと輪だけ先に動いて足元からずれる。
+  const x = m ? m.position.x : a.y*CELL+CELL*.5;
+  const y = m ? m.position.y : a.x*CELL+CELL*.5;
+  _camMark.position.set(x, y, 0.035);
+  // ゆっくり明滅させて、地面の模様と見分けやすくする
+  const t=Date.now()/1000;
+  _camMark.material.opacity = 0.40 + 0.25*(0.5+0.5*Math.sin(t*2.2));
 }
 
 function updateTrackingCamera(cam) {
@@ -12375,6 +12537,7 @@ function updateTrackingCamera(cam) {
     cam.position.set(fx, fx, fs*CAM_OVERVIEW);
     cam.lookAt(fx, fx + 1, 0);
     _camLookAt.set(fx, fx, 0);
+    stepCamMark(scene, null, false);
   } else {
     const a = agents[camTargetIdx - 1];
     if (!a) return;
@@ -12401,71 +12564,63 @@ function updateTrackingCamera(cam) {
       cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
       cam.lookAt(tx + dwx*(fwd+4), ty + dwy*(fwd+4), eyeZ*0.85);   // 進行方向やや下向き
       _camLookAt.set(tx + dwx*(fwd+4), ty + dwy*(fwd+4), 0);
-    } else if (camChase) {
-      // ── 上空背後からの追跡 ──
-      // 住民の**進行方向の真後ろ**、建物より高い位置から追う。何をしに行くのかが
-      // 画に入るので、追跡ショットとしてはこちらのほうが分かりやすい。
-      //   ★ 向きは強くなまして使う。生の a.th をそのまま使うと、住民が曲がるたびに
-      //     カメラが振り回されて酔う画になる (住民は 1tick で 40 度まで回る)。
-      cam.up.set(0, 0, 1);                       // 水平線を水平に保つ
-      const hx = Math.sin(a.th), hy = Math.cos(a.th);
-      const k = Math.min(1, dtCam * CHASE_TURN);
-      _chaseDir.x += (hx - _chaseDir.x) * k;
-      _chaseDir.y += (hy - _chaseDir.y) * k;
-      if (_chaseDir.lengthSq() < 1e-6) _chaseDir.set(hx, hy);
-      _chaseDir.normalize();
-      const wx = tx - _chaseDir.x * CHASE_BACK;
-      const wy = ty - _chaseDir.y * CHASE_BACK;
-      const wz = CHASE_HIGH;
-      // 位置の遅れは follow と同じ仕掛け。ショットの切り替わりだけは飛ばす。
-      const cut = camTargetIdx !== _camPrevTarget;
-      _camPrevTarget = camTargetIdx;
-      if (cut || _camPos0.lengthSq() === 0) { _camPos0.set(wx, wy, wz); _camAim0.set(tx, ty, 0); }
-      else {
-        const p = Math.min(1, dtCam * CAM_LAG);
-        _camPos0.x += (wx - _camPos0.x) * p;
-        _camPos0.y += (wy - _camPos0.y) * p;
-        _camPos0.z += (wz - _camPos0.z) * p;
-        const ak = Math.min(1, dtCam * CAM_LAG * 1.6);
-        _camAim0.x += (tx - _camAim0.x) * ak;
-        _camAim0.y += (ty - _camAim0.y) * ak;
-      }
-      const T = Date.now() / 1000, A = CELL * CAM_SHAKE;
-      cam.position.set(_camPos0.x + Math.sin(T * 0.73) * A,
-                       _camPos0.y + Math.sin(T * 0.61 + 2.1) * A,
-                       _camPos0.z + Math.sin(T * 0.47 + 1.3) * A * 0.7);
-      // 少し前を見る = 住民が画面の下寄りに来て、これから向かう先が広く入る
-      cam.lookAt(_camAim0.x + _chaseDir.x * CELL * CHASE_AHEAD,
-                 _camAim0.y + _chaseDir.y * CELL * CHASE_AHEAD, CELL * 0.30);
-      _camLookAt.set(tx, ty, 0);
+      stepCamMark(scene, a, false);
     } else {
-      // ── 追跡カメラ (斜め後方から) ── CAM_DIST でプレイヤーまでの距離を調整 (小さいほど寄る)
-      //
-      // ★ 目標の座標をそのまま毎フレーム代入すると、カメラが住民に**完全に固定**
-      //   されて、街のほうが動いて見える。少し遅れて追わせると「人を追いかけて
-      //   撮っている」画になる。さらに微かな揺れを足すと手持ちのカメラに見える。
-      //   どちらも見た目だけの話で、シミュレーションには一切触れない。
-      cam.up.set(0, 1, 0);
-      const wx=tx, wy=ty - CELL*5*CAM_DIST, wz=CELL*7*CAM_DIST;
-      // ショットが切り替わった瞬間だけは飛ばす (街を横切って滑っていくと切替に見えない)
-      const cut = camTargetIdx!==_camPrevTarget;
-      _camPrevTarget=camTargetIdx;
-      if(cut || _camPos0.lengthSq()===0){ _camPos0.set(wx,wy,wz); _camAim0.set(tx, ty+CELL*1.5, 0); }
-      else{
+      // ── 追跡カメラ (固定方位のオービット) ──
+      //   ★ 住民の向きには**追従しない**。カメラが回るのは視線が建物に遮られた
+      //     ときだけで、そのときもいちばん近い通る方位へゆっくり回す。
+      //   ★ どの方位からも見えないときは高さを上げて建物を越える (回り続けない)。
+      cam.up.set(0, 0, 1);                        // 水平線を水平に保つ
+      const aimZ = CAM_AIM_Z;
+      const cxNow = tx + Math.cos(_camAz)*CAM_ORBIT_DIST;
+      const cyNow = ty + Math.sin(_camAz)*CAM_ORBIT_DIST;
+      const blocked = sightBlocked(cxNow, cyNow, _camHigh, tx, ty, aimZ);
+      _camBlockT = blocked ? _camBlockT + dtCam : 0;
+      if (_camBlockT > CAM_BLOCK_WAIT) {
+        const az = clearAzimuth(tx, ty, _camAz, CAM_ORBIT_HIGH);
+        if (az != null) { _camAzWant = az; _camHighWant = CAM_ORBIT_HIGH; _camLostT = 0; }
+        else { _camHighWant = CAM_ORBIT_LIFT; _camLostT += CAM_BLOCK_WAIT; } // 逃げ場が無い
+        _camBlockT = 0;
+      } else if (!blocked) { _camHighWant = CAM_ORBIT_HIGH; _camLostT = 0; }
+      // ★ どの方向からも見えない状態が続くなら、その人を映すのは諦める。
+      //   真上から屋根を見せ続けるより、見える人へ渡すほうが画になる。
+      if (_camLostT > CAM_LOST_SEC) { _camLostT = 0; camSwitchTimer = 0; }
+      // 方位はゆっくりだけ動かす (最大 CAM_ORBIT_SLEW rad/秒)
+      const dAz = angWrap(_camAzWant - _camAz);
+      const mx  = CAM_ORBIT_SLEW * dtCam;
+      _camAz = angWrap(_camAz + Math.max(-mx, Math.min(mx, dAz)));
+      _camHigh += (_camHighWant - _camHigh) * Math.min(1, dtCam*1.2);
+
+      // 逃げの高さに寄るほど**真上へ近づける**。高いだけで水平距離を保つと
+      // 見下ろし 73 度になり、手前の建物の屋根で結局隠れる (実際そうなった)。
+      const lift = Math.max(0, Math.min(1,
+        (_camHigh - CAM_ORBIT_HIGH) / Math.max(0.001, CAM_ORBIT_LIFT - CAM_ORBIT_HIGH)));
+      const rad = CAM_ORBIT_DIST * (1 - 0.68*lift);
+      const wx = tx + Math.cos(_camAz)*rad;
+      const wy = ty + Math.sin(_camAz)*rad;
+      const wz = _camHigh;
+      // ショットの切り替わり。**近くの人へ渡したときは飛ばさない** — カメラを
+      // そのまま滑らせると、切替が「パン」に見えて画がつながる。
+      const cut = camTargetIdx !== _camPrevTarget && !_camGlide;
+      _camPrevTarget = camTargetIdx; _camGlide = false;
+      if (cut || _camPos0.lengthSq() === 0) { _camPos0.set(wx,wy,wz); _camAim0.set(tx,ty,aimZ); }
+      else {
         const k=Math.min(1, dtCam*CAM_LAG);
         _camPos0.x+=(wx-_camPos0.x)*k; _camPos0.y+=(wy-_camPos0.y)*k; _camPos0.z+=(wz-_camPos0.z)*k;
         const ak=Math.min(1, dtCam*CAM_LAG*1.6);          // 注視点は少し早く追う
         _camAim0.x+=(tx-_camAim0.x)*ak;
-        _camAim0.y+=((ty+CELL*1.5)-_camAim0.y)*ak;
+        _camAim0.y+=(ty-_camAim0.y)*ak;
+        _camAim0.z+=(aimZ-_camAim0.z)*ak;
       }
-      // 手持ちの揺れ。周期の違う正弦を重ねて、往復に見えないようにする。
+      // 手持ちの揺れ。**弱め**にする。追跡が安定した以上、ここが目立つと
+      // 「動きすぎ」の原因そのものになる。
       const T=Date.now()/1000, A=CELL*CAM_SHAKE;
-      const sx=(Math.sin(T*0.73)+Math.sin(T*1.19)*0.6)*A;
-      const sy=(Math.sin(T*0.61+2.1)+Math.sin(T*1.37+0.7)*0.6)*A;
-      const sz=(Math.sin(T*0.47+1.3))*A*0.7;
-      cam.position.set(_camPos0.x+sx, _camPos0.y+sy, _camPos0.z+sz);
-      cam.lookAt(_camAim0.x, _camAim0.y, 0);
+      cam.position.set(_camPos0.x+(Math.sin(T*0.73)+Math.sin(T*1.19)*0.6)*A,
+                       _camPos0.y+(Math.sin(T*0.61+2.1)+Math.sin(T*1.37+0.7)*0.6)*A,
+                       _camPos0.z+Math.sin(T*0.47+1.3)*A*0.7);
+      cam.lookAt(_camAim0.x, _camAim0.y, _camAim0.z);
       _camLookAt.set(tx, ty, 0);
+      stepCamMark(scene, a, true);
     }
   }
 }
@@ -13203,7 +13358,7 @@ tick(); setInterval(tick, ${ms});
       //   (屋内の目線は壁しか映らないので fpv=true かつ indoors=true にはならない)
       camera:(()=>{
         const a=camTargetIdx>0?agents[camTargetIdx-1]:null;
-        return {target:a?a.name:'overview', fpv:camFPV, chase:camChase,
+        return {target:a?a.name:'overview', fpv:camFPV, azimuth:+(_camAz*180/Math.PI).toFixed(0),
                 indoors:a?MW.isIndoors(a):null,
                 event:!!camEventCur};
       })(),
