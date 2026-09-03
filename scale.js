@@ -21,6 +21,11 @@
 
 const HUMAN_M = 1.70;          // 住民の身長 (m)。これが唯一の基準
 
+// 人型の大きさの既定値。**server.js と tools/scale-report.js の両方が引く。**
+// 以前は両方に 1/3 と書いてあり、server.js だけ変えると寸法表が古い縮尺のまま
+// 「住民 1.70m」と報告して食い違った (実際そうなった)。ここを唯一の出どころにする。
+const DEFAULT_CHAR_SCALE = 1/3 * 0.8;
+
 /**
  * CELL と CHAR_SCALE から寸法表を作る。
  * server.js がこの 2 つを持っているので、二重定義を避けるため引数で受け取る。
@@ -69,10 +74,12 @@ function make(CELL, CHAR_SCALE, env) {
     // 実物の約2倍あった。灯具も 0.66m と大きい。高さを少し下げ、太さを実物に寄せる。
     LAMP: {
       h:       wu(num('LAMP_H_M',    4.60)),
-      poleR:   wu(0.065),                          // 支柱の半径 (径 0.13m)
-      collarR: wu(0.11),  collarH: wu(0.26),       // 根巻き
+      // 支柱の径。実物の街灯は 0.13m ほどだが、支柱は**角柱で描いている**ので
+      // 断面が丸より太く見え、遠景でも線が残って街がごちゃつく。細めに寄せる。
+      poleR:   wu(num('LAMP_POLE_M', 0.090) / 2),  // 支柱の半径 (既定 径 0.09m)
+      collarR: wu(0.070), collarH: wu(0.22),       // 根巻き (支柱に合わせて細く)
       armLen:  wu(num('LAMP_ARM_M', 0.95)),        // 車道側へ伸ばす腕
-      armR:    wu(0.055),
+      armR:    wu(num('LAMP_ARM_R_M', 0.070) / 2),
       headW:   wu(0.21),  headL: wu(0.30),         // 灯具 (幅の半分, 長さの半分)
       poolR:   wu(num('LAMP_POOL_M', 4.60)),       // 地面に落ちる光の輪の半径
     },
@@ -85,8 +92,8 @@ function make(CELL, CHAR_SCALE, env) {
     //   ★ 制御はしない (車も住民も信号を見ない)。見た目だけの設備。
     SIGNAL: {
       h:       wu(num('SIGNAL_H_M', 4.20)),        // 灯器の中心の高さ
-      poleR:   wu(0.075),                          // 支柱の半径 (径 0.15m)
-      armR:    wu(0.055),
+      poleR:   wu(num('SIGNAL_POLE_M', 0.105) / 2),  // 支柱の半径 (既定 径 0.105m)
+      armR:    wu(num('SIGNAL_ARM_R_M', 0.070) / 2),
       armLen:  wu(num('SIGNAL_ARM_M', 1.30)),      // 車道側へ張り出す腕
       headW:   wu(0.92) / 2,                       // 灯器の幅の半分 (灯火3つぶん)
       headD:   wu(0.34) / 2,                       // 灯器の奥行きの半分
@@ -133,4 +140,4 @@ function report(S, CELL) {
   return L.join('\n');
 }
 
-module.exports = { HUMAN_M, make, report };
+module.exports = { DEFAULT_CHAR_SCALE, HUMAN_M, make, report };

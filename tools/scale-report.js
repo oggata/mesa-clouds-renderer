@@ -5,7 +5,7 @@
 // 数字を足したり変えたりしたあと、人間 (1.70m) から見て妥当かを一目で見るため。
 const SC=require('../scale.js');
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?parseFloat(a.split('=')[1]):null; };
-const CELL=arg('cell')||2.0, CHAR=arg('char')||1/3;
+const CELL=arg('cell')||2.0, CHAR=arg('char')||SC.DEFAULT_CHAR_SCALE;
 const S=SC.make(CELL, CHAR, process.env);
 console.log(SC.report(S, CELL));
 const png=(process.argv.find(v=>v.startsWith('--png='))||'').split('=')[1];

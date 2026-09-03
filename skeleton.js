@@ -84,6 +84,77 @@ const JOINTS = [
   { j:'wrist',  r:JOINT_R*0.6,  bone:'FARM',  side:1 },
 ];
 
+// ── 服を着た人体 ────────────────────────────────────────────────────────────
+// 骨格 (BONES/JOINTS) は **姿勢推定オーバーレイ風の見た目** 専用にそのまま残す。
+// こちらは同じ関節 J・同じ骨番号 BONE の上に「人の形」を載せた別の型紙で、
+// server.js が CHAR_STYLE で切り替える。リグは共通なので歩行の式は一切変わらない
+// (= tools/check-walk-shader.js の検算もそのまま通る)。
+//
+// 部位ごとの色の決まり方。1頂点につき1つの区分を持たせ、頂点シェーダで解決する:
+//   BAKED  … 型紙に焼き込んだ固定色 (靴)
+//   TOP    … 上衣。住民ごとの色 = instanceColor (ペルソナ色。誰が誰か分かるように)
+//   BOTTOM … 下衣。住民ごとの色 = aWear.rgb (PANTS から抽選)
+//   SKIN   … 肌。aWear.w が指す SKIN_TONES
+//   HAIR   … 髪。aWear.w が指す HAIR_TONES
+const PART = { BAKED:0, TOP:1, BOTTOM:2, SKIN:3, HAIR:4 };
+
+const SKIN_TONES = [0xecc39c, 0xd8a87e, 0xb8834f, 0x82502f];
+const HAIR_TONES = [0x2a2320, 0x4a352a, 0x6b4a30, 0x8f8579];   // 黒 / 焦茶 / 茶 / 白髪
+// ズボン/スカートの色。彩度を落として現実の街の色味に寄せる。上衣がペルソナ色
+// (原色) なので、下まで派手にすると 1000 人が万華鏡になる。
+const PANTS = [0x2b3242, 0x39404a, 0x23262b, 0x4a5468, 0x6b6152, 0x3d4a3f];
+const SHOE_COL = 0x1e2026;
+
+// 体のパーツ。単位は骨格と同じ「身長 H の比」。
+//   cone … 上下に伸びるテーパー付き円柱 (a→b, 半径 r1→r2)。sy で前後を潰す
+//   ball … 楕円体 (半径 r に sx/sy/sz を掛ける)
+//   cap  … 上半分だけの球 (髪)
+//   box  … 直方体 (靴)
+// rest pose では手足の骨はすべて鉛直なので、cone は「Y 軸で作って Z 向きに倒し、
+// 中点へ運び、y だけ潰す」だけで済む (server.js 側の実装が簡単になる)。
+function bodyParts() {
+  const out = [];
+  const cone = (a, b, r1, r2, part, bone, opt) =>
+    out.push(Object.assign({ type:'cone', a, b, r1, r2, part, bone, sy:1, seg:8 }, opt||{}));
+  const ball = (p, r, part, bone, opt) =>
+    out.push(Object.assign({ type:'ball', p, r, part, bone, sx:1, sy:1, sz:1, seg:[8,6] }, opt||{}));
+
+  // 胴。腰を細く胸を広く、前後を潰して板ではなく人の断面にする。
+  cone({x:0,y:0,z:0.500}, {x:0,y:0,z:0.845}, 0.088, 0.108, PART.TOP, BONE.TORSO, {sy:0.60});
+  // 腰まわり (下衣)。胴の裾に少し食い込ませて隙間を作らない。
+  cone({x:0,y:0,z:0.450}, {x:0,y:0,z:0.548}, 0.082, 0.096, PART.BOTTOM, BONE.TORSO, {sy:0.66});
+  // 首と頭と髪。**すべて TORSO** なので前傾と一緒に動く。
+  cone({x:0,y:0,z:0.836}, {x:0,y:0,z:0.880}, 0.032, 0.030, PART.SKIN, BONE.TORSO, {sy:1, seg:6});
+  ball({x:0,y:0,z:J.head.z}, HEAD_R, PART.SKIN, BONE.TORSO, {sy:0.92, sz:1.06});
+  // 髪は頭より一回り大きい「上半分だけの球」の殻。
+  //   theta は頭頂から何度ぶん覆うか。**半球 (PI*0.5) まで伸ばすと眉から下も
+  //   隠れて顔が無くなる**ので、生え際が眉の上で止まるところまでに留める。
+  //   さらに y を後ろへずらして、前髪側をもう少し上げる。
+  out.push({ type:'cap', p:{x:0,y:-0.012,z:J.head.z+0.010}, r:HEAD_R*1.05,
+             sx:1.0, sy:0.96, sz:1.02, theta:Math.PI*0.40, seg:[8,4],
+             part:PART.HAIR, bone:BONE.TORSO });
+
+  for (const s of [1, -1]) {
+    const id = k => BONE[(s > 0 ? 'L' : 'R') + k];
+    const X = v => v * s;
+    // 脚。腿の付け根は股関節より少し上から始めて、回したときに穴が開かないようにする。
+    cone({x:X(J.hip.x),y:0,z:0.548}, {x:X(J.knee.x),y:0,z:0.285}, 0.058, 0.046,
+         PART.BOTTOM, id('THIGH'), {sy:0.94, seg:7});
+    cone({x:X(J.knee.x),y:0,z:0.292}, {x:X(J.ankle.x),y:0,z:0.058}, 0.046, 0.036,
+         PART.BOTTOM, id('SHIN'), {sy:0.94, seg:7});
+    // 靴。足首から下、つま先 (J.foot.y) の方向へ伸ばす。脛と一緒に動く。
+    out.push({ type:'box', p:{x:X(J.ankle.x), y:0.026, z:0.029},
+               w:0.074, d:0.124, h:0.058, part:PART.BAKED, col:SHOE_COL, bone:id('SHIN') });
+    // 腕。袖 (上腕) は上衣の色、前腕から先は肌。
+    cone({x:X(J.shoulder.x),y:0,z:0.828}, {x:X(J.elbow.x),y:0,z:0.620}, 0.042, 0.034,
+         PART.TOP, id('UARM'), {seg:6});
+    cone({x:X(J.elbow.x),y:0,z:0.624}, {x:X(J.wrist.x),y:0,z:0.452}, 0.034, 0.028,
+         PART.SKIN, id('FARM'), {seg:6});
+    ball({x:X(J.wrist.x),y:0,z:0.430}, 0.036, PART.SKIN, id('FARM'), {sz:1.2, seg:[5,4]});
+  }
+  return out;
+}
+
 // ── 歩行のパラメータ ────────────────────────────────────────────────────────
 const WALK = {
   thigh:      0.62,   // 腿の振れ角 (rad)
@@ -188,4 +259,5 @@ function jointSpheres() {
 }
 
 module.exports = { J, BONE, COL, BONES, JOINTS, WALK, HEAD_R, BONE_R, JOINT_R,
+                   PART, SKIN_TONES, HAIR_TONES, PANTS, SHOE_COL, bodyParts,
                    limbAngles, rotX, poseVertex, boneSegments, jointSpheres };

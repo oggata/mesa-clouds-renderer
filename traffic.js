@@ -71,6 +71,45 @@ function deadEnds(map, roadClass, roadVal, minClass = 1) {
   return out;
 }
 
+/**
+ * 発着点が足りないときの保険。走行可能な道から**互いに離れたセル**を拾う。
+ *
+ * ── なぜ要るか ──
+ * gateways も deadEnds も 0 になる街が実在する。実測 (day8 / 一辺12 / 道54セル):
+ *   ・出入口 0   … 若い街は道がフィールドの縁まで届かないので、外に face しない
+ *   ・行き止まり … classifyRoads が「次数1の道」を PATH (歩行者専用) に落とすため、
+ *                  本当の袋小路は**そもそも走行可能でない**。deadEnds が拾えるのは
+ *                  隣が PATH に落ちた境目のセルだけで、これはいつ消えてもおかしくない
+ * 両方 0 になると server.js の湧かし条件 (発着点が2つ以上) が二度と成立せず、
+ * 走り終えた車が消えたきり**1台も湧かなくなる**。
+ *
+ * ここは「道がある限り必ず 2 点は返す」ことを保証する最後の砦。端点でない道の
+ * 途中で湧いて消えることになるが、透明度のフェードがあるので違和感は出ない。
+ */
+function roadEnds(map, roadClass, roadVal, minClass = 1, want = 8) {
+  const n = map.length, all = [];
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (drivable(map, roadClass, r, c, roadVal, minClass)) all.push({ r, c });
+  if (all.length <= want) return all;
+  // 貪欲な最遠点サンプリング。道は多くても数百セルなので総当たりで足りる。
+  // 近い点ばかり選ぶと経路が短くなり、車が湧いてすぐ消える画になる。
+  const out = [all[0]];
+  while (out.length < want) {
+    let best = null, bestD = -1;
+    for (const p of all) {
+      let d = Infinity;
+      for (const q of out) {
+        const dd = (p.r - q.r) * (p.r - q.r) + (p.c - q.c) * (p.c - q.c);
+        if (dd < d) d = dd;
+      }
+      if (d > bestD) { bestD = d; best = p; }
+    }
+    if (!best || bestD <= 0) break;
+    out.push(best);
+  }
+  return out;
+}
+
 // 小さな二分ヒープ (ダイクストラ用)。優先度つき取り出しさえできればよいので、
 // 依存を増やさず 30 行で済ませる。並列配列で持つのは、要素をオブジェクトにすると
 // 経路 1 本ごとに数百個の短命オブジェクトができて GC が毎フレーム走るため。
@@ -317,6 +356,13 @@ function stepCars(cars, dt, opts) {
   // これが小さすぎると車はウェイポイントに近づけず周りを回り続ける。
   const O = Object.assign({
     accel: 2.2, brake: 6.0, turnRate: 4.5, arrive: 0.5, force: 2.5,
+    // 詰みの保険。にらみ合いの解消 (sees) は **2 台のときしか効かない**。
+    // 3 台以上が輪になって互いの前を塞ぐと、どの 2 台も相互に見えていないので
+    // 全員が車間の制限で止まったまま戻らない。段階的にほどく:
+    //   unstickSec 秒 … 車間を無視してじりじり進む (creep)
+    //   giveUpSec  秒 … それでも動けなければ諦めて消す (フェードで消える)
+    // 車が重なって見えるのは一瞬だが、止まったままの車は延々と画に残る。
+    unstickSec: 6, creep: 0.4, giveUpSec: 30,
     // 車間。既定はワールド単位 (server.js が車の実寸から渡す)。
     len: 0.68,        // 車長
     stopGap: 0.75,    // 停止時に空けるバンパー間の距離
@@ -397,9 +443,14 @@ function stepCars(cars, dt, opts) {
     // 効かせないと、詰まった交差点で車体がめり込む (それが「渋滞で重なる」の正体)。
     if (ahead < Infinity) {
       const slack = (ahead - half) - gap;     // バンパー間の余裕
-      car.v = Math.min(car.v, slack <= 0 ? 0 : slack * 1.8);
+      let cap = slack <= 0 ? 0 : slack * 1.8;
+      // 長く止まったままなら車間を無視して進む (上の unstickSec の説明を参照)
+      if (O.unstickSec > 0 && car.hold > O.unstickSec) cap = Math.max(cap, O.creep);
+      car.v = Math.min(car.v, cap);
     }
     car.hold = car.v < 0.05 ? car.hold + dt : 0;
+    // creep でも動けない = 幾何的にほどけない詰み。諦めて消す。
+    if (O.giveUpSec > 0 && car.hold > O.giveUpSec) { car.done = true; car.stuck = true; continue; }
 
     let want = Math.atan2(dy, dx) - car.th;
     want = Math.atan2(Math.sin(want), Math.cos(want));
@@ -423,5 +474,5 @@ function stepCars(cars, dt, opts) {
   return cars.filter(c => !c.done);
 }
 
-module.exports = { D4, drivable, gateways, deadEnds, route, spreadCost, laneLine, occKey,
+module.exports = { D4, drivable, gateways, deadEnds, roadEnds, route, spreadCost, laneLine, occKey,
                    tailDist, makeCar, retarget, stepCars };

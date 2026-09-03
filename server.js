@@ -153,8 +153,16 @@ const ORT_OPTS = { executionProviders:['cpu'], intraOpNumThreads:ONNX_THREADS, i
 //   例:  CAM_MODE=B node server.js
 //const CAM_MODE         = (process.env.CAM_MODE||'A').toUpperCase()==='B' ? 'B' : 'A';
 const CAM_MODE = 'B';
-const CAM_INTERVAL_MS  = parseInt(process.env.CAM_INTERVAL_MS)  || 20000;
+const CAM_INTERVAL_MS  = parseInt(process.env.CAM_INTERVAL_MS)  || 35000;
 const CAM_STALL_SWITCH = parseInt(process.env.CAM_STALL_SWITCH) || 20;
+// ★ 切替が多すぎて「何が起きているか分からない」問題への手当て。
+//   間隔 (CAM_INTERVAL_MS) を伸ばすだけでは足りない。実際に効いていたのは
+//   **早め切替** のほうで、追跡中の相手が少し止まったり建物に入ったりするたびに
+//   即座に別人へ移っていた。住民は頻繁に建物へ出入りするので、20秒どころか
+//   数秒で切り替わる。切り替えた直後だけは、多少止まっても粘る時間を設ける。
+const CAM_MIN_HOLD_MS  = parseInt(process.env.CAM_MIN_HOLD_MS)  || 12000;
+// 建物に入られたときはもう少し早めに諦める (壁を映し続けても仕方がない)
+const CAM_INDOOR_HOLD_MS = parseInt(process.env.CAM_INDOOR_HOLD_MS) || 5000;
 // FPV_CHANCE: ターゲット切替時に、そのキャラの一人称視点(目線)ショットになる確率 (0..1, 既定0.25)。
 //             A/B どちらでも「たまに挟む」形で入る。0 で無効。 例: FPV_CHANCE=0.3 node server.js
 const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); return isNaN(v)?0.25:Math.max(0,Math.min(1,v)); })();
@@ -162,7 +170,10 @@ const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); retu
 const FPV_EYE          = (()=>{ const v=parseFloat(process.env.FPV_EYE); return isNaN(v)?1.0:Math.max(0.3,Math.min(4.0,v)); })();
 // CAM_DIST: 追跡カメラのプレイヤーまでの距離倍率 (1.0=従来)。小さいほど寄る。 例: CAM_DIST=0.5 node server.js
 //const CAM_DIST         = (()=>{ const v=parseFloat(process.env.CAM_DIST); return isNaN(v)?1.0:Math.max(0.2,Math.min(3.0,v)); })();
-const CAM_DIST = 0.42;     // 追跡カメラの引き。小さいほど住民に寄る
+// 既定は 0.42 (寄り気味)。環境変数で上書きできる — キャラクターの見た目を確かめる
+// ときに CAM_DIST=0.2 まで寄せられると助かるので、決め打ちをやめて読み直す。
+const CAM_DIST = (()=>{ const v=parseFloat(process.env.CAM_DIST);
+                        return Number.isFinite(v) ? Math.max(0.1,Math.min(3.0,v)) : 0.42; })();
 // CAM_OVERVIEW: 俯瞰ショットの引き具合 (フィールドの一辺に対するカメラ高さの倍率)。
 //   小さいほど寄る = 画角から外れる建物が増え、three の視錐台カリングが効いて
 //   ドローコール(1建物=1メッシュ)が減る。ただし画面が埋まる面積は変わらないので
@@ -251,13 +262,25 @@ const CELL=2.0, TICK=parseInt(process.env.TICK)||150;
 const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||10;
 // キャラクター / 軌跡マーカーの大きさ倍率 (1=従来)。街や建物に対して小さくしたい時に下げる。
 // 環境変数 CHAR_SCALE / TRAIL_SCALE で可変。例: CHAR_SCALE=0.5 node server.js
-const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || 1/3;   // 人型の大きさ
 // 街の寸法表。**メートルで書いてある** (scale.js)。車・木・街灯・建物の大きさは
 // 全部ここから引く。以前はワールド単位の生の数字が散らばっていて、どれが何 m
 // 相当なのか分からなくなっていた (実測すると車 4.64m・木 6.95m・街灯の支柱が
 // 実物の約2倍という具合に、個別には妥当でも並べると揃っていなかった)。
 //   node tools/scale-report.js  で一覧できる。
 const SCALE = require('./scale.js');
+// ★ CHAR_SCALE が SCALE.DEFAULT_CHAR_SCALE を引くので、require はこの上に置くこと。
+// 人型の大きさ。**これが街全体の縮尺の基準**でもある (scale.js を参照)。
+//   住民の身長を 1.70m と決めることで「1ワールド単位 = 何m」が決まり、車・街灯・
+//   信号・街路樹の寸法がそこから引かれる。つまりここを下げると、**人と一緒に
+//   車や街灯も同じ比率で小さくなる** = 人と車の大小関係は保たれたまま、
+//   道幅や建物のほうが相対的に大きくなる (セル基準なので変わらないため)。
+//   ★ DINOv2 の観測 (EYE_HEIGHT / AGENT_SPRITE_*) はセル単位の直値なので影響しない。
+//     ここを触っても方策の入力は 1 ビットも変わらない = 再学習は不要。
+const CHAR_SCALE =parseFloat(process.env.CHAR_SCALE) || SCALE.DEFAULT_CHAR_SCALE;
+// 住民の見た目。'human' = 服を着た人型 (既定) / 'skeleton' = 姿勢推定オーバーレイ風の骨格。
+// リグ (関節・骨番号・歩行の式) は共通で、変わるのは骨にぶら下がる型紙と色だけ。
+//   例:  CHAR_STYLE=skeleton node server.js
+const CHAR_STYLE = (process.env.CHAR_STYLE||'human').toLowerCase()==='skeleton' ? 'skeleton' : 'human';
 const DIM = SCALE.make(CELL, CHAR_SCALE, process.env);
 // 軌跡マーカーの大きさ。1/3 だと 1 枚が 0.13 ワールド単位 = 0.52m あり、住民の
 // 足元に対して大きすぎて「足跡」というより敷石に見えていた。1/9 で約 0.17m。
@@ -288,6 +311,7 @@ const RD = require('./roads.js');
 // three が要る server.js はテスト環境で動かせないので、ポーズの式がここに無いと
 // 「歩き方が正しいか」を実機に載せる前に確かめる手段が無くなる。
 const SK = require('./skeleton.js');
+const CHARMESH = require('./charmesh.js');   // 型紙 → three のジオメトリ (プレビューと共用)
 // 車の出入口・経路・走行。住民 (ONNX 推論・欲求・屋内状態) とは別系統にする。
 // three にも server.js にも依存しない計算なので単体で検証できる。
 const TR = require('./traffic.js');
@@ -314,6 +338,12 @@ const VOID = 4;
 // WORLD_ALIGNED=0 で従来の LEGACY に戻せる。
 const WORLD = process.env.WORLD_ALIGNED === '0' ? MW.LEGACY : MW.ALIGNED;
 const PASSABLE = MW.passableSet(WORLD);
+// ワールド座標が建物セルの上か。住民の描画位置の補間が壁へめり込むのを防ぐのに使う。
+//   ワールド x = 列*CELL + CELL/2 / ワールド y = 行*CELL + CELL/2 (住民の a.x が行)
+function inBuildingWorld(wx, wy){
+  const c=Math.floor(wx/CELL), r=Math.floor(wy/CELL);
+  return r>=0 && r<GRID && c>=0 && c<GRID && MAP[r][c]===BUILDING;
+}
 const OPTICS_OK = WORLD.solidBuildings && WORLD.visibleTrees && WORLD.walkableEmpty;
 console.log(`[World] ${WORLD.solidBuildings?'ALIGNED':'LEGACY'} `
           + `passable={${[...PASSABLE].join(',')}} 光学=物理:${OPTICS_OK}`);
@@ -1968,9 +1998,16 @@ function updateOcclusionFade(){
 // 足元のローカル z は -CELL*.26 (地面)。MeshLambert にしてシーンのライトで陰影を付ける。
 // ── 昼夜: 時刻に応じて空の色・光の色/強さを変える ────────────────────────────
 //   d=1(正午) 昼白色で明るい / d=0(深夜) 青く暗い。夕方は朝焼け/夕焼け色を混ぜる。
-const _cDay=new THREE.Color(0xeaf2f7), _cNight=new THREE.Color(0x0b1a33);
+// NIGHT_DEPTH: 夜の深さ (0=以前の明るい夜 / 1=既定 / 1.5 まで)。空と環境光の
+// **夜側だけ**を落とす。街灯・窓・店明かり・前照灯はそのままなので、相対的に
+// 明かりが際立つ。暗いところは今より見えなくなる (それが狙い)。
+const NIGHT_DEPTH = Math.max(0, Math.min(1.5, envNum('NIGHT_DEPTH', 1.0)));
+const _cDay=new THREE.Color(0xeaf2f7);
+// 夜空。以前は 0x0b1a33 で、街灯が点いていない場所もはっきり見えていた。
+const _cNight=new THREE.Color().setHex(0x0b1a33).multiplyScalar(1-0.55*NIGHT_DEPTH);
 const _sDay=new THREE.Color(0xfff4e0), _sDusk =new THREE.Color(0xff9a5c), _sNight=new THREE.Color(0x2a4a8a);
-const _gDay=new THREE.Color(0xbcd0e0), _gNight=new THREE.Color(0x24304a);
+const _gDay=new THREE.Color(0xbcd0e0);
+const _gNight=new THREE.Color().setHex(0x24304a).multiplyScalar(1-0.55*NIGHT_DEPTH);
 const _cWeather=new THREE.Color();
 const SKY_DOME  = process.env.SKY_DOME !== '0';
 const LIGHT_KEY  = envNum('LIGHT_KEY', 1.0);    // 平行光 (陽射し) の強さ
@@ -2063,16 +2100,21 @@ function updateDayNight(S){
   // どの面もほぼ同じ明るさになり **箱に立体感が出ていなかった**。
   // 環境を落として平行光を上げると、陽の当たる面と陰の面に差がついて形が見える。
   // LIGHT_KEY / LIGHT_FILL で好みに寄せられる。
-  L.sun.intensity  = (0.18+2.35*d)*w.light*LIGHT_KEY;
+  // ★ 夜を深くする。**足元 (d=0 のときの値) だけ**を下げて、昼は変えない。
+  //   明かりは絶対値ではなく周りとの差で「明るく」見えるので、暗い側を下げる
+  //   ほうが街灯も窓も店明かりも一斉に映える。NIGHT_DEPTH=0 で以前の明るさ。
+  const nd=1-0.52*NIGHT_DEPTH;
+  L.sun.intensity  = (0.18*nd+2.35*d)*w.light*LIGHT_KEY;
   L.amb.color.copy(_gNight).lerp(_gDay,d);
   // 影が入ったので**環境光を落とせる**。以前は環境光だけで形を見せていたので
   // 高くせざるを得なかったが、それが影を薄めてもいた。曇り/雨の日は逆に環境光を
   // 残す (実際、曇天は影が出ずに全体が明るい)。
   const flat=1.0-0.45*(1.0-w.light);            // 晴れ 1.0 / 雨 0.78
-  L.amb.intensity  = (0.24+0.30*d)*(0.65+0.35*w.light)*LIGHT_FILL/flat;
-  L.hemi.intensity = (0.16+0.40*d)*(0.65+0.35*w.light)*LIGHT_FILL/flat;
+  L.amb.intensity  = (0.24*nd+0.30*d)*(0.65+0.35*w.light)*LIGHT_FILL/flat;
+  L.hemi.intensity = (0.16*nd+0.40*d)*(0.65+0.35*w.light)*LIGHT_FILL/flat;
   stepBldgLights(d);                 // 窓・入り口・看板を夜だけ光らせる
   stepLamps(S, d);                   // 街灯
+  stepShopGlow(S, d);                // 店明かりの路面への漏れ
   stepSignals(S, d);                 // 交差点の信号 (赤青黄の切り替え)
   stepCarLights(d);                  // 車の前照灯 / 尾灯
   stepProps(S, d);                   // 自販機の窓
@@ -2561,17 +2603,58 @@ async function refreshTalkLog(){
 //   「〇〇が建ちました」「〇〇がなくなりました」を数秒だけ大きく出す。
 //   ティッカーは一周に時間がかかるので、その瞬間に見せたいものは別枠にする。
 let hudBanner=null, hudBannerT0=0, hudBannerUntil=0, hudBannerBusy=false;
+// ★ 以前は **1行に決め打ち**で、板の幅を文字数から見積もっていた。長い一言
+//   (「◯◯ が △△ の不足を見て □□ を建てはじめた (12,7)」など) は画面幅で頭打ちに
+//   なり、**右側が切れて最後まで読めなかった**。折り返して行数ぶん板を伸ばす。
+const BANNER_FS    = _hs(envNum('HUD_BANNER_FONT', 15));      // 以前は 21
+const BANNER_PAD   = _hs(16);
+const BANNER_LINES = Math.max(1, Math.min(4, envNum('HUD_BANNER_LINES', 3)));
+const BANNER_MAXW  = Math.min(WIDTH-40, Math.round(WIDTH*0.72));
+// 日本語は単語の切れ目が無いので、**表示幅**で割る (全角=2 / 半角=1)。
+//   句読点や閉じ括弧が行頭に来ないよう、その1文字だけは前の行にぶら下げる。
+function wrapByWidth(text, cols){
+  const lines=[]; let cur='', w=0;
+  for(const ch of String(text)){
+    if(ch==='\n'){ lines.push(cur); cur=''; w=0; continue; }
+    const cw = ch.codePointAt(0)>0x2E80 ? 2 : 1;
+    if(w+cw>cols && cur){
+      if(/[、。，．,.!?！？」』）\)：:;；]/.test(ch)){ cur+=ch; w+=cw; continue; }
+      // 英単語の途中では割らない。行内に半角スペースがあればそこまで巻き戻す。
+      const sp=cur.lastIndexOf(' ');
+      if(sp>0 && cw===1 && _tw(cur.slice(sp+1))<cols*0.6){
+        lines.push(cur.slice(0,sp)); cur=cur.slice(sp+1); w=_tw(cur);
+      }else{
+        lines.push(cur); cur=''; w=0;
+      }
+    }
+    cur+=ch; w+=cw;
+  }
+  if(cur) lines.push(cur);
+  return lines.length ? lines : [''];
+}
 
 async function setBanner(text, secs){
   if(!hudScene) return;
-  const w=Math.min(WIDTH-40, Math.max(_hs(240),
-            Math.ceil(_hs(44) + text.length*11.5*HUD_SCALE))), h=_hs(48);
+  const cols=Math.max(10, Math.floor((BANNER_MAXW-BANNER_PAD*2)/(BANNER_FS*0.5)));
+  let lines=wrapByWidth(_hud(text), cols);
+  if(lines.length>BANNER_LINES){                       // 溢れたぶんは畳んで … を付ける
+    lines=lines.slice(0, BANNER_LINES);
+    lines[BANNER_LINES-1]=lines[BANNER_LINES-1].replace(/.$/,'…');
+  }
+  const lh=Math.round(BANNER_FS*1.42);
+  const wide=Math.max(...lines.map(_tw));
+  const w=Math.min(BANNER_MAXW, Math.max(_hs(200),
+            Math.ceil(BANNER_PAD*2 + wide*BANNER_FS*0.5)));
+  const h=Math.round(lines.length*lh + BANNER_FS*0.8);
+  const top=(h-lines.length*lh)/2 + BANNER_FS*0.95;
   const {tex}=await svgTexture(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">`
     +`<rect width="${w}" height="${h}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.74"/>`
     +`<rect x="0" y="0" width="${_hs(3)}" height="${h}" fill="#00d2a0"/>`
-    +`<text x="${_hs(18)}" y="${_hs(31)}" font-size="${_hs(21)}" fill="#eaf6f2"`
-    +` font-family="${HUD_FACE_T}">${_esc(_hud(text))}</text></svg>`);
+    + lines.map((ln,i)=>`<text x="${BANNER_PAD}" y="${Math.round(top+i*lh)}"`
+        +` font-size="${BANNER_FS}" fill="#eaf6f2"`
+        +` font-family="${HUD_FACE_T}">${_esc(ln)}</text>`).join('')
+    +`</svg>`);
   if(hudBanner){ hudScene.remove(hudBanner); hudBanner.material.map.dispose(); hudBanner.material.dispose(); hudBanner.geometry.dispose(); }
   hudBanner=hudPlane(w, h, tex);
   hudBanner.material.opacity=0;
@@ -2669,67 +2752,41 @@ function mergeGeos(list){
   return g;
 }
 
-// 住民の体を「体」と「肌・髪・ズボン」の2本のジオメトリに分けて作る。
-//   体だけ住民ごとに色が変わるので、インスタンスカラーで塗り分けられるよう別にする。
-//   残りは色が固定なので頂点カラーに焼いて1マテリアルにまとめる。
+// 住民のジオメトリ。骨番号 aBone と部位 aPart を頂点ごとに焼き込んだ **1 本**にまとめる。
+//   以前は「住民ごとに色が変わる頭」と「固定色の骨」で 2 メッシュに分けていたが、
+//   部位を aPart で持てば色はシェーダ側で解決できるので分ける必要が無くなった。
+//   → ドローコールは 2 本 → **1 本**。
 const AGENT_BASE = -CELL*.26;                 // 足元 (ローカル原点からの高さ)
 const AGENT_H_GEO = CELL*0.66;                // 骨格の身長 (ジオメトリ単位)。AGENT_H と同じ定義
 // 関節の高さ (ジオメトリ単位)。シェーダの回転支点にそのまま使う。
 const SKZ = k => AGENT_BASE + SK.J[k].z*AGENT_H_GEO;
-// 頭だけ住民ごとの色にする。骨は姿勢推定の配色 (シアン/黄/マゼンタ) の固定色。
-// 胴まで住民色にすると骨格に見えなくなり、かといって全部固定色だと 1000 人の
-// 見分けが付かない。いちばん大きく上にある頭が識別子として素直だった。
-const SKEL_HEAD_TINT = process.env.SKEL_HEAD_TINT !== '0';
-// 円柱と球の分割数。細い骨なので粗くてよい。実測でこの設定なら 1 体あたり
-// 約 490 三角形で、以前の丸い人型 (約 1350) より軽い。
-const BONE_SEG = 5, JOINT_SEG = [5,3], HEAD_SEG = [8,5];
-let _agentGeoBody=null, _agentGeoParts=null;
+let _agentGeo=null;
 
-// 住民の体を「頭 (住民ごとの色)」と「骨と関節 (固定色)」の 2 本に分けて作る。
-// 形も配色も歩き方も skeleton.js が持っている。ここは three のジオメトリに
-// 起こすだけで、寸法や角度をここで決め直さない。
+// 住民のジオメトリを組む。形も配色も歩き方も skeleton.js が、three への
+// 起こし方は charmesh.js が持っている。ここは 1 本にまとめるだけ。
 function buildAgentGeos(){
-  if(_agentGeoBody) return;
-  const H=AGENT_H_GEO;
-  const P=p=>new THREE.Vector3(p.x*H, p.y*H, AGENT_BASE+p.z*H);
-  const head=[], rest=[];
-  // 骨 = 端を開けた細い円柱。継ぎ目は関節の玉が隠すので蓋は要らない。
-  for(const b of SK.boneSegments()){
-    const a=P(b.a), c=P(b.b), d=new THREE.Vector3().subVectors(c,a);
-    const L=d.length(); if(L<1e-6) continue;
-    const g=new THREE.CylinderGeometry(b.r*H, b.r*H, L, BONE_SEG, 1, true);
-    g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(
-      new THREE.Vector3(0,1,0), d.clone().normalize()));
-    g.translate((a.x+c.x)/2, (a.y+c.y)/2, (a.z+c.z)/2);
-    rest.push({geo:g, color:new THREE.Color(b.col), bone:b.bone});
-  }
-  // 関節の玉と頭
-  for(const s of SK.jointSpheres()){
-    const p=P(s.p), isHead=s.r>=SK.HEAD_R-1e-9;
-    const sg=isHead?HEAD_SEG:JOINT_SEG;
-    const g=new THREE.SphereGeometry(s.r*H, sg[0], sg[1]);
-    g.translate(p.x, p.y, p.z);
-    // 頭は住民ごとの色を載せる側 (body) に置く。**その頂点カラーは白**にすること。
-    // 骨格の配色をそのまま残すと instanceColor と掛け算になって色が濁る。
-    const tint = isHead && SKEL_HEAD_TINT;
-    (isHead ? head : rest).push({geo:g, bone:s.bone,
-      color:new THREE.Color(tint ? 0xffffff : s.col)});
-  }
-  if(!head.length) head.push(rest.pop());     // 念のため (頭は必ず1個ある)
-  _agentGeoBody =mergeWithBone(head);
-  _agentGeoParts=mergeWithBone(rest);
-  SHARED_GEO.add(_agentGeoBody); SHARED_GEO.add(_agentGeoParts);
+  if(_agentGeo) return;
+  const list=CHARMESH.partList(THREE, CHAR_STYLE, AGENT_H_GEO, AGENT_BASE);
+  _agentGeo = mergeWithBonePart(list);
+  SHARED_GEO.add(_agentGeo);
+  console.log(`[Char] ${CHAR_STYLE} — ${list.length}パーツ / 1体 ${_agentGeo.index.count/3}三角形`);
 }
 
-// mergeGeos に「頂点ごとの骨番号」を足す。mergeGeos は渡した順に頂点を並べる
-// ので、各ジオメトリの頂点数を先に数えておけば同じ並びで aBone を作れる。
-function mergeWithBone(list){
+// mergeGeos に「頂点ごとの骨番号と部位」を足す。mergeGeos は渡した順に頂点を
+// 並べるので、各ジオメトリの頂点数を先に数えておけば同じ並びで作れる。
+function mergeWithBonePart(list){
   const counts=list.map(it=>it.geo.attributes.position.count);
   const geo=mergeGeos(list);                    // ← ここで入力ジオメトリは破棄される
-  const bone=new Float32Array(counts.reduce((a,b)=>a+b,0));
+  const n=counts.reduce((a,b)=>a+b,0);
+  const bone=new Float32Array(n), part=new Float32Array(n);
   let o=0;
-  list.forEach((it,i)=>{ bone.fill(it.bone, o, o+counts[i]); o+=counts[i]; });
+  list.forEach((it,i)=>{
+    bone.fill(it.bone, o, o+counts[i]);
+    part.fill(it.part, o, o+counts[i]);
+    o+=counts[i];
+  });
   geo.setAttribute('aBone', new THREE.BufferAttribute(bone,1));
+  geo.setAttribute('aPart', new THREE.BufferAttribute(part,1));
   return geo;
 }
 
@@ -2769,11 +2826,38 @@ const WALK_ANGLES_GLSL = `
              : _lean;
 `;
 
+// 部位ごとの色。1 頂点 = 1 区分 (aPart) なので、色はここで引くだけで済む。
+//   肌と髪の候補は skeleton.js が持っているので、GLSL も**そこから生成**する
+//   (JS 側の配列を足したらシェーダにも自動で乗る)。
+const _glslCol = hex => { const c=new THREE.Color(hex);
+  return `vec3(${c.r.toFixed(4)},${c.g.toFixed(4)},${c.b.toFixed(4)})`; };
+// WebGL1 の GLSL ES 1.00 は配列の動的添字を確実には通せないので if の連鎖にする。
+const glslPick = (fn, hexes) =>
+  `vec3 ${fn}(float i){\n  vec3 r=${_glslCol(hexes[0])};\n`
+  + hexes.slice(1).map((h,k)=>`  if(i>${(k+0.5).toFixed(1)}) r=${_glslCol(h)};\n`).join('')
+  + `  return r;\n}\n`;
+
+// 上衣 = instanceColor (ペルソナ色) / 下衣 = aWear.rgb / 肌と髪 = aWear.w が指す候補。
+// aWear.w には肌と髪の 2 つの番号を tone = 肌*4 + 髪 で詰めてある。
+const WEAR_COLOR_GLSL = `
+  vColor = color;
+  if(aPart > 0.5){
+    if(aPart < 1.5)      vColor = instanceColor;          // 上衣 (袖も)
+    else if(aPart < 2.5) vColor = aWear.rgb;              // 下衣
+    else {
+      float _si = floor(aWear.w * 0.25);
+      vColor = (aPart < 3.5) ? mesaSkin(_si) : mesaHair(aWear.w - _si*4.0);
+    }
+  }
+`;
+
 // マテリアルに歩行を仕込む。位置と法線の両方を回す。
 function addWalkShader(mat){
   mat.onBeforeCompile = (sh)=>{
     sh.vertexShader =
       'attribute vec2 aWalk;\nattribute float aBone;\n'
+    + 'attribute float aPart;\nattribute vec4 aWear;\n'
+    + glslPick('mesaSkin', SK.SKIN_TONES) + glslPick('mesaHair', SK.HAIR_TONES)
     + 'vec3 mesaRotX(vec3 p, float pz, float a){\n'
     + '  float s=sin(a), c=cos(a); float y=p.y, z=p.z-pz;\n'
     + '  return vec3(p.x, y*c - z*s, pz + y*s + z*c);\n}\n'
@@ -2808,8 +2892,11 @@ function addWalkShader(mat){
         }
         transformed.z += ${_f(SK.WALK.bob*AGENT_H_GEO)}*_am*cos(2.0*_ph);
       }`);
+    // three 既定の色経路 (頂点カラー × instanceColor) は使わず、部位で選ぶ。
+    sh.vertexShader = sh.vertexShader.replace('#include <color_vertex>',
+      `{${WEAR_COLOR_GLSL}}`);
   };
-  mat.customProgramCacheKey = ()=> 'agentSkelWalk';
+  mat.customProgramCacheKey = ()=> 'agentWearWalk';
 }
 
 // ── 車 ──────────────────────────────────────────────────────────────────────
@@ -2871,10 +2958,14 @@ const CAR_STEP_OPTS = {
   laneHalf: CAR_W*0.73,     // 「前の車」とみなす横方向の許容
   fadeSec:  CAR_FADE_SEC,
   fadeDist: CAR_FADE_DIST,
+  // 詰みの保険 (traffic.js の説明を参照)。0 にすると以前の挙動に戻る。
+  unstickSec: envNum('CAR_UNSTICK_SEC', 6),
+  giveUpSec:  envNum('CAR_GIVEUP_SEC', 30),
 };
 
-let cars=[], _carGw=null, _carEnd=null, _carGwDirty=true;
+let cars=[], _carGw=null, _carEnd=null, _carAny=null, _carGwDirty=true;
 let _carSpawnAt=0, _carSeed=1, _carGwLogged=-1;
+let _carStuck=0;   // 詰んで消した車の累計 (/city の診断に出す)
 // 最近どのセルを車が通ったか。経路の重みに効かせて、同じ道ばかり選ばせない。
 let _carUse=null;
 const CarInst={ body:null, trim:null, alpha:null };
@@ -3050,10 +3141,19 @@ function carSpots(){
                      || r<lo || r>hi || c<lo || c>hi || MAP[r][c]===VOID;
   _carGw  = ok ? TR.gateways(MAP, CITY.roadClass, ROAD, VOID, 1, outside) : [];
   _carEnd = ok ? TR.deadEnds(MAP, CITY.roadClass, ROAD) : [];
-  if(ok && _carGw.length<2 && _carEnd.length>=2 && _carGwLogged!==_carEnd.length){
-    _carGwLogged=_carEnd.length;
-    console.log(`[Car] 街の外との接点が ${_carGw.length} しかありません`
-      + ` → 街の中の行き止まり ${_carEnd.length} 箇所だけで走らせます`);
+  // ★ 出入口も行き止まりも足りない街では、道の途中を発着点に使う。
+  //   若い街では出入口は**構造的に 0** になる (道がフィールドの縁まで届かない)。
+  //   行き止まりも classifyRoads が次数1の道を PATH に落とすので当てにならない。
+  //   両方 0 になると「発着点が2つ以上」が二度と成立せず、走り終えた車が消えた
+  //   きり 1 台も湧かなくなる。ここが最後の砦。
+  _carAny = (ok && _carGw.length + _carEnd.length < 2)
+          ? TR.roadEnds(MAP, CITY.roadClass, ROAD, 1, 8) : [];
+  const sig=`${_carGw.length}/${_carEnd.length}/${_carAny.length}`;
+  if(ok && _carGw.length<2 && _carGwLogged!==sig){
+    _carGwLogged=sig;
+    console.log(`[Car] 街の外との接点 ${_carGw.length} / 行き止まり ${_carEnd.length}`
+      + (_carAny.length ? ` → 足りないので道の途中 ${_carAny.length} 箇所を発着点にします`
+                        : ` → 行き止まりだけで走らせます`));
   }
 }
 
@@ -3063,7 +3163,8 @@ function carSpot(){
   const end=_carEnd && _carEnd.length, gw=_carGw && _carGw.length;
   // ★ 出入口が無い街でも走らせる。**片方しか無ければそちらだけを使う。**
   //   以前は出入口が 0 だと必ず null を返し、通過交通も発着交通も止まった。
-  if(!gw)  return end ? _carEnd[(Math.random()*end)|0] : null;
+  if(!gw && !end){ const n=_carAny?_carAny.length:0; return n ? _carAny[(Math.random()*n)|0] : null; }
+  if(!gw)  return _carEnd[(Math.random()*end)|0];
   if(!end) return _carGw[(Math.random()*gw)|0];
   return Math.random()<CAR_LOCAL_P ? _carEnd[(Math.random()*end)|0]
                                    : _carGw[(Math.random()*gw)|0];
@@ -3113,7 +3214,7 @@ function stepTraffic(dt){
   const now=Date.now();
   // ★ 「出入口が2つ以上」ではなく「**発着点が2つ以上**」で判定する。
   //   出入口が消えた街でも、行き止まりどうしを結べば車は走れる。
-  const spots=(_carGw?_carGw.length:0)+(_carEnd?_carEnd.length:0);
+  const spots=(_carGw?_carGw.length:0)+(_carEnd?_carEnd.length:0)+(_carAny?_carAny.length:0);
   if(spots>1 && cars.length<carMaxNow() && now-_carSpawnAt>=CAR_SPAWN_SEC*1000){
     const a=carSpot(), b=carSpot();
     if(a && b && (a.r!==b.r || a.c!==b.c)){
@@ -3152,6 +3253,7 @@ function stepTraffic(dt){
     if(p && p.length>=2 && TR.retarget(c, carLine(p))) carMarkUse(p);
   }
 
+  for(const c of cars) if(c.stuck && !c._counted){ c._counted=true; _carStuck++; }
   cars=TR.stepCars(cars, dt, CAR_STEP_OPTS);
   // インスタンスへ流す
   const B=CarInst.body, T=CarInst.trim, A=CarInst.alpha;
@@ -3204,8 +3306,7 @@ function stepCarLights(d){
 // 形はみな同じで、違うのは「位置・向き・体の色・歩行位相」だけなので、
 // InstancedMesh 2本 (体 / パーツ) にまとめて **2 ドローコール** で描く。
 const AGENT_CAP = NUM_AGENTS + 8;
-const AgentInst = { body:null, parts:null, walk:null };
-const _agentHide = new THREE.Matrix4().makeScale(0,0,0);   // 屋内の住民を隠す行列
+const AgentInst = { mesh:null, walk:null, wear:null };
 
 // ── 画角の外に居る住民を描かない (ビューポートカリング) ──────────────────────
 //   建物は 1 個 = 1 メッシュなので three が自前で視錐台カリングしてくれるが、
@@ -3312,43 +3413,54 @@ function inCameraView(pos, agent, keepAll){
 function initAgentInstances(S){
   if(!S) return;
   buildAgentGeos();
+  // インスタンス属性。aWalk=(位相,振幅) / aWear=(下衣RGB, 肌と髪の番号)。
   const walk=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*2), 2);
-  // 同じ属性オブジェクトを両ジオメトリで共有する (GPUバッファも1本で済む)
-  _agentGeoBody.setAttribute('aWalk', walk);
-  _agentGeoParts.setAttribute('aWalk', walk);
+  const wear=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*4), 4);
+  walk.setUsage(THREE.DynamicDrawUsage); wear.setUsage(THREE.DynamicDrawUsage);
+  _agentGeo.setAttribute('aWalk', walk);
+  _agentGeo.setAttribute('aWear', wear);
 
-  // three 0.132 の color_fragment は USE_COLOR / USE_COLOR_ALPHA のときしか vColor を
-  // 使わない。USE_INSTANCING_COLOR だけだと頂点側で計算した色が捨てられ、全員白になる。
-  // 頭のジオメトリには白の頂点カラーを入れてあるので、vertexColors を有効にして
-  // 経路を通し、その上に instanceColor (住民ごとの色) を掛けさせる。
-  const bodyMat=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
-  const partsMat=new THREE.MeshLambertMaterial({vertexColors:true});
-  bodyMat.userData.shared=true; partsMat.userData.shared=true;
-  addWalkShader(bodyMat); addWalkShader(partsMat);
+  // vertexColors を有効にして three に `color` と `vColor` を用意させる。
+  // 実際にどの色を vColor へ入れるかは WEAR_COLOR_GLSL が部位ごとに決める。
+  const mat=new THREE.MeshLambertMaterial({color:0xffffff, vertexColors:true});
+  mat.userData.shared=true;
+  addWalkShader(mat);
 
-  const body =new THREE.InstancedMesh(_agentGeoBody,  bodyMat,  AGENT_CAP);
-  const parts=new THREE.InstancedMesh(_agentGeoParts, partsMat, AGENT_CAP);
-  for(const m of [body,parts]){
-    m.count=0;
-    m.frustumCulled=false;     // 境界球はジオメトリ1体ぶんしか無く、街全体には効かない
-    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    markShadow(m, true, false);
-    S.add(m);
-  }
-  AgentInst.body=body; AgentInst.parts=parts; AgentInst.walk=walk;
-  // 既に住民が居る状態でシーンを作り直した場合に備えて色を入れ直す
-  for(let i=0;i<agents.length && i<AGENT_CAP;i++) setAgentColor(i, agents[i].def.color);
+  const mesh=new THREE.InstancedMesh(_agentGeo, mat, AGENT_CAP);
+  // instanceColor は **ここで明示的に用意する**。setColorAt 任せだと、住民が
+  // 1 人も居ない状態で最初のフレームを描いたときに USE_INSTANCING_COLOR が
+  // 立たず、instanceColor を参照するシェーダがコンパイルに失敗する。
+  mesh.instanceColor=new THREE.InstancedBufferAttribute(
+    new Float32Array(AGENT_CAP*3).fill(1), 3);
+  mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  mesh.count=0;
+  mesh.frustumCulled=false;   // 境界球はジオメトリ1体ぶんしか無く、街全体には効かない
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  markShadow(mesh, true, false);
+  S.add(mesh);
+
+  AgentInst.mesh=mesh; AgentInst.walk=walk; AgentInst.wear=wear;
+  _slotColor.fill(-1); _slotWear.fill(-1);   // シーンを作り直したら詰め直す
+}
+
+// 住民ごとの服装。上衣はペルソナ色 (instanceColor) なので、ここで決めるのは
+// 下衣の色と、肌・髪の番号。**aid から作った固定値**なので毎回同じ人が同じ服になる。
+function agentWear(a){
+  if(a._wear) return a._wear;
+  let h=2166136261;                                  // FNV-1a
+  for(let i=0;i<a.aid.length;i++){ h^=a.aid.charCodeAt(i); h=Math.imul(h,16777619); }
+  h>>>=0;
+  const pants=SK.PANTS[h % SK.PANTS.length];
+  const skin =(h>>>7)  % SK.SKIN_TONES.length;
+  const hair =(h>>>13) % SK.HAIR_TONES.length;
+  // 肌と髪は 1 つの float に詰める (インスタンス属性を増やさないため)
+  return a._wear={ pants, tone: skin*4+hair, key: pants*16 + skin*4 + hair };
 }
 
 const _acol=new THREE.Color();
-function setAgentColor(i, hex){
-  if(!AgentInst.body || i>=AGENT_CAP) return;
-  AgentInst.body.setColorAt(i, _acol.set(SKEL_HEAD_TINT ? hex : 0xffffff));
-  AgentInst.body.instanceColor.needsUpdate=true;
-  // 色の持ち主は syncAgentInstances (スロット詰め直しのたびに書く)。
-  // ここで直接書いた値をキャッシュと食い違わせないよう、スロットを無効化しておく。
-  _slotColor[i]=-1;
-}
+// 色の持ち主は syncAgentInstances (スロットを詰め直すたびに書く)。ここは
+// 「次のフレームで書き直せ」と印を付けるだけ。
+function setAgentColor(i, hex){ if(i<AGENT_CAP){ _slotColor[i]=-1; _slotWear[i]=-1; } }
 
 // 住民1人ぶんの「置き場所」。ジオメトリもマテリアルも持たない純粋な変換だけの器で、
 // scene には入れない。renderLoop がここに補間後の位置と向きを書き、
@@ -3367,29 +3479,40 @@ function createAgentMesh(S,color){
 //   インスタンスの並びが毎フレーム変わるので、色 (instanceColor) も詰め直す。
 //   agentMeshes[i].userData.onScreen に判定結果を残し、頭上アイコン/近接フェードが使う。
 const _slotColor = new Int32Array(AGENT_CAP).fill(-1);   // スロットに今入っている色
+const _slotWear  = new Int32Array(AGENT_CAP).fill(-1);   // スロットに今入っている服装
 let _drawnAgents=0;   // 直近フレームで実際に描いた住民の数 (Perf ログ用)
 function syncAgentInstances(){
-  const B=AgentInst.body, P=AgentInst.parts; if(!B) return;
+  const M=AgentInst.mesh; if(!M) return;
   const n=Math.min(agents.length, AGENT_CAP);
-  const w=AgentInst.walk.array;
-  let k=0, colDirty=false;
+  const w=AgentInst.walk.array, wr=AgentInst.wear.array;
+  let k=0, colDirty=false, wearDirty=false;
   // カメラが今追っている本人だけは絶対に間引かない (主役が消えたら画が成立しない)
   const star = camTargetIdx>0 ? camTargetIdx-1 : -1;
   for(let i=0;i<n;i++){
     const o=agentMeshes[i]; if(!o) continue;
-    const on = o.visible && inCameraView(o.position, agents[i], i===star);
+    const a=agents[i];
+    const on = o.visible && inCameraView(o.position, a, i===star);
     o.userData.onScreen = on;
     if(!on) continue;
     o.updateMatrix();
-    B.setMatrixAt(k,o.matrix); P.setMatrixAt(k,o.matrix);
-    const col=SKEL_HEAD_TINT ? agents[i].def.color : 0xffffff;
-    if(_slotColor[k]!==col){ B.setColorAt(k, _acol.set(col)); _slotColor[k]=col; colDirty=true; }
+    M.setMatrixAt(k,o.matrix);
+    // 上衣 = ペルソナ色。スロットの並びが毎フレーム変わるので詰め直す。
+    const col=a.def.color;
+    if(_slotColor[k]!==col){ M.setColorAt(k, _acol.set(col)); _slotColor[k]=col; colDirty=true; }
+    // 下衣と肌・髪
+    const we=agentWear(a);
+    if(_slotWear[k]!==we.key){
+      _acol.set(we.pants);
+      wr[k*4]=_acol.r; wr[k*4+1]=_acol.g; wr[k*4+2]=_acol.b; wr[k*4+3]=we.tone;
+      _slotWear[k]=we.key; wearDirty=true;
+    }
     w[k*2]=o.userData.ph||0; w[k*2+1]=o.userData.amp||0;
     k++;
   }
-  B.count=P.count=k;
-  B.instanceMatrix.needsUpdate=true; P.instanceMatrix.needsUpdate=true;
-  if(colDirty && B.instanceColor) B.instanceColor.needsUpdate=true;
+  M.count=k;
+  M.instanceMatrix.needsUpdate=true;
+  if(colDirty && M.instanceColor) M.instanceColor.needsUpdate=true;
+  if(wearDirty) AgentInst.wear.needsUpdate=true;
   AgentInst.walk.needsUpdate=true;
   _drawnAgents=k;
 }
@@ -4373,14 +4496,28 @@ const BLDG_GLOW  = envNum('BLDG_GLOW', 1.0);       // 夜の明るさの倍率 (
 // 明かりの強さ。ACES トーンマップ (exposure 0.6) を通ると素の emissive は
 // かなり落ちるので、写真の窓がはっきり点いて見えるところまで持ち上げてある。
 const NIGHT_LIT  = envNum('NIGHT_LIT', 2.6);
+// 就寝による減光。h は現在時刻 (0-24)。sleep から wake までを 30 分かけて
+// 落として戻す。完全には消さない (真っ暗な家が並ぶと街が死んで見えるので常夜灯ぶん)。
+const HOME_SLEEP = Math.max(0, Math.min(1, envNum('HOME_SLEEP', 0.88)));
+function sleepFactor(u, h){
+  if(!u.home || HOME_SLEEP<=0) return 1;
+  const ramp=x=>{ const t=Math.max(0,Math.min(1,x)); return t*t*(3-2*t); };
+  const asleep = (h>=u.sleep) || (h<u.wake);        // 寝ている時間帯か (日をまたぐ)
+  if(!asleep) return 1;
+  const intoSleep = h>=u.sleep ? (h-u.sleep) : (h+24-u.sleep);
+  const toWake    = h<u.wake  ? (u.wake-h)  : Infinity;
+  return 1 - HOME_SLEEP*Math.min(ramp(intoSleep/0.5), ramp(toWake/0.5));
+}
 function stepBldgLights(d){
   if(!litStructs.size) return;
+  const h=gameHour();
   for(const mesh of litStructs){
     const u=mesh.userData.lit; if(!u) continue;
     const t=Math.max(0, Math.min(1, (0.55+u.phase-d)/0.40));
     const e=t*t*(3-2*t);                            // smoothstep: 夕方にじわっと点く
-    if(u.facade) u.facade.emissiveIntensity=e*NIGHT_LIT*BLDG_GLOW;
-    if(u.sign)   u.sign.emissiveIntensity=(0.25+e*1.25)*BLDG_GLOW;  // 看板は薄暮から
+    const sf=sleepFactor(u, h);                     // 住宅は深夜に一軒ずつ消える
+    if(u.facade) u.facade.emissiveIntensity=e*sf*NIGHT_LIT*BLDG_GLOW;
+    if(u.sign)   u.sign.emissiveIntensity=(0.25+e*1.25)*sf*BLDG_GLOW;  // 看板は薄暮から
   }
 }
 
@@ -4671,9 +4808,16 @@ function addStructMesh(S, st){
   if(st.state==='open' && Array.isArray(mesh.material) && mesh.material.length===GROUP_ORDER.length){
     const facade=mesh.material[0], sign=mesh.material[GROUP_ORDER.indexOf('sign')];
     const hash=((st.r*73856093) ^ (st.c*19349663)) >>> 0;
+    // 住宅は夜通し点けっぱなしにしない。**家ごとに就寝/起床の時刻を振る**ので、
+    // 深夜にかけて窓が一軒ずつ消え、明け方にまた点く = 画で時間の流れが分かる。
+    // 店 (home 以外) は営業の明かりなのでこれまで通り朝まで点ける。
+    const home=HOME_IDX.includes(st.typeIdx);
     mesh.userData.lit={ facade: facade.emissiveMap?facade:null,
                         sign:   sign.emissive?sign:null,
-                        phase:((((hash>>16)&255)/255)-0.5)*0.12 };
+                        phase:((((hash>>16)&255)/255)-0.5)*0.12,
+                        home,
+                        sleep: 21.5 + (((hash>>>8)&255)/255)*3.2,   // 21:30〜24:42
+                        wake:  5.2  + (((hash>>>3)&31)/31)*1.6 };   // 5:12〜6:48
     litStructs.add(mesh);
   }
   S.add(mesh);
@@ -5623,6 +5767,19 @@ const WIRE_SAG  = envNum('WIRE_SAG', 0.28);     // たるみ (支間に対する
 const WIRE_MAX  = envNum('WIRE_SPAN', CELL*LAMP_STEP*1.45);
 const WIRE_SEG  = 6;                            // 1 本を何分割して曲げるか
 
+// 街灯 a と b のあいだが最後まで道か。a.r===b.r か a.c===b.c のときだけ呼ぶ。
+function spanOverRoad(a, b){
+  const dr=Math.sign(b.r-a.r), dc=Math.sign(b.c-a.c);
+  let r=a.r, c=a.c;
+  for(let n=0; n<64; n++){
+    if(r<0||r>=GRID||c<0||c>=GRID) return false;
+    if(MAP[r][c]!==ROAD) return false;
+    if(r===b.r && c===b.c) return true;
+    r+=dr; c+=dc;
+  }
+  return false;
+}
+
 function buildWires(S, poles){
   if(!WIRE_ON || !poles || poles.length<2) return;
   const L=S.userData.lamps;
@@ -5640,6 +5797,12 @@ function buildWires(S, poles){
       if(len<0.1 || len>WIRE_MAX) continue;
       // 道の同じ側に立っている街灯どうしだけ。反対側の縁と結ぶと道路を横断する。
       if(a.dr!==b.dr || a.dc!==b.dc) continue;
+      // ★ 支間の下が最後まで道であること。
+      //   同じ行/列で近いというだけで結んでいたので、間に建物が挟まっていても
+      //   お構いなしに張られ、電線が壁を突き抜けていた (支間は最大 4.3 セルある
+      //   ので、間に 3 軒挟まることもある)。電線は道に沿って張るものなので、
+      //   間のセルが 1 つでも道でなければ張らない。これで建物も敷地も跨がない。
+      if(!spanOverRoad(a, b)) continue;
       const px=-dy/len, py=dx/len;               // 支間に直交する向き
       for(let k=0;k<hs.length;k++){
         const o=off[k];
@@ -5675,6 +5838,65 @@ function stepLamps(S, d){
     L.pool.visible = LAMP_GLOW>0 && e>0.02;
     L.pool.material.opacity = e*0.85*LAMP_GLOW;
   }
+}
+
+// ── 店明かりの路面への漏れ ──────────────────────────────────────────────────
+// 窓が光っても地面が暗いままだと、夜の通りが平板に見える。営業中の店の足元に
+// 暖色の光だまりを置く。街灯の光の輪と同じ作りで、**1 メッシュ = 1 ドローコール**。
+//   ★ 住宅には出さない。店の明かりだけが通りへ漏れる、という区別が付くように。
+//   ★ 街灯 (LAMP_POOL) より小さく暖かい色にして、光源の違いが分かるようにする。
+const SHOP_GLOW = envNum('SHOP_GLOW', 1.0);        // 0 で無効
+const SHOP_GLOW_R = envNum('SHOP_GLOW_R', CELL*0.62);
+let _shopGlowStamp=-1;
+
+function rebuildShopGlow(S){
+  const L=S.userData.lamps||(S.userData.lamps={});
+  if(L.shop){ S.remove(L.shop); L.shop.geometry.dispose(); L.shop.material.dispose(); L.shop=null; }
+  if(!CITY || SHOP_GLOW<=0) return;
+  const isRoad=(r,c)=> r>=0&&r<GRID&&c>=0&&c<GRID&&MAP[r][c]===ROAD;
+  const qp=[], quv=[];
+  for(const st of CITY.structs){
+    if(st.state!=='open') continue;
+    if(HOME_IDX.includes(st.typeIdx)) continue;     // 住宅の窓は通りを照らさない
+    // 敷地の周囲から道に面している向きを探す。見つからなければ光だまりは置かない
+    // (裏地の店の明かりが道に漏れるのはおかしい)。
+    let dr=0, dc=0, found=false;
+    for(let k=0;k<st.fp && !found;k++){
+      const probes=[[-1,k,-1,0],[st.fp,k,1,0],[k,-1,0,-1],[k,st.fp,0,1]];
+      for(const [a,b,ur,uc] of probes)
+        if(isRoad(st.r+a, st.c+b)){ dr=ur; dc=uc; found=true; break; }
+    }
+    if(!found) continue;
+    const cx=(st.c+st.fp*0.5)*CELL + dc*CELL*(st.fp*0.5+0.10);
+    const cy=(st.r+st.fp*0.5)*CELL + dr*CELL*(st.fp*0.5+0.10);
+    const R=SHOP_GLOW_R, z=0.025;                   // 街灯の輪 (0.02) の少し上
+    qp.push(cx-R,cy-R,z, cx+R,cy-R,z, cx+R,cy+R,z,
+            cx-R,cy-R,z, cx+R,cy+R,z, cx-R,cy+R,z);
+    quv.push(0,0, 1,0, 1,1,  0,0, 1,1, 0,1);
+  }
+  if(!qp.length) return;
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(qp),3));
+  g.setAttribute('uv',       new THREE.BufferAttribute(new Float32Array(quv),2));
+  L.shop=new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+    map:lampPoolTexture(), color:0xffb060, transparent:true, opacity:0,
+    depthWrite:false, blending:THREE.AdditiveBlending, fog:false }));
+  L.shop.visible=false;
+  L.shop.renderOrder=1;
+  S.add(L.shop);
+}
+
+// 街灯と同じ夜の曲線で明るさを上下させる。店が建つ/閉まると作り直す
+// (cityStamp は syncCity が上げるので、開店・閉店・取り壊しを全部拾える)。
+function stepShopGlow(S, d){
+  if(SHOP_GLOW<=0 || !S) return;
+  if(_shopGlowStamp!==cityStamp){ _shopGlowStamp=cityStamp; rebuildShopGlow(S); }
+  const L=S.userData.lamps;
+  if(!L || !L.shop) return;
+  const t=Math.max(0, Math.min(1, (0.55-d)/0.40));
+  const e=t*t*(3-2*t);
+  L.shop.visible = e>0.02;
+  L.shop.material.opacity = e*0.55*SHOP_GLOW;
 }
 
 // ── 信号機 ──────────────────────────────────────────────────────────────────
@@ -7371,6 +7593,24 @@ const MOVEOUT_MIN_POP = Math.max(2, envNum('MOVEOUT_MIN_POP', 6));  // ここま
 //     出して知らせる。MOVEOUT_VIEWER=0 にすると完全に対象外にできる。
 const MOVEOUT_VIEWER = envNum('MOVEOUT_VIEWER', 0.25);
 // 転入の引き。働き口が無い街への転入をどこまで絞るか / 不穏度がこの値で転入ゼロ
+// ── 人口の振れ幅 ──────────────────────────────────────────────────────────
+// 「少ないときと多いときの差が出ない」への対処。効かせる場所は 2 つだけ:
+//   ・転入は景気に**非線形**で反応させる (好況は一気に、不況はほぼ止まる)
+//   ・不況では困っていない住民も出ていく (上の shrinkPopulation)
+// 人口の上限そのもの (住居の定員) は触らない。あれは街の育ち方を決める骨格で、
+// ここを緩めると「家が建つ → 人が来る」の因果が壊れる。
+//
+// 既定値は当てずっぽうではなく、周期を通した増減率を計算して決めてある
+// (tools/pop-curve.js)。最初に置いた 2.6 / 0.09 では**どん底でも +2.1%/日**で
+// 一度も減らず、「増えて頭打ち」のままだった。3.0 / 0.22 で -2.8% 〜 +10%/日 になる。
+const MOVEIN_BOOM_P   = Math.max(1, envNum('MOVEIN_BOOM_P', 3.0));   // 景気への感度 (指数)
+const MOVEOUT_BOOM    = Math.max(0, envNum('MOVEOUT_BOOM', 0.22));   // どん底の日に出ていく割合
+const MOVEOUT_BUST_AT = Math.max(0.01, envNum('MOVEOUT_BUST_AT', 0.95)); // これを下回ると不況
+// 1日の転入/転出の上限。人口に比例させないと、街が大きくなるほど**相対的な
+// 揺れが小さくなって**平らに見える (人口300で上限8人/日 = 2.7%)。
+const MOVE_MAX_FRAC   = Math.max(0, envNum('MOVE_MAX_FRAC', 0.10));
+const moveInMaxNow  = () => Math.max(MOVEIN_MAX,  Math.ceil(agents.length*MOVE_MAX_FRAC));
+const moveOutMaxNow = () => Math.max(MOVEOUT_MAX, Math.ceil(agents.length*MOVE_MAX_FRAC));
 const MOVEIN_NOJOB  = Math.max(0, Math.min(1, envNum('MOVEIN_NOJOB', 0.25)));
 const MOVEIN_UNREST = Math.max(0.01, envNum('MOVEIN_UNREST', 0.10));
 function moveOutScore(a){
@@ -7393,12 +7633,35 @@ function shrinkPopulation(day){
     const sc=moveOutScore(agents[i]);
     if(sc>0) cand.push({i, sc, a:agents[i]});
   }
+  // ★ **不況では、困っていない住民も街を出る。**
+  //   これが無いと人口は「住居の定員まで埋まって、あとは動かない」になる。
+  //   転出の条件が「6日以上の無職 / 追い詰められた / 家が無い」だけなので、
+  //   ふつうに暮らしている街では候補が 0 になり、景気の波が人口に出てこない
+  //   (実測: 人口31 で定員44、好況が続いても転出は毎日0)。
+  //   仕事があっても不況の街からは人が離れる、という当たり前の流れを足す。
+  const bf=boomFactor(day);
+  const bust=Math.max(0, Math.min(1, (MOVEOUT_BUST_AT-bf)/Math.max(0.01,MOVEOUT_BUST_AT)));
+  let quota=Math.round(agents.length*MOVEOUT_BOOM*bust);
+  if(quota>cand.length){
+    // 出ていってもらう順: 店主は残す (店が消えると街が壊れる)。
+    // それ以外は「街とのつながりが薄い人」から。友達の数を薄さの目安に使う。
+    const extra=[];
+    const inCand=new Set(cand.map(x=>x.i));
+    for(let i=0;i<agents.length;i++){
+      const a=agents[i];
+      if(inCand.has(i) || a.owns || a.jail>0) continue;
+      const ties=(SOCIAL_ON && a.rel) ? Object.keys(a.rel).length : 0;
+      extra.push({i, sc:0.01+1/(1+ties), a});      // つながりが薄いほど高い
+    }
+    extra.sort((x,y)=>y.sc-x.sc);
+    for(const e of extra){ if(cand.length>=quota) break; cand.push(e); }
+  }
   if(!cand.length) return 0;
   // 治安が悪い日は出ていく人が増える (荒れた街から人が去る)
   const u=(CITY.unrest||0);
   const boost=1 + MOVEOUT_UNREST*Math.min(1, u/0.12);
-  const n=Math.min(cand.length, MOVEOUT_MAX, agents.length-MOVEOUT_MIN_POP,
-                   Math.max(1, Math.round(cand.length*0.5*boost)));
+  const n=Math.min(cand.length, moveOutMaxNow(), agents.length-MOVEOUT_MIN_POP,
+                   Math.max(1, Math.round(Math.max(cand.length*0.5, quota)*boost)));
   cand.sort((x,y)=>y.sc-x.sc);
   // index の大きい順に抜く (swap-remove で前の要素がずれないように)
   const pick=cand.slice(0,n).sort((x,y)=>y.i-x.i);
@@ -7442,10 +7705,13 @@ function growPopulation(day){
   const jobSlack=workplaceCapacity()-workers;                    // 余っている働き口
   const jobF=jobSlack<=0 ? MOVEIN_NOJOB : 1;
   const unrestF=Math.max(0, 1 - (CITY.unrest||0)/MOVEIN_UNREST);
-  const attract=Math.max(0, bf*jobF*unrestF);
+  // 景気には**非線形**に反応させる。線形 (bf そのまま) だと 0.65〜1.35 倍にしか
+  // ならず、上限 8人/日 に頭打ちされて差が画に出ない。指数を掛けると
+  // 好況 1.33^2.6 = 2.0倍 / 不況 0.67^2.6 = 0.24倍 になり、増える年と減る年ができる。
+  const attract=Math.max(0, Math.pow(bf, MOVEIN_BOOM_P)*jobF*unrestF);
   const want=Math.ceil(agents.length*POP_GROWTH*attract);
   if(want<=0) return 0;
-  const n=Math.max(1, Math.min(room, MOVEIN_MAX, want));
+  const n=Math.max(1, Math.min(room, moveInMaxNow(), want));
   const base=agents.length;
   const moved=[];
   for(let k=0;k<n;k++){
@@ -9487,7 +9753,7 @@ function settleAgent(a){
 function initAgents(S){
   // 既存エージェント/トレイルのメッシュを scene から外し GPU リソースを解放
   // 住民は InstancedMesh 1本で描いているので、個別に解放するものは無い
-  if(AgentInst.body) AgentInst.body.count=AgentInst.parts.count=0;
+  if(AgentInst.mesh) AgentInst.mesh.count=0;
   for(const a of agents){ a.needIcon=null; a.talkIcon=null; }   // 古いシーンの板を掴んだままにしない
   clearTrails();
   agents=[];agentMeshes=[];
@@ -12046,8 +12312,14 @@ function pickCameraTarget() {
     // 俯瞰中、または追跡中の対象がしばらく停止していて、他に動いてる人が居れば早めに切替。
     // **対象が建物に入った時点でも切り替える** — 入るところまでは映るが、その後
     // 20 秒も壁を映し続けない。
-    const curStalled = !cur || cur.stall >= CAM_STALL_SWITCH || MW.isIndoors(cur);
-    if (!(timeUp || (curStalled && pool0.length > 0))) return;
+    // 早め切替の判定。**切り替えた直後は粘る** (held のあいだは我慢する)。
+    //   ・俯瞰中 (cur が無い) は粘らない。動く人が居ればすぐ拾う
+    //   ・建物に入られたときだけ、短いほうの持ち時間で諦める
+    const since = now - camSwitchTimer;
+    const indoors = !!cur && MW.isIndoors(cur);
+    const held = cur && since < (indoors ? CAM_INDOOR_HOLD_MS : CAM_MIN_HOLD_MS);
+    const curStalled = !cur || cur.stall >= CAM_STALL_SWITCH || indoors;
+    if (!(timeUp || (!held && curStalled && pool0.length > 0))) return;
 
     if (pool0.length > 0) {
       // できれば今と違う人を選ぶ (同じ人ばかり映さない)
@@ -12684,6 +12956,20 @@ tick(); setInterval(tick, ${ms});
         video:YTC.video||null, channel:YTC.channel||null, chatId:YTC.chatId||null,
         autoFind:YTC.autoFind, mode:YTC.mode,
         searchCallsToday:YTC._searchCalls, unitsToday:YTC.units,
+        // ★ **そもそもチャットが届いているか**。返信が0件のとき、投稿に失敗したのか
+        //   入力が来ていないのかをここで切り分ける (以前は区別できなかった)。
+        //   クォータ切れで取り込みが止まっていると、当然コマンドも返信も0になる。
+        ingest:{
+          received:YTC.seen, commands:YTC.cmds, polls:YTC.polls, pushes:YTC.pushes,
+          lastMessageSecAgo: YTC.lastMsgAt ? Math.round((Date.now()-YTC.lastMsgAt)/1000) : null,
+          pausedSec: (YTC.pausedUntil && Date.now()<YTC.pausedUntil)
+                       ? Math.round((YTC.pausedUntil-Date.now())/1000) : 0,
+          recent: chatSeen.slice(-5).reverse().map(c=>({by:c.by, text:c.text,
+                    secAgo:Math.round((Date.now()-c.t)/1000)})),
+          hint: YTC.seen ? null
+              : (YTC.pausedUntil && Date.now()<YTC.pausedUntil)
+                ? 'クォータ切れで取り込みを止めています (復帰するまで命令も返信も動きません)'
+                : 'まだ1件も受け取っていません。チャットに何か書いてから見てください'},
         reply:{mode:YTC.reply||'off', sentToday:YTC.repliesDay, sentTotal:YTC.replies,
                maxPerDay:YTC.replyMaxDay, minSec:YTC.replyMinSec,
                errors:YTC.replyErrors, last:YTC.lastReply, lastError:YTC.replyError,
@@ -12874,6 +13160,7 @@ tick(); setInterval(tick, ${ms});
         boom:+boomFactor(gameDay()).toFixed(3), boomState:boomLabel(gameDay()),
         cars:{now:cars.length, max:carMaxNow(), maxDay:CAR_MAX,
           gateways:_carGw?_carGw.length:0, deadEnds:_carEnd?_carEnd.length:0,
+          fallbackSpots:_carAny?_carAny.length:0, stuckRemoved:_carStuck,
           // 1台ずつの様子。止まっているのか走っているのかは速度を見ないと分からない。
           list:cars.slice(0,12).map(c=>({x:+c.x.toFixed(2), y:+c.y.toFixed(2),
             v:+c.v.toFixed(2), idx:c.idx, len:c.line.length,
@@ -13153,7 +13440,7 @@ let frameCount=0, encoding=false, _groundAt=0;
 // 描画のどこに時間が消えているかの計測 (PERF_LOG=1 で有効)。
 //   フィールドが広がると重くなる、という話を数字で切り分けるため。
 const PERF_LOG = process.env.PERF_LOG === '1';
-const _perf = {agents:0, fade:0, render:0, pixels:0, jpeg:0, n:0, sim:0, simN:0};
+const _perf = {agents:0, fade:0, render:0, pixels:0, jpeg:0, n:0, sim:0, simN:0, wallFix:0};
 const _gl   = {calls:0, tris:0};   // 3D パスの描画呼び出し数 / 三角数 (10秒ぶんの累計→平均)
 function perfReport(){
   if(!_perf.n) return;
@@ -13170,13 +13457,15 @@ function perfReport(){
     ? ` 歩行${walking}/${agentMeshes.length}(平均振幅${(ampSum/agentMeshes.length).toFixed(2)})` : '';
   const p=k=>(_perf[k]/_perf.n).toFixed(1);
   const sim=_perf.simN ? ` | 1tick平均: シム${(_perf.sim/_perf.simN).toFixed(1)}ms (TICK=${TICK}ms)` : '';
+  // 住民の描画位置が建物へめり込むのを直した回数 (0 なら角のショートカットは起きていない)
+  const wf=_perf.wallFix ? ` | 壁めり込み補正 ${_perf.wallFix}回/${_perf.n}フレーム` : '';
   console.log(`[Perf] 1フレーム平均: agent更新${p('agents')}ms フェード${p('fade')}ms `
     + `描画${p('render')}ms 読出${p('pixels')}ms JPEG${p('jpeg')}ms `
     + `| 描画呼${Math.round(_gl.calls/_perf.n)} 三角${(_gl.tris/_perf.n/1000).toFixed(0)}k `
     + `メッシュ${meshes} テクスチャ実体${tex.size} 住民${_drawnAgents}/${agents.length}描画 `
     + `建物${CITY?CITY.structs.length:0} フィールド${fieldSize()}/${GRID}` + walkStat
     + (_navN ? ` | 経路探索${_navN}回 計${_navMs.toFixed(0)}ms (1回${(_navMs/_navN).toFixed(2)}ms`
-             + ` 走査${Math.round(_navPop/_navN).toLocaleString()})` : '') + sim);
+             + ` 走査${Math.round(_navPop/_navN).toLocaleString()})` : '') + sim + wf);
   _navMs=0; _navN=0; _navPop=0;
   for(const k in _perf) _perf[k]=0;
   _gl.calls=0; _gl.tris=0;
@@ -13200,6 +13489,18 @@ async function renderLoop(){
       const px=m.position.x, py=m.position.y;
       m.position.x+=(tx-px)*Math.min(1,dt*14);
       m.position.y+=(ty-py)*Math.min(1,dt*14);
+      // ★ 補間で建物を突き抜けさせない。
+      //   シミュレーション側は建物セルへ**絶対に入らない** (stepAll が
+      //   PASSABLE で弾いている)。それでも住民が壁を通り抜けて見えたのは、
+      //   描画位置が実位置を**直線で追いかける**平滑化だから。角を曲がる住民は
+      //   曲がり角の内側 = 建物の角をショートカットする。1 セル 7.7m なので、
+      //   0.3 セルぶんの近道でも数メートル壁にめり込んで見える。
+      //   建物セルに入ってしまったフレームは補間をあきらめて実位置に置く。
+      //   (見た目は 1 フレーム飛ぶが、壁を通るよりはるかに目立たない)
+      if(inBuildingWorld(m.position.x, m.position.y)){
+        m.position.x=tx; m.position.y=ty;
+        if(PERF_LOG) _perf.wallFix++;         // 何回めり込みを直したか (効いているかの確認)
+      }
       m.position.z=CELL*.26*CHAR_SCALE;   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
       // 体は **実際に進んでいる向き** へ向ける。
       //
