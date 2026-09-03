@@ -294,6 +294,8 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/9;   // 軌跡マー�
 const MW = require('./world.js');
 // 住民どうしの関係と立ち話。街の物理/経済と混ざると読めなくなるので別ファイル。
 const SOC = require('./social.js');
+const PT  = require('./pastime.js');   // 暇な時間の娯楽 (建物も小物も増やさない)
+const EV  = require('./events.js');    // 良いこと・悪いこと (病気の発症もここに一本化)
 // GLB (glTF) から静的なジオメトリだけ読む最小の読み取り。
 // three の GLTFLoader は ESM で CommonJS から require できないため自前で持つ。
 const GLB = require('./glb.js');
@@ -3663,7 +3665,10 @@ const SLEEP_RECOVER = 0.55;        // 自宅に着いたときの疲労回復量
 const NEED_HI       = envNum('NEED_HI', 0.62);
 const SUPPLY_RATE   = 1/(16*60);   // 日用品の消費 (買い物欲)
 const BORED_RATE    = 1/(11*60);   // 退屈の蓄積 (人と会う/娯楽で解消)
-const SICK_PROB     = 1/(60*90);   // 1秒あたりの発症確率 (平均90分に1回)
+// 発症そのものは events.js (風邪/腹痛/怪我) が担う。この定数は**移行前の基準値**
+// として残してある — tools/event-report.js がこの値と突き合わせて、重みを変えても
+// 発症率がズレていないか検算する。ここを動かすなら検算も一緒に見ること。
+const SICK_PROB     = 1/(60*90);   // 移行前の発症率 (平均90分に1回)
 const SICK_HEAL     = 1/(4*60);    // 病院/薬局での回復速度
 const BUY_RECOVER   = 0.85;        // 店に着いたときの補充量
 const FUN_RECOVER   = 0.5;         // 娯楽施設での退屈解消
@@ -6748,9 +6753,11 @@ function stepNeeds(dtSec){
     if(!alone && CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec)
       gossip(a, _nearBuf[0]);      // すれ違いざまに「行きつけ」の話をする (低確率)
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
-    // 病気: 低確率で発症。疲労が高いほどかかりやすい (内部状態同士の因果)
-    if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
-      a.sick = 0.6 + Math.random()*0.4;
+    // 病気の発症は events.js へ移した。ここに書いてあったころは**何の説明も無く**
+    // 体調が悪くなるので、視聴者には「急に病院へ歩き出した人」にしか見えなかった。
+    // いまは「風邪をひいた / お腹を壊した / 転んで怪我をした」という出来事として
+    // 出る。発症率 (平均90分・疲労で最大2倍) は据え置き — tools/event-report.js
+    // が元の SICK_PROB と突き合わせて検算する。
 
     // 屋内なら「その建物の中に居る」ので、自分のセルではなく屋内の建物で判定する。
     const r=Math.floor(a.x), c=Math.floor(a.y);
@@ -6795,6 +6802,148 @@ function stepNeeds(dtSec){
   }
 }
 
+
+// ═══ 暇な時間の娯楽 ═════════════════════════════════════════════════════════
+// needOf() が null を返す時間 = 用事が何も無い住民。街の中でいちばん多い状態なのに、
+// これまでは**ただ徘徊するだけ**で、画としては全員が歩き続けているだけだった。
+// pastime.js の一覧から 1 つ選んで、しばらくその場で過ごさせる。
+//   ★ 建物も小物も増やさない。表現は「立ち止まる」「会話ログの一言」
+//     「住民一覧の説明文」「たまにニュース」の 4 つだけで足りる。
+//   ★ 立ち話 (a.talk) と同じ仕組みで止める。歩かない娯楽の間は stall を 0 に
+//     保つので、カメラが「動いていない」と判断して離れていかない
+//     (読書している人を映し続けられる = 配信としてはむしろ見どころになる)。
+const PASTIME_ON     = process.env.PASTIME !== '0';
+const PASTIME_P      = envNum('PASTIME_P', 0.05);      // 暇な1秒あたりに始める確率
+const PASTIME_TALK_P = envNum('PASTIME_TALK_P', 0.30); // 始めたとき会話ログに出す確率
+const PASTIME_NEWS_SEC = envNum('PASTIME_NEWS_SEC', 90); // ニュースに出す最短間隔
+const PASTIME_MATE_R = envNum('PASTIME_MATE_R', 2);    // 一緒に遊ぶ相手を探す半径 (セル)
+let _ptNewsAt = 0;
+const _ptBuf = [];
+
+const ptActive = a => !!(a.pastime && a.pastime.until > Date.now());
+
+// いま暇か。**用事があるうちは遊ばせない** (needOf の優先順位を壊さないため)。
+function ptIdle(a){
+  if(a.jail>0 || a.deliv || a.talk) return false;
+  return needOf(a) === null;
+}
+
+function startPastime(a, A, mates){
+  const now=Date.now();
+  a.pastime={ id:A.id, until: now + PT.duration(A)*1000, walk:!!A.walk,
+              mates: mates.map(m=>m.aid) };
+  for(const m of mates)
+    m.pastime={ id:A.id, until:a.pastime.until, walk:!!A.walk, mates:[a.aid] };
+  // 会話ログ。全部出すと流れが速すぎるので確率で間引く。
+  if(Math.random() < PASTIME_TALK_P){
+    const t=PT.line(A, JA_HUD);
+    if(t) pushTalkLine(a.name, t);
+  }
+  // ニュースはごくたまに。街の出来事に埋もれない程度の頻度に抑える。
+  if(CITY_EVOLVE && now-_ptNewsAt > PASTIME_NEWS_SEC*1000){
+    _ptNewsAt=now;
+    const who = mates.length ? `${a.name} と ${mates[0].name}` : a.name;
+    const whoEn = mates.length ? `${a.name} and ${mates[0].name}` : a.name;
+    news('life', `${A.icon} ${who} が ${PT.doing(A, true)}`,
+                 `${whoEn} ${PT.doingN(A, false, mates.length+1)}`);
+  }
+}
+
+function stepPastime(dtSec){
+  if(!PASTIME_ON) return;
+  const now=Date.now(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
+  for(const a of agents){
+    // 終わった娯楽を片づけて、退屈を晴らす
+    if(a.pastime && a.pastime.until<=now){
+      const A=PT.byId[a.pastime.id];
+      if(A){
+        a.bored=Math.max(0, (a.bored||0) - A.bored);
+        // 誰かと過ごした時間は孤独にも効く (社交の代わりになる)
+        if(A.social) a.bored=Math.max(0, a.bored - A.social*0.3);
+      }
+      a.pastime=null;
+    }
+    if(ptActive(a) || !ptIdle(a)) continue;
+    if(Math.random() >= PASTIME_P*dtSec) continue;
+
+    const r=Math.floor(a.x), c=Math.floor(a.y);
+    const indoors=MW.isIndoors(a);
+    const atHome = !!a.home && (indoors
+      ? (a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1])
+      : (Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1));
+    // 一緒に遊べる相手 = 近くに居て、同じく暇で、まだ何も始めていない人
+    _ptBuf.length=0;
+    SOC.neighbors(SOC_STATE, a, _ptBuf, 4);
+    const mates=_ptBuf.filter(b=>b!==a && !ptActive(b) && ptIdle(b)
+      && Math.abs(b.x-a.x)<=PASTIME_MATE_R && Math.abs(b.y-a.y)<=PASTIME_MATE_R
+      && MW.isIndoors(b)===indoors);
+
+    const A=PT.pick({hour:h, raining, indoors, atHome, mates:mates.length});
+    if(!A) continue;
+    startPastime(a, A, A.group>1 ? mates.slice(0, A.group-1) : []);
+  }
+}
+
+
+// ═══ 良いこと・悪いこと ═════════════════════════════════════════════════════
+// 住民の内部状態は時間で溜まって店で解消される、という規則的な動きしかしていな
+// かった。外から不規則な揺さぶりを入れて、同じ生活の中に良い日と悪い日を作る。
+//   ★ 病気の発症もここに一本化してある (events.js の注記を参照)。
+//   ★ ニュースは流しすぎない。住民が増えるほど件数は比例して増えるので、
+//     小さな出来事は最短間隔で間引く。大きな出来事 (財布・詐欺・怪我・昇給・
+//     臨時収入) だけは必ず出す。
+const EVENT_ON       = process.env.EVENTS !== '0';
+const EVENT_MEAN_MIN = envNum('EVENT_MEAN_MIN', 25);   // 1人あたり平均何分に1回
+const EVENT_NEWS_SEC = envNum('EVENT_NEWS_SEC', 12);   // 小さな出来事の最短間隔
+const EVENT_BIG_SEC  = envNum('EVENT_BIG_SEC', 4);     // 大きな出来事の最短間隔
+let _evNewsAt=0, _evBigAt=0;
+const _evStat={};                                      // 何が何回起きたか (診断)
+const _evBuf=[];
+
+function applyEventFx(a, E){
+  const f=E.fx||{}, cl=v=>Math.max(0, Math.min(1, v));
+  if(f.cash)     a.cash    = Math.max(0, (a.cash||0)*(1+f.cash));
+  if(f.cashFlat) a.cash    = Math.max(0, (a.cash||0)+f.cashFlat);
+  if(f.sick)     a.sick    = f.sick[0] + Math.random()*(f.sick[1]-f.sick[0]);
+  if(f.sickAdd)  a.sick    = Math.max(0, (a.sick||0)+f.sickAdd);
+  if(f.fatigue)  a.fatigue = cl((a.fatigue||0)+f.fatigue);
+  if(f.hunger)   a.hunger  = cl((a.hunger ||0)+f.hunger);
+  if(f.supply)   a.supply  = cl((a.supply ||0)+f.supply);
+  if(f.bored)    a.bored   = cl((a.bored  ||0)+f.bored);
+  if(f.desper)   a.desper  = cl((a.desper ||0)+f.desper);
+}
+
+function stepEvents(dtSec){
+  if(!EVENT_ON || !agents.length) return;
+  const p = dtSec/(EVENT_MEAN_MIN*60);       // 1人あたりの発生確率
+  const now=Date.now(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
+  for(const a of agents){
+    if(a.jail>0) continue;                   // 収監中は街の出来事の外
+    if(Math.random() >= p) continue;
+    _evBuf.length=0;
+    SOC.neighbors(SOC_STATE, a, _evBuf, 2);
+    const E=EV.pick({
+      job:    !!(a.work || a.owns),          // 学生は「昇給」しない
+      home:   !!a.home,
+      indoors: MW.isIndoors(a),
+      sick:   (a.sick||0) > 0,
+      mate:   _evBuf.some(b=>b!==a),
+      cash:   (a.cash||0) >= 10,
+      raining, hour:h, fatigue:a.fatigue||0,
+    });
+    if(!E) continue;
+    applyEventFx(a, E);
+    _evStat[E.id]=(_evStat[E.id]||0)+1;
+    // 見出しに出すか。大きな出来事は必ず、小さな出来事は間引く。
+    const gap = E.news ? EVENT_BIG_SEC*1000 : EVENT_NEWS_SEC*1000;
+    const last = E.news ? _evBigAt : _evNewsAt;
+    if(now-last < gap) continue;
+    if(E.news) _evBigAt=now; else _evNewsAt=now;
+    news(E.good?'good':'bad', `${E.icon} ${a.name} が ${E.ja}`,
+         `${a.name} ${E.en}`);
+  }
+}
+
 // 屋内から出るべきか。needOf() が示す用事と、いま居る建物が合っているかで決める。
 //   自宅で寝ている間は sleep が解消するまで出ない。飲食店で食べ終えたら出る。
 //   用事が無い (need=null) なら出て徘徊する。
@@ -6803,6 +6952,8 @@ function shouldLeaveBuilding(a){
   const [br,bc]=a.indoors;
   const t=BUILDING_TYPES[br+'_'+bc];
   const n=needOf(a);
+  // 家で本を読んでいる/ゲームをしている最中に追い出さない
+  if(ptActive(a) && PT.byId[a.pastime.id] && PT.byId[a.pastime.id].where==='home') return false;
   if(n===null) return true;                                   // 用事なし → 外へ
   if(n==='sleep') return a.home ? !(br===a.home[0] && bc===a.home[1])
                                 : !HOME_IDX.includes(t);   // 家なしは住居なら留まる
@@ -6855,6 +7006,15 @@ function nonWorkNeed(a, h){
 // いま何をしているか (住民一覧ページ用)。既に到着済みなら「〜している」、移動中なら「〜へ向かっている」。
 //   建物到着時の欲求回復 (stepNeeds) と同じ判定基準 (現在地/隣接の建物カテゴリ) を使う。
 function describeActivity(a){
+  // 娯楽はいちばん手前で見せる。needOf は null なので、下の判定に任せると
+  // 「ぶらぶらしている」に潰れてしまい、何をしているのか分からなくなる。
+  if(ptActive(a)){
+    const A=PT.byId[a.pastime.id];
+    if(A){
+      const n=(a.pastime.mates||[]).length;
+      return `${A.icon} ${PT.doing(A, true)}${n ? ` (${n}人と)` : ''}`;
+    }
+  }
   const r=Math.floor(a.x), c=Math.floor(a.y);
   const t=BUILDING_TYPES[r+'_'+c];
   const near=(idxList)=>{
@@ -9121,6 +9281,7 @@ const CRIME_CAM_P         = envNum('CRIME_CAM_P', 0.5);
 // 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
 function onArrive(a, dest){
   a.trips++;
+  cameraOnArrive(a, dest);   // 追跡中なら「着いた」を出して、ひと呼吸おいて次へ
   if(!CITY_EVOLVE || !CITY || !dest) return;
   const st=structAt(dest[0], dest[1]);
   if(!st) return;
@@ -9998,6 +10159,9 @@ async function stepAll(){
     // 立ち話の間は足を止めて相手を向く。歩行シェーダの振幅は「実際に進んだ距離」で
     // 決まるので、止めるだけで脚も自動的に止まる。
     if(a.talk && a.talk.until>Date.now()){ a.th=a.talk.th; a.stall=0; continue; }
+    // 娯楽の最中は歩かない (散歩など walk:true のものは歩かせたままにする)。
+    // stall を 0 に保つのは立ち話と同じ理由 — 追跡カメラに見捨てられないため。
+    if(ptActive(a) && !a.pastime.walk){ a.stall=0; continue; }
     // ── 屋内は物理と方策の外 ──
     // 建物セルは通行不可なので、屋内エージェントに推論や移動を適用すると
     // 「壁の中で前進が常に失敗する」状態になる。欲求だけ進めて、外出条件が
@@ -10522,8 +10686,8 @@ const CAM_SHAKE = envNum('CAM_SHAKE', 0.004);
 //   ・建物の陰に入ったら、建物の無い側へ回り込む
 // 次のターゲットを探す範囲 (セル)。この中に居る人へ渡すときはカメラを切らない。
 const CAM_NEXT_R     = envNum('CAM_NEXT_R', 6);
-const CAM_ORBIT_DIST = envNum('CAM_ORBIT_DIST', 2.2);   // 被写体までの水平距離 (ワールド単位)
-const CAM_ORBIT_HIGH = envNum('CAM_ORBIT_HIGH', 1.5);   // 通常の高さ (見下ろし 34 度)
+const CAM_ORBIT_DIST = envNum('CAM_ORBIT_DIST', 3.0);   // 被写体までの水平距離 (ワールド単位)
+const CAM_ORBIT_HIGH = envNum('CAM_ORBIT_HIGH', 2.05);  // 通常の高さ (見下ろし 34 度)
 // どの方位からも見えないときに逃げる高さ。建物のいちばん高いもの (6.6) より上。
 const CAM_ORBIT_LIFT = envNum('CAM_ORBIT_LIFT', 7.4);
 const CAM_ORBIT_SLEW = envNum('CAM_ORBIT_SLEW', 0.55);  // 方位の最大回転速度 (rad/秒)
@@ -11046,6 +11210,7 @@ function holdCamera(){
   if(Date.now()>=camHold.until || (camHold.idx>=0 && !agents[camHold.idx])){ camHold=null; return false; }
   camTargetIdx = camHold.idx<0 ? 0 : camHold.idx+1;
   camFPV=false;
+  _camTripNeed=null; _camArrivedAt=0;   // 指名中は「着くまで追う」の状態を持たない
   camSwitchTimer=Date.now();     // 指名が切れた直後に即切り替わらないように
   return true;
 }
@@ -12398,6 +12563,61 @@ function rollFPV() {
   }
 }
 
+// ── 用事が済むまで追う ──────────────────────────────────────────────────────
+// 「通勤なら着くまで、眠いなら家に帰るまで、弁当屋へ向かうなら着くまで」。
+// 目的地へ歩いている住民は途中で切らずに最後まで追い、着いたら短い一言を出して
+// から次へ渡す。**職場や学校に着いてしまえば用事は済んでいる**ので、そこからは
+// 従来どおりの間隔で切り替わる。
+const CAM_TRIP        = process.env.CAM_TRIP !== '0';
+// 保険。道に迷う / 目的地が消える等で永久に着かないことがあるので上限を置く。
+const CAM_TRIP_MAX_MS = parseInt(process.env.CAM_TRIP_MAX_MS) || 80000;
+// 到着してから切り替えるまでの間 (「着いた」を読ませる時間)
+const CAM_ARRIVE_MS   = parseInt(process.env.CAM_ARRIVE_MS)   || 3200;
+let _camArrivedAt = 0;      // 追跡中の人が着いた時刻 (0 = 着いていない)
+let _camTripNeed  = null;   // その移動の目的 (到着の一言に使う)
+
+// いま「用事のために移動している」か。
+//   ・屋内に居る = もう着いている (職場・学校・自宅) → 対象外
+//   ・needOf が null = 用事が無い散歩 → 対象外 (ここまで粘る必要は無い)
+//   ・娯楽の最中 = 目的地へ向かってはいない → 対象外
+function camOnTrip(a){
+  if(!CAM_TRIP || !a || MW.isIndoors(a)) return false;
+  if(ptActive(a) || a.rally) return false;
+  if(!a.navDest) return false;
+  return needOf(a) !== null;
+}
+
+// 到着したときに出す一言。目的と、着いた先の名前から作る。
+const ARRIVE_JA = { work:'に着いた', sleep:'に帰った', eat:'に着いた',
+                    shop:'に着いた', sick:'に着いた', bored:'に着いた' };
+const ARRIVE_EN = { work:'got to', sleep:'made it home', eat:'arrived at',
+                    shop:'arrived at', sick:'arrived at', bored:'arrived at' };
+function arriveBanner(a, dest, need){
+  const st = dest ? structAt(dest[0], dest[1]) : null;
+  const place = st ? (JA_HUD ? BLDG_TYPES[st.typeIdx].label : enOf(st.typeIdx)) : null;
+  if(JA_HUD){
+    if(need==='sleep') return `${a.name} が帰宅した`;
+    return place ? `${a.name} が ${place} ${ARRIVE_JA[need]||'に着いた'}`
+                 : `${a.name} が目的地に着いた`;
+  }
+  if(need==='sleep') return `${a.name} made it home`;
+  return place ? `${a.name} ${ARRIVE_EN[need]||'arrived at'} the ${place}`
+               : `${a.name} arrived`;
+}
+
+// 住民が目的地に着いた。**追跡中の本人のときだけ**カメラに知らせる。
+function cameraOnArrive(a, dest){
+  // 一人称ショットでも抜けないこと。ここで return すると _camArrivedAt が
+  // 立たず、上限 (CAM_TRIP_MAX_MS) まで解除されない。
+  if(!CAM_TRIP) return;
+  if(camTargetIdx<=0 || agents[camTargetIdx-1]!==a) return;
+  if(_camArrivedAt) return;                       // 二重に出さない
+  const need=_camTripNeed;
+  if(!need) return;                               // 用事の無い到着は黙って通す
+  _camArrivedAt=Date.now();
+  showBanner(arriveBanner(a, dest, need), 4);
+}
+
 // 次に映すターゲットを決める (モード別)。camTargetIdx を更新する。
 function pickCameraTarget() {
   const now = Date.now();
@@ -12427,6 +12647,19 @@ function pickCameraTarget() {
     // 早め切替の判定。**切り替えた直後は粘る** (held のあいだは我慢する)。
     //   ・俯瞰中 (cur が無い) は粘らない。動く人が居ればすぐ拾う
     //   ・建物に入られたときだけ、短いほうの持ち時間で諦める
+    // ★ 用事のために移動している人は、着くまで切らない。
+    //   途中で信号待ちのように止まっても (stall が伸びても) 粘る — 「どこへ
+    //   何をしに行ったのか」が最後まで見えることのほうが、細かく切り替えるより
+    //   配信として分かりやすい。
+    if(_camArrivedAt){
+      if(now-_camArrivedAt < CAM_ARRIVE_MS) return;   // 「着いた」を読ませる間
+      _camArrivedAt=0; _camTripNeed=null;             // ひと呼吸おいたので次へ
+    }else if(camOnTrip(cur)){
+      _camTripNeed = needOf(cur);                     // 到着の一言に使う
+      if(now - camSwitchTimer < CAM_TRIP_MAX_MS) return;
+      _camTripNeed=null;                              // 着かないまま上限 → 諦める
+    }else _camTripNeed=null;
+
     const since = now - camSwitchTimer;
     const indoors = !!cur && MW.isIndoors(cur);
     const held = cur && since < (indoors ? CAM_INDOOR_HOLD_MS : CAM_MIN_HOLD_MS);
@@ -12459,6 +12692,7 @@ function pickCameraTarget() {
       camTargetIdx = Math.floor(Math.random() * (agents.length + 1));
     }
     camSwitchTimer = now;
+    _camArrivedAt = 0; _camTripNeed = null;
     rollFPV();
   } else {
     // パターンA (既存): 俯瞰 → 各エージェントを順番に巡回
@@ -13354,6 +13588,25 @@ tick(); setInterval(tick, ${ms});
         waiting:(CITY.waiting||[]).map(w=>w.name),
         limit:Math.max(5, Math.round(NUM_AGENTS*VIEWER_MAX_FRAC)),
         favorite:(()=>{ const f=townFavorite(); return f?{name:f.name, cheers:f.cheers||0}:null; })()},
+      // 良いこと・悪いこと。何がどれだけ起きたか (病気の発症率の確認にも使う)。
+      events:(()=>{
+        const total=Object.values(_evStat).reduce((n,v)=>n+v,0);
+        const sick=EV.EVENTS.filter(e=>e.sickly).reduce((n,e)=>n+(_evStat[e.id]||0),0);
+        const good=EV.EVENTS.filter(e=>e.good).reduce((n,e)=>n+(_evStat[e.id]||0),0);
+        return {enabled:EVENT_ON, kinds:EV.EVENTS.length, meanMin:EVENT_MEAN_MIN,
+                total, good, bad:total-good, sickOnset:sick, by:_evStat};
+      })(),
+      // 暇な時間の娯楽。何種類が実際に使われているか / 偏っていないかを見る。
+      pastime:(()=>{
+        const now=Date.now(), by={};
+        let doing=0, idle=0;
+        for(const a of agents){
+          if(a.pastime && a.pastime.until>now){ doing++; by[a.pastime.id]=(by[a.pastime.id]||0)+1; }
+          else if(needOf(a)===null) idle++;
+        }
+        return {enabled:PASTIME_ON, doing, idleNotPlaying:idle, kinds:PT.ACTS.length,
+                inUse:Object.keys(by).length, by};
+      })(),
       // いま何をどう映しているか。一人称が屋内で使われていないかの確認に使う
       //   (屋内の目線は壁しか映らないので fpv=true かつ indoors=true にはならない)
       camera:(()=>{
@@ -13802,7 +14055,7 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepPolice(); stepDelivery(); retargetOnNeedChange(); }, 1000);
+  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepPastime(1); stepEvents(1); stepPolice(); stepDelivery(); retargetOnNeedChange(); }, 1000);
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
     setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子
