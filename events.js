@@ -143,6 +143,42 @@ const EVENTS = [
     fx:{hunger:-0.20, cashFlat:+3, bored:-0.12} },
 ];
 
+// ── 相手を巻き込む出来事 ────────────────────────────────────────────────────
+// ここまでの 34 件は**一人ずつ独立に**起きる。それだけだと出来事が点のままで、
+// 住民どうしが交わらない。「A が落とした財布を B が拾う」のように、**一つの
+// 出来事から二人分の話が生まれる**形を足す。
+//
+//   from … きっかけになる出来事の id
+//   pick … 相手の選び方 ('near' = 近くの誰か / 'friend' = 友人優先)
+//   then … 相手に起きること。honesty (正直さ) で分岐するものは good/bad の二択
+// 分岐の材料はすべて既にある (economy.js の honestyOf、social.js の rel)。
+const PAIRS = [
+  { from:'wallet_lost', pick:'near', honesty:true,
+    good:{ id:'found_wallet', icon:'👛', ja:'落ちていた財布を届けた', en:'returned a lost wallet',
+           fx:{bored:-0.20, desper:-0.10} },
+    bad: { id:'kept_wallet',  icon:'🤐', ja:'落ちていた財布を拾って黙っていた', en:'pocketed a lost wallet',
+           fx:{cashFlat:+18, desper:-0.20} },
+    // 届けてもらった側 (きっかけを起こした本人) に返ってくること
+    backGood:{ icon:'🙏', ja:'落とした財布が戻ってきた', en:'got their wallet back',
+               fx:{cashFlat:+16, desper:-0.20} } },
+  { from:'work_fail', pick:'near',
+    good:{ id:'covered', icon:'🫶', ja:'同僚の失敗をかばった', en:'covered for a colleague',
+           fx:{bored:-0.15, desper:-0.08} },
+    backGood:{ icon:'😌', ja:'同僚に助けてもらった', en:'was helped by a colleague',
+               fx:{desper:-0.18} } },
+  { from:'scam', pick:'friend',
+    good:{ id:'lent_money', icon:'💸', ja:'友達にお金を貸した', en:'lent money to a friend',
+           fx:{cashFlat:-12, bored:-0.10} },
+    backGood:{ icon:'🤝', ja:'友達がお金を貸してくれた', en:'was lent money by a friend',
+               fx:{cashFlat:+12, desper:-0.25} } },
+  { from:'injury', pick:'near',
+    good:{ id:'helped_hurt', icon:'🚑', ja:'転んだ人を助け起こした', en:'helped someone who fell',
+           fx:{bored:-0.18} },
+    backGood:{ icon:'🙇', ja:'通りがかりの人に助けられた', en:'was helped by a passer-by',
+               fx:{sickAdd:-0.15} } },
+];
+const pairOf = id => PAIRS.find(p => p.from === id) || null;
+
 const byId = {};
 for (const e of EVENTS) byId[e.id] = e;
 
@@ -193,4 +229,4 @@ function pick(ctx, rnd) {
 
 const label = (E, ja) => (ja ? E.ja : E.en);
 
-module.exports = { EVENTS, byId, ok, weightOf, pick, label };
+module.exports = { EVENTS, PAIRS, pairOf, byId, ok, weightOf, pick, label };

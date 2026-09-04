@@ -296,6 +296,7 @@ const MW = require('./world.js');
 const SOC = require('./social.js');
 const PT  = require('./pastime.js');   // 暇な時間の娯楽 (建物も小物も増やさない)
 const EV  = require('./events.js');    // 良いこと・悪いこと (病気の発症もここに一本化)
+const CH  = require('./chronicle.js'); // 住民ごとの来歴 (!story で読める)
 // GLB (glTF) から静的なジオメトリだけ読む最小の読み取り。
 // three の GLTFLoader は ESM で CommonJS から require できないため自前で持つ。
 const GLB = require('./glb.js');
@@ -1888,6 +1889,7 @@ function occluderGrid(){
 }
 
 function updateOcclusionFade(){
+  if(BLDG_BATCH_ALWAYS) return;   // 束ねている間は軒ごとに透かせない
   const near=new Set();
   const grid=occluderGrid();
   const R=Math.ceil(FADE_DIST/CELL);
@@ -2473,6 +2475,9 @@ function camStateShort(a){
 function camStateShortJa(a){
   if(!a) return '';
   const jaOf = t => (t!=null && BLDG_TYPES[t]) ? BLDG_TYPES[t].label : '';
+  // 目的地が「誰かの店」なら固有名で出す (『カフェ』より『アイのカフェ』)
+  const destName = () => { const d=a.navDest; const st=d?structAt(d[0],d[1]):null;
+    return (st && st.owner) ? shopNameJa(st) : (a.goalType!=null ? jaOf(a.goalType) : null); };
   if(MW.isIndoors(a)){
     const t=_typeAt(a.indoors);
     if(a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1]) return '自宅';
@@ -2485,7 +2490,7 @@ function camStateShortJa(a){
     if(D.phase==='drop') return '配達中 - 荷物を置いている';
     return '配達中';
   }
-  const dest=a.goalType!=null ? jaOf(a.goalType) : null;
+  const dest=destName();
   const NEED_JA={eat:'空腹', sleep:'眠い', work:'通勤中', shop:'買い物',
                  bored:'退屈', sick:'具合が悪い'};
   const st=NEED_JA[needOf(a)]||'歩いている';
@@ -6152,6 +6157,8 @@ function stepStructAnims(){
 //   「片方だけ測って効果が薄いから捨てる」と、この 3.4 倍を取り逃す。
 const BLDG_BATCH       = process.env.BLDG_BATCH !== '0';
 const BLDG_BATCH_CHUNK = Math.max(4, envNum('BLDG_BATCH_CHUNK', 32));  // 何セル角で束ねるか
+// 近接フェードを捨てて常にバッチで描く。ドローコールがどれだけ減るかを測るためのつまみ。
+const BLDG_BATCH_ALWAYS = process.env.BLDG_BATCH_ALWAYS === '1';
 
 const bldgBatches = new Map();     // key -> {mesh, slots:Map(structKey->{ranges,saved})}
 const _batchOf    = new Map();     // structKey -> batch key (どのバッチに入っているか)
@@ -6377,7 +6384,11 @@ function syncBatchVisibility(){
 // カメラが俯瞰⇄追跡をまたいだら表現を入れ替える (またいだ瞬間だけ O(N))
 function updateBatchMode(){
   if(!BLDG_BATCH) return;
-  const want = (camTargetIdx===0);
+  // ★ 追跡ショットでバッチに切り替えられないのは**近接フェードのため**。
+  //   住民が近づいた軒だけ半透明にするには 1 軒 = 1 メッシュでなければならず、
+  //   束ねてしまうとチャンクごと透ける。BLDG_BATCH_ALWAYS=1 は
+  //   「フェードを捨てて、常に束ねる」モード (ドローコールを比べるためのつまみ)。
+  const want = BLDG_BATCH_ALWAYS || (camTargetIdx===0);
   if(want===_batchMode) return;
   _batchMode=want;
   syncBatchVisibility();
@@ -6434,7 +6445,7 @@ function cityToJSON(){
     if(a.seenMask || a.owns || a.viewer || a.cheers || rel || eco || (a.pref && Object.keys(a.pref).length)){
       // 好みは上位6件だけ保存する (1000人ぶん全部持つと保存ファイルが膨らむ)
       const top=Object.entries(a.pref||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,6);
-      own[a.aid]={m:a.seenMask||0, o:a.owns||null,
+      own[a.aid]={m:a.seenMask||0, o:a.owns||null, h:CH.serialize(a),
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
                   b:a.viewer?a.by:undefined, c:a.cheers||undefined,
                   p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
@@ -6889,9 +6900,13 @@ function stepPastime(dtSec){
     // 一緒に遊べる相手 = 近くに居て、同じく暇で、まだ何も始めていない人
     _ptBuf.length=0;
     SOC.neighbors(SOC_STATE, a, _ptBuf, 4);
-    const mates=_ptBuf.filter(b=>b!==a && !ptActive(b) && ptIdle(b)
+    let mates=_ptBuf.filter(b=>b!==a && !ptActive(b) && ptIdle(b)
       && Math.abs(b.x-a.x)<=PASTIME_MATE_R && Math.abs(b.y-a.y)<=PASTIME_MATE_R
       && MW.isIndoors(b)===indoors);
+    // ★ トランプも占いも将棋も、**まず友達と**。誰とでも同じ確率で遊ぶと
+    //   人間関係が画に効いてこない (せっかく rel を持っているのに使われない)。
+    const fr=mates.filter(b=>SOC.relOf(a, b.aid) >= SOC_STATE.cfg.relFriend);
+    if(fr.length) mates=fr;
 
     const A=PT.pick({hour:h, raining, indoors, atHome, mates:mates.length});
     if(!A) continue;
@@ -6928,6 +6943,104 @@ function applyEventFx(a, E){
   if(f.desper)   a.desper  = cl((a.desper ||0)+f.desper);
 }
 
+// きっかけの出来事 E から、近くの誰かに「その続き」を起こす。
+//   ・相手の選び方は pick ('friend' なら友人を優先)
+//   ・honesty=true の連鎖は**正直さで分岐する**。届けるか、黙って持ち去るか
+//     (economy.js が持っている性格をそのまま使う。同じ状況でも人によって違う)
+//   ・届いたときだけ、落とした本人にも「戻ってきた」を返す
+// 返り値: 巻き込んだ相手 (誰も居なければ null)
+function chainEvent(a, E, near){
+  const P=EV.pairOf(E.id); if(!P) return null;
+  const day=gameDay();
+  let pool=near.filter(b=>b!==a && !MW.isIndoors(b) && b.jail<=0);
+  if(P.pick==='friend'){
+    const fr=pool.filter(b=>SOC.relOf(a, b.aid) >= SOC_STATE.cfg.relFriend);
+    if(fr.length) pool=fr;
+  }
+  if(!pool.length) return null;
+  const b=pool[(Math.random()*pool.length)|0];
+  // 正直さで分岐する連鎖。honesty が高いほど届ける
+  const honest = !P.honesty || Math.random() < ((b.def && b.def.honesty!=null) ? b.def.honesty : 0.6);
+  const R = honest ? P.good : (P.bad || P.good);
+  applyEventFx(b, R);
+  _evStat[R.id]=(_evStat[R.id]||0)+1;
+  CH.push(b, {day, icon:R.icon, ja:R.ja, en:R.en});
+  // 届いたときだけ本人に返す (持ち去られたら本人には何も起きない = 財布は戻らない)
+  if(honest && P.backGood){
+    applyEventFx(a, P.backGood);
+    CH.push(a, {day, icon:P.backGood.icon, ja:P.backGood.ja, en:P.backGood.en});
+  }
+  // 連鎖は**必ず**見出しに出す。二人の名前が並ぶ行はこの街でいちばん物語になる。
+  news(honest?'good':'bad',
+       `${R.icon} ${a.name} の ${E.ja} — ${b.name} が ${R.ja}`,
+       `${b.name} ${R.en} after ${a.name} ${E.en}`);
+  return b;
+}
+
+// ── 友達を誘って出かける ────────────────────────────────────────────────────
+// 「一緒にカードゲームをする」はその場でできるが、**誘って一緒にどこかへ行く**は
+// 別物で、これが無いと人間関係が「立ち話」で終わってしまう。
+//   ・暇で、近くに友達が居て、両方とも用事が無いときだけ
+//   ・行き先は飲食店 (eat)。屋台やラーメン屋なら「飲みに」、カフェなら「お茶しに」
+//   ・**二人を同じ建物へ navigate させるだけ。** 到着も滞在も既存の仕組みが担う
+const OUTING_ON  = process.env.OUTING !== '0';
+const OUTING_P   = envNum('OUTING_P', 0.02);     // 暇な1秒あたりに誘う確率
+const OUTING_R   = envNum('OUTING_R', 3);        // 誘える距離 (セル)
+let _outingAt=0;
+const OUTING_COOL_SEC = envNum('OUTING_COOL_SEC', 25);
+
+// 業種から誘い文句を決める。屋台/ラーメンは「飲みに」、カフェは「お茶しに」。
+function outingVerb(typeIdx){
+  const n=BLDG_TYPES[typeIdx] ? BLDG_TYPES[typeIdx].name : '';
+  if(n==='kiosk' || n==='ramen' || n==='gyudon') return ['飲みに行った', 'went out for a drink'];
+  if(n==='cafe')                                 return ['お茶しに行った', 'went out for coffee'];
+  return ['食べに行った', 'went out to eat'];
+}
+
+function stepOutings(dtSec){
+  if(!OUTING_ON || !CITY) return;
+  const now=Date.now();
+  if(now-_outingAt < OUTING_COOL_SEC*1000) return;   // 街じゅうで同時に起きないように
+  // ★ **一人遊びの最中でも誘える / 誘われる。**
+  //   娯楽は暇な住民をすぐ捕まえるので、これを除くと「友達2人が同時に空いている」
+  //   瞬間がほとんど無く、外出が永久に起きなかった (実測: 暇17人中、遊んでいない
+  //   のは9人で、その中に近くの友達が居ることは稀)。友達に誘われたら本を閉じて
+  //   出かける、というほうが自然でもある。**誰かと遊んでいる最中は誘わない。**
+  const free = x => ptIdle(x) && !MW.isIndoors(x)
+    && !(ptActive(x) && (x.pastime.mates||[]).length);   // group の遊びは邪魔しない
+  for(const a of agents){
+    if(!free(a)) continue;
+    if(Math.random() >= OUTING_P*dtSec) continue;
+    _evBuf.length=0;
+    SOC.neighbors(SOC_STATE, a, _evBuf, 4);
+    const fr=_evBuf.filter(b=>b!==a && free(b)
+      && Math.abs(b.x-a.x)<=OUTING_R && Math.abs(b.y-a.y)<=OUTING_R
+      && SOC.relOf(a, b.aid) >= SOC_STATE.cfg.relFriend);
+    if(!fr.length) continue;
+    const b=fr[(Math.random()*fr.length)|0];
+    // 行き先は営業中の飲食店。無ければ誘わない (街に店が無いうちは起きない)
+    const cells=catBuildings('eat');
+    if(!cells.length) continue;
+    const g=cells[(Math.random()*cells.length)|0];
+    const gr=Math.round(g[0]), gc=Math.round(g[1]);
+    const st=structAt(gr, gc); if(!st) continue;
+    if(!sendToBuilding(a, gr, gc)) continue;
+    if(!sendToBuilding(b, gr, gc)){ enterWander(a); continue; }   // 片方だけ行かせない
+    a.pastime=null; b.pastime=null;      // 読みかけの本を閉じて出かける
+    _outingAt=now;
+    const [vj, ve]=outingVerb(st.typeIdx);
+    const place=shopNameOf(st);
+    const day=gameDay();
+    news('life', `🍻 ${a.name} と ${b.name} が ${place} へ ${vj}`,
+                 `${a.name} and ${b.name} ${ve} at the ${place}`);
+    CH.push(a, {day, icon:'🍻', ja:`${b.name} と ${place} へ ${vj}`, en:`${ve} with ${b.name}`});
+    CH.push(b, {day, icon:'🍻', ja:`${a.name} と ${place} へ ${vj}`, en:`${ve} with ${a.name}`});
+    pushTalkLine(a.name, JA_HUD ? `${place} でも行く?` : `Fancy going to the ${place}?`);
+    pushTalkLine(b.name, JA_HUD ? 'いいね、行こう' : "Sure, let's go.");
+    return;                                        // 1回につき1組だけ
+  }
+}
+
 function stepEvents(dtSec){
   if(!EVENT_ON || !agents.length) return;
   const p = dtSec/(EVENT_MEAN_MIN*60);       // 1人あたりの発生確率
@@ -6949,6 +7062,11 @@ function stepEvents(dtSec){
     if(!E) continue;
     applyEventFx(a, E);
     _evStat[E.id]=(_evStat[E.id]||0)+1;
+    CH.push(a, {day:gameDay(), icon:E.icon, ja:E.ja, en:E.en});
+    // ★ 相手を巻き込む出来事なら、近くの誰かに「その続き」を起こす。
+    //   一つの出来事から二人分の話が生まれるので、住民どうしが交わる。
+    const mate = chainEvent(a, E, _evBuf);
+    if(mate) continue;   // 連鎖したぶんは chainEvent 側でニュースを出している
     // 見出しに出すか。大きな出来事は必ず、小さな出来事は間引く。
     const gap = E.news ? EVENT_BIG_SEC*1000 : EVENT_NEWS_SEC*1000;
     const last = E.news ? _evBigAt : _evNewsAt;
@@ -7478,6 +7596,29 @@ function pickFounder(cat){
   return pool[0];
 }
 
+// 住民の「下の名前」。表示名は "Hard Worker Karim" のように肩書き付きなので、
+// 店の名前に使うには最後の語だけを取る。
+const givenName = a => String(a && a.name || '').trim().split(/\s+/).pop() || '';
+
+// 店の表示名。**創業者が付けた固有名があればそれを使う。**
+//   業種名しか無いと全部「🍜 ラーメン屋」になり、潰れても誰も悲しくない。
+//   「カリムのラーメン屋」なら、その店の開店も閉店も一人の住民の話になる。
+//
+//   ★ 持つのは**店主の名前 (st.owner) だけ**で、表示名は日英それぞれ組み立てる。
+//     最初は日本語の完成形 (st.name) だけを持たせたが、英語の見出しでそれを使うと
+//     「Zoraの牛丼屋's Beef Bowl Shop」になった。ニュースは ja/en の両方を要求する
+//     ので、片方の言語の完成形から他方を作ろうとしてはいけない。
+const jaLabelOf = t => BLDG_TYPES[t].label.replace(/^\S+\s*/,'');   // 絵文字を落とす
+function shopNameJa(st){
+  if(!st) return '';
+  return st.owner ? `${st.owner}の${jaLabelOf(st.typeIdx)}` : BLDG_TYPES[st.typeIdx].label;
+}
+function shopNameEn(st){
+  if(!st) return '';
+  return st.owner ? `${st.owner}'s ${enOf(st.typeIdx)}` : enOf(st.typeIdx);
+}
+const shopNameOf = st => JA_HUD ? shopNameJa(st) : shopNameEn(st);
+
 function foundShop(cat, site, typeIdx, founder, day){
   const fp=site.fp||1;
   let st;
@@ -7498,7 +7639,14 @@ function foundShop(cat, site, typeIdx, founder, day){
   // カメラが寄る口実になり「街が育っている」ことが伝わるため。
   st.doneAt=Date.now() + CONSTRUCT_HOURS*(DAY_MINUTES*60/24)*1000;
   st.openedBy=founder?founder.aid:null;
-  if(founder){ founder.owns=[st.r,st.c]; founder.work=[st.r,st.c]; if(founder.unmetBy) founder.unmetBy[cat]=0; }
+  // 創業者の名前を店に付ける。跡地を再利用したときは前の名前を必ず上書きする
+  // (前の店主の名前が残ると「潰れた店の名前で別人が営業している」ことになる)。
+  st.owner = founder ? givenName(founder) : null;
+  if(founder){
+    founder.owns=[st.r,st.c]; founder.work=[st.r,st.c]; if(founder.unmetBy) founder.unmetBy[cat]=0;
+    CH.push(founder, {day, icon:'🏗', mark:true,
+      ja:`${shopNameJa(st)} を開いた`, en:`opened ${shopNameEn(st)}`});
+  }
   syncCity();
   rebuildBuildings(MAP);              // 新しい建物セルを目的地候補に入れる
   addStructMesh(scene, st);
@@ -7723,10 +7871,10 @@ function maybeWorkExit(day){
   works.sort((a,b)=>(b.fp*b.fp)-(a.fp*a.fp));
   const st=works[0];
   CITY.lastWorkExit=day;
-  const label=BLDG_TYPES[st.typeIdx].label;
+  const label=shopNameJa(st);
   closeShop(st, day, false);
   news('close', `🏭 ${label} (${st.r},${st.c}) が撤退した`,
-       `The ${enOf(st.typeIdx)} pulled out of town`);
+       `${shopNameEn(st)} pulled out of town`);
   return 1;
 }
 
@@ -7914,7 +8062,11 @@ function growPopulation(day){
     if(w){ a.name=w.name; a.viewer=true; a.by=w.by; moved.push(w.name); }
   }
   assignHomes();
-  for(let k=0;k<n;k++) settleAgent(agents[base+k]);
+  for(let k=0;k<n;k++){
+    settleAgent(agents[base+k]);
+    CH.push(agents[base+k], {day, icon:'🏠', mark:true,
+      ja:'この街に引っ越してきた', en:'moved into town'});
+  }
   CITY.pop=agents.length;
   if(moved.length){
     news('pop', `🏠 入居待ちだった ${moved.join(', ')} が引っ越してきた (人口 ${agents.length})`,
@@ -7938,8 +8090,8 @@ function finishConstruction(){
     CITY.stats.shopsOpened++;
     syncCity(); addStructMesh(scene, st);
     const owner=st.openedBy?agents.find(a=>a.aid===st.openedBy):null;
-    const label=BLDG_TYPES[st.typeIdx].label;
-    const enLabel=enOf(st.typeIdx);
+    const label=shopNameJa(st);
+    const enLabel=shopNameEn(st);
     news('open', `${label} が開店しました (${st.r},${st.c})`
       + (owner?` — 店主 ${owner.name}`:''),
       `${enLabel} opened` + (owner?` - run by ${owner.name}`:''));
@@ -7985,10 +8137,10 @@ function closeShop(st, day, vacant){
   CITY.stats.shopsClosed++;
   if(ECON_ON) layOff(st, day);        // ここで働いていた人は職を失う
   syncCity(); addStructMesh(scene, st);
-  const label=BLDG_TYPES[st.typeIdx].label;
+  const label=shopNameJa(st);
   if(vacant){                                  // 空き家/空き職場は「閉店」ではない
     news('close', `🏚 誰も使わなくなった ${label} (${st.r},${st.c}) が閉じられた`,
-         `${enOf(st.typeIdx)} stood empty and was closed up`);
+         `${shopNameEn(st)} stood empty and was closed up`);
     return;
   }
   for(const a of agents){
@@ -8111,9 +8263,9 @@ function bestCongestionTarget(){
 }
 
 function demolishForStreets(st, showCam){
-  const label=BLDG_TYPES[st.typeIdx].label;
+  const label=shopNameJa(st);
   news('demolish', `🚧 道が狭くなったため ${label} (${st.r},${st.c}) が取り壊された`,
-       `${enOf(st.typeIdx)} was cleared to open up the streets`);
+       `${shopNameEn(st)} was cleared to open up the streets`);
   st.state='demolishing'; CITY.stats.demolished++;
   if(showCam){
     showCityEvent(st.r, st.c, `${enOf(st.typeIdx)} cleared for the streets`, null,
@@ -8169,7 +8321,7 @@ function maybeDemolish(day){
   for(const st of CITY.structs){
     if(st.state!=='closed' || st.closedDay==null) continue;
     if(day-st.closedDay < DEMOLISH_DAYS) continue;
-    const label=BLDG_TYPES[st.typeIdx].label;
+    const label=shopNameJa(st);
     st.state='demolishing';        // 目的地には選ばれない / まだ通行不可のまま
     n++; CITY.stats.demolished++;
     news('demolish', `${label} (${st.r},${st.c}) が取り壊されて空き地になった`,
@@ -8605,6 +8757,10 @@ function onFriend(a, b){
   if(!CITY) return;
   CITY.stats.friendships=(CITY.stats.friendships||0)+1;
   const day=gameDay();
+  // 来歴には**必ず両方に**残す。ニュースは1日の上限で間引かれるが、
+  // 「誰と友達になったか」は本人の一生の話なので落とさない。
+  CH.push(a, {day, icon:'🤝', mark:true, ja:`${b.name} と友達になった`, en:`became friends with ${b.name}`});
+  CH.push(b, {day, icon:'🤝', mark:true, ja:`${a.name} と友達になった`, en:`became friends with ${a.name}`});
   if(day!==_friendNewsDay){ _friendNewsDay=day; _friendNewsN=0; }
   const viewer = a.viewer || b.viewer;
   if(!viewer && _friendNewsN>=FRIEND_NEWS_PER_DAY) return;
@@ -9708,6 +9864,22 @@ function enterWander(a){
   applyGoalZ(a);   // goalType に応じて z をセット (未対応タイプなら z=0 に落ちる)
 }
 
+// 指定した**建物セル**へ向かわせる。
+//   enterNavigateTo は通行可能セルしか受け付けない (建物は PASSABLE に無い) ので、
+//   建物を行き先にしたいときはこちらを使う。組み立ては enterWander と同じで、
+//   到着判定 (MW.hasArrived = 玄関に着いたら到着) もそちらと共通。
+function sendToBuilding(a, gr, gc){
+  if(!(gr>=0&&gr<GRID&&gc>=0&&gc<GRID)) return false;
+  const path=planPath(Math.floor(a.x), Math.floor(a.y), gr, gc);
+  if(!path || path.length<1) return false;
+  a.mode='wander'; a.rally=false;
+  a.goalType = (BUILDING_TYPES[gr+'_'+gc] != null) ? BUILDING_TYPES[gr+'_'+gc] : null;
+  a.path=path; a.pathIdx=0; a.navDest=[gr,gc];
+  resetNavWatch(a);
+  applyGoalZ(a);
+  return true;
+}
+
 // B: ナビ行動へ。T=正準の建物タイプindex。失敗したら A に落として理由を返す。
 // 戻り値: 'ok' | 'no-building'(そのタイプが無い) | 'unreachable'(経路が引けない=周囲を木/空地に囲まれている等)
 function enterNavigate(a, T){
@@ -9993,6 +10165,7 @@ function initAgents(S){
     for(const a of agents){
       const sv=CITY.savedAgents[a.aid]; if(!sv) continue;
       a.seenMask=sv.m||0;
+      CH.restore(a, sv.h);          // 来歴 (!story で読む)
       a.cheers=sv.c||0;
       if(sv.p){ a.pref={}; for(const k in sv.p) a.pref[k]={s:sv.p[k][0], n:sv.p[k][1]}; }
       if(sv.t) a.taught=sv.t;
@@ -11007,6 +11180,26 @@ function handleChatCommand(text, author){
       return viewerAsk(qq);
     }
     return viewerAskTown(qq, who);
+  }
+
+  // 住民の来歴を読む。**この街でいちばん「自分の分身」を感じられる機能**なので、
+  // カメラもその人へ向ける (文字だけ返しても、画の中のどれか分からない)。
+  const ms=raw.match(/^!?(?:story|history|来歴|経歴)\s+(.{1,40})$/i);
+  if(ms){
+    const hit=findAgentByQuery(ms[1]);
+    if(!hit || hit.overview) return chatMiss(ms[1], who);
+    const a=agents[hit.idx];
+    const ls=CH.lines(a, JA_HUD, 6);
+    pointCamera(hit.idx, who);
+    chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:a.name});
+    while(chatLog.length>30) chatLog.shift();
+    // 会話ログへ流す (ティッカーは他の出来事と取り合いになるので使わない)
+    pushTalkLine(a.name, JA_HUD ? 'これまでのこと' : 'my story so far');
+    for(const l of ls) pushTalkLine('', l);
+    if(!ls.length) pushTalkLine('', JA_HUD ? 'まだ何もありません' : 'nothing yet');
+    return {ok:true, msg:`story ${a.name}`,
+      reply: ls.length ? `${a.name}: ${ls.join(' / ')}`.slice(0,340)
+                       : (JA_HUD?`${a.name} はまだ来歴がありません`:`${a.name} has no story yet`)};
   }
 
   // 住民を応援する
@@ -14101,7 +14294,7 @@ function startLoops(){
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepPastime(1); stepEvents(1); stepPolice(); stepDelivery(); retargetOnNeedChange(); }, 1000);
+  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepOutings(1); stepPastime(1); stepEvents(1); stepPolice(); stepDelivery(); retargetOnNeedChange(); }, 1000);
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
     setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子
