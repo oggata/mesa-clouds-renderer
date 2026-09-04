@@ -2452,6 +2452,15 @@ function camStateShort(a){
     if(a.work && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1]) return 'at work';
     return t!=null ? `inside ${enOf(t)}` : 'indoors';
   }
+  // ★ 配達中は「通勤中」ではない。needOf は勤務時間なので 'work' を返すが、
+  //   配達員にとって**配達そのものが仕事**なので、字幕もそう出す
+  //   (describeActivity は既にそうなっていたのに、ここだけ揃っていなかった)。
+  if(a.deliv){
+    const D=a.deliv;
+    if(D.phase==='load') return 'on the job - loading up';
+    if(D.phase==='drop') return 'on the job - dropping off';
+    return 'on the job - delivering';
+  }
   const dest=a.goalType!=null ? enOf(a.goalType) : null;
   const n=needOf(a);
   const NEED_EN={eat:'hungry', sleep:'sleepy', work:'commuting', shop:'shopping',
@@ -2469,6 +2478,12 @@ function camStateShortJa(a){
     if(a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1]) return '自宅';
     if(a.work && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1]) return '職場';
     return t!=null ? `${jaOf(t)} の中` : '屋内';
+  }
+  if(a.deliv){                       // 英語版と同じ理由 (配達中は通勤ではない)
+    const D=a.deliv;
+    if(D.phase==='load') return '配達中 - 積み込み';
+    if(D.phase==='drop') return '配達中 - 荷物を置いている';
+    return '配達中';
   }
   const dest=a.goalType!=null ? jaOf(a.goalType) : null;
   const NEED_JA={eat:'空腹', sleep:'眠い', work:'通勤中', shop:'買い物',
@@ -8183,7 +8198,7 @@ let _hintN=0, _lifeN=0;
 //     これなので、日本語にすると誰も通せなくなる。
 const CHAT_HINTS_JA = [
   'チャットに:  test  - メッセージが街に届くか確かめる',
-  'チャットに:  !focus ミカ  - その住民を10秒カメラが追う',
+  'チャットに:  !focus ミカ  - その住民を1分カメラが追う',
   'チャットに:  !join  - この街の住民として引っ越してくる',
   'チャットに:  !join 好きな名前  - 名前を決めて住む',
   'チャットに:  !cheer 名前  - 住民を応援する。気分が上がる',
@@ -8193,7 +8208,7 @@ const CHAT_HINTS_JA = [
 ];
 const CHAT_HINTS_EN = [
   'TYPE IN CHAT:  test  - check your message reaches the town',
-  'TYPE IN CHAT:  !focus rex  - the camera follows that resident for 10s',
+  'TYPE IN CHAT:  !focus rex  - the camera follows that resident for a minute',
   'TYPE IN CHAT:  !join  - move into this town as a resident',
   'TYPE IN CHAT:  !join YourName  - pick the name you live under',
   'TYPE IN CHAT:  !cheer <name>  - cheer a resident, it lifts their mood',
@@ -8978,6 +8993,22 @@ const DELIV_STUCK_SEC  = envNum('DELIV_STUCK_SEC', 90);  // これだけ経っ�
 const DELIV_RETRY_SEC  = envNum('DELIV_RETRY_SEC', 4);   // 経路が引けなかったときの再挑戦間隔
 
 // 倉庫に勤めている住民か
+// 表示用の職業。**ペルソナ定義の肩書きではなく、いま実際に就いている役割**を優先する。
+//   ・倉庫勤務 → 配達員。荷物を担いで歩いているのに「会社員」と出ていた
+//   ・自分の店を持っている → 店主
+// どちらでもなければペルソナの肩書き (def.job) をそのまま使う。
+function jobTitle(a){
+  if(!a || !a.def) return null;
+  const base=(JA_HUD && a.def.jobJa) || a.def.job || null;
+  if(isCourier(a))            return JA_HUD ? '配達員' : 'Courier';
+  if(a.owns){
+    const st=structAt(a.owns[0], a.owns[1]);
+    if(st) return JA_HUD ? `${BLDG_TYPES[st.typeIdx].label} の店主`
+                         : `${enOf(st.typeIdx)} owner`;
+  }
+  return base;
+}
+
 const isCourier = a => {
   if(!DELIVERY_ON || WAREHOUSE_IDX==null) return false;
   const w=a.work; if(!w) return false;
@@ -10704,6 +10735,7 @@ let _camAz = Math.PI*0.5;      // いまのカメラ方位 (rad)
 let _camAzWant = _camAz;       // 向かいたい方位
 let _camBlockT = 0;            // 遮られている時間 (秒)
 let _camLostT  = 0;            // どの方位からも見えない時間 (秒)
+let _camClearT = 0;            // 通常の高さで見通せている時間 (秒)
 let _camHigh = CAM_ORBIT_HIGH; // いまの高さ (逃げるときだけ上がる)
 
 // カメラ位置 (cx,cy,cz) から被写体 (tx,ty,tz) への視線が建物に遮られるか。
@@ -10775,7 +10807,9 @@ function clearAzimuth(tx, ty, curAz, high){
 //   (街を作り直す・天気を変える等はチャットからは触らせない)。
 //   画面に出す名前も _ascii() で ASCII に落とし、長さを詰めてから描く。
 const CHAT_CMD        = process.env.CHAT_CMD !== '0';
-const CHAT_FOCUS_SEC  = envNum('CHAT_FOCUS_SEC', 10);    // 1回の指名で映す秒数
+// 1回の指名で映す秒数。10秒だと「呼んだ人が画に出た」と思った頃に切り替わって
+// しまい、指名した視聴者が自分のリクエストの結果を見届けられない。
+const CHAT_FOCUS_SEC  = envNum('CHAT_FOCUS_SEC', 60);
 const CHAT_COOLDOWN   = envNum('CHAT_COOLDOWN_SEC', 12); // 次の指名を受け付けるまで
 const CHAT_TOKEN      = process.env.CHAT_TOKEN || '';    // /chat に付ける合言葉 (任意)
 const CHAT_LOG        = process.env.CHAT_LOG !== '0';    // 届いたチャットを全部ログに出す
@@ -11412,7 +11446,7 @@ function toolResident(args){
   const rel=Object.entries(a.rel||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,4)
     .map(([id,e])=>`${nameOfAid(id)||id}(親しさ${e.s.toFixed(1)})`);
   return {name:a.name, persona:(JA_HUD&&a.def.descJa)||a.def.desc||a.def.id, viewer:!!a.viewer,
-    job:(JA_HUD&&a.def.jobJa)||a.def.job||null, age:a.def.age!=null?a.def.age:null,
+    job:jobTitle(a), age:a.def.age!=null?a.def.age:null,
     home:home?`${jaOf(home.typeIdx)}(${home.r},${home.c})`:null,
     work:work?`${jaOf(work.typeIdx)}(${work.r},${work.c})`:null,
     owns:owns?`${jaOf(owns.typeIdx)}(${owns.r},${owns.c})`:null,
@@ -12808,14 +12842,25 @@ function updateTrackingCamera(cam) {
       const aimZ = CAM_AIM_Z;
       const cxNow = tx + Math.cos(_camAz)*CAM_ORBIT_DIST;
       const cyNow = ty + Math.sin(_camAz)*CAM_ORBIT_DIST;
-      const blocked = sightBlocked(cxNow, cyNow, _camHigh, tx, ty, aimZ);
+      // ★ 遮蔽の判定は**常に「通常の高さ」で**行う。
+      //   ここを現在の高さ (_camHigh) で判定すると閉ループになる:
+      //     隠れる → 上がる → (高いので) 見える → 下がる → また隠れる → …
+      //   住民が歩いているうちは位置が変わって輪が切れるが、**立ち止まると
+      //   永久に往復する** = カメラが上下に揺れる。実際これが縦揺れの正体。
+      //   判定用のカメラ姿勢を高さに依存させなければループは閉じない。
+      const blocked = sightBlocked(cxNow, cyNow, CAM_ORBIT_HIGH, tx, ty, aimZ);
       _camBlockT = blocked ? _camBlockT + dtCam : 0;
+      _camClearT = blocked ? 0 : _camClearT + dtCam;
       if (_camBlockT > CAM_BLOCK_WAIT) {
         const az = clearAzimuth(tx, ty, _camAz, CAM_ORBIT_HIGH);
         if (az != null) { _camAzWant = az; _camHighWant = CAM_ORBIT_HIGH; _camLostT = 0; }
         else { _camHighWant = CAM_ORBIT_LIFT; _camLostT += CAM_BLOCK_WAIT; } // 逃げ場が無い
         _camBlockT = 0;
-      } else if (!blocked) { _camHighWant = CAM_ORBIT_HIGH; _camLostT = 0; }
+      } else if (_camClearT > CAM_BLOCK_WAIT) {
+        // 下がるのも「通常の高さで見通せる状態が続いたとき」だけ。すぐ下げると
+        // 上げ下げが小刻みに繰り返される。
+        _camHighWant = CAM_ORBIT_HIGH; _camLostT = 0;
+      }
       // ★ どの方向からも見えない状態が続くなら、その人を映すのは諦める。
       //   真上から屋根を見せ続けるより、見える人へ渡すほうが画になる。
       if (_camLostT > CAM_LOST_SEC) { _camLostT = 0; camSwitchTimer = 0; }
@@ -13612,6 +13657,7 @@ tick(); setInterval(tick, ${ms});
       camera:(()=>{
         const a=camTargetIdx>0?agents[camTargetIdx-1]:null;
         return {target:a?a.name:'overview', fpv:camFPV, azimuth:+(_camAz*180/Math.PI).toFixed(0),
+                high:+_camHigh.toFixed(3), lifted:_camHigh>CAM_ORBIT_HIGH+0.05,
                 indoors:a?MW.isIndoors(a):null,
                 event:!!camEventCur};
       })(),
@@ -13679,7 +13725,7 @@ tick(); setInterval(tick, ${ms});
           id:a.aid, name:a.name||a.def.name, personaType:a.def.id, color:a.def.hex,
           // 「どういう人か」。プール運用では称号+職業+年齢+性別が入る。
           title:(JA_HUD&&a.def.titleJa)||a.def.title||null,
-          job:(JA_HUD&&a.def.jobJa)||a.def.job||null,
+          job:jobTitle(a),
           age:a.def.age!=null?a.def.age:null,
           gender:a.def.gender||null,
           personaDesc:(JA_HUD&&a.def.descJa)||a.def.desc||'',
