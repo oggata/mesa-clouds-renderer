@@ -3234,7 +3234,7 @@ function stepTraffic(dt){
   // ── 湧かせる ──
   // 間隔を空ける。毎フレーム試すと、経路が引けるかぎり湧き口に連続で置かれて
   // 車体が重なる。加えて、湧き口に車が居るあいだは湧かせない。
-  const now=Date.now();
+  const now=simNow();
   // ★ 「出入口が2つ以上」ではなく「**発着点が2つ以上**」で判定する。
   //   出入口が消えた街でも、行き止まりどうしを結べば車は走れる。
   const spots=(_carGw?_carGw.length:0)+(_carEnd?_carEnd.length:0)+(_carAny?_carAny.length:0);
@@ -3728,8 +3728,25 @@ SHOP_JOB_IDX.push(...FOOD_IDX, ...BUY_IDX, ...FUN_IDX, ...CARE_IDX);
 //   実時間に直接紐づけると、起動タイミング次第で深夜(=全員sleep)から始まってしまうため。
 const START_HOUR = (()=>{ const v=parseFloat(process.env.START_HOUR); return isNaN(v)?8:((v%24)+24)%24; })();
 const _bootMs = Date.now();
+
+// ── シミュレーション内の時計 ────────────────────────────────────────────────
+// ゲーム内時刻を **tick の数から** 作る。以前は Date.now() から作っていたので、
+// シミュレーションが実時間に縛られていた。困るのは 2 点:
+//   ・実時間より速く回せない。30日を回すのに 12 時間かかり、**入れた仕掛けが
+//     効いているのか確かめられない** (集積の効果を測ろうとして詰まった)
+//   ・DAY_MINUTES を下げても速くならない。1日あたりの tick が減るだけで、
+//     住民が1日に歩く歩数まで減る = 速いのではなく**粗い**別の街になる
+//     (実測: DAY_MINUTES=0.4 で 1日 160tick、来店 0.1件/日)
+// tick 起点にすれば、通常運転では今までと同じ速さで進み (setInterval が TICK
+// ごとに回るので実時間と一致する)、SIM_FAST=1 のときだけ早送りできる。
+let _simTicks = 0;
+const simNow = () => _bootMs + _simTicks*TICK;
+// **どちらを使うかの決まり**
+//   simNow() … 街の中の出来事 (立ち話・娯楽・工事・天気・配達・巡回の間隔)
+//   Date.now() … 画面と外部 (カメラ・HUD・チャット・YouTube・保存の間隔)
+// 混ぜると早送り時にだけ壊れるので、迷ったら「早送りしても意味が通るか」で決める。
 function gameHour(){
-  const elapsed=(Date.now()-_bootMs)/1000;
+  const elapsed=(simNow()-_bootMs)/1000;
   return (START_HOUR + elapsed/(DAY_MINUTES*60)*24) % 24;
 }
 // 昼夜の明るさ [0,1] (0=真夜中, 1=正午)。日の出6時/日の入18時あたりで滑らかに遷移。
@@ -3858,7 +3875,14 @@ const FOOT_HEALTH     = envNum('FOOT_HEALTH', 0.01);
 //   makeMap は学習側 (mesa_env) と bit-identical でなければならないので触らない。
 //   生成された「完成した街」から間引いて村に戻す後処理として実装する。
 const START_VILLAGE   = process.env.START_VILLAGE !== '0';
-const START_SIZE      = envNum('START_SIZE', 10);        // 最初のフィールドの一辺 (最大 GRID)
+// フィールドの一辺。**「最初の広さ」であると同時に「最低限保つ広さ」**。
+//   ★ 以前は 10 で、拡張は「建て込んできたら」(EXPAND_DENSITY=0.28) だけが条件
+//     だった。つまり**フィールドが常に建物の数を追いかける**ので、密度は永久に
+//     28% 付近に張り付き、**離れた場所に家が建つ余地が構造的に生まれなかった**。
+//     集積(店が寄り集まる)と分散(郊外に住む)の綱引きは、余白が無いと始まらない。
+//   ★ 横断にかかる時間は問題にならない。一辺30セルでも徒歩29秒 = 1日の2%
+//     (実測の歩幅 0.156セル/tick から)。広げる側のコストは低い。
+const START_SIZE      = envNum('START_SIZE', 20);        // フィールドの一辺 (最大 GRID)
 const START_BUILDINGS = envNum('START_BUILDINGS', 12);   // 最初に建っている建物の数
 const START_POP       = envNum('START_POP', 8);          // 最初の人口
 // 人口の上限。サーバの余力を超えると描画も推論も破綻するので、ここに達したら
@@ -3905,12 +3929,41 @@ const EXPAND_STARVE   = Math.max(1, envNum('EXPAND_STARVE', 2));        // 空�
 //   ほうが描画呼よりはるかに高い。そこではこの取引が逆転する可能性があるので、
 //   実装は残してつまみにしてある。本番で PERF_LOG を見ながら試す価値はある。
 const GROUND_CHUNK    = Math.max(0, envNum('GROUND_CHUNK', 0));
+// 広げた土地に元の地形の道を引き継ぐか。0 にすると草地だけになるが、
+// **道が無い土地には建てられない**ので、街は中心に固まったままになる。
+const EXPAND_ROADS    = process.env.EXPAND_ROADS !== '0';
 const EXPAND_TREES    = envNum('EXPAND_TREES', 3);       // 新しい土地の木の間引き (n セルに1本)
 // 住居/職場の定員 (人口の上限を決める = 家が建つと人が増える)
-const HOUSE_CAP       = envNum('HOUSE_CAP', 2);
-const APT_CAP         = envNum('APT_CAP', 12);
-const WORK_CAP        = envNum('WORK_CAP', 6);           // 1つの職場が受け入れる人数
-const SHOP_JOBS       = envNum('SHOP_JOBS', 2);          // 店1軒が雇う人数 (economy.js)
+//   ★ **定員は建物の大きさ (fp^2 x height) に比例させる。** 以前は種類ごとの固定値で、
+//     2x2 の大きなマンションでも 1x1 のワンルームと同じ12人しか住めなかった。
+//     オフィスも同様で、一棟に会社がいくつも入っていることを表現できていなかった。
+//     economy.js の capacityOf が既に大きさ基準なのに、住民の割り当て側だけが
+//     固定値のまま取り残されていた (workplaceCapacity は WORK_CAP x 軒数)。
+//   ★ **1区画は「1戸」ではなく「分譲住宅の1区画」**として数える。1x1 のマスに
+//     4〜6戸が入っている、という見立て (見た目を分割するのは後からでよい)。
+//     以前は 1マス2人で、村の住宅33軒でも人口66が上限だった。街に店が3〜4軒しか
+//     建たない原因を辿ると、需要を生む人口がここで頭打ちになっていた。
+//       house     fp1 h1.4 → 8.6x1.0x1.4 = 12人
+//       house     fp2      → 48人
+//       apartment fp1 h2.1 → 8.6x2.0x2.1 = 36人 (戸建ての3倍)
+//       apartment fp2      → 144人
+const HOME_CAP_UNIT   = envNum('HOME_CAP_UNIT', 8.6);    // 定員 = これ x 密度 x 大きさ
+// 種類ごとの「詰まり具合」。同じ体積でも集合住宅のほうが多く住める。
+//   戸建て区画(12人)に対して集合住宅(36人)が3倍になるように決めてある。
+const APT_DENSITY     = envNum('APT_DENSITY', 2.0);
+// 職場の詰まり具合。1棟のオフィスビルには会社がいくつも入っている、という想定。
+//   economy.js の capacityOf (= 収入の上限にも使う) をこの倍率で伸ばす。
+//   維持費は大きさのままなので、オフィスは**低い稼働率でも黒字になる**ようになる。
+const HOUSE_CAP       = envNum('HOUSE_CAP', 12);         // ECON_OFF 時の代替値
+const APT_CAP         = envNum('APT_CAP', 36);           // ECON_OFF 時の代替値
+const WORK_CAP        = envNum('WORK_CAP', 6);           // ECON_OFF 時の代替値
+// 店1軒が雇う人数。**アルバイトを含めた頭数**として数える。
+//   ★ 村の段階では「職場」の大半がオフィスではなく店なので、ここが小さいと
+//     workDensity (オフィスの倍率) を上げても働き口が増えない。実測で村の
+//     職場定員は 16 しかなく、住居定員60に対してここが律速になっていた。
+//   ★ 店の収支は来客収入で決まり、雇用人数は維持費に影響しない (給料は街が払う)。
+//     つまりここを増やしても店が潰れやすくなることはない。
+const SHOP_JOBS       = envNum('SHOP_JOBS', 10);         // 店1軒が雇う人数 (economy.js)
 const POP_GROWTH      = envNum('POP_GROWTH', 0.15);      // 1日の転入は人口の何割か
 const MOVEIN_MAX      = envNum('MOVEIN_MAX', 8);         // 1日の転入の上限
 const HOME_PRESSURE   = envNum('HOME_PRESSURE', 0.85);   // 定員のこの割合を超えたら住宅を建てる
@@ -3966,7 +4019,7 @@ function wetness(){
 function stepWeather(){
   if(!CITY) return;
   if(WEATHER_FORCE){ CITY.weather=WEATHER_FORCE; return; }
-  const now=Date.now();
+  const now=simNow();
   if(CITY.weatherUntil && now < CITY.weatherUntil) return;
   let r=Math.random(), pick=WEATHER_KEYS[0];
   for(const k of WEATHER_KEYS){ r-=WEATHERS[k].p; if(r<=0){ pick=k; break; } }
@@ -4647,7 +4700,7 @@ function enterOpenPlace(a, dst){
   // 公園のほうを向いて立つ (背を向けて突っ立っていると不自然)
   a.th = Math.atan2(dst[1]+0.5-a.y, dst[0]+0.5-a.x);
   a.mode='hold';
-  a.linger = Date.now() + OPEN_STAY_SEC*1000*(0.6+Math.random()*0.8);
+  a.linger = simNow() + OPEN_STAY_SEC*1000*(0.6+Math.random()*0.8);
   return true;
 }
 
@@ -6430,7 +6483,7 @@ function stepCamEvents(){
 //   gameHour() と同じく実時間から求める。dayBase を永続化するので再起動しても戻らない。
 //   境目は朝 DAY_ROLL_H 時。深夜に街が変わるより「朝起きたら道ができている」ほうが自然。
 function daysSinceBoot(){
-  const elapsed=(Date.now()-_bootMs)/1000;
+  const elapsed=(simNow()-_bootMs)/1000;
   return Math.max(0, Math.floor((START_HOUR - DAY_ROLL_H + elapsed/(DAY_MINUTES*60)*24)/24));
 }
 function gameDay(){ return (CITY?CITY.dayBase:0) + daysSinceBoot(); }
@@ -6622,8 +6675,17 @@ function initCity(){
     CITY = freshCity();
     console.log(`[City] 新しい街を生成: 建物${CITY.structs.length}軒`);
   }
+  // ★ START_SIZE を上げたら、保存済みの街もそこまで広げる。
+  //   ここが無いと、既にある街は次の世代交代まで狭いままになる。
+  //   scene はまだ無いので MAP だけ書く (木は stepMapTrees が作り直す)。
+  if(CITY && CITY.size < START_SIZE && CITY.size < GRID){
+    const before=CITY.size;
+    const t=growFieldTo(START_SIZE, false);
+    console.log(`[City] フィールドを最低の広さまで拡張 ${before} → ${CITY.size} (木+${t})`);
+  }
+
   // 工事中のまま保存された建物は、落ちていた間に完成したものとして開業させる
-  for(const st of CITY.structs) if(st.state==='construction' && st.doneAt && st.doneAt<Date.now()) st.state='open';
+  for(const st of CITY.structs) if(st.state==='construction' && st.doneAt && st.doneAt<simNow()) st.state='open';
   // 取り壊しアニメの途中で保存された建物は閉店状態に戻す (翌日また取り壊される)
   for(const st of CITY.structs) if(st.state==='demolishing') st.state='closed';
   syncCity();
@@ -6649,13 +6711,29 @@ function buildingsOfTypes(idxs){
 // ── 住居と職場の定員 ────────────────────────────────────────────────────────
 //   人口の上限は住居の定員で決まる。**家が建つと人が増える**という因果をここで作る。
 const cellKey   = b => b ? b[0]+'_'+b[1] : '';
-const homeCapOf = t => (t===IDX_OF('apartment') ? APT_CAP : HOUSE_CAP);
+// 住居1棟の定員。**大きさに比例**させる (economy.js の capacityOf と同じ考え方)。
+//   引数は struct。typeIdx だけでは fp が分からず大きさを出せない。
+const homeCapOf = st => {
+  if(!st) return HOUSE_CAP;
+  const dens = st.typeIdx===IDX_OF('apartment') ? APT_DENSITY : 1.0;
+  return Math.max(1, Math.round(HOME_CAP_UNIT * dens * structSize(st)));
+};
 const openStructsOf = idxs => (CITY?CITY.structs:[])
   .filter(st=>st.state==='open' && idxs.includes(st.typeIdx));
 function housingCapacity(){
-  let n=0; for(const st of openStructsOf(HOME_IDX)) n+=homeCapOf(st.typeIdx); return n;
+  let n=0; for(const st of openStructsOf(HOME_IDX)) n+=homeCapOf(st); return n;
 }
-function workplaceCapacity(){ return openStructsOf(WORK_IDX).length * WORK_CAP; }
+// 職場の総定員。**assignHomes が実際に配っている定員と同じ規則で数える。**
+//   以前は WORK_CAP x 軒数 という別勘定で、(a) 建物の大きさを見ておらず
+//   (b) 人を雇っている店を数に入れていなかった。実測で「職場47件(定員36)」という
+//   矛盾したログが出ていたのはこれが原因で、この値を使う WORK_PRESSURE の判定
+//   (働き口が足りているか) もずれていた。
+function workplaceCapacity(){
+  let n=0;
+  for(const st of openStructsOf(WORK_IDX)) n += ECON_ON ? workCapOf(st) : WORK_CAP;
+  if(ECON_ON) for(const st of openStructsOf(SHOP_JOB_IDX)) n += SHOP_JOBS;
+  return n;
+}
 
 // 拠点(自宅/職場)の割当。**既に住んでいる人はそのまま**で、空きのある建物へ順に入れる。
 //   以前は index で機械的に割り当てていたので、家が1軒建つたびに全員の住所がずれた。
@@ -6723,7 +6801,7 @@ function assignHomes(){
     a.school = pick ? [pick.r, pick.c] : null;
   }
   for(const a of agents){
-    if(!a.home) a.home=take(homeStructs, occ, homeCapOf);
+    if(!a.home) a.home=take(homeStructs, occ, (t, st)=>homeCapOf(st));
     // 学生は働かない (通学が本業)
     if(isStudent(a)){ a.work=null; a.jobless=-1; continue; }
     if(a.work) continue;
@@ -6846,7 +6924,7 @@ const PASTIME_MATE_R = envNum('PASTIME_MATE_R', 2);    // 一緒に遊ぶ相手�
 let _ptNewsAt = 0;
 const _ptBuf = [];
 
-const ptActive = a => !!(a.pastime && a.pastime.until > Date.now());
+const ptActive = a => !!(a.pastime && a.pastime.until > simNow());
 
 // いま暇か。**用事があるうちは遊ばせない** (needOf の優先順位を壊さないため)。
 function ptIdle(a){
@@ -6855,7 +6933,7 @@ function ptIdle(a){
 }
 
 function startPastime(a, A, mates){
-  const now=Date.now();
+  const now=simNow();
   a.pastime={ id:A.id, until: now + PT.duration(A)*1000, walk:!!A.walk,
               mates: mates.map(m=>m.aid) };
   for(const m of mates)
@@ -6877,7 +6955,7 @@ function startPastime(a, A, mates){
 
 function stepPastime(dtSec){
   if(!PASTIME_ON) return;
-  const now=Date.now(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
+  const now=simNow(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
   for(const a of agents){
     // 終わった娯楽を片づけて、退屈を晴らす
     if(a.pastime && a.pastime.until<=now){
@@ -6999,7 +7077,7 @@ function outingVerb(typeIdx){
 
 function stepOutings(dtSec){
   if(!OUTING_ON || !CITY) return;
-  const now=Date.now();
+  const now=simNow();
   if(now-_outingAt < OUTING_COOL_SEC*1000) return;   // 街じゅうで同時に起きないように
   // ★ **一人遊びの最中でも誘える / 誘われる。**
   //   娯楽は暇な住民をすぐ捕まえるので、これを除くと「友達2人が同時に空いている」
@@ -7044,7 +7122,7 @@ function stepOutings(dtSec){
 function stepEvents(dtSec){
   if(!EVENT_ON || !agents.length) return;
   const p = dtSec/(EVENT_MEAN_MIN*60);       // 1人あたりの発生確率
-  const now=Date.now(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
+  const now=simNow(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
   for(const a of agents){
     if(a.jail>0) continue;                   // 収監中は街の出来事の外
     if(Math.random() >= p) continue;
@@ -7415,6 +7493,51 @@ function passableCount(map){
   return n;
 }
 // 未充足需要のヒートマップ。商売はこれがいちばん濃い所に建つ。
+// ── 集積の利益 ────────────────────────────────────────────────────────────
+// 店が寄り集まると、客はついでに他の店にも寄れる。だから**集まっているほど
+// 一軒あたりの魅力が上がる**。これが「集積の経済」。
+//
+// ── なぜこれを足すか ──
+// 反対側の力 (混雑すると満足度が落ちる) は learnFromVisit に既にあった:
+//     reward = 近さ − 混雑
+// **片側しか無いので振り子が回らなかった。** 混雑の罰だけがあると店は散る一方で、
+// 現実の商店街や激戦区のような塊ができない。両方あって初めて
+//     集まる → 客が集まる → 混む → 満足が落ちる → 散る → また集まれる
+// という往復になり、しかも**最適な密度が人口によって動く** (人が増えれば
+// 集積の利益が勝ち、混雑で頭打ちになる点も動く)。
+//
+// ★ 個体最適と全体最適は一致しない。店は「客の多い場所」に寄るので、
+//   ホテリングの立地競争と同じく**全体としては非効率な塊**ができる。
+//   これはバグではなく、そう見えることを狙っている。
+const AGGLO_R    = Math.max(1, Math.round(envNum('AGGLO_R', 3)));   // 「近く」の範囲 (セル)
+const AGGLO_GAIN = envNum('AGGLO_GAIN', 0.06);   // 近くの店 1 軒あたりの上乗せ
+const AGGLO_MAX  = envNum('AGGLO_MAX', 0.30);    // 上限 (混雑の罰 0.4 と釣り合う程度)
+const SITE_AGGLO = envNum('SITE_AGGLO', 0.6);    // 立地選びで集積をどれだけ好むか
+// 混雑の罰。**上限は AGGLO_MAX より大きく取ること** (でないと振り子が止まる)。
+const CROWD_MAX       = envNum('CROWD_MAX', 0.90);
+const CROWD_PER_VISIT = envNum('CROWD_PER_VISIT', 1/50);   // 来店45/日で上限
+
+// 近くにある「営業中で、行き先に選ばれる種類の」店の数。
+//   建物の増減 (cityStamp) でだけ作り直す。来店のたびに数え直すと、
+//   1000人の街では毎秒何百回も走ることになる。
+let _aggloStamp=-1;
+const _aggloBy=new Map();
+function shopsNear(r, c){
+  if(_aggloStamp!==cityStamp){ _aggloStamp=cityStamp; _aggloBy.clear(); }
+  const k=r+'_'+c;
+  const hit=_aggloBy.get(k);
+  if(hit!=null) return hit;
+  let n=0;
+  if(CITY) for(const st of CITY.structs){
+    if(st.state!=='open' || !CHOOSABLE(st.typeIdx)) continue;
+    if(Math.abs(st.r-r)<=AGGLO_R && Math.abs(st.c-c)<=AGGLO_R) n++;
+  }
+  _aggloBy.set(k, n);
+  return n;
+}
+// 自分の店は数えないので 1 を引く。
+const aggloBonus = (r,c) => Math.min(AGGLO_MAX, Math.max(0, shopsNear(r,c)-1)*AGGLO_GAIN);
+
 function siteScoreDemand(cat, r, c){
   const D=CITY.demand[cat];
   if(!D) return 0;
@@ -7424,7 +7547,9 @@ function siteScoreDemand(cat, r, c){
     if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
     s+=D[nr*GRID+nc]*0.5;
   }
-  return s;
+  // ★ 既存店の近くを好む = ホテリング的な立地競争。需要ヒートの値は場面で桁が
+  //   変わる (積分値なので) ため、足し算ではなく**倍率**で効かせる。
+  return s * (1 + SITE_AGGLO*Math.min(1, shopsNear(r,c)/4));
 }
 // 住居と職場は「欲求」ではないのでヒートマップが無い。人が通る所 (踏み跡) と
 // 既存の建物の隣を好む = 街が虫食いにならず塊として広がる。
@@ -7637,7 +7762,7 @@ function foundShop(cat, site, typeIdx, founder, day){
   st.founded=true;                    // 住民が建てた店 (創世からある建物と区別する)
   // 工事中はゲーム内 CONSTRUCT_HOURS 時間。即座にポップさせないのは、
   // カメラが寄る口実になり「街が育っている」ことが伝わるため。
-  st.doneAt=Date.now() + CONSTRUCT_HOURS*(DAY_MINUTES*60/24)*1000;
+  st.doneAt=simNow() + CONSTRUCT_HOURS*(DAY_MINUTES*60/24)*1000;
   st.openedBy=founder?founder.aid:null;
   // 創業者の名前を店に付ける。跡地を再利用したときは前の名前を必ず上書きする
   // (前の店主の名前が残ると「潰れた店の名前で別人が営業している」ことになる)。
@@ -7777,6 +7902,39 @@ function buildingPaused(){
   return fieldDensity()>=BUILD_MAX_DENS || walkability()<WALK_MIN;
 }
 
+// フィールドを target まで広げ、新しい土地の地形を作る。生えた木の数を返す。
+//   ★ **読み込み時 (scene がまだ無い) からも呼べること。** START_SIZE を上げたときに
+//     保存済みの街にも効かせたいので、メッシュ生成は任意にしてある
+//     (scene が無いときは MAP だけ書けばよい。木は stepMapTrees が MAP から作り直す)。
+function growFieldTo(target, withMesh){
+  if(!CITY) return 0;
+  const want=Math.min(GRID, Math.max(6, Math.round(target)));
+  if(CITY.size>=want) return 0;
+  const base=makeMap(GRID, CITY.seed);        // 元の地形 (種から決定的に再生成できる)
+  const oldLo=fieldLo(), oldHi=fieldHi();
+  CITY.size=want;
+  const lo=fieldLo(), hi=fieldHi();
+  let trees=0;
+  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++){
+    if(r>=oldLo&&r<=oldHi&&c>=oldLo&&c<=oldHi) continue;   // 既存部分は触らない
+    // ★ **元の地形の道は引き継ぐ。** ここを全部草地に潰していたせいで、
+    //   広げた土地に道が1本も無く、**建設は「道か建物に面していること」が条件**
+    //   なので実質建てられなかった (実測: 外周195セルのうち建設可能はわずか6)。
+    //   道が無い → 誰も歩かない → 踏み跡もできない → 永久に道ができない、
+    //   という鶏と卵にもなっていた。**建物は引き継がない** (それをやると
+    //   広げた瞬間にタダで街が生えるので、街が育った実感が消える)。
+    if(EXPAND_ROADS && base[r][c]===ROAD){ MAP[r][c]=ROAD; continue; }
+    // 残りは草地。元の地形の木を間引いて少しだけ生やす (一面の林にしない)
+    const wantTree = base[r][c]===TREE && EXPAND_TREES>0 && ((r*7+c*13)%EXPAND_TREES===0);
+    MAP[r][c]= wantTree ? TREE : OTHER;
+    if(wantTree){ if(withMesh) addTreeMesh(scene, r, c); trees++; }
+  }
+  groundDirty=true;
+  rebuildBuildings(MAP);
+  _carGwDirty=true;                 // 道が伸びた = 車の発着点を取り直す
+  return trees;
+}
+
 function maybeExpand(day){
   if(!CITY || CITY.size>=GRID) return 0;
   const free=buildableLots(), dens=fieldDensity();
@@ -7793,22 +7951,15 @@ function maybeExpand(day){
   //   上がり、置ける区画も生まれるので、街は自力で膠着から抜け出せる。
   const stuck = buildingPaused() || (CITY.starved||0) >= EXPAND_STARVE;
   if(!stuck && dens<EXPAND_DENSITY && free>EXPAND_FREE) return 0;
-  const base=makeMap(GRID, CITY.seed);        // 元の地形 (種から決定的に再生成できる)
-  const oldLo=fieldLo(), oldHi=fieldHi();
-  CITY.size=Math.min(GRID, CITY.size+EXPAND_STEP);
+  // ★ 広げる**前**の一辺を控えておく。growFieldTo に切り出したときに、
+  //   ここのログだけが切り出し前のローカル変数 (oldLo/oldHi) を参照したまま
+  //   残っていた。復元した街ではフィールドが広がらないので発火せず、
+  //   まっさらな村から80日回して初めて落ちた (ReferenceError: oldHi)。
+  const before=CITY.size;
+  const trees=growFieldTo(CITY.size+EXPAND_STEP, true);
   CITY.starved=0;
   const lo=fieldLo(), hi=fieldHi();
-  let trees=0;
-  for(let r=lo;r<=hi;r++)for(let c=lo;c<=hi;c++){
-    if(r>=oldLo&&r<=oldHi&&c>=oldLo&&c<=oldHi) continue;   // 既存部分は触らない
-    // 新しい土地は草地。元の地形の木を間引いて少しだけ生やす (一面の林にしない)
-    const wantTree = base[r][c]===TREE && EXPAND_TREES>0 && ((r*7+c*13)%EXPAND_TREES===0);
-    MAP[r][c]= wantTree ? TREE : OTHER;
-    if(wantTree){ addTreeMesh(scene, r, c); trees++; }
-  }
-  groundDirty=true;
-  rebuildBuildings(MAP);
-  console.log(`[City] フィールド拡張 ${oldHi-oldLo+1} → ${CITY.size}`
+  console.log(`[City] フィールド拡張 ${before} → ${CITY.size}`
     + ` (建て込み ${(dens*100).toFixed(0)}% / 空き区画${free} / 木+${trees}`
     + `${stuck?' / 建設が止まっていたので拡張':''})`);
   news('expand', `🌱 街の範囲が広がった (${CITY.size}×${CITY.size})`,
@@ -8083,7 +8234,7 @@ function growPopulation(day){
 // 工事の完了 (1秒ごとに確認)。落ちている間に完了予定を過ぎたぶんもここで開く。
 function finishConstruction(){
   if(!CITY) return;
-  const now=Date.now();
+  const now=simNow();
   for(const st of CITY.structs){
     if(st.state!=='construction' || !st.doneAt || now<st.doneAt) continue;
     st.state='open'; st.doneAt=null;
@@ -8779,7 +8930,7 @@ function onFriend(a, b){
 function stepSocial(dtSec){
   if(!SOCIAL_ON) return;
   SOC.step(SOC_STATE, {
-    agents, dtSec, day:gameDay(), now:Date.now(),
+    agents, dtSec, day:gameDay(), now:simNow(),
     isIndoors:MW.isIndoors, canTalkAt,
     freshShopFor, deadShopFor, applyTopic, onTalk, onFriend,
     rng:Math.random,
@@ -8819,8 +8970,17 @@ function learnFromVisit(a, st, pathLen){
   if(CHAT_LOG && a.taught && a.taught.key===key)
     console.log(`[Learn] ${a.name} が勧められた店に到着 (${key})`);
   const dist=pathLen || 8;
-  const crowd=Math.min(0.4, (st.visitsToday||0)/40);          // 混雑の軽い減点
-  const reward=Math.max(0, Math.min(1, 1 - dist/PREF_FAR)) - crowd;
+  // ★ 混雑の罰は**集積の利益より深くまで効かせる**こと。
+  //   元は min(0.4, visits/40) の「軽い減点」だったが、集積(最大0.30)を足した
+  //   ところ、両方が頭打ちになった先で合計が定数になった。検算するとこうなる:
+  //       近隣6軒 来店32/日 → 0.33   /   近隣6軒 来店80/日 → 0.33
+  //   **どれだけ混んでも評価が変わらない = 振り子が止まる。**
+  //   罰の上限を集積の上限より高く取り、傾きを緩めて効く範囲を広げる。
+  const crowd=Math.min(CROWD_MAX, (st.visitsToday||0)*CROWD_PER_VISIT);
+  // 近さ + 集積の利益 − 混雑。この 3 項で「ちょうど良い密度」が決まり、
+  // その点は人口が変われば動く (上の集積の説明を参照)。
+  const agglo=aggloBonus(st.r, st.c);
+  const reward=Math.max(0, Math.min(1, 1 - dist/PREF_FAR)) + agglo - crowd;
   const e=prefBump(a, key, reward);
   e.n=(e.n||0)+1;
   // 勧められて来たのなら、その結果を記録する (定着したかの判定に使う)
@@ -8907,8 +9067,11 @@ function structKind(st){
   if(cat==='civic') return 'civic';
   return 'visit';
 }
-// 職場/住宅の定員も大きさで決める (economy.js と同じ規則)
-const workCapOf = st => ECON_ON ? ECO.capacityOf(ECO_STATE, structSize(st)) : WORK_CAP;
+// 職場の定員。大きさ x workDensity (1棟に会社がいくつも入っている想定)。
+//   ★ 定員の定義は **server が持つ** (homeCapOf / workCapOf)。economy.js は
+//     ctx 経由でこれを受け取って収入の上限に使う。以前は両側が別々に計算していて、
+//     住宅を12人に変えたあとも収入だけ4人ぶんで頭打ちになっていた。
+const workCapOf = st => ECON_ON ? ECO.workCapacityOf(ECO_STATE, structSize(st)) : WORK_CAP;
 
 function bankruptSweep(day){
   if(!ECON_ON || !BANKRUPT_ON || !CITY) return 0;
@@ -8920,6 +9083,9 @@ function bankruptSweep(day){
   const ctx={
     population: agents.length,
     kindOf: structKind, sizeOf: structSize,
+    // 定員は server の定義をそのまま渡す (economy.js 側で二重に計算させない)
+    workCapAt: st=>workCapOf(st),
+    homeCapAt: st=>homeCapOf(st),
     workersAt:   st=>workers[st.r+'_'+st.c]||0,
     residentsAt: st=>residents[st.r+'_'+st.c]||0,
     // いまの発展段階では建てられない大きさか (= 街に対して大きすぎる)
@@ -9228,15 +9394,15 @@ function delivWalkTo(a, br, bc){
 function delivGo(a){
   const D=a.deliv;
   const dst = (D.phase==='toHome' && D.target) ? [D.target.r, D.target.c] : a.work;
-  D.since=Date.now();
+  D.since=simNow();
   if(delivWalkTo(a, dst[0], dst[1])){ D.retryAt=0; return true; }
-  D.retryAt=Date.now()+DELIV_RETRY_SEC*1000;
+  D.retryAt=simNow()+DELIV_RETRY_SEC*1000;
   return false;
 }
 
 // 配達の 1 巡を始める (まず倉庫へ荷物を取りに行く)
 function delivStartRun(a){
-  a.deliv={ phase:'toDepot', box:false, target:null, since:Date.now(), retryAt:0, waitUntil:0 };
+  a.deliv={ phase:'toDepot', box:false, target:null, since:simNow(), retryAt:0, waitUntil:0 };
   _delivStats.runs++;
   delivGo(a);
 }
@@ -9255,7 +9421,7 @@ function delivEndRun(a){
 
 function stepDelivery(){
   if(!DELIVERY_ON || WAREHOUSE_IDX==null || !CITY) return;
-  const now=Date.now();
+  const now=simNow();
   for(const a of agents){
     if(!isCourier(a) || !onDeliveryDuty(a)){ if(a.deliv) delivEndRun(a); continue; }
     // 屋内に居るあいだは何もしない (shouldLeaveBuilding が勤務時間に外へ出す)
@@ -9489,8 +9655,8 @@ function onArrive(a, dest){
   const bit=1<<st.typeIdx;                       // typeIdx < 25 なのでビット演算で足りる
   if(!((a.seenMask||0)&bit)){
     a.seenMask=(a.seenMask||0)|bit;
-    if(st.state==='open' && Date.now()-_lastFirstNews>FIRST_NEWS_COOLDOWN_MS){
-      _lastFirstNews=Date.now();
+    if(st.state==='open' && simNow()-_lastFirstNews>FIRST_NEWS_COOLDOWN_MS){
+      _lastFirstNews=simNow();
       news('first', `${a.name} が初めて ${BLDG_TYPES[st.typeIdx].label} に入った`,
            `${a.name} visited a ${enOf(st.typeIdx)} for the first time`);
     }
@@ -10357,12 +10523,12 @@ async function stepAll(){
     const a=agents[i];
     if(a.mode==='hold'){
       // 広場での滞在は時間で切れる (rally の静止は linger を持たないので従来どおり)
-      if(a.linger && Date.now()>=a.linger){ a.linger=null; enterWander(a); }
+      if(a.linger && simNow()>=a.linger){ a.linger=null; enterWander(a); }
       else continue;
     }
     // 立ち話の間は足を止めて相手を向く。歩行シェーダの振幅は「実際に進んだ距離」で
     // 決まるので、止めるだけで脚も自動的に止まる。
-    if(a.talk && a.talk.until>Date.now()){ a.th=a.talk.th; a.stall=0; continue; }
+    if(a.talk && a.talk.until>simNow()){ a.th=a.talk.th; a.stall=0; continue; }
     // 娯楽の最中は歩かない (散歩など walk:true のものは歩かせたままにする)。
     // stall を 0 に保つのは立ち話と同じ理由 — 追跡カメラに見捨てられないため。
     if(ptActive(a) && !a.pastime.walk){ a.stall=0; continue; }
@@ -11696,7 +11862,11 @@ function runTownTool(name, args){
 const GEM = {
   enabled:  !!process.env.GEMINI_API_KEY,
   key:      process.env.GEMINI_API_KEY || '',
-  model:    process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+  // ★ 既定のモデル名。gemini-2.5-flash は「新規ユーザーには提供終了」になり、
+  //   API が 「models/gemini-3.6-flash を使え」というエラーだけを返すようになった。
+  //   街への自由質問 (!ask) が丸ごと死ぬので、既定を追随させる。
+  //   .env の GEMINI_MODEL が優先されるので、そちらが古いままだと直らない。
+  model:    process.env.GEMINI_MODEL || 'gemini-3.6-flash',
   base:     process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1beta',
   maxChars: Math.max(800, envNum('GEMINI_BRIEF_CHARS', 5000)),   // 日報の上限
   timeoutMs: envNum('GEMINI_TIMEOUT_MS', 15000),
@@ -13411,7 +13581,7 @@ tick(); setInterval(tick, ${ms});
       parcelsOnGround:parcels.length,
       // 置かれている荷物: cell=玄関のセル / home=届け先の建物 / leftSec=消えるまで
       parcels:parcels.map(x=>({cell:[x.r,x.c], home:[x.hr,x.hc],
-                               leftSec:Math.max(0,Math.round((x.until-Date.now())/1000))})),
+                               leftSec:Math.max(0,Math.round((x.until-simNow())/1000))})),
       totals:_delivStats,
       homes:openStructsOf(HOME_IDX).length,
       // need/onDuty も返す。phase=null の配達員が「サボっている」のか
@@ -13689,7 +13859,7 @@ tick(); setInterval(tick, ${ms});
         return;
       }
       CITY.weather=wx;
-      CITY.weatherUntil=Date.now()+WEATHER_HOURS*(DAY_MINUTES*60/24)*1000;
+      CITY.weatherUntil=simNow()+WEATHER_HOURS*(DAY_MINUTES*60/24)*1000;
       news('weather', `天気が ${WEATHERS[wx].ja} になった`, `Weather: ${WEATHERS[wx].en}`);
       res.writeHead(200); res.end(JSON.stringify({ok:true, weather:wx}));
       return;
@@ -13769,7 +13939,7 @@ tick(); setInterval(tick, ${ms});
         construction:CITY.structs.filter(s=>s.state==='construction').length,
         closed:CITY.structs.filter(s=>s.state==='closed').length},
       weather:{now:CITY.weather||'sunny', label:weatherNow().ja, en:weatherNow().en,
-        untilSec:Math.max(0, Math.round(((CITY.weatherUntil||0)-Date.now())/1000))},
+        untilSec:Math.max(0, Math.round(((CITY.weatherUntil||0)-simNow())/1000))},
       field:{size:CITY.size, max:GRID, freeLots:buildableLots(),
         density:+fieldDensity().toFixed(3), walkability:+walkability().toFixed(3),
         limits:{maxDensity:BUILD_MAX_DENS, minWalkability:WALK_MIN},
@@ -13798,7 +13968,7 @@ tick(); setInterval(tick, ${ms});
         workCap:workplaceCapacity(),
         homeless:agents.reduce((n,a)=>n+(a.home?0:1),0),
         homes:openStructsOf(HOME_IDX).map(st=>({label:BLDG_TYPES[st.typeIdx].label, cell:[st.r,st.c],
-          cap:homeCapOf(st.typeIdx),
+          cap:homeCapOf(st),
           residents:agents.reduce((n,a)=>n+((a.home&&a.home[0]===st.r&&a.home[1]===st.c)?1:0),0)}))},
       demand:Object.fromEntries(CATS.map(c=>{
         const dg=CITY.diag[c];
@@ -13826,6 +13996,21 @@ tick(); setInterval(tick, ${ms});
         waiting:(CITY.waiting||[]).map(w=>w.name),
         limit:Math.max(5, Math.round(NUM_AGENTS*VIEWER_MAX_FRAC)),
         favorite:(()=>{ const f=townFavorite(); return f?{name:f.name, cheers:f.cheers||0}:null; })()},
+      // 集積と混雑の綱引き。店がどれだけ寄り集まっているかを見る。
+      //   avg が上がり続けるだけなら集積が強すぎ (混雑の罰が効いていない)、
+      //   1.0 付近で動かないなら集積が弱すぎる。振り子が回っているかの確認用。
+      agglomeration:(()=>{
+        const open=(CITY?CITY.structs:[]).filter(st=>st.state==='open' && CHOOSABLE(st.typeIdx));
+        if(!open.length) return {shops:0};
+        const ns=open.map(st=>shopsNear(st.r, st.c)-1);
+        const busy=open.map(st=>st.visitsToday||0);
+        return {shops:open.length, radius:AGGLO_R,
+          nearAvg:+(ns.reduce((a,b)=>a+b,0)/ns.length).toFixed(2),
+          nearMax:Math.max(...ns),
+          alone:ns.filter(n=>n===0).length,          // 周りに店が無い一軒家的な店
+          visitsAvg:+(busy.reduce((a,b)=>a+b,0)/busy.length).toFixed(1),
+          gain:{agglo:AGGLO_GAIN, max:AGGLO_MAX, site:SITE_AGGLO}};
+      })(),
       // 良いこと・悪いこと。何がどれだけ起きたか (病気の発症率の確認にも使う)。
       events:(()=>{
         const total=Object.values(_evStat).reduce((n,v)=>n+v,0);
@@ -14066,9 +14251,138 @@ wss.on('connection',ws=>{
 
 // sim ループ
 let simRunning = false;
+// 「ゲーム内で1秒ぶん」の生活処理。通常運転は setInterval、早送りは tick 数で呼ぶ。
+// **両方から同じものを呼ぶ**ので、早送りで挙動がズレない。
+function stepOneSecond(){
+  stepSocial(1); stepNeeds(1); stepOutings(1); stepPastime(1); stepEvents(1);
+  stepPolice(); stepDelivery(); retargetOnNeedChange();
+}
+
+// ── 早送り (SIM_FAST=1) ────────────────────────────────────────────────────
+// 描画も配信もせず、シミュレーションだけを回せるだけ速く進める。
+//   ★ ゲーム内時計が tick 起点になったので成立する。実時間に縛られていたころは
+//     DAY_MINUTES を下げても 1日あたりの tick が減るだけで、住民が歩けない
+//     「粗い街」になっていた (実測: 1日160tick / 来店0.1件)。ここでは
+//     **1日あたりの tick 数は通常運転と同じまま**、それを速く消化する。
+//   ★ 目的は「入れた仕掛けが効いているか」を一晩で確かめられるようにすること。
+const SIM_FAST      = process.env.SIM_FAST === '1';
+const SIM_FAST_DAYS = Math.max(1, envNum('SIM_FAST_DAYS', 30));
+const SIM_FAST_EVERY= Math.max(1, envNum('SIM_FAST_REPORT_DAYS', 5));  // 何日ごとに報告するか
+
+async function fastRun(){
+  const perSec  = Math.max(1, Math.round(1000/TICK));            // 1秒 = 何tick
+  const perDay  = Math.round(DAY_MINUTES*60*1000/TICK);          // 1日 = 何tick
+  const total   = perDay*SIM_FAST_DAYS;
+  console.log(`[Fast] 早送り開始: ${SIM_FAST_DAYS}日 = ${total.toLocaleString()}tick`
+    + ` (1日 ${perDay.toLocaleString()}tick / 通常運転と同じ密度)`);
+  const t0=Date.now();
+  let acc=0, lastDay=gameDay();
+  for(let i=0;i<total;i++){
+    await stepAll();
+    _simTicks++;
+    if(++acc>=perSec){
+      acc=0;
+      stepOneSecond();
+      if(CITY_EVOLVE) cityTick();
+    }
+    // イベントループを譲る (HTTP が固まらないように)
+    if((i & 1023)===0) await new Promise(r=>setImmediate(r));
+    const d=gameDay();
+    if(d!==lastDay){                       // 日が変わった瞬間だけ (二重に出さない)
+      lastDay=d;
+      if((d-CITY.dayBase)%SIM_FAST_EVERY===0) fastReport(d, t0);
+    }
+  }
+  fastReport(gameDay(), t0);
+  // 掃引 (tools/agglo-sweep.js) が拾う 1 行。**人が読む行とは別に出す** —
+  // ログの書式を変えたときに集計側が黙って壊れるのを避けるため。
+  const S=spatialStats();
+  console.log('[FastJSON] '+JSON.stringify({
+    days:SIM_FAST_DAYS, seed:CITY_SEED,
+    aggloMax:AGGLO_MAX, aggloGain:AGGLO_GAIN, crowdMax:CROWD_MAX, siteAgglo:SITE_AGGLO,
+    pop:agents.length, shops:S.n, size:S.size,
+    // ── 生の値。指標の解釈を間違えても、これがあれば後から検算できる ──
+    pairs:S.pairs,                      // AGGLO_R 以内にいる店のペア数
+    opened:S.opened, closed:S.closed,   // 店の入れ替わり。これが少ない run は比較に使えない
+    // ── 指標 ──
+    nn: S.nn==null ? null : +S.nn.toFixed(3),      // 最近隣距離の平均 (セル)
+    ce: S.ce==null ? null : +S.ce.toFixed(3),      // Clark-Evans: <1 集積 / 1 無作為 / >1 分散
+    nearAvg:+S.avg.toFixed(3), nearRandom:+S.rnd.toFixed(3),
+    index: S.index==null ? null : +S.index.toFixed(3),  // 旧・集積指数 (店数に依存する。単独では読まない)
+    econ:Math.round(CITY?CITY.econ:0),
+    unmet:+CATS.reduce((n,c)=>n+(CITY?CITY.unmet[c]:0),0).toFixed(0),
+    secs:+((Date.now()-t0)/1000).toFixed(0),
+  }));
+  console.log(`[Fast] 完了 ${( (Date.now()-t0)/1000 ).toFixed(0)}秒`);
+}
+
+// 街の「店の散らばりかた」を測る。**店の数に左右されない指標を出すのが肝**。
+//   ★ 以前ここは 集積指数 = 近隣店の平均数 ÷ 無作為の期待値 だけを出していた。
+//     これは店数 n で正規化しているつもりで、実際には n に強く依存する。
+//     11run の掃引を分解したら、近接ペアがどの run も 1 組で一定なのに
+//     指数だけが 1.361→0.544 と動いていた (動いたのは分母の n)。
+//     「効果があった」と誤読しかけたので、生の値と別指標を必ず併記する。
+function spatialStats(){
+  const open=(CITY?CITY.structs:[]).filter(st=>st.state==='open' && CHOOSABLE(st.typeIdx));
+  const n=open.length, size=fieldSize(), cells=size*size;
+
+  // ── 生の値。これを出しておけば指標の解釈を間違えても後から復元できる ──
+  let pairs=0;                       // AGGLO_R 以内にいる店のペア数 (順序なし)
+  for(let i=0;i<n;i++) for(let j=i+1;j<n;j++)
+    if(Math.abs(open[i].r-open[j].r)<=AGGLO_R && Math.abs(open[i].c-open[j].c)<=AGGLO_R) pairs++;
+
+  // ── 従来の集積指数 (継続性のために残すが、単独では読まない) ──
+  const win=Math.min(cells,(AGGLO_R*2+1)**2);
+  const rnd=n ? (n-1)*win/cells : 0;
+  const avg=n ? 2*pairs/n : 0;
+  const index=rnd>0 ? avg/rnd : null;
+
+  // ── Clark-Evans の最近隣指数。店数と面積で正規化されるので run 間で比べられる ──
+  //   R = 実測の最近隣距離の平均 ÷ 無作為配置での期待値 (0.5/√密度)
+  //   R < 1 … 寄り集まっている / R ≈ 1 … 無作為 / R > 1 … 散っている
+  //   ※ 縁の効果は補正していない (店が少ないと R がやや大きめに出る)。
+  //     対照群と同じ条件で比べるぶんには問題ない。
+  let ce=null, nn=null;
+  if(n>=2){
+    let sum=0;
+    for(let i=0;i<n;i++){
+      let best=Infinity;
+      for(let j=0;j<n;j++){
+        if(i===j) continue;
+        const dr=open[i].r-open[j].r, dc=open[i].c-open[j].c;
+        const d=Math.sqrt(dr*dr+dc*dc);
+        if(d<best) best=d;
+      }
+      sum+=best;
+    }
+    nn=sum/n;
+    const expect=0.5/Math.sqrt(n/cells);
+    ce=expect>0 ? nn/expect : null;
+  }
+  return { n, size, pairs, avg, rnd, index, nn, ce,
+           opened:CITY?CITY.stats.shopsOpened:0, closed:CITY?CITY.stats.shopsClosed:0 };
+}
+
+// 早送り中の指標。**集積が育つか**を見るのが主目的。
+function fastReport(day, t0){
+  const S=spatialStats();
+  const unmet=CATS.reduce((n,c)=>n+(CITY?CITY.unmet[c]:0),0);
+  const con=(CITY?CITY.structs:[]).filter(st=>st.state==='construction').length;
+  // 判定は Clark-Evans で行う。近接ペア数も必ず出す (指標が壊れても生の値は読める)
+  const verdict = S.ce==null ? '店が少なすぎ'
+                : S.ce<0.85 ? '集積 ✔' : S.ce>1.15 ? '分散' : '無作為と同じ';
+  console.log(`[Fast] Day${day+1}  人口${agents.length}  店${S.n}  建設中${con}  `
+    + `開業${S.opened}/閉店${S.closed}  `
+    + `近接ペア${S.pairs}  最近隣${S.nn==null?'--':S.nn.toFixed(2)}  `
+    + `CE${S.ce==null?'--':S.ce.toFixed(3)} ${verdict}  `
+    + `経済${Math.round(CITY?CITY.econ:0)}  未充足${unmet.toFixed(0)}  `
+    + `実時間${((Date.now()-t0)/1000).toFixed(0)}秒`);
+}
+
 async function simLoop(){
   if(simRunning) return;
   simRunning = true;
+  _simTicks++;                      // ゲーム内時計はこれで進む
   const _ts=PERF_LOG?Date.now():0;
   try{
     for(let s=0;s<speedMul;s++) await stepAll();
@@ -14291,10 +14605,25 @@ function statsLoop(){
  *   完全に完了した後にのみ呼ばれるため、scene が null になることはない。
  */
 function startLoops(){
+  if(SIM_FAST){
+    // 早送り: 描画も配信もしない。cityTick / 生活処理は fastRun が自分で回す。
+    console.log('[Fast] SIM_FAST=1 — 描画と配信を止めてシミュレーションだけ回します');
+    // ★ 早送りの結果を**本番の街に書き戻さない**。掃引は同じ server.js を何十回も
+    //   起動するので、CITY_STATE_FILE を指定し忘れると実験結果が本番の街を
+    //   上書きしてしまう。明示的に別ファイルを指したときだけ保存する。
+    const isDefaultState = !process.env.CITY_STATE_FILE;
+    fastRun().then(()=>{
+      if(isDefaultState){
+        console.log('[Fast] CITY_STATE_FILE 未指定のため保存しません (本番の街を守るため)');
+      }else{ saveCity(); console.log('[Fast] 保存しました'); }
+      process.exit(0);
+    }).catch(e=>{ console.error('[Fast]', e); process.exit(1); });
+    return;
+  }
   setInterval(simLoop,    TICK);
   setInterval(renderLoop, 1000/FPS);
   setInterval(statsLoop,  2000);
-  setInterval(()=>{ stepSocial(1); stepNeeds(1); stepOutings(1); stepPastime(1); stepEvents(1); stepPolice(); stepDelivery(); retargetOnNeedChange(); }, 1000);
+  setInterval(stepOneSecond, 1000);
   if(CITY_EVOLVE){
     setInterval(cityTick, 1000);                                      // 日付の切替と工事の完了
     setInterval(pushLifeNews, Math.max(5,LIFE_NEWS_SEC)*1000);        // 住民のいまの様子

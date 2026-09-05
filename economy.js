@@ -61,6 +61,11 @@ const DEFAULTS = Object.freeze({
   workerOutput: 7,     // 職場: 従業員1人が1日に生む価値
   rentPerHead:  5,     // 住宅: 住人1人あたりの家賃
   civicPerHead: 0.22,  // 公共施設: 人口1人あたりの税収 (街が支える)
+  // 職場の詰まり具合。**1棟のオフィスビルには会社がいくつも入っている**という見立てで、
+  //   大きさから出る定員をこの倍率で伸ばす (アルバイトを含めた頭数)。
+  //   ★ 維持費も同じ倍率で伸ばすので、「定員の breakEven が埋まって収支ゼロ」という
+  //     関係は変わらない。来客で稼ぐ店 (visit) と住宅には掛からない。
+  workDensity:  5,
   balanceEma:   0.25,  // 収支の均し方
   bankruptDays: 5,     // 赤字が続いてこの日数で閉鎖
   oversizePenalty: 3.0,// 発展段階に対して大きすぎる建物の維持費の倍率
@@ -222,16 +227,29 @@ function stepDay(S, ctx){
 //   'work'  … 職場。従業員が価値を生む
 //   'home'  … 住宅。住人が家賃を払う
 //   'civic' … 公共施設。人口に応じた税収で支えられる (人口が少ないと維持できない)
-function upkeepOf(S, size){ return S.cfg.upkeepUnit * size; }
+//   kind='work' だけは workDensity ぶん維持費も重くする (定員を伸ばしたぶん)。
+//   これを掛けないとオフィスは頭数だけ5倍になって無条件に黒字になる。
+function upkeepOf(S, size, kind){
+  const u = S.cfg.upkeepUnit * size;
+  return kind==='work' ? u * S.cfg.workDensity : u;
+}
 // 建物の収容力 (職場なら定員、住宅なら世帯数)。大きいほど多く入るが、
 // 埋まらなければそのぶん維持費が重くのしかかる。
 const capacityOf = (S, size) => Math.max(1, Math.round(S.cfg.capUnit * size));
+// 職場の定員。大きさぶんの定員 x workDensity。
+const workCapacityOf = (S, size) =>
+  Math.max(1, Math.round(S.cfg.capUnit * S.cfg.workDensity * size));
 
 function buildingIncome(S, kind, st, ctx){
   // **収入は定員で頭打ち**にする。定員を超えて詰め込まれた人数まで数えると、
   // 人口が多い街ではどんな大きさの建物も黒字になり、大きすぎる建物が
   // いつまでも潰れない (実測: 1000人の街にタワーが10本残った)。
-  const cap=capacityOf(S, ctx.sizeOf(st));
+  // ★ 定員は **server 側が持っているものを使う**。以前ここで独自に capacityOf を
+  //   呼んでいたので、server が「住宅1棟12人」に変えたあとも収入は4人ぶんで
+  //   頭打ちになっていた。二重管理をやめ、ctx 経由で受け取る。
+  const cap = kind==='work' ? (ctx.workCapAt ? ctx.workCapAt(st) : workCapacityOf(S, ctx.sizeOf(st)))
+            : kind==='home' ? (ctx.homeCapAt ? ctx.homeCapAt(st) : capacityOf(S, ctx.sizeOf(st)))
+            : capacityOf(S, ctx.sizeOf(st));
   switch(kind){
     case 'work':  return Math.min(ctx.workersAt(st)||0, cap) * S.cfg.workerOutput;
     case 'home':  return Math.min(ctx.residentsAt(st)||0, cap) * S.cfg.rentPerHead;
@@ -250,7 +268,7 @@ function settleBuilding(S, st, ctx){
   // 街の発展段階に対して**大きすぎる**建物は、維持費が重くのしかかる。
   //   集落にランドマークタワーが建っていても採算が合わないのは当たり前で、
   //   これを入れないと「昔の生成で建った巨大な建物」が永久に残る。
-  let upkeep=upkeepOf(S, ctx.sizeOf(st));
+  let upkeep=upkeepOf(S, ctx.sizeOf(st), kind);
   if(ctx.oversized && ctx.oversized(st)) upkeep *= S.cfg.oversizePenalty;
   const net=income-upkeep;
   st.balance = (st.balance==null) ? net : st.balance*(1-cfg.balanceEma) + net*cfg.balanceEma;
@@ -296,6 +314,6 @@ module.exports = {
   honestyOf, priceOf, isBroke, isJobless, isStudent, inJail, pay,
   willOffend, caught, shoplift, pickpocket, arrest,
   stepDay, unrest, mostDesperate,
-  upkeepOf, capacityOf, buildingIncome, settleBuilding,
+  upkeepOf, capacityOf, workCapacityOf, buildingIncome, settleBuilding,
   serializeAgent, restoreAgent,
 };
