@@ -436,11 +436,28 @@ const PERSONA_DEFS = loadPersonaDefs();
 //     (AGENT_CAP / TRAIL_CAP がこれを見ている)。既定値 1000 は据え置いてある。
 //   ★ 旧コードは parseInt(...)||1000 で NaN になりえず、Number.isFinite の
 //     else 側 (ペルソナ数) は到達しなかった。min(x,x) も何もしていなかった。
+//   ★ **既定では POP_MAX から自動で決める。** NUM_AGENTS と POP_MAX の 2 つを
+//     人が手で合わせるのは間違えやすく、しかも間違え方が静かだった:
+//       ・NUM_AGENTS <= POP_MAX にすると人口が閾値に届かず、街のリセットが
+//         **永久に発火しない** (警告は出るが、何も起きないので気づきにくい)
+//       ・逆に NUM_AGENTS だけ大きいと、使わない枠まで InstancedMesh と
+//         足跡バッファを起動時に確保する (人口100の街で1000人ぶん確保していた)
+//     意味を持つのは「どこまで育ったら作り直すか」= POP_MAX のほうなので、
+//     そちらだけを設定すれば済むようにする。NUM_AGENTS を明示したときはそれを尊重する
+//     (POP_MAX=0 でリセットを切っている場合は上限が他に無いので、明示が要る)。
 const _numAgentsEnv = parseInt(process.env.NUM_AGENTS, 10);
+const _popMaxEnv    = parseFloat(process.env.POP_MAX);      // POP_MAX の const はまだ先
 const NUM_AGENTS = (Number.isFinite(_numAgentsEnv) && _numAgentsEnv > 0)
-  ? Math.min(5000, _numAgentsEnv)
-  : 1000;
-console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`);
+  ? Math.min(5000, _numAgentsEnv)                            // 明示されていればそれ
+  : (Number.isFinite(_popMaxEnv) && _popMaxEnv > 0)
+    // 転入は 1 日に MOVEIN_MAX 人まとめて来るので、閾値ちょうどだと超える瞬間に
+    // 枠が足りない。2 割 (最低20人) の余裕を足す。
+    ? Math.min(5000, Math.ceil(_popMaxEnv + Math.max(20, _popMaxEnv*0.2)))
+    : 1000;
+console.log(`[Persona] ${PERSONA_DEFS.length} personas loaded | NUM_AGENTS=${NUM_AGENTS}`
+  + ((Number.isFinite(_numAgentsEnv) && _numAgentsEnv > 0) ? ' (明示)'
+     : (Number.isFinite(_popMaxEnv) && _popMaxEnv > 0) ? ` (POP_MAX=${_popMaxEnv} から自動)`
+     : ' (既定)'));
 
 // ─── 名前プール / ペルソナプール ──────────────────────────────────────────────
 // personas.json の 15体は **行動モデルの単位** (data/persona_multi.onnx が id ごとの
@@ -3896,7 +3913,7 @@ const POP_MAX_NEWMAP  = process.env.POP_MAX_NEWMAP === '1';  // 1 で地形も�
 // NUM_AGENTS は「存在できる住民の上限」なので、これが POP_MAX 以下だと人口が
 // POP_MAX に届かず、**リセットが永久に発火しない**。何も起きないだけで
 // エラーにならず気づけないので、起動時に叩いておく。
-if(POP_MAX>0 && NUM_AGENTS<=POP_MAX)
+if(POP_MAX>0 && NUM_AGENTS<=POP_MAX && Number.isFinite(_numAgentsEnv) && _numAgentsEnv>0)
   console.warn(`[Config] ⚠ NUM_AGENTS=${NUM_AGENTS} が POP_MAX=${POP_MAX} 以下です。`
     + ` 人口が ${POP_MAX} に届かないので街のリセットが発火しません。`
     + ` NUM_AGENTS を ${POP_MAX+20} 以上にするか、POP_MAX を ${NUM_AGENTS-1} 以下にしてください。`);
