@@ -297,6 +297,10 @@ const SOC = require('./social.js');
 const PT  = require('./pastime.js');   // 暇な時間の娯楽 (建物も小物も増やさない)
 const EV  = require('./events.js');    // 良いこと・悪いこと (病気の発症もここに一本化)
 const CH  = require('./chronicle.js'); // 住民ごとの来歴 (!story で読める)
+const RNG = require('./rng.js');       // 種の決まった乱数 (シミュレーションだけが使う)
+const WIT = require('./witness.js');   // 目撃台帳 (犯行を「誰がどこまで見たか」)
+const AL  = require('./alibi.js');     // アリバイ台帳 (その時間、誰がどこに居たか)
+const MYS = require('./mystery.js');   // 事件を「謎として解ける形か」で採点する
 // GLB (glTF) から静的なジオメトリだけ読む最小の読み取り。
 // three の GLTFLoader は ESM で CommonJS から require できないため自前で持つ。
 const GLB = require('./glb.js');
@@ -957,7 +961,7 @@ function renderFPImageCfg(map, agent, cfg, others){
 function sampleLogits(lg){
   const mx=Math.max(...lg), ex=lg.map(v=>Math.exp(v-mx));
   const sm=ex.reduce((a,b)=>a+b,0), pr=ex.map(v=>v/sm);
-  let rv=Math.random();
+  let rv=RNG.R();
   for(let i=0;i<pr.length;i++){rv-=pr[i];if(rv<=0)return i;}
   return 0;
 }
@@ -973,7 +977,7 @@ function biasedRandom(map, agent){
     }
     return ROAD;
   })();
-  return (fwd===ROAD && Math.random()<0.55) ? 0 : (Math.random()<0.5?1:2);
+  return (fwd===ROAD && RNG.R()<0.55) ? 0 : (RNG.R()<0.5?1:2);
 }
 
 // seg_head: DINOv2 patch tokens → セグメンテーション → 前方中央が open か
@@ -1181,7 +1185,7 @@ async function prefetchAllActions(map, agents){
 }
 
 function selectAction(agent){
-  return actionCache[agent.aid] ?? Math.floor(Math.random()*3);
+  return actionCache[agent.aid] ?? Math.floor(RNG.R()*3);
 }
 
 // ─── 建物タイプ定義 (マスター) ───────────────────────────────────────────────
@@ -3831,6 +3835,14 @@ const tempoUp      = v => v*CITY_TEMPO;      // 大きいほど活発になる�
 const tempoDown    = v => v/CITY_TEMPO;      // 小さいほど活発になる値
 const CITY_EVOLVE  = process.env.CITY_EVOLVE !== '0';
 const CITY_SEED    = envNum('CITY_SEED', 42);
+// ── シミュレーションの種 ────────────────────────────────────────────────────
+// 既定は街の種と同じ。**同じ SIM_SEED なら同じ歴史が出てくる**ので、
+// 面白かった時間帯は「種 + 何日目から何日目まで」だけ控えておけば再生できる。
+// 分岐探索 (tools/branch-search.js) はここを振って別の未来を引く。
+const SIM_SEED = envNum('SIM_SEED', CITY_SEED);
+RNG.seed(SIM_SEED);
+// 純粋モジュールの既定乱数も差し替える。**ここを忘れると1本だけ非決定になる。**
+SOC.setRng(RNG.R); ECO.setRng(RNG.R); EV.setRng(RNG.R); PT.setRng(RNG.R); WIT.setRng(RNG.R);
 const CITY_FILE    = process.env.CITY_STATE_FILE || path.join(__dirname,'data','city_state.json');
 const CITY_SAVE_SEC= envNum('CITY_SAVE_SEC', 60);
 const DAY_ROLL_H   = envNum('DAY_ROLL_H', 5);       // 日付が変わる時刻 (朝5時)
@@ -4038,7 +4050,7 @@ function stepWeather(){
   if(WEATHER_FORCE){ CITY.weather=WEATHER_FORCE; return; }
   const now=simNow();
   if(CITY.weatherUntil && now < CITY.weatherUntil) return;
-  let r=Math.random(), pick=WEATHER_KEYS[0];
+  let r=RNG.R(), pick=WEATHER_KEYS[0];
   for(const k of WEATHER_KEYS){ r-=WEATHERS[k].p; if(r<=0){ pick=k; break; } }
   const changed = pick!==CITY.weather;
   CITY.weather=pick;
@@ -4709,7 +4721,7 @@ function enterOpenPlace(a, dst){
   //   到着した場所 (玄関側の通れるセル) にそのまま留まらせる。姿が消えないので
   //   「公園のところに人が居る」絵にはなる。
   //   重ならないよう、いま居るセルの中だけで少し散らす。
-  const jr=(Math.random()-0.5)*0.5, jc=(Math.random()-0.5)*0.5;
+  const jr=(RNG.R()-0.5)*0.5, jc=(RNG.R()-0.5)*0.5;
   const nx=a.x+jr, ny=a.y+jc;
   const r=Math.floor(nx), c=Math.floor(ny);
   if(r>=0 && r<GRID && c>=0 && c<GRID && PASSABLE.has(MAP[r][c])){ a.x=nx; a.y=ny; }
@@ -4717,7 +4729,7 @@ function enterOpenPlace(a, dst){
   // 公園のほうを向いて立つ (背を向けて突っ立っていると不自然)
   a.th = Math.atan2(dst[1]+0.5-a.y, dst[0]+0.5-a.x);
   a.mode='hold';
-  a.linger = simNow() + OPEN_STAY_SEC*1000*(0.6+Math.random()*0.8);
+  a.linger = simNow() + OPEN_STAY_SEC*1000*(0.6+RNG.R()*0.8);
   return true;
 }
 
@@ -6505,6 +6517,42 @@ function daysSinceBoot(){
 }
 function gameDay(){ return (CITY?CITY.dayBase:0) + daysSinceBoot(); }
 
+// ── スナップショット ────────────────────────────────────────────────────────
+// 保存ファイルは元々「街の蓄積」だけを持っていた (道・店・人間関係・所持金)。
+// 住民の**いまの居場所と体調**は持っていないので、復元すると全員が自宅から
+// やり直しになる。日々の配信ではそれで困らないが、**分岐探索には足りない**。
+// 同じ瞬間から別の未来を50本引くには、その瞬間が完全に再現できないといけない。
+//
+// ★ 「元の歴史と寸分たがわず」である必要は無い。分岐どうしが**同じ地点から
+//   始まっていれば**比較になる。だから経路や探索メモのような、すぐ引き直せる
+//   ものは捨ててよい (捨て方が全分岐で同じなら、比較は成立する)。
+const _r3 = v => (v==null || !isFinite(v)) ? null : +(+v).toFixed(3);
+function agentSnap(a){
+  return {
+    x:_r3(a.x), y:_r3(a.y), t:_r3(a.th), gx:_r3(a.gx), gy:_r3(a.gy),
+    hu:_r3(a.hunger), fa:_r3(a.fatigue), su:_r3(a.supply), bo:_r3(a.bored), sk:_r3(a.sick),
+    hm:a.home||null, wk:a.work||null, sc:a.school||null, ind:a.indoors||null,
+    md:a.mode||null, gt:a.goalType||null, gz:(a.goalZ==null?null:a.goalZ),
+  };
+}
+function applyAgentSnap(a, sn){
+  if(!sn) return false;
+  if(sn.x!=null) a.x=sn.x;
+  if(sn.y!=null) a.y=sn.y;
+  if(sn.t!=null) a.th=sn.t;
+  if(sn.gx!=null) a.gx=sn.gx;
+  if(sn.gy!=null) a.gy=sn.gy;
+  a.hunger=sn.hu||0; a.fatigue=sn.fa||0; a.supply=sn.su||0; a.bored=sn.bo||0; a.sick=sn.sk||0;
+  if(sn.hm) a.home=[...sn.hm];
+  if(sn.wk) a.work=[...sn.wk];
+  if(sn.sc) a.school=[...sn.sc];
+  if(sn.ind) a.indoors=[...sn.ind];
+  a.mode=sn.md||'wander'; a.goalType=sn.gt||null; a.goalZ=(sn.gz==null?null:sn.gz);
+  a.path=null; a.pathIdx=0; a.navDest=null;   // 経路は次の tick で引き直される
+  a._snapped=true;
+  return true;
+}
+
 // ── 永続化 ──────────────────────────────────────────────────────────────────
 //   マップ生成則や種を変えたら読まない (壊れた街を復元しないため)。
 function cityToJSON(){
@@ -6512,10 +6560,13 @@ function cityToJSON(){
   for(const a of agents){
     const rel=SOCIAL_ON ? SOC.serializeAgent(a, REL_SAVE) : undefined;
     const eco=ECON_ON ? ECO.serializeAgent(a) : undefined;
-    if(a.seenMask || a.owns || a.viewer || a.cheers || rel || eco || (a.pref && Object.keys(a.pref).length)){
+    // ★ 「何か蓄積のある人だけ保存」をやめる。まだ何も起きていない住民は
+    //   居場所ごと落ちていたので、復元のたびに位置が変わっていた。
+    //   分岐を比べるには **全員** が同じ地点から始まる必要がある。
+    {
       // 好みは上位6件だけ保存する (1000人ぶん全部持つと保存ファイルが膨らむ)
       const top=Object.entries(a.pref||{}).sort((x,y)=>y[1].s-x[1].s).slice(0,6);
-      own[a.aid]={m:a.seenMask||0, o:a.owns||null, h:CH.serialize(a),
+      own[a.aid]={m:a.seenMask||0, o:a.owns||null, h:CH.serialize(a), sn:agentSnap(a),
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
                   b:a.viewer?a.by:undefined, c:a.cheers||undefined,
                   p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
@@ -6524,10 +6575,23 @@ function cityToJSON(){
   }
   return {
     version:1, seed:CITY.seed, grid:GRID, savedAt:Date.now(),
+    // 分岐探索のための最小限: いまの時刻と、乱数がどこまで進んでいるか。
+    //   時刻を戻さないと復元のたびに朝から始まり、夜の事件が再現できない。
+    sim:{hour:+gameHour().toFixed(4), rng:RNG.state(), seed:SIM_SEED},
     day:gameDay(), bornAt:CITY.bornAt,
     econ:CITY.econ, level:CITY.level, pop:agents.length, size:CITY.size, weather:CITY.weather,
     map:MAP.map(row=>row.join('')),
-    structs:CITY.structs.map(st=>({...st})),
+    // ★ doneAt (工事の完了時刻) は simNow() の**絶対値**なので、そのまま保存しては
+    //   いけない。simNow() は起動時の実時計 (_bootMs) を基点にしているため、
+    //   別のプロセスで読むと基点が変わって意味を失う。しかも「ずれる量 = 起動の
+    //   タイミング差」なので、**同じファイルから2回再開すると結果が変わる**。
+    //   (実測: 再開すると15日後の状態が毎回違い、これが唯一の原因だった。)
+    //   残り時間に直して保存し、読むときに新しい時計で組み直す。
+    structs:CITY.structs.map(st=>{
+      const o={...st};
+      if(o.doneAt){ o.doneIn=Math.max(0, Math.round(o.doneAt-simNow())); delete o.doneAt; }
+      return o;
+    }),
     foot:Array.from(CITY.foot),
     roadUse:Array.from(CITY.roadUse),
     roadClass:Array.from(CITY.roadClass||[]),
@@ -6538,6 +6602,9 @@ function cityToJSON(){
     // これがあると再起動しても「学生リリ」が同じ人として戻る (上の agents は aid キー)。
     residents: POOL_ON ? agents.map(a=>[a.aid, a.def.pool, a.def.nameIdx]) : undefined,
     waiting:CITY.waiting||[], recs:CITY.recs||[],
+    // 事件は稀にしか起きない。再起動で台帳が消えると、材料が貯まる前に毎回ゼロに戻る。
+    witness: WITNESS_ON ? WIT.serialize(WIT_STATE) : undefined,
+    dead:CITY.dead||[], bodies:CITY.bodies||[],
   };
 }
 function saveCity(){
@@ -6637,7 +6704,8 @@ function freshCity(){
     demand:Object.fromEntries(CATS.map(c=>[c,new Float32Array(GRID*GRID)])),
     unmet:Object.fromEntries(CATS.map(c=>[c,0])),
     stats:{roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
-           crimes:0,jobsLost:0,delivered:0},
+           feuds:0,crimes:0,murders:0,jobsLost:0,delivered:0},
+    dead:[], bodies:[],          // 亡くなった住民 / まだ見つかっていない死体
     unrest:0,
     news:[], savedAgents:{}, residents:null, diag:freshDiag(),
     waiting:[],                      // 入居待ちの視聴者 (家が建ったら順に迎える)
@@ -6660,20 +6728,36 @@ function resetCity(keepMap){
 
 function initCity(){
   const j=loadCity();
+  // ★ 時刻の復元は **CITY を組む前**。工事の残り時間 (doneIn) を simNow() で
+  //   組み直すので、ここが後だと時計がずれた状態で計算してしまう。
+  //   1日ぶんに満たない量しか進めないので daysSinceBoot() は 0 のまま =
+  //   gameDay() は保存された日 (dayBase) をそのまま指す。
+  if(j && j.sim && j.sim.hour!=null){
+    const perDay=Math.round(DAY_MINUTES*60*1000/TICK);
+    const frac=((((j.sim.hour - START_HOUR)%24)+24)%24)/24;
+    _simTicks=Math.round(perDay*frac);
+    console.log(`[City] 時刻を復元: ${(+j.sim.hour).toFixed(2)}時 (tick ${_simTicks})`);
+  }
   if(j){
     MAP = j.map.map(row=>row.split('').map(Number));
     CITY = {
       seed:CITY_SEED, dayBase:j.day||0, bornAt:j.bornAt||Date.now(),
       econ:j.econ||0, level:j.level||0, pop:j.pop||0, size:j.size||GRID,
       weather:j.weather||'sunny', weatherUntil:0,
-      structs:j.structs.map(st=>({...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st})),
+      // doneIn (残りの工事時間) を、この プロセスの時計で doneAt に組み直す。
+      structs:j.structs.map(st=>{
+        const o={...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st};
+        if(o.doneIn!=null){ o.doneAt=simNow()+o.doneIn; delete o.doneIn; }
+        return o;
+      }),
       foot:Int32Array.from(j.foot||[]),
       roadUse:Int32Array.from(j.roadUse||[]),
       roadClass:Int8Array.from(j.roadClass||[]),
       demand:Object.fromEntries(CATS.map(c=>[c, Float32Array.from((j.demand&&j.demand[c])||[])])),
       unmet:Object.assign(Object.fromEntries(CATS.map(c=>[c,0])), j.unmet||{}),
       stats:Object.assign({roadsBorn:0,roadsGone:0,shopsOpened:0,shopsClosed:0,demolished:0,friendships:0,
-                          crimes:0,jobsLost:0,delivered:0}, j.stats||{}),
+                          feuds:0,crimes:0,murders:0,jobsLost:0,delivered:0}, j.stats||{}),
+      dead:j.dead||[], bodies:j.bodies||[],
       unrest:j.unrest||0,
       news:j.news||[], savedAgents:j.agents||{}, residents:j.residents||null, diag:freshDiag(),
       waiting:j.waiting||[], recs:j.recs||[],
@@ -6701,6 +6785,10 @@ function initCity(){
     console.log(`[City] フィールドを最低の広さまで拡張 ${before} → ${CITY.size} (木+${t})`);
   }
 
+  if(j && j.witness && WITNESS_ON){
+    const n=WIT.restore(WIT_STATE, j.witness);
+    if(n) console.log(`[City] 目撃台帳 ${n}件を復元`);
+  }
   // 工事中のまま保存された建物は、落ちていた間に完成したものとして開業させる
   for(const st of CITY.structs) if(st.state==='construction' && st.doneAt && st.doneAt<simNow()) st.state='open';
   // 取り壊しアニメの途中で保存された建物は閉店状態に戻す (翌日また取り壊される)
@@ -6814,7 +6902,7 @@ function assignHomes(){
     if(a.school && okSchool(a.school)) continue;
     const pool=(schoolsByLevel[lv]&&schoolsByLevel[lv].length)?schoolsByLevel[lv]:anySchool;
     // 1回だけ抽選する。行と列を別々に引くと、別々の学校の座標が混ざる
-    const pick=pool.length ? pool[Math.floor(Math.random()*pool.length)] : null;
+    const pick=pool.length ? pool[Math.floor(RNG.R()*pool.length)] : null;
     a.school = pick ? [pick.r, pick.c] : null;
   }
   for(const a of agents){
@@ -6871,7 +6959,7 @@ function stepNeeds(dtSec){
     // 以前は全員を総当たりしていて、300人で9万回/tick の走査になっていた。
     SOC.neighbors(SOC_STATE, a, _nearBuf, 1);   // 居るかどうかだけ分かればよい
     const alone = _nearBuf.length===0;
-    if(!alone && CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec)
+    if(!alone && CITY_EVOLVE && RNG.R()<GOSSIP_P*dtSec)
       gossip(a, _nearBuf[0]);      // すれ違いざまに「行きつけ」の話をする (低確率)
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
     // 病気の発症は events.js へ移した。ここに書いてあったころは**何の説明も無く**
@@ -6956,7 +7044,7 @@ function startPastime(a, A, mates){
   for(const m of mates)
     m.pastime={ id:A.id, until:a.pastime.until, walk:!!A.walk, mates:[a.aid] };
   // 会話ログ。全部出すと流れが速すぎるので確率で間引く。
-  if(Math.random() < PASTIME_TALK_P){
+  if(RNG.R() < PASTIME_TALK_P){
     const t=PT.line(A, JA_HUD);
     if(t) pushTalkLine(a.name, t);
   }
@@ -6985,7 +7073,7 @@ function stepPastime(dtSec){
       a.pastime=null;
     }
     if(ptActive(a) || !ptIdle(a)) continue;
-    if(Math.random() >= PASTIME_P*dtSec) continue;
+    if(RNG.R() >= PASTIME_P*dtSec) continue;
 
     const r=Math.floor(a.x), c=Math.floor(a.y);
     const indoors=MW.isIndoors(a);
@@ -7029,7 +7117,7 @@ function applyEventFx(a, E){
   const f=E.fx||{}, cl=v=>Math.max(0, Math.min(1, v));
   if(f.cash)     a.cash    = Math.max(0, (a.cash||0)*(1+f.cash));
   if(f.cashFlat) a.cash    = Math.max(0, (a.cash||0)+f.cashFlat);
-  if(f.sick)     a.sick    = f.sick[0] + Math.random()*(f.sick[1]-f.sick[0]);
+  if(f.sick)     a.sick    = f.sick[0] + RNG.R()*(f.sick[1]-f.sick[0]);
   if(f.sickAdd)  a.sick    = Math.max(0, (a.sick||0)+f.sickAdd);
   if(f.fatigue)  a.fatigue = cl((a.fatigue||0)+f.fatigue);
   if(f.hunger)   a.hunger  = cl((a.hunger ||0)+f.hunger);
@@ -7053,11 +7141,24 @@ function chainEvent(a, E, near){
     if(fr.length) pool=fr;
   }
   if(!pool.length) return null;
-  const b=pool[(Math.random()*pool.length)|0];
+  const b=pool[(RNG.R()*pool.length)|0];
   // 正直さで分岐する連鎖。honesty が高いほど届ける
-  const honest = !P.honesty || Math.random() < ((b.def && b.def.honesty!=null) ? b.def.honesty : 0.6);
+  const honest = !P.honesty || RNG.R() < ((b.def && b.def.honesty!=null) ? b.def.honesty : 0.6);
   const R = honest ? P.good : (P.bad || P.good);
   applyEventFx(b, R);
+  // ★ 恨みが残る連鎖 (言い合い・すっぽかし)。**街で動機が生まれる場所はここだけ。**
+  //   一度では閾値に届かない値にしてあるので、同じ相手と何度もめたかが効く。
+  // 貸し借りは関係として残す (b が a に貸した)。返済と取り立ては stepDebts が回す。
+  if(P.lend && SOCIAL_ON && honest){
+    SOC.lend(SOC_STATE, b, a, P.lend, day);
+    CH.push(b, {day, icon:'💸', ja:`${a.name} に ${P.lend} 貸した`, en:`lent ${P.lend} to ${a.name}`});
+  }
+  const G = R.grudge || P.grudge;
+  if(G && SOCIAL_ON){
+    const f1=SOC.bumpGrudge(SOC_STATE, a, b, G.a||0, day);
+    const f2=SOC.bumpGrudge(SOC_STATE, b, a, G.b||0, day);
+    if(f1||f2) onFeud(a, b);
+  }
   _evStat[R.id]=(_evStat[R.id]||0)+1;
   CH.push(b, {day, icon:R.icon, ja:R.ja, en:R.en});
   // 届いたときだけ本人に返す (持ち去られたら本人には何も起きない = 財布は戻らない)
@@ -7066,9 +7167,12 @@ function chainEvent(a, E, near){
     CH.push(a, {day, icon:P.backGood.icon, ja:P.backGood.ja, en:P.backGood.en});
   }
   // 連鎖は**必ず**見出しに出す。二人の名前が並ぶ行はこの街でいちばん物語になる。
-  news(honest?'good':'bad',
-       `${R.icon} ${a.name} の ${E.ja} — ${b.name} が ${R.ja}`,
-       `${b.name} ${R.en} after ${a.name} ${E.en}`);
+  //   ただし quiet の連鎖 (もめ事) だけは別。数が多いので流すと開店/閉店を押し出すし、
+  //   一度の口論より **こじれた瞬間 (onFeud)** のほうが見出しに値する。
+  if(!P.quiet)
+    news(honest?'good':'bad',
+         `${R.icon} ${a.name} の ${E.ja} — ${b.name} が ${R.ja}`,
+         `${b.name} ${R.en} after ${a.name} ${E.en}`);
   return b;
 }
 
@@ -7105,18 +7209,18 @@ function stepOutings(dtSec){
     && !(ptActive(x) && (x.pastime.mates||[]).length);   // group の遊びは邪魔しない
   for(const a of agents){
     if(!free(a)) continue;
-    if(Math.random() >= OUTING_P*dtSec) continue;
+    if(RNG.R() >= OUTING_P*dtSec) continue;
     _evBuf.length=0;
     SOC.neighbors(SOC_STATE, a, _evBuf, 4);
     const fr=_evBuf.filter(b=>b!==a && free(b)
       && Math.abs(b.x-a.x)<=OUTING_R && Math.abs(b.y-a.y)<=OUTING_R
       && SOC.relOf(a, b.aid) >= SOC_STATE.cfg.relFriend);
     if(!fr.length) continue;
-    const b=fr[(Math.random()*fr.length)|0];
+    const b=fr[(RNG.R()*fr.length)|0];
     // 行き先は営業中の飲食店。無ければ誘わない (街に店が無いうちは起きない)
     const cells=catBuildings('eat');
     if(!cells.length) continue;
-    const g=cells[(Math.random()*cells.length)|0];
+    const g=cells[(RNG.R()*cells.length)|0];
     const gr=Math.round(g[0]), gc=Math.round(g[1]);
     const st=structAt(gr, gc); if(!st) continue;
     if(!sendToBuilding(a, gr, gc)) continue;
@@ -7142,7 +7246,7 @@ function stepEvents(dtSec){
   const now=simNow(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
   for(const a of agents){
     if(a.jail>0) continue;                   // 収監中は街の出来事の外
-    if(Math.random() >= p) continue;
+    if(RNG.R() >= p) continue;
     _evBuf.length=0;
     SOC.neighbors(SOC_STATE, a, _evBuf, 2);
     const E=EV.pick({
@@ -7178,6 +7282,12 @@ function stepEvents(dtSec){
 function shouldLeaveBuilding(a){
   if(!MW.isIndoors(a)) return true;
   const [br,bc]=a.indoors;
+  // ★ 誘い出された先では留まる。用事が無い建物 (郵便局など) は needOf が null に
+  //   なるので、放っておくと**着いた瞬間に出ていく**。誘い出しても二人きりの
+  //   時間が1秒も生まれず、殺人の条件が永久に満たされなかった (実測)。
+  const pl=(a.plot && a.plot.until>simNow()) ? a.plot.place
+         : (a.lured && a.lured.until>simNow()) ? a.lured.place : null;
+  if(pl && br===pl[0] && bc===pl[1]) return false;
   const t=BUILDING_TYPES[br+'_'+bc];
   const n=needOf(a);
   // 家で本を読んでいる/ゲームをしている最中に追い出さない
@@ -7332,13 +7442,13 @@ function pickLifeGoal(a, ex){
       });
       scored.sort((p,q)=>q.sc-p.sc);
       const k = n==='sick' ? 2 : 3;                // 上位から少しばらけさせる
-      return [...scored[Math.floor(Math.random()*Math.min(k,scored.length))].b];
+      return [...scored[Math.floor(RNG.R()*Math.min(k,scored.length))].b];
     }
   }
   return randB(ex);
 }
 
-function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(Math.random()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
+function randB(ex){for(let i=0;i<500;i++){const b=BUILDINGS[Math.floor(RNG.R()*BUILDINGS.length)];if(!ex||Math.abs(b[0]-ex[0])>1||Math.abs(b[1]-ex[1])>1)return[...b];}return[...BUILDINGS[0]];}
 
 // ═══ 街の進化: 日次の変化 ═══════════════════════════════════════════════════
 // 変化はすべて dailyRollover() に集約する。1か所を読めば「今日この街に何が
@@ -7715,7 +7825,7 @@ function pickTypeFor(cat){
   for(const st of CITY.structs) if(st.state!=='gone' && (st.typeIdx in count)) count[st.typeIdx]++;
   let min=Infinity; for(const t of types) min=Math.min(min, count[t]);
   const pool=types.filter(t=>count[t]===min);
-  return pool[Math.floor(Math.random()*pool.length)];
+  return pool[Math.floor(RNG.R()*pool.length)];
 }
 
 // 起業者 = 「自分が一番困っていて、かつ性格的に動く人」。1人1軒まで。
@@ -7733,7 +7843,7 @@ function pickFounder(cat){
   const pool=agents.filter(a=>!a.owns && ((a.def&&a.def.enterprise)||0)>0);
   if(!pool.length) return null;
   let sum=0; for(const a of pool) sum+=a.def.enterprise;
-  let r=Math.random()*sum;
+  let r=RNG.R()*sum;
   for(const a of pool){ r-=a.def.enterprise; if(r<=0) return a; }
   return pool[0];
 }
@@ -8028,7 +8138,7 @@ const EXIT_SLACK      = envNum('WORK_EXIT_SLACK', 1.35);            // 雇用の
 function maybeWorkExit(day){
   if(!EXIT_ON || !CITY || !ECON_ON) return 0;
   if(day - (CITY.lastWorkExit||-999) < EXIT_EVERY) return 0;
-  if(Math.random() >= EXIT_P) return 0;
+  if(RNG.R() >= EXIT_P) return 0;
   const works=openStructsOf(WORK_IDX);
   if(works.length<=EXIT_MIN_WORK) return 0;
   // 雇用に余力があるときだけ。ここを外すと過去の暴走が再現する。
@@ -8318,7 +8428,7 @@ function closeShop(st, day, vacant){
       // 本人に何も起きない。失業の期間を持たせて、生活が傾くようにする。
       if(!ECON_ON){
         const works=buildingsOfTypes(WORK_IDX);
-        a.work = works.length ? [...works[Math.floor(Math.random()*works.length)]] : null;
+        a.work = works.length ? [...works[Math.floor(RNG.R()*works.length)]] : null;
       }
       news('close', `🚪 ${a.name} の ${label} が閉店しました (${st.r},${st.c})`,
            `${a.name}'s ${enOf(st.typeIdx)} closed down`);
@@ -8740,6 +8850,346 @@ const SOC_STATE = SOC.createState({
   talkCoolSec: envNum('TALK_COOL_SEC', 25),
 });
 
+// ── 目撃台帳 (witness.js) ───────────────────────────────────────────────────
+// 犯行そのものは economy.js が既に起こしている。ここで足すのは **誰がどこまで
+// 見たか**。これが無いと事件は「起きた」だけで、街の側には何も残らない。
+const WITNESS_ON       = process.env.WITNESS !== '0';
+const WITNESS_NEWS_SEC = envNum('WITNESS_NEWS_SEC', 60);
+let _witNewsAt=0;
+const WIT_STATE = WIT.createState({
+  cap:     envNum('WITNESS_CAP', 64),
+  // 1件につき何人ぶんの証言を残すか。**多くすると必ず誰か1人はよく見ている**ことに
+  //   なり、一番良い証言が採用されて謎が易しくなる。人混みの全員が使える証言を
+  //   するわけではない、という当たり前のところに合わせて絞る。
+  maxSeen: envNum('WITNESS_MAX_SEEN', 3),
+  range:   envNum('WITNESS_RANGE', 9),
+  jitter:  envNum('WITNESS_JITTER', 0.18),
+});
+
+// ── アリバイ台帳 (alibi.js) ─────────────────────────────────────────────────
+// 目撃台帳が「犯人はどう見えたか」を持つのに対し、こちらは **犯人以外がどこに居たか**。
+// 消去法に要るのは後者で、これが無いと「人相に当てはまる12人」から先へ進めない。
+const ALIBI_ON = process.env.ALIBI !== '0';
+const AL_STATE = AL.createState({
+  slotMin: envNum('ALIBI_SLOT_MIN', 10),
+  days:    envNum('ALIBI_DAYS', 2),
+  zone:    envNum('ALIBI_ZONE', 4),
+  outMin:  envNum('ALIBI_OUT_MIN', 2),
+  grid:    GRID,
+});
+let _alibiSlot=-1;
+// スロットが変わったときだけ全員ぶん記録する (10分刻みなので毎秒回らない)。
+function stepAlibi(){
+  if(!ALIBI_ON) return;
+  const slot=AL.absSlot(AL_STATE, gameDay(), gameHour());
+  if(slot===_alibiSlot) return;
+  _alibiSlot=slot;
+  AL_STATE.stats.slots++;
+  for(const a of agents){
+    const ind=MW.isIndoors(a);
+    const r=ind ? a.indoors[0] : Math.floor(a.x);
+    const c=ind ? a.indoors[1] : Math.floor(a.y);
+    // 場所と一緒に所持金も刻む。「事件のあと金回りが良くなった人」を後から引ける。
+    AL.mark(AL_STATE, a, slot, AL.placeCode(AL_STATE, r, c, ind), a.cash||0);
+  }
+}
+
+// 住民の見た目。証言はここから作られる。
+//   上衣 = ペルソナ色 (def.color) / 髪 = agentWear の tone / 性別・年齢 = def。
+//   ★ 見た目は **aid から決まる**ので、同じ人はいつ誰が見ても同じ姿になる。
+//     別々の証言を突き合わせられるのはこれが理由。
+function lookOf(a){
+  const w=agentWear(a);
+  return {aid:a.aid, name:a.name, color:a.def.color,
+          hair:(w.tone|0)%SK.HAIR_TONES.length,
+          gender:a.def.gender, age:a.def.age};
+}
+
+// ── 変装 ────────────────────────────────────────────────────────────────────
+// **トリックとは、嘘をつかずに台帳が誤解を生む記録を残す行動のこと。**
+// 変装はその一番安い形で、目撃台帳には本当に見えたとおりが刻まれるのに、
+// それが街の知っているその人の姿と食い違う。
+//
+// ── 見た目を二つに割る ──
+//   lookOf(a)     … 街が知っている素顔。**容疑者を絞るのはこちら**
+//   seenLookOf(a) … 目撃者が実際に見た姿。**証言が作られるのはこちら**
+// この二つが食い違うこと自体がトリックの正体で、割っていないと変装は表現できない。
+//
+// ── 手がかりは勝手に落ちてくる ──
+// 服は変えられても背格好は変えられないので、変装は**部分的**にしかできない。
+// すると証言に当てはまる住民は何人か居るのに、その全員に裏が取れている、
+// という状態が起きる。これは「当てはまらない誰かが化けていた」以外に説明が
+// つかない — 消去推理としてフェアで、しかも手数が一段伸びる。
+//
+// ── 誰が化けるか ──
+// 新しい動機付けは要らない。**手配されている人ほど顔を隠す。** wanted は
+// 既にある状態なので、そのまま引き金にできる。
+const DISGUISE_ON    = process.env.DISGUISE !== '0';
+const DISGUISE_WANTED= envNum('DISGUISE_WANTED', 0.5);   // これ以上手配されていたら
+const DISGUISE_P     = envNum('DISGUISE_P', 0.02);       // 屋外に居る1秒あたりの着替え確率
+const DISGUISE_HOURS = envNum('DISGUISE_HOURS', 3);      // 何時間そのままか (ゲーム内)
+const _disguiseCols = CHAR_POOL.length
+  ? [...new Set(CHAR_POOL.map(p=>p.color))] : [0x888888];
+
+/** 目撃者が実際に見た姿。変装中なら変装後。 */
+function seenLookOf(a){
+  const L=lookOf(a);
+  if(a.disguise && a.disguise.until > simNow()){
+    L.color=a.disguise.color;
+    L.hair =a.disguise.hair;
+    L.disguised=true;
+  }
+  return L;
+}
+
+function stepDisguise(dtSec){
+  if(!DISGUISE_ON || !CRIME_ON) return;
+  const now=simNow();
+  const dur=DISGUISE_HOURS*(DAY_MINUTES*60/24)*1000;
+  for(const a of agents){
+    if(a.disguise && a.disguise.until<=now) a.disguise=null;
+    if(a.jail>0 || MW.isIndoors(a)) continue;
+    if((a.wanted||0) < DISGUISE_WANTED) continue;
+    if(a.disguise) continue;
+    if(RNG.R() >= DISGUISE_P*dtSec) continue;
+    // 服と髪だけ変える。**背格好 (性別・年代) は変えられない** ので、
+    // 変装は必ず部分的になる — そこが手がかりの残りしろになる。
+    const w=agentWear(a);
+    const own=a.def.color, hair0=(w.tone|0)%SK.HAIR_TONES.length;
+    let col=own;
+    for(let k=0;k<8 && col===own;k++) col=_disguiseCols[RNG.Ri(_disguiseCols.length)];
+    const hair=(hair0 + 1 + RNG.Ri(SK.HAIR_TONES.length-1)) % SK.HAIR_TONES.length;
+    a.disguise={color:col, hair, until:now+dur};
+    // ★ ニュースには**出さない**。街が気づいたら変装の意味が無い。
+    //   運用者だけが見えるコンソールに出す (来歴には本人の記憶として残る)。
+    console.log(`[Disguise] Day${gameDay()+1} ${a.name} (wanted ${(a.wanted||0).toFixed(2)})`);
+    CH.push(a, {day:gameDay(), icon:'🎭', ja:'人目を避けて身なりを変えた',
+                en:'changed their look to avoid being recognised'});
+  }
+}
+
+// 犯行の場に居合わせた住民を近い順に集める。戻り値は [{s:証言, a:目撃者}]。
+//   ★ 立ち話の空間ハッシュ (social.js) は使わず素直に全員見る。犯行は稀で
+//     毎tick回らないので O(N) で足りるし、ハッシュのセル幅 (meetRadius=3) より
+//     広い範囲を見たいため。ハッシュの鮮度に依存しないぶん壊れにくい。
+const _witCand=[];
+function witnessesAt(culprit, victim, indoors){
+  const cfg=WIT_STATE.cfg;
+  // 屋内は照明があるので夜でも見える。雨も関係ない。
+  const light = indoors ? 1 : daylight();
+  const rain  = !indoors && !!(CITY && CITY.weather==='rain');
+  _witCand.length=0;
+  for(const b of agents){
+    if(b===culprit || b===victim || b.jail>0) continue;
+    if(indoors){
+      // 屋内の犯行 (万引き) が見えるのは、同じ建物の中に居る人だけ
+      if(!b.indoors || b.indoors[0]!==indoors[0] || b.indoors[1]!==indoors[1]) continue;
+      // ★ 屋内の客が店のどこに居るかは持っていないので、店の広さぶんの散らばりとして引く。
+      //   ここを定数 (1.5) にしていたころは **店内の全員が至近距離**になり、
+      //   全員が顔まで見える証言をしてしまった。人相が毎回一意に決まり、
+      //   容疑者が必ず1人に絞れて、赤鰊の立つ余地が消えていた。
+      //   レジの正面に居た人も、奥の棚に居た人も同じ、というのが無理だった。
+      const st=structAt(indoors[0], indoors[1]);
+      const span=1 + (st && st.fp>1 ? 4 : 2.6);        // 大きい店ほど散らばる
+      _witCand.push([b, 1 + RNG.R()*span]);
+      continue;
+    }
+    if(MW.isIndoors(b)) continue;     // 建物の中からは外の出来事は見えない
+    const dx=b.x-culprit.x, dy=b.y-culprit.y;
+    if(Math.abs(dx)>cfg.range || Math.abs(dy)>cfg.range) continue;
+    const d=Math.hypot(dx, dy);
+    if(d>cfg.range) continue;
+    if(!losClear(culprit.x, culprit.y, b.x, b.y)) continue;   // 建物の陰は見えない
+    _witCand.push([b, d]);
+  }
+  _witCand.sort((p,q)=>p[1]-q[1]);
+  const look=seenLookOf(culprit), out=[];   // ★ 目撃者が見たのは変装後の姿
+  for(const [b, d] of _witCand){
+    if(out.length>=cfg.maxSeen) break;
+    // 顔見知りなら名前まで出る。SOC.relOf は「どれだけ親しいか」なので、
+    // すれ違っただけの相手 (0 に近い) は顔は見えても名前が出ない。
+    const sg=WIT.sight(WIT_STATE, look,
+      {dist:d, light, rain, indoors:!!indoors, known:SOC.relOf(b, culprit.aid)});
+    if(!sg) continue;
+    sg.aid=b.aid; sg.name=b.name;
+    out.push({s:sg, a:b});
+  }
+  return out;
+}
+
+// 事件を1件、台帳に積む。
+//   o = {kind, culprit, victim, r, c, indoors, place, act, amount, noticed, selfSeen}
+//   selfSeen … 被害者本人の証言 (向き合っていたので確実)。無ければ null
+// ★ ここは記録だけをする。**捕まるかどうか (ECO.caught) には手を出さない。**
+//   あちらは「店員に見咎められた」ぶんを含む抽象で、台帳は「街の誰が何を見たか」。
+//   二つを繋ぐと犯罪の発生率と警官の仕事が変わってしまうので、いまは分けておく。
+function recordCrime(o){
+  if(!WITNESS_ON) return null;
+  const day=gameDay(), hour=gameHour();
+  const found=witnessesAt(o.culprit, o.victim, o.indoors);
+  const seen=[];
+  if(o.selfSeen) seen.push(o.selfSeen);
+  for(const {s} of found) seen.push(s);
+  // ★ 事件をアリバイと同じ座標系 (スロット / 場所コード) に刻む。
+  //   これが無いと台帳と台帳が突き合わせられず、消去法が始まらない。
+  const slot = ALIBI_ON ? AL.absSlot(AL_STATE, day, hour) : -1;
+  const sceneCode = ALIBI_ON
+    ? AL.placeCode(AL_STATE, o.r, o.c, !!o.indoors) : 0;
+  if(ALIBI_ON){
+    // ★★ その場に居た人は「その場に居た」と記録し直す。スロットは10分幅なので、
+    //   境目で記録したあと現場へ歩いてきた人は別の場所のまま残ってしまう。
+    //   放っておくと **犯人が自分のアリバイで容疑者から消える** — 手がかりが
+    //   嘘をつくことになり、消去法が原理的に不公平になる。
+    AL.mark(AL_STATE, o.culprit, slot, sceneCode);
+    if(o.victim) AL.mark(AL_STATE, o.victim, slot, sceneCode);
+    for(const {a} of found) AL.mark(AL_STATE, a, slot, sceneCode);
+  }
+  const inc=WIT.record(WIT_STATE, {
+    day, hour:+hour.toFixed(1), slot, sceneCode, kind:o.kind,
+    at:[o.r, o.c], place:o.place||null, indoors:!!o.indoors,
+    night:daylight()<0.25, rain:!!(CITY && CITY.weather==='rain'),
+    // ★ 真相。台帳は持つが publicView() で落とす。
+    //   これが「起きたこと」と「街が知っていること」の差そのもの。
+    culprit:{aid:o.culprit.aid, name:o.culprit.name},
+    victim:o.victim ? {aid:o.victim.aid, name:o.victim.name} : null,
+    amount:o.amount||0, noticed:!!o.noticed,
+    // 真相の一部。publicView で落ちる。
+    disguised: !!(o.culprit.disguise && o.culprit.disguise.until>simNow()),
+    act:o.act, seen,
+  });
+  // 目撃者の来歴に残す。**後から聞き込みができる形**にしておくのが目的で、
+  // 気配だけ (glimpse) は 24件しかない来歴には積まない。
+  for(const {s, a} of found){
+    if(s.level==='glimpse') continue;
+    CH.push(a, {day, icon:'👁', ja:WIT.line(inc, s, true), en:WIT.line(inc, s, false)});
+  }
+  // 見出しは間引く。事件そのものは crimeNews が出しているので、ここは
+  // 「証言が立った」ときだけ、しかも間隔を空けて出す。
+  const best=WIT.bestSight(inc);
+  if(best && best.sawAct && best.aid){
+    const now=simNow();
+    if(now-_witNewsAt >= WITNESS_NEWS_SEC*1000){
+      _witNewsAt=now;
+      news('witness', `👁 ${best.name} が見ていた — ${WIT.line(inc, best, true)}`,
+           `${best.name} witnessed it - ${WIT.line(inc, best, false)}`);
+    }
+  }
+  return inc;
+}
+
+// ── 捜査 ────────────────────────────────────────────────────────────────────
+// 台帳2冊 (目撃 / アリバイ) と人間関係を突き合わせて、mystery.js の消去法を回す。
+//   ★ **探偵という住民は居ない。** ここは街の外から回す手続きで、誰かの主観ではない。
+//     住民に推理させると「その人が知り得ないこと」を使ってしまい、話が壊れる。
+function investigate(inc){
+  const byAid=new Map(agents.map(a=>[a.aid, a]));
+  // ★ 亡くなった住民も引けるようにする。被害者が居なくなっても
+  //   「その人への恨み」「その人の店」は動機として生きているため。
+  for(const d of ((CITY&&CITY.dead)||[]))
+    if(!byAid.has(d.aid)) byAid.set(d.aid, {aid:d.aid, name:d.name, owns:d.owns, rel:{}, dead:true});
+  const looks=agents.map(lookOf);
+  const slot=(inc.slot==null) ? -1 : inc.slot;
+
+  // 証言を突き合わせた時刻の幅。よく見た人が居るほど狭くなる。
+  const win=WIT.timeWindow(inc);
+  // 幅ぶんの「その時間・その場所に居た人」を先に配っておく (人口が増えると効く)。
+  const alIdx = (ALIBI_ON && slot>=0)
+    ? AL.buildIndex(AL_STATE, agents, win?win.from:slot, win?win.to:slot) : null;
+
+  // その人にアリバイがあるか。**現場に居たことが分かっている人は消さない。**
+  //   幅ぜんぶを裏付けられて初めてアリバイになる (一瞬でも空白があれば晴れない)。
+  const alibiOf=(aid, w)=>{
+    const a=byAid.get(aid);
+    if(!a || !ALIBI_ON || slot<0) return null;
+    const from=w?w.from:slot, to=w?w.to:slot;
+    const al=AL.alibiOver(AL_STATE, agents, a, from, to, inc.sceneCode, alIdx);
+    al.by=(al.by||[]).map(b=>b.name);
+    return al;
+  };
+  // 1スロットあたりの所持金の跳ね。盗った瞬間は必ずどこかに現れる。
+  //   ★ 記録は各スロットの境目で取るので、犯行が境目をまたぐぶんを +1 見る。
+  const jumpOf=(aid, w)=>{
+    const a=byAid.get(aid);
+    if(!a || !ALIBI_ON || slot<0) return null;
+    return AL.maxJump(AL_STATE, a, (w?w.from:slot), (w?w.to:slot)+1);
+  };
+  // 動機。恨み (social.js) / 困窮 (economy.js) / 前科 の3つだけ。
+  //   万引きには被害者が居ないので、その場合は困窮と前科しか効かない。
+  //   軸は6つ。**被害者に結びつく理由 (恨み・貸し・借り・商売敵) と、
+  //   誰に対しても成り立つ理由 (困窮・前科) を分けてある。** 前者だけだと
+  //   動機を持つ人がほとんど居なくなり、後者だけだと街の半分が容疑者になる。
+  const victim = inc.victim ? byAid.get(inc.victim.aid) : null;
+  const vShop  = (victim && victim.owns) ? structAt(victim.owns[0], victim.owns[1]) : null;
+  const motiveOf=aid=>{
+    const a=byAid.get(aid);
+    if(!a) return {score:0, why:[]};
+    const why=[]; let sc=0;
+    if(inc.victim){
+      const g=SOC.grudgeOf(a, inc.victim.aid);
+      if(g>=SOC_STATE.cfg.grudgeEnemy){ sc+=g; why.push(`${inc.victim.name} への恨み ${g.toFixed(2)}`); }
+      // 貸している = 取り立てる理由がある
+      const lent=SOC.debtOf(a, inc.victim.aid);
+      if(lent>0){ sc+=0.35; why.push(`${inc.victim.name} に ${Math.round(lent)} 貸したまま`); }
+      // 借りている = 返済を迫られている
+      const owes=victim ? SOC.debtOf(victim, a.aid) : 0;
+      if(owes>0){ sc+=0.30; why.push(`${inc.victim.name} に ${Math.round(owes)} 借りている`); }
+      // 商売敵: 同じ商いを近くでやっている
+      if(vShop && a.owns){
+        const sa=structAt(a.owns[0], a.owns[1]);
+        if(sa && sa!==vShop && BLDG_TYPES[sa.typeIdx].category===BLDG_TYPES[vShop.typeIdx].category){
+          const d=Math.hypot(sa.r-vShop.r, sa.c-vShop.c);
+          if(d<=RIVAL_R){ sc+=0.35; why.push(`${d.toFixed(0)}セル先で同じ ${BLDG_TYPES[vShop.typeIdx].label} を営む商売敵`); }
+        }
+      }
+    }
+    if((a.desper||0)>=ECO_STATE.cfg.crimeMin){ sc+=0.5*a.desper; why.push(`追い詰められている ${(a.desper||0).toFixed(2)}`); }
+    if(a.crimes){ sc+=0.1*Math.min(3, a.crimes); why.push(`前科 ${a.crimes}`); }
+    return {score:+sc.toFixed(2), why};
+  };
+  // 素朴な推理 =「街でいちばん手配されている奴が犯人だろう」。
+  // これが当たってしまう事件は謎として成立していない (mystery.js の naiveWrong)。
+  let naive=null;
+  for(const a of agents)
+    if(!naive || (a.wanted||0)>(naive.wanted||0)
+       || ((a.wanted||0)===(naive.wanted||0) && (a.desper||0)>(naive.desper||0))) naive=a;
+
+  // 伏線 = 犯人が被害者の来歴に**事件より前から**出ているか。
+  //   来歴は本文しか持たないので名前の一致で見る。粗いが、粗いなりに嘘は言わない。
+  let fore=false;
+  if(inc.victim){
+    const v=byAid.get(inc.victim.aid);
+    if(v) fore=CH.timeline(v).some(e=>e.day<inc.day && String(e.ja||'').includes(inc.culprit.name));
+  }
+
+  // アリバイ台帳の保持期間 (既定2日) を過ぎた事件は、消去に使える記録が無い。
+  //   ★ スロットの引き算だけでは足りない。**台帳は保存されない**ので、
+  //     再起動した直後は「窓の中なのに記録が空」という状態になる。
+  //     そのときは全員が「記録なし」で誰も消えず、解けない事件が
+  //     解ける事件のふりをしてしまう。実際に記録があるかを見る。
+  const nowSlot=ALIBI_ON ? AL.absSlot(AL_STATE, gameDay(), gameHour()) : -1;
+  let hasData=false;
+  const probe = (inc.window ? inc.window.to : slot);
+  if(ALIBI_ON && probe>=0){
+    for(const a of agents) if(AL.codeAt(AL_STATE, a, probe)){ hasData=true; break; }
+  }
+  const inWindow = ALIBI_ON && probe>=0 && (nowSlot-probe) < AL_STATE.cap && hasData;
+
+  // 死亡推定時刻のあいだに被害者と同じ場所に居たか。**殺人の三段目**。
+  //   被害者の足取り (vplaces) は死ぬ直前に控えてあるので、本人が居なくても引ける。
+  const withVictim = (inc.vplaces && inc.vplaces.length && ALIBI_ON)
+    ? (aid=>{
+        const a=byAid.get(aid);
+        if(!a || a.dead) return false;
+        for(const [t, code] of inc.vplaces) if(AL.codeAt(AL_STATE, a, t)===code) return true;
+        return false;
+      })
+    : null;
+
+  const sol=MYS.solve(inc, {looks, alibiOf, jumpOf, motiveOf, withVictim, alibiWindow:inWindow,
+    window:win, naiveName: naive?naive.name:null, foreshadow:fore});
+  return {sol, grade:MYS.grade(inc, sol), naive:naive?naive.name:null};
+}
+
 // ── social.js に渡すコールバック束 ──────────────────────────────────────────
 // 話題を「決める」のは social.js、話題が街に「効く」のはこちら側。
 // 好みの機構 (pref) は既にここにあるので、二重に持たない。
@@ -8841,7 +9291,7 @@ const TALK_LINES_EN = {
   },
 };
 const TALK_LINES = JA_HUD ? TALK_LINES_JA : TALK_LINES_EN;
-const _one = arr => arr[Math.floor(Math.random()*arr.length)];
+const _one = arr => arr[Math.floor(RNG.R()*arr.length)];
 
 let _talkNewsAt=0;
 function onTalk(a, b, topic){
@@ -8871,7 +9321,7 @@ function onTalk(a, b, topic){
   // ティッカーには「話題のあるもの」だけ流す。世間話まで流すと開店/閉店の
   // ニュースを押し出すし、左下の会話ログと二重になる。
   if(topic.kind==='place' || !st) return;
-  const now=Date.now();
+  const now=simNow();
   if(now-_talkNewsAt < TALK_NEWS_COOL_SEC*1000) return;
   _talkNewsAt=now;
   const what = topic.kind==='newshop' ? `word is spreading about the new ${enOf(st.typeIdx)}`
@@ -8886,15 +9336,39 @@ function onTalk(a, b, topic){
 // **相手との関係が壊れて口コミで広まる** ので、犯人は街で孤立していく。
 function maybePickpocket(a, b){
   for(const [x,y] of [[a,b],[b,a]]){
+    if(doPickpocket(x, y)) return;
+  }
+}
+
+// x が y から抜き取る。**立ち話からも、恨みからも呼ばれる**ので独立させてある。
+//   戻り値 = 実際に盗ったか。
+function doPickpocket(x, y){
+  {
     ECO.initAgent(ECO_STATE, x); ECO.initAgent(ECO_STATE, y);
-    if(!ECO.willOffend(ECO_STATE, x)) continue;
-    if((y.cash||0) < 5) continue;
+    // ★ **誰から盗るか**に理由を持たせる。恨んでいる相手、自分に貸しのある相手
+    //   (= 取り立てられている相手) が目の前にいるときは手が伸びやすい。
+    //   これが無いと被害者はいつも通りすがりで、街に仕込んだ動機と事件が
+    //   噛み合わない — 事件が起きても「その人を狙う理由」が誰にも無い。
+    const bias = SOCIAL_ON
+      ? SOC.grudgeOf(x, y.aid)*CRIME_GRUDGE_BIAS
+        + (SOC.debtOf(y, x.aid)>0 ? CRIME_DEBT_BIAS : 0)
+      : 0;
+    if(!ECO.willOffend(ECO_STATE, x, bias)) return false;
+    if((y.cash||0) < 5) return false;
     const got=ECO.pickpocket(ECO_STATE, x, y);
-    if(!got) continue;
+    if(!got) return false;
     // 被害者は犯人を信用しなくなる。関係が壊れると立ち話も起きにくくなる。
     if(y.rel && y.rel[x.aid]){ y.rel[x.aid].s=Math.max(0, y.rel[x.aid].s-0.6); }
     if(x.rel && x.rel[y.aid]){ x.rel[y.aid].s=Math.max(0, x.rel[y.aid].s-0.3); }
-    if(ECO.caught(ECO_STATE, x)){
+    // ★ 気づかれたか。ここで1回だけ引く (二度引くと台帳と見出しが食い違う)。
+    const noticed=ECO.caught(ECO_STATE, x);
+    // ★★ 恨みが立つのは「誰にやられたか分かった」ときだけ。
+    //   気づかれなければ、被害者は財布が軽いことしか知らず、恨む相手がいない。
+    //   ここが動機の非対称を生む — **見られずに済んだ犯人は誰からも恨まれない。**
+    //   0.55 は grudgeEnemy (0.45) を一度で越える値。すられれば一発で険悪になる。
+    if(noticed && SOCIAL_ON && SOC.bumpGrudge(SOC_STATE, y, x, THEFT_GRUDGE, gameDay()))
+      onFeud(y, x);
+    if(noticed){
       x.wanted=Math.min(1, (x.wanted||0)+0.35);
       crimeNews(x, `${y.name} saw ${x.name} taking their money`,
                 `👀 ${y.name} が ${x.name} に金を抜かれたのを見た`,
@@ -8905,7 +9379,344 @@ function maybePickpocket(a, b){
                 `🕶 ${y.name} が ${x.name} にすられた`,
                 Math.floor(x.x), Math.floor(x.y), false);
     }
-    return;
+    // 台帳へ。被害者は向き合っていたので、気づけば必ず名前まで分かる証言になる。
+    recordCrime({kind:'pickpocket', culprit:x, victim:y,
+      r:Math.floor(x.x), c:Math.floor(x.y), indoors:null, place:null,
+      act:{ja:`${y.name} から金を抜くのを見た`, en:`lifting money from ${y.name}`},
+      amount:got, noticed,
+      selfSeen: noticed ? Object.assign(WIT.eyewitness(seenLookOf(x)),
+                                        {aid:y.aid, name:y.name}) : null});
+    return true;
+  }
+}
+
+// ── 殺人 ────────────────────────────────────────────────────────────────────
+// ここまでの犯罪はすべて窃盗で、**街には死が無かった**。密室ものを成り立たせる
+// には死が要るので入れる。ただし入れるのは **殺人だけ** で、寿命や病死は入れない。
+// 人口の輪 (転入・転出) はそのままにして、街の性格を変えずに謎の材料だけを足す。
+//
+// ── なぜ「偶然」ではなく「意図」なのか ──
+// 密室も洋館も、作者が用意しているのではなく **犯人が作っている**。だから足すのは
+// 作者の層ではなく、犯人が条件を選べる層になる。ここでは最小の形として
+//   ・強い恨み (窃盗より高い敷居)
+//   ・追い詰められている
+//   ・**周りに誰も居ない**
+// の三つが揃ったときだけ起きる。三つ目が効いていて、これがあるから
+// 「目撃者のいない事件」= 密室に近い形が自然に生まれる。
+//
+// ── 死体は時間差を連れてくる ──
+// 犯行と発覚がずれる。街が知るのは発覚時刻で、犯行時刻は分からない。
+// 分かるのは **死亡推定時刻の幅** = [被害者が最後に裏を取れた時刻, 発見時刻] だけ。
+// アリバイはこの幅ぜんぶを埋めて初めて成立する。犯人は現場に居るので必ず網に残り、
+// フェアは保たれたまま、窓が広いぶん容疑者が多く残る。**時間差トリックが只で付く。**
+const MURDER_ON      = process.env.MURDER !== '0';
+// ★ 敷居は **実際に到達する値** から決める。最初 0.85/0.70 にしたところ一件も
+//   起きなかった: 恨みは一度の重い出来事 (解雇・被害) で 0.8 が上限、
+//   追い詰められ度は経済が回っている街では 0.69 が上限だった (実測)。
+//   窃盗 (どちらも 0.45) よりはるかに厳しいまま、届く値へ下げる。
+const MURDER_GRUDGE  = envNum('MURDER_GRUDGE', 0.75);
+const MURDER_DESPER  = envNum('MURDER_DESPER', 0.55);
+const MURDER_P       = envNum('MURDER_P', 0.06);       // 条件が揃った1秒あたり
+// ★ 屋外で「半径7セルに誰も居ない」は 368人の街では **一度も成立しなかった**
+//   (実測: 条件を満たしかけた80組すべてがここで落ちた)。人口密度を考えれば当然で、
+//   路上での犯行は目撃者だらけになる。**密室の本体は屋内**なので、
+//   屋外は狭くして「路地裏で二人きり」程度に留め、屋内の二人きりを主役にする。
+const MURDER_ALONE_R = envNum('MURDER_ALONE_R', 3.5);  // 屋外: この半径に他人が居ないこと
+const BODY_FIND_R    = envNum('BODY_FIND_R', 3);       // 何セルまで近づいたら気づくか
+const BODY_MAX_DAYS  = envNum('BODY_MAX_DAYS', 2);     // 誰も通らなくてもこの日数で発覚
+
+// 被害者が最後に「裏の取れる場所」に居たスロット。死亡推定時刻の下限になる。
+function lastCorroboratedSlot(v, slot){
+  if(!ALIBI_ON) return slot;
+  for(let t=slot; t>slot-AL_STATE.cap && t>=0; t--)
+    if(AL.alibiFor(AL_STATE, agents, v, t).ok) return t;
+  return Math.max(0, slot-6);
+}
+
+// どの条件で落ちているかの内訳。**敷居を勘で決めないための計器**で、
+// これが無いと「一件も起きない」の原因が恨みなのか孤立なのか分からない。
+const _mrDiag={pair:0, grudge:0, desper:0, sameRoom:0, alone:0, fired:0,
+               inRoom:0, outdoor:0, aloneIn:0, aloneOut:0};
+// 計画した場所に二人きりで居られているか。**誘い出しが効いているかの計器**。
+let _plotSeen=0, _plotPairs=0, _plotAlone=0;
+function stepPlotWatch(){
+  const now=simNow();
+  // ★ 誘われた側は途中で気が変わる。用事 (needOf) が変われば別の建物へ折れるし、
+  //   経路が詰まれば enterWander で行き先ごと捨てる。実測では犯人だけが現場で
+  //   692秒待ち、**相手は一度も来なかった**。約束はもう一度促すもの、として
+  //   誘いが生きているあいだは行き先を張り直す。
+  for(const b of agents){
+    if(!b.lured || b.lured.until<=now) continue;
+    const [pr,pc]=b.lured.place;
+    if(MW.isIndoors(b)){
+      if(b.indoors[0]===pr && b.indoors[1]===pc) continue;   // もう着いている
+      continue;                                              // 別の建物の中 = 出るのを待つ
+    }
+    if(b.navDest && b.navDest[0]===pr && b.navDest[1]===pc && b.mode==='navigate') continue;
+    if(sendToBuilding(b, pr, pc)) b.mode='navigate';
+  }
+  for(const a of agents){
+    if(!a.plot || a.plot.until<=now) continue;
+    // 犯人のほうも同じように張り直す
+    if(!MW.isIndoors(a)){
+      const [pr,pc]=a.plot.place;
+      if(!(a.navDest && a.navDest[0]===pr && a.navDest[1]===pc && a.mode==='navigate'))
+        if(sendToBuilding(a, pr, pc)) a.mode='navigate';
+    }
+    if(!MW.isIndoors(a)) continue;
+    if(a.indoors[0]!==a.plot.place[0] || a.indoors[1]!==a.plot.place[1]) continue;
+    _plotSeen++;                                    // 犯人は現場に着いている
+    const t=agents.find(z=>z.aid===a.plot.target);
+    if(!t || !MW.isIndoors(t)) continue;
+    if(t.indoors[0]!==a.plot.place[0] || t.indoors[1]!==a.plot.place[1]) continue;
+    _plotPairs++;                                   // 相手も着いている
+    let third=false;
+    for(const b of agents){
+      if(b===a || b===t) continue;
+      if(b.indoors && b.indoors[0]===a.plot.place[0] && b.indoors[1]===a.plot.place[1]){ third=true; break; }
+    }
+    if(!third) _plotAlone++;                        // 二人きりになれた
+  }
+}
+
+// x が y を殺せる状況か。**周りに誰も居ないこと**が本体。
+function murderChance(x, y){
+  if(!MURDER_ON || !CRIME_ON || !SOCIAL_ON) return false;
+  _mrDiag.pair++;
+  if(SOC.grudgeOf(x, y.aid) < MURDER_GRUDGE) return false;
+  _mrDiag.grudge++;
+  if((x.desper||0) < MURDER_DESPER) return false;
+  _mrDiag.desper++;
+  // 屋内どうしなら **同じ建物の中** に居ることが条件 (別の建物で隣接していても駄目)
+  if(MW.isIndoors(x) !== MW.isIndoors(y)) return false;
+  if(MW.isIndoors(x) && (x.indoors[0]!==y.indoors[0] || x.indoors[1]!==y.indoors[1])) return false;
+  _mrDiag.sameRoom++;
+  if(MW.isIndoors(x)) _mrDiag.inRoom++; else _mrDiag.outdoor++;
+  // 周囲に人が居ないか (屋内どうしなら同じ建物に他に誰も居ないか)
+  for(const b of agents){
+    if(b===x || b===y || b.jail>0) continue;
+    if(MW.isIndoors(x)){
+      if(b.indoors && b.indoors[0]===x.indoors[0] && b.indoors[1]===x.indoors[1]) return false;
+      continue;
+    }
+    if(MW.isIndoors(b)) continue;
+    if(Math.abs(b.x-x.x)>MURDER_ALONE_R || Math.abs(b.y-x.y)>MURDER_ALONE_R) continue;
+    if(Math.hypot(b.x-x.x, b.y-x.y) <= MURDER_ALONE_R) return false;
+  }
+  _mrDiag.alone++;
+  if(MW.isIndoors(x)) _mrDiag.aloneIn++; else _mrDiag.aloneOut++;
+  return true;
+}
+
+function doMurder(x, y){
+  const day=gameDay(), hour=gameHour();
+  const ind = MW.isIndoors(y) ? [...y.indoors] : null;
+  const r = ind ? ind[0] : Math.floor(y.x), c = ind ? ind[1] : Math.floor(y.y);
+  const slot = ALIBI_ON ? AL.absSlot(AL_STATE, day, hour) : -1;
+  const from = (slot>=0) ? lastCorroboratedSlot(y, slot) : -1;
+  // 犯人はその場に居た。**現場に居た記録がないと自分のアリバイで消えてしまう。**
+  if(ALIBI_ON && slot>=0)
+    AL.mark(AL_STATE, x, slot, AL.placeCode(AL_STATE, r, c, !!ind), x.cash||0);
+  // ★ 被害者の足取りを **死ぬ前に** 控える。街から消えるとアリバイ台帳から
+  //   引けなくなり、「最後に誰と一緒に居たか」が永久に分からなくなる。
+  const vplaces=[];
+  if(ALIBI_ON && slot>=0 && from>=0)
+    for(let t=from; t<=slot; t++){
+      const code=AL.codeAt(AL_STATE, y, t);
+      if(code) vplaces.push([t, code]);
+    }
+  const inc=recordCrime({kind:'murder', culprit:x, victim:y, vplaces,
+    r, c, indoors:ind, place: ind ? (BLDG_TYPES[BUILDING_TYPES[ind[0]+'_'+ind[1]]]||{}).label||null : null,
+    act:{ja:`${y.name} を手にかけるのを見た`, en:`killing ${y.name}`},
+    amount:0, noticed:false});
+  if(inc) inc.vplaces=vplaces;      // 被害者の足取り (公開情報。真相ではない)
+  x.crimes=(x.crimes||0)+1;
+  x.wanted=Math.min(1, (x.wanted||0)+0.25);   // 誰にも見られていなければ疑いは薄い
+  x.desper=Math.max(0, (x.desper||0)-0.2);
+  // 街の記憶に残す。**居なくなっても動機の突き合わせに要る** (恨みの相手として)。
+  if(CITY){
+    (CITY.dead || (CITY.dead=[])).push({aid:y.aid, name:y.name, owns:y.owns?[...y.owns]:null, day});
+    while(CITY.dead.length>64) CITY.dead.shift();
+    // 死体。誰かが通りかかるまで街は気づかない。
+    (CITY.bodies || (CITY.bodies=[])).push({
+      x:y.x, y:y.y, r, c, indoors:ind, day, hour:+hour.toFixed(2), slot, from,
+      incId: inc ? inc.id : null, victim:{aid:y.aid, name:y.name}});
+  }
+  const i=agents.indexOf(y);
+  if(i>=0) removeAgentAt(i);
+  console.log(`[Murder] Day${day+1} ${Math.floor(hour)}時 ${y.name} (${r},${c}) — 目撃者なし`);
+  return true;
+}
+
+// 死体が見つかる。**ここで初めて街が事件を知る。**
+function stepBodies(){
+  if(!CITY || !CITY.bodies || !CITY.bodies.length) return;
+  const day=gameDay(), hour=gameHour();
+  for(let i=CITY.bodies.length-1; i>=0; i--){
+    const b=CITY.bodies[i];
+    let finder=null;
+    for(const a of agents){
+      if(b.indoors){
+        if(a.indoors && a.indoors[0]===b.indoors[0] && a.indoors[1]===b.indoors[1]){ finder=a; break; }
+        continue;
+      }
+      if(MW.isIndoors(a)) continue;
+      if(Math.abs(a.x-b.x)>BODY_FIND_R || Math.abs(a.y-b.y)>BODY_FIND_R) continue;
+      finder=a; break;
+    }
+    const overdue = (day-b.day) >= BODY_MAX_DAYS;
+    if(!finder && !overdue) continue;
+    CITY.bodies.splice(i,1);
+    const inc = WIT_STATE.log.find(z=>z.id===b.incId);
+    if(inc){
+      const to = ALIBI_ON ? AL.absSlot(AL_STATE, day, hour) : -1;
+      inc.found={day, hour:+hour.toFixed(2), slot:to, by: finder?finder.name:null};
+      // ★ 死亡推定時刻。ここだけが街に分かる時刻で、**証言より優先される**。
+      if(b.from>=0 && to>=0) inc.window={from:b.from, to, slack:Math.ceil((to-b.from)/2)};
+    }
+    CITY.stats.murders=(CITY.stats.murders||0)+1;
+    const where = b.indoors ? (BLDG_TYPES[BUILDING_TYPES[b.r+'_'+b.c]]||{}).label||'建物の中' : '路上';
+    news('crime', `🕯 ${b.victim.name} が ${where} で亡くなっているのが見つかった`
+         + (finder?` (${finder.name} が発見)`:' (誰も通らないまま日が経った)'),
+         `${b.victim.name} was found dead${finder?` by ${finder.name}`:''}`);
+    if(finder) CH.push(finder, {day, icon:'🕯', mark:true,
+      ja:`${b.victim.name} を見つけてしまった`, en:`found ${b.victim.name}`});
+    showCityEvent(b.r, b.c, `${b.victim.name} found dead`, 8);
+  }
+}
+
+// ── 誘い出す ────────────────────────────────────────────────────────────────
+// **孤立は待っても来ない。** 368人の街では「半径3.5セルに誰も居ない」も
+// 「建物の中に二人きり」も、6日回して一度しか起きなかった (実測)。
+// これは調整不足ではなく、人口密度から出る当たり前の結果で、
+// **密室は偶然には生まれない**ということそのものである。
+//
+// だから敷居を下げて偶然殺人が起きるようにするのは逆で、正しいのは
+// **犯人に孤立を作らせること**。ミステリの洋館も、作者ではなく犯人が用意している。
+// ここでやるのは既にある「友達を誘って出かける」(stepOutings) の悪意版で、
+//   ・人気のない建物を選び
+//   ・恨んでいる相手をそこへ誘い
+//   ・二人きりになったところで、既存の殺人の条件が自然に満たされる
+// 殺人を強制はしない。**機会を作るだけ**で、あとは同じ規則が判断する。
+//
+// ── 誘いに乗る条件 ──
+// 恨まれていることを知らない相手だけが乗る (相手側の grudge が立っていないこと)。
+// 一方通行の恨みがここで効く。
+const LURE_ON      = process.env.LURE !== '0';
+const LURE_P       = envNum('LURE_P', 0.05);      // 条件が揃った1秒あたり
+const LURE_SAMPLE  = envNum('LURE_SAMPLE', 24);   // 候補地を何軒見るか
+const LURE_QUIET_R = envNum('LURE_QUIET_R', 6);   // 「人気がない」を測る半径
+let _lureAt=0;
+
+// **洋館の代わり**を探す。要るのは「人気がない」ではなく **「誰も来る理由がない」**。
+//
+// ★ 最初は営業中の建物から周囲の人数だけで選んでいた。周囲0人の郵便局が
+//   選ばれたが、殺人は一度も起きなかった — 外が無人でも **中に従業員が居る**。
+//   さらに営業中の店には客が入ってくる。二人きりが続かない。
+//   閉店した建物なら誰も入る用事が無い。**廃屋こそが洋館**である。
+//   本番の街は毎日のように店が潰れるので、候補は放っておいても供給される。
+function quietPlace(){
+  if(!CITY) return null;
+  const all=CITY.structs.filter(st=>st.state==='open' || st.state==='closed');
+  if(!all.length) return null;
+  const h=gameHour(), dayTime = (h>=7 && h<19);
+  let best=null, bestScore=Infinity, bestNear=0;
+  for(let k=0;k<LURE_SAMPLE;k++){
+    const st=all[RNG.Ri(all.length)];
+    let inside=0, workers=0, near=0;
+    for(const b of agents){
+      if(b.indoors && b.indoors[0]===st.r && b.indoors[1]===st.c){ inside=1; break; }
+      if(b.work && b.work[0]===st.r && b.work[1]===st.c) workers++;
+      if(Math.abs(b.x-st.r)<=LURE_QUIET_R && Math.abs(b.y-st.c)<=LURE_QUIET_R) near++;
+    }
+    if(inside) continue;                              // いま中に誰か居る → 論外
+    if(st.state==='open' && workers>0 && dayTime) continue;  // 勤務時間中の職場は避ける
+    // 閉店を優先しつつ、**人通りの多さのほうを重く見る**。-20 にしていたときは
+    // 「周囲18人の閉店ビル」が選ばれた。誰も入ってこないことと、
+    // 誰も通りかからないことの両方が要る。
+    const score = near + workers*3 + (st.state==='closed' ? -6 : 0);
+    if(score<bestScore){ bestScore=score; best=st; bestNear=near; }
+  }
+  return best ? {st:best, near:bestNear, closed:best.state==='closed'} : null;
+}
+
+function stepLure(dtSec){
+  if(!LURE_ON || !MURDER_ON || !CITY || !SOCIAL_ON) return;
+  const now=simNow();
+  if(now-_lureAt < 30*1000) return;                 // 街じゅうで同時に起きないように
+  const thr=SOC_STATE.cfg.grudgeEnemy;
+  for(const a of agents){
+    if(a.jail>0 || MW.isIndoors(a)) continue;
+    if((a.desper||0) < MURDER_DESPER) continue;
+    if(a.plot && a.plot.until>now) continue;
+    let any=false;
+    for(const k in (a.rel||{})) if((a.rel[k].g||0)>=MURDER_GRUDGE){ any=true; break; }
+    if(!any) continue;
+    if(RNG.R() >= LURE_P*dtSec) continue;
+    _evBuf.length=0;
+    SOC.neighbors(SOC_STATE, a, _evBuf, 6);
+    for(const b of _evBuf){
+      if(b===a || b.jail>0 || MW.isIndoors(b)) continue;
+      if(SOC.grudgeOf(a, b.aid) < MURDER_GRUDGE) continue;
+      // ★ 恨まれていると知っている相手は誘いに乗らない。一方通行の恨みだけが通る。
+      if(SOC.grudgeOf(b, a.aid) >= thr) continue;
+      if(SOC.relOf(a, b.aid) <= 0.05) continue;      // 見ず知らずでは誘えない
+      const q=quietPlace();
+      if(!q) continue;
+      const gr=q.st.r, gc=q.st.c;
+      if(!sendToBuilding(a, gr, gc)) continue;
+      if(!sendToBuilding(b, gr, gc)){ enterWander(a); continue; }
+      a.pastime=null; b.pastime=null;
+      // ★ sendToBuilding は mode='wander' のまま経路だけ張る。だが経路を辿って
+      //   到着処理 (onArrive → 建物に入る) が走るのは **mode==='navigate' のときだけ**。
+      //   そのため誘い出しても二人とも現場に一度も入らなかった
+      //   (実測: 犯人が現場に居た秒 = 0)。ナビへ入れて初めて歩き出す。
+      a.mode='navigate'; b.mode='navigate';
+      // 誘った側も誘われた側も、着いたらしばらくそこに留まる (下の shouldLeaveBuilding)
+      a.plot ={target:b.aid, place:[gr,gc], until:now+30*60*1000};
+      b.lured={by:a.aid,     place:[gr,gc], until:now+30*60*1000};
+      _lureAt=now;
+      console.log(`[Lure] Day${gameDay()+1} ${Math.floor(gameHour())}時 ${a.name} → ${b.name} を `
+        + `${q.closed?'閉店した ':''}${BLDG_TYPES[q.st.typeIdx].label} (${gr},${gc}) へ [周囲${q.near}人]`);
+      // ★ ニュースには**出さない**。誘い自体はただの外出にしか見えない。
+      pushTalkLine(a.name, JA_HUD ? 'ちょっと付き合ってくれないか' : 'Come with me a moment.');
+      return;
+    }
+  }
+}
+
+// ── 恨んでいる相手を狙う ────────────────────────────────────────────────────
+// スリは元々「立ち話の相手から」だけだった。だが**掏摸は人混みでやるもの**で、
+// 向き合って話し込む必要はない。そして立ち話に限ると、犯人と被害者のあいだに
+// 因縁が生まれない — 街に遺恨を96組ためても、被害者がその相手だった事件は
+// **1件も出なかった** (実測)。恨んでいる相手が近くに居たら狙う、を足して輪を閉じる。
+//   ★ 恨んでいるだけでは手を出さない。**追い詰められていることが前提**で、
+//     恨みは「誰から盗るか」を決めるだけ (economy.js の willOffend の bias)。
+const GRUDGE_CRIME_P = envNum('GRUDGE_CRIME_P', 0.12);   // 1秒あたりの試行確率
+const _gcBuf=[];
+function stepGrudgeCrime(dtSec){
+  if(!CRIME_ON || !ECON_ON || !SOCIAL_ON) return;
+  const thr=SOC_STATE.cfg.grudgeEnemy;
+  for(const a of agents){
+    if(a.jail>0) continue;
+    // ★ 屋内も見る。**建物の中で二人きり**が密室の形なので、ここで屋内を
+    //   弾いていると殺人が一度も起きない。掏摸のほうは下で屋外に限っている。
+    if((a.desper||0) < ECO_STATE.cfg.crimeMin) continue;
+    if(!a.rel) continue;
+    let has=false;
+    for(const k in a.rel) if((a.rel[k].g||0)>=thr){ has=true; break; }
+    if(!has) continue;                                  // 恨んでいる相手が居ない
+    if(RNG.R() >= GRUDGE_CRIME_P*dtSec) continue;
+    SOC.neighbors(SOC_STATE, a, _gcBuf, 6);
+    for(const b of _gcBuf){
+      if(b===a || b.jail>0) continue;
+      if(MW.isIndoors(b) !== MW.isIndoors(a)) continue;
+      if(SOC.grudgeOf(a, b.aid) < thr) continue;        // 恨んでいる相手だけ
+      // ★ 恨みが極まって、周りに誰も居ないときだけ、盗みでは済まなくなる。
+      if(murderChance(a, b) && RNG.R() < MURDER_P){ _mrDiag.fired++; doMurder(a, b); break; }
+      if(MW.isIndoors(a)) continue;                     // 掏摸は屋外だけ
+      if(doPickpocket(a, b)) break;
+    }
   }
 }
 
@@ -8936,12 +9747,73 @@ function onFriend(a, b){
   news('friend', `🤝 ${a.name} と ${b.name} が友達になった`,
        `${a.name} and ${b.name} became friends`);
   // カメラは間隔を空ける。寄りで映す (wide だと街全体が映って誰の話か分からない)
-  const now=Date.now();
+  const now=simNow();
   if(now-_friendCamAt >= FRIEND_CAM_COOL_SEC*1000){
     _friendCamAt=now;
     showCityEvent(Math.floor(a.x), Math.floor(a.y),
       `${a.name} & ${b.name} - new friends`, 5);
   }
+}
+
+// ── 貸し借りの日次 ──────────────────────────────────────────────────────────
+// 余裕ができたら返す。返さないまま日が経つと、貸した側の恨みがじりじり育つ。
+//   ★ これが**時間の掛かる動機**になる。口論は3回で済むが、借金は返せない日が
+//     続いて初めて濃くなるので、街の中に「長く燻っている関係」ができる。
+// ★ 一発で立つ恨みの重さ。**閾値 (0.45) をぎりぎり超える程度では足りない。**
+//   grudgeDecay 0.96/日 なので 0.5 だと3日で閾値を割り、街に恨みが溜まらない
+//   (実測: 累計90組も生まれているのに、いま生きている遺恨は8組だけだった)。
+//   0.8 なら約14日は「遺恨あり」でいる。職を奪われた・盗まれた、は
+//   口論とは違って**その程度には尾を引く**。
+const LAYOFF_GRUDGE = envNum('LAYOFF_GRUDGE', 0.8);   // 解雇された側が店主を恨む
+const RIVAL_R       = envNum('RIVAL_R', 8);          // 何セル以内の同業を「商売敵」とみなすか
+// 「この相手なら」の上乗せ。正直さの敷居をどれだけ下げるか (economy.js の willOffend)。
+const CRIME_GRUDGE_BIAS = envNum('CRIME_GRUDGE_BIAS', 0.35);
+const CRIME_DEBT_BIAS   = envNum('CRIME_DEBT_BIAS', 0.15);
+const THEFT_GRUDGE  = envNum('THEFT_GRUDGE', 0.8);    // 盗まれた側が犯人を恨む
+function stepDebts(day){
+  if(!SOCIAL_ON || !ECON_ON) return;
+  const cfg=SOC_STATE.cfg;
+  const by=new Map(agents.map(a=>[a.aid, a]));
+  let paid=0, aged=0;
+  for(const lender of agents){
+    for(const k of Object.keys(lender.rel||{})){
+      const e=lender.rel[k];
+      if(!(e.debt>0)) continue;
+      const borrower=by.get(k);
+      if(!borrower){ e.debt=0; continue; }        // 街を出た相手の借金は追えない
+      // 余裕があれば返す
+      if((borrower.cash||0) >= e.debt + cfg.debtBuffer){
+        const amt=SOC.repay(SOC_STATE, lender, k, e.debt);
+        borrower.cash-=amt; lender.cash=(lender.cash||0)+amt;
+        paid++;
+        CH.push(lender, {day, icon:'🧾', ja:`${borrower.name} が ${Math.round(amt)} 返してくれた`,
+                         en:`${borrower.name} paid back ${Math.round(amt)}`});
+        continue;
+      }
+      // 返ってこない日が積み上がる
+      aged++;
+      if(SOC.bumpGrudge(SOC_STATE, lender, borrower, cfg.debtGrudge, day)) onFeud(lender, borrower);
+    }
+  }
+  if(paid || aged) console.log(`[Debt] 返済${paid}件 / 未返済${aged}件`);
+}
+
+// 仲がこじれた瞬間。onFriend の**裏返し**で、街に残る出来事として積む。
+//   友達になった日と同じく、来歴には必ず両方に残す。ここが動機の出どころなので、
+//   ニュースが間引かれても「いつ誰とこじれたか」だけは落とさない。
+let _feudNewsDay=-1, _feudNewsN=0;
+const FEUD_NEWS_PER_DAY = envNum('FEUD_NEWS_PER_DAY', 3);
+function onFeud(a, b){
+  if(!CITY) return;
+  CITY.stats.feuds=(CITY.stats.feuds||0)+1;
+  const day=gameDay();
+  CH.push(a, {day, icon:'💢', mark:true, ja:`${b.name} と険悪になった`, en:`fell out with ${b.name}`});
+  CH.push(b, {day, icon:'💢', mark:true, ja:`${a.name} と険悪になった`, en:`fell out with ${a.name}`});
+  if(day!==_feudNewsDay){ _feudNewsDay=day; _feudNewsN=0; }
+  if(!(a.viewer||b.viewer) && _feudNewsN>=FEUD_NEWS_PER_DAY) return;
+  _feudNewsN++;
+  news('feud', `💢 ${a.name} と ${b.name} の仲がこじれた`,
+       `${a.name} and ${b.name} have fallen out`);
 }
 
 function stepSocial(dtSec){
@@ -8950,7 +9822,7 @@ function stepSocial(dtSec){
     agents, dtSec, day:gameDay(), now:simNow(),
     isIndoors:MW.isIndoors, canTalkAt,
     freshShopFor, deadShopFor, applyTopic, onTalk, onFriend,
-    rng:Math.random,
+    rng:RNG.R,
   });
 }
 
@@ -9178,7 +10050,7 @@ function maybeFoundSchool(day){
     if(t==null || !typeAllowed(t)) continue;
     const have=CITY.structs.filter(st=>st.state==='open' && st.typeIdx===t).length;
     if(have >= Math.max(1, Math.ceil(need[lv]/SCHOOL_PER_STUDENT))) continue;
-    const site=pickSite(day, BLDG_TYPES[t].footprint, (r,c)=>Math.random());
+    const site=pickSite(day, BLDG_TYPES[t].footprint, (r,c)=>RNG.R());
     if(!site) continue;
     foundShop('learn', site, t, null, day);
     news('found', `🏫 子どもが増えたので ${BLDG_TYPES[t].label} が建てられた`,
@@ -9243,7 +10115,7 @@ const policeCount = () => POLICE_IDX==null ? 0
 let _copStats={chases:0, arrests:0};
 function stepPolice(){
   if(!POLICE_ON || !CRIME_ON || !ECON_ON || POLICE_IDX==null) return;
-  const now=Date.now(), near=[];
+  const now=simNow(), near=[];
   for(const cop of agents){
     if(!isCop(cop) || MW.isIndoors(cop) || ECO.inJail(cop)) continue;
 
@@ -9378,7 +10250,7 @@ let _delivStats = { delivered:0, runs:0, failed:0 };
 //   倉庫の隣の家へ往復するだけになり、配達が街に散らばらない。
 function pickDropTarget(a){
   const depot=a.work;
-  const now=Date.now();
+  const now=simNow();
   let best=null, bestSc=-Infinity;
   for(const st of openStructsOf(HOME_IDX)){
     // すでに荷物が置いてある玄関には二重に届けない
@@ -9387,7 +10259,7 @@ function pickDropTarget(a){
     if(agents.some(o=>o!==a && o.deliv && o.deliv.target===st)) continue;
     const d=Math.hypot(st.r-depot[0], st.c-depot[1]);
     const ago=Math.min((now-(st.deliveredAt||0))/1000, 3600);
-    const sc=ago - d*8 + Math.random()*40;
+    const sc=ago - d*8 + RNG.R()*40;
     if(sc>bestSc){ bestSc=sc; best=st; }
   }
   return best;
@@ -9493,7 +10365,7 @@ function stepDelivery(){
         // 余裕があるぶん隣のセルに落ちて「家から離れた道端に置かれている」ように見える。
         const door=a.navDest || [Math.floor(a.x), Math.floor(a.y)];
         parcels.push({ r:door[0], c:door[1], hr:st.r, hc:st.c,
-                       until:now+DELIV_PARCEL_SEC*1000, th:Math.random()*Math.PI*2 });
+                       until:now+DELIV_PARCEL_SEC*1000, th:RNG.R()*Math.PI*2 });
         while(parcels.length>PARCEL_CAP) parcels.shift();   // 描ける数を超えたら古いものから消す
         _delivStats.delivered++;
         CITY.stats.delivered=(CITY.stats.delivered||0)+1;
@@ -9582,13 +10454,25 @@ function maybeFoundWarehouse(day){
 //   JOB_SEARCH_DAYS のあいだ無職にする。この間に貯金が尽きると追い詰められる。
 function layOff(st, day){
   let n=0;
+  // ★ 店主は先に控えておく。下のループで a.owns を消してしまうので、
+  //   あとから「誰の店だったか」を引けなくなる。
+  const owner = st.openedBy ? agents.find(a=>a.aid===st.openedBy) : null;
+  const fired=[];
   for(const a of agents){
     const w=a.work;
     if(!w || w[0]!==st.r || w[1]!==st.c) continue;
+    if(a!==owner) fired.push(a);
     a.work=null; a.owns=null;
     ECO.initAgent(ECO_STATE, a);
     a.jobless=0;
     ECO_STATE.stats.jobsLost++; n++;
+  }
+  // ★★ 職を失った人は**店主を恨む**。ここが「一人の被害者に対して動機を持つ人が
+  //   まとめて生まれる」唯一の場所で、赤鰊 (動機はあるが犯人ではない人) の
+  //   いちばんの供給源になる。恨みの相手が誰か分かっているのもここの条件を満たす。
+  if(owner && SOCIAL_ON && fired.length){
+    for(const a of fired)
+      if(SOC.bumpGrudge(SOC_STATE, a, owner, LAYOFF_GRUDGE, day)) onFeud(a, owner);
   }
   if(n){
     CITY.stats.jobsLost=(CITY.stats.jobsLost||0)+n;
@@ -9611,25 +10495,57 @@ function settleVisit(a, st){
     return;
   }
   // 払えなかった
-  if(!CRIME_ON || !ECO.willOffend(ECO_STATE, a)) return;
+  // ★ 店主を恨んでいる店では手を出しやすい。解雇された元従業員が古巣で、
+  //   というのが典型で、**同じ店主を恨む人がまとめて容疑者になる**ため
+  //   赤鰊 (動機はあるが犯人ではない人) の供給源になる。
+  const bias = (SOCIAL_ON && st.openedBy)
+    ? SOC.grudgeOf(a, st.openedBy)*CRIME_GRUDGE_BIAS : 0;
+  if(!CRIME_ON || !ECO.willOffend(ECO_STATE, a, bias)) return;
   ECO.shoplift(ECO_STATE, a);
   // 店は「売れずに客だけ来た」ぶん損をする。これが積もると人を切ることになる。
   st.revenue=(st.revenue||0)-ECO.priceOf(ECO_STATE, kind);
   st.salesLost=(st.salesLost||0)+ECO.priceOf(ECO_STATE, kind);
   st.thefts=(st.thefts||0)+1;
-  const what=enOf(st.typeIdx);
-  if(ECO.caught(ECO_STATE, a)){
+  const what=enOf(st.typeIdx), label=BLDG_TYPES[st.typeIdx].label;
+  const noticed=ECO.caught(ECO_STATE, a);
+  if(noticed){
     // 目撃された = 手配される。**捕まえるのは警官の仕事**。
     // 警察署が無い街では誰も捕まらず、前科だけが積み上がっていく。
     a.wanted=Math.min(1, (a.wanted||0)+0.35);
+    // 店主は「誰にやられたか」を知る。見られなかったときは恨みが立たない
+    //   — 恨みは相手が分かっているときにしか生まれない、という一本の規則のまま。
+    if(SOCIAL_ON && st.openedBy){
+      const owner=agents.find(x=>x.aid===st.openedBy);
+      if(owner && owner!==a && SOC.bumpGrudge(SOC_STATE, owner, a, THEFT_GRUDGE, gameDay()))
+        onFeud(owner, a);
+    }
     crimeNews(a, `${a.name} was seen shoplifting at the ${what}`,
-              `👀 ${a.name} が ${BLDG_TYPES[st.typeIdx].label} で万引きするのを見られた`,
+              `👀 ${a.name} が ${label} で万引きするのを見られた`,
               st.r, st.c, true);
   }else{
     crimeNews(a, `${a.name} walked out of the ${what} without paying`,
-              `🕶 ${a.name} が ${BLDG_TYPES[st.typeIdx].label} で万引きした`,
+              `🕶 ${a.name} が ${label} で万引きした`,
               st.r, st.c, false);
   }
+  // 台帳へ。目撃者は**同じ店の中に居た客**だけ。
+  //   ★ noticed が true でも台帳が空のことがある。それは「店員に見咎められた」
+  //     ぶんで、店員は住民として立っていないため誰の証言にもならない。
+  //     ここは埋めずに空のまま残す — 台帳は住民が見たものだけを持つ。
+  // ★ 万引きの「被害者」は店ではなく **店主**。ここを null にしていたころは、
+  //   万引き事件に被害者が居ないので、恨み・商売敵・貸し借りといった
+  //   **相手に結びつく動機がひとつも効かなかった** (困窮と前科しか出なかった)。
+  //   ★ 店主が居ない店 (最初から建っていた店は openedBy を持たない) では、
+  //     そこで働いている人を被害者とする。null のままだと万引きの半分以上が
+  //     「被害者不在」になり、相手に結びつく動機が一切効かない
+  //     (実測: 64件中33件が被害者なしだった)。
+  let shopOwner = st.openedBy ? agents.find(x=>x.aid===st.openedBy) : null;
+  if(!shopOwner)
+    shopOwner = agents.find(x=>x!==a && x.work && x.work[0]===st.r && x.work[1]===st.c) || null;
+  recordCrime({kind:'shoplift', culprit:a, victim:(shopOwner&&shopOwner!==a)?shopOwner:null,
+    r:st.r, c:st.c, indoors:[st.r, st.c], place:label,
+    act:{ja:`${label} で品物を持ち出すのを見た`,
+         en:`walking out of the ${what} without paying`},
+    amount:ECO.priceOf(ECO_STATE, kind), noticed});
 }
 
 // 犯罪のニュース。多すぎると街の出来事を押し出すので流量を絞る。
@@ -9638,11 +10554,11 @@ let _crimeNewsAt=0;
 function crimeNews(a, en, ja, r, c, big){
   if(CITY) CITY.stats.crimes=(CITY.stats.crimes||0)+1;
   pushTalkLine(a.name, JA_HUD ? (big ? '見られた…' : '誰も見ていない') : (big ? 'Caught in the act.' : 'Nobody saw me.'));
-  const now=Date.now();
+  const now=simNow();
   if(!big && now-_crimeNewsAt < CRIME_NEWS_COOL_SEC*1000) return;
   _crimeNewsAt=now;
   news('crime', ja, en);
-  if(big && Math.random()<CRIME_CAM_P) showCityEvent(r, c, en.slice(0,52), 6);
+  if(big && RNG.R()<CRIME_CAM_P) showCityEvent(r, c, en.slice(0,52), 6);
 }
 const CRIME_NEWS_COOL_SEC = envNum('CRIME_NEWS_COOL_SEC', 45);
 const CRIME_CAM_P         = envNum('CRIME_CAM_P', 0.5);
@@ -9686,6 +10602,7 @@ function dailyRollover(day){
   const t0=Date.now();
   rolloverVisits();                       // 先に EMA を更新してから閉店判定する
   if(SOCIAL_ON) SOC.dailyDecay(SOC_STATE, agents);   // 会わない相手との関係は薄れる
+  stepDebts(day);                                   // 返済と取り立て (借金が恨みに育つ)
   const roads=promoteFootpaths(day);
   const roadsBack=decayRoads(day);        // 使われなくなった道は空き地へ戻す
   reclassRoads();                         // よく使われる道は太く、使われない道は路地へ
@@ -10006,7 +10923,7 @@ function pickBuildingOfType(a, T, k=NAV_PICK_K){
   if(!cands.length) return null;
   cands.sort((p,q)=>((p[0]+0.5-a.x)**2+(p[1]+0.5-a.y)**2)-((q[0]+0.5-a.x)**2+(q[1]+0.5-a.y)**2));
   const pool=cands.slice(0, Math.min(k, cands.length));
-  return pool[Math.floor(Math.random()*pool.length)];
+  return pool[Math.floor(RNG.R()*pool.length)];
 }
 
 // agent.goalType (正準index) からモデル用の z を名前対応で組み立てる。
@@ -10233,12 +11150,12 @@ function drawNameIdx(g){
   const bag=_nameBag[g];
   if(!bag.length){
     for(let i=0;i<NAME_POOL.length;i++) if(NAME_POOL[i].g===g || NAME_POOL[i].g==='n') bag.push(i);
-    for(let i=bag.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); const t=bag[i]; bag[i]=bag[j]; bag[j]=t; }
+    for(let i=bag.length-1;i>0;i--){ const j=Math.floor(RNG.R()*(i+1)); const t=bag[i]; bag[i]=bag[j]; bag[j]=t; }
   }
   return bag.length ? bag.pop() : 0;
 }
 function pickPoolIdx(){
-  let r=Math.random()*POOL_W;
+  let r=RNG.R()*POOL_W;
   for(let i=0;i<CHAR_POOL.length;i++){ r-=CHAR_POOL[i].weight; if(r<=0) return i; }
   return CHAR_POOL.length-1;
 }
@@ -10247,7 +11164,7 @@ function newDef(){
   let def=null;
   for(let k=0;k<8;k++){
     const pi=pickPoolIdx(), pg=CHAR_POOL[pi].gender;
-    def=makeDef(pi, drawNameIdx(pg==='any' ? (Math.random()<0.5?'m':'f') : pg));
+    def=makeDef(pi, drawNameIdx(pg==='any' ? (RNG.R()<0.5?'m':'f') : pg));
     if(!agents.some(a=>a.name===personaName(def))) break;
   }
   return def;
@@ -10271,7 +11188,7 @@ function spawnAgent(S, ident){
   if(m) _aidSeq=Math.max(_aidSeq, +m[1]+1);
   const b=randB(null), g=randB(b);
   const a={aid, name:agentDisplayName(seq,def),
-    x:b[0]+0.5, y:b[1]+0.5, th:Math.random()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
+    x:b[0]+0.5, y:b[1]+0.5, th:RNG.R()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
     trips:0, viols:0, steps:0, stall:0, def, ti:allocTrailSlot(), active:true,
     visited:new Set(), explored:0, visMem:new Map(),
     // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
@@ -10291,8 +11208,8 @@ function spawnAgent(S, ident){
     school:null,                     // 学生の通学先 (assignHomes が割り当てる)
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
-    hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
-    supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0};
+    hunger:RNG.R()*0.4, fatigue:RNG.R()*0.4,
+    supply:RNG.R()*0.4, bored:RNG.R()*0.4, sick:0};
   agents.push(a);
   agentMeshes.push(createAgentMesh(S, def.color));
   setAgentColor(agentMeshes.length-1, def.color);
@@ -10309,12 +11226,12 @@ function settleAgent(a){
     if(b){ a.x=b[0]+0.5; a.y=b[1]+0.5; enterWander(a); }
     return;
   }
-  a.fatigue=Math.random()*0.15;
+  a.fatigue=RNG.R()*0.15;
   if(WORLD.solidBuildings){
     MW.enterBuilding(a, a.home[0], a.home[1]);
   }else{
-    a.x=a.home[0]+0.5+(Math.random()-0.5)*0.6;
-    a.y=a.home[1]+0.5+(Math.random()-0.5)*0.6;
+    a.x=a.home[0]+0.5+(RNG.R()-0.5)*0.6;
+    a.y=a.home[1]+0.5+(RNG.R()-0.5)*0.6;
     enterWander(a);
   }
 }
@@ -10345,6 +11262,7 @@ function initAgents(S){
     let restored=0;
     let viewers=0;
     let rels=0;
+    let snapped=0;
     for(const a of agents){
       const sv=CITY.savedAgents[a.aid]; if(!sv) continue;
       a.seenMask=sv.m||0;
@@ -10356,14 +11274,18 @@ function initAgents(S){
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
       if(sv.r && SOCIAL_ON){ SOC.restoreAgent(a, sv.r); rels++; }
       if(sv.e && ECON_ON) ECO.restoreAgent(a, sv.e);
+      if(sv.sn && applyAgentSnap(a, sv.sn)) snapped++;
     }
+    if(snapped) console.log(`[City] ${snapped}人の居場所と体調を復元 (分岐はここから始まる)`);
     if(restored) console.log(`[City] 店主 ${restored}人の職場を復元`);
     if(viewers)  console.log(`[City] 視聴者住民 ${viewers}人を復元`);
     if(rels)     console.log(`[City] ${rels}人の人間関係を復元`);
   }
-  assignHomes();         // 空きのある住居/職場へ割り当てる
+  assignHomes();         // 空きのある住居/職場へ割り当てる (復元した home はそのまま残る)
   // 自宅から一日を始める。夜間起動でも「家に居るのに眠くて彷徨う」不自然さを避ける。
-  for(const a of agents) settleAgent(a);
+  //   ★ スナップショットから戻した住民は **その場所のまま** 始める。
+  //     ここで自宅へ戻すと、せっかく再現した瞬間が毎回朝に巻き戻ってしまう。
+  for(const a of agents) if(!a._snapped) settleAgent(a);
   if(CITY) CITY.pop=agents.length;
   inferWarmed = false;   // エージェントが入れ替わったので推論キャッシュを温め直す
   console.log(`[Sim] ${agents.length} agents initialized`
@@ -10711,11 +11633,15 @@ function doCityReset(newMap){
 // 1秒ごとに見ておけば取りこぼさない。
 //   祝いの画 → POP_MAX_SEC 秒待つ → リセット、の2段階。待っている間に
 //   もう一度火が点かないよう _popResetAt で状態を持つ。
+//   ★ 待ち時間は **街の中の時計 (simNow)** で測る。Date.now で測っていたころは、
+//     早送りだと「祝っている14実秒」のあいだに街の中で何日も進んでしまい、
+//     しかも進む量が機械の速さで変わるので、**同じ種でも結果が変わっていた**。
+//     決定性が壊れていた唯一の場所がここだった (tools/determinism-check.js で発覚)。
 let _popResetAt = 0;                    // この時刻を過ぎたらリセット (0 = 予定なし)
 function stepPopReset(){
   if(!CITY || !CITY_EVOLVE || POP_MAX<=0) return;
   if(_popResetAt){
-    if(Date.now() < _popResetAt) return;
+    if(simNow() < _popResetAt) return;
     _popResetAt=0;
     console.log(`[City] 人口が ${POP_MAX} に達したので街を作り直します`);
     doCityReset(POP_MAX_NEWMAP);
@@ -10723,7 +11649,7 @@ function stepPopReset(){
   }
   if(agents.length < POP_MAX) return;
 
-  _popResetAt = Date.now() + POP_MAX_SEC*1000;
+  _popResetAt = simNow() + POP_MAX_SEC*1000;
   const pop=agents.length, days=gameDay()+1;
   const en=`Congratulations!  ${pop} residents in ${days} days`;
   news('level',
@@ -10890,6 +11816,17 @@ function buildYtArgs(){
 
 function startYtStream(){
   if (!YT_ENABLED || YT.shuttingDown) return;
+  // ★ **二重起動を防ぐ。** 生きている ffmpeg を残したまま spawn すると、同じ
+  //   ストリームキーへ 2 本が同時に送出され、YouTube 側からは文字どおり
+  //   フレームが倍に見える (「必要以上のフレーム」の典型)。YT.child を
+  //   上書きすると前の子プロセスは参照を失ったまま送り続けるので気づけない。
+  if (YT.child) {
+    console.warn('[YT] 既に ffmpeg が動いています → 先に停止してから起動し直します');
+    const old = YT.child;
+    YT.child = null; YT.ready = false;
+    try { old.stdin.end(); } catch(_){}
+    try { old.kill('SIGKILL'); } catch(_){}
+  }
 
   const args = buildYtArgs();
   const started = Date.now();
@@ -10939,6 +11876,10 @@ function setYtFrame(raw){
 
 // 固定レートポンプ: 実時間に対して「送るべき総枚数」との差分を埋める。
 // イベントループが長時間ブロックされた後でも、複製フレームで追いついて実時間同期を保つ。
+// 1回のポンプで書ける最大枚数。1 に近いほど実時間ペースに忠実だが、
+// 遅延のたびにコマ落ちする。既定は FPS/5 (15fps なら 3枚 = 0.2秒ぶん)。
+const YT_BURST_MAX = Math.max(1, Math.round(envNum('YT_BURST_MAX', Math.max(2, FPS/5))));
+
 function ytPumpTick(){
   if (!YT_ENABLED || !YT.ready || !YT.child) return;
   const stdin = YT.child.stdin;
@@ -10959,8 +11900,15 @@ function ytPumpTick(){
   const due = Math.floor((now - YT.t0) * FPS / 1000);   // 今までに送っておくべき総枚数
   let need = due - YT.sent;
   if (need <= 0) return;
-  // 遅れが大きすぎるときは一気に埋めず、基準をずらして最大1秒ぶんに制限 (バースト暴走防止)
-  if (need > FPS) { YT.sent = due - FPS; need = FPS; }
+  // ★ **遅れは取り戻さない。** ライブ配信で「古いフレームを速く送って」帳尻を
+  //   合わせるのは逆効果で、YouTube が欲しいのは実時間ペースそのもの。
+  //   ffmpeg は入力を貪欲に読むので、ここで N 枚まとめて書くと N/FPS 秒ぶんの
+  //   映像が一瞬で送出され、ingest 側に「必要以上のフレーム」と判定される。
+  //   実測: 平常時のイベントループ遅延は p99=2ms だが、まれに 455ms 止まる
+  //   (dailyRollover / フィールド拡張のメッシュ生成 / GC)。以前の上限 FPS だと
+  //   その1回で 8〜15枚 = 1秒ぶんのバーストになっていた。
+  //   遅れたぶんのフレームは捨て、基準を今に合わせ直す (数枚のコマ落ちで済む)。
+  if (need > YT_BURST_MAX) { YT.sent = due - YT_BURST_MAX; need = YT_BURST_MAX; }
 
   for (let i = 0; i < need; i++){
     stdin.write(YT.lastFrame);               // 戻り値は見ない (上記の理由)
@@ -13708,12 +14656,15 @@ tick(); setInterval(tick, ${ms});
       if(!a){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:`no match: ${who}`})); return; }
       const rel=Object.entries(a.rel||{}).sort((x,y)=>y[1].s-x[1].s).map(([id,e])=>{
         const o=agents.find(x=>x.aid===id);
-        return {aid:id, name:o?o.name:null, closeness:+e.s.toFixed(2), met:e.n, lastDay:e.d};
+        return {aid:id, name:o?o.name:null, closeness:+e.s.toFixed(2),
+                grudge:+(e.g||0).toFixed(2), lent:Math.round(e.debt||0),
+                lentSince:e.since==null?null:e.since, met:e.n, lastDay:e.d};
       });
       res.writeHead(200);
       res.end(JSON.stringify({ok:true, name:a.name, aid:a.aid,
         sociability:a.def.sociability!=null?a.def.sociability:0.4,
-        friends:SOC.degreeOf(a), knows:rel.length, rel}));
+        friends:SOC.degreeOf(a), enemies:SOC.enemiesOf(a).length,
+        knows:rel.length, rel}));
       return;
     }
     // なぜ newshop / closed の話題が出ないのか、を後から追えるようにしておく。
@@ -13736,6 +14687,14 @@ tick(); setInterval(tick, ${ms});
       }
     }
     const top=SOC.topConnected(agents, 5).map(x=>({name:x.a.name, friends:x.deg}));
+    // 遺恨。**動機のある人物**を引くための入口なので、街の一覧にも出しておく。
+    const debts=SOC.debts(agents, 10)
+      .map(x=>({lender:x.lender.name, borrower:x.borrower.name,
+                amount:Math.round(x.amt), sinceDay:x.since,
+                grudge:+SOC.grudgeOf(x.lender, x.borrower.aid).toFixed(2)}));
+    const feuds=SOC.feuds(agents, null, 10)
+      .map(f=>({from:f.a.name, to:f.b.name, grudge:+f.g.toFixed(2),
+                mutual:SOC.grudgeOf(f.b, f.a.aid)>=SOC_STATE.cfg.grudgeEnemy}));
     const talking=agents.filter(a=>SOC.isTalking(a, Date.now()))
       .map(a=>({name:a.name, with:(agents.find(x=>x.aid===a.talk.with)||{}).name||null,
                 topic:a.talk.topic}));
@@ -13744,12 +14703,132 @@ tick(); setInterval(tick, ${ms});
       totals:{meets:SOC_STATE.stats.meets, talks:SOC_STATE.stats.talks,
               friendshipsSinceBoot:SOC_STATE.stats.friends,
               topics:SOC_STATE.stats.topics,
-              friendshipsAllTime:(CITY&&CITY.stats.friendships)||0},
-      talkingNow:talking, mostConnected:top,
+              friendshipsAllTime:(CITY&&CITY.stats.friendships)||0,
+              feudsAllTime:(CITY&&CITY.stats.feuds)||0},
+      talkingNow:talking, mostConnected:top, feuds, debts,
       diag:{residents:agents.length, withPref, freshShopsInTown:freshShops,
             canTellNewShop:freshCand, canTellClosed:deadCand,
             newShopDays:NEWSHOP_DAYS},
       config:SOC_STATE.cfg}));
+    return;
+  }
+
+  // ── /witness : 目撃台帳 ──
+  //   /witness            新しい順に事件と証言 (真相を伏せた「街から見える形」)
+  //   /witness?truth=1    真相 (犯人) 込み。答え合わせ用
+  //   /witness?id=inc7    1件だけ。証言に当てはまる住民 (容疑者) も返す
+  if(urlPath==='/witness'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!WITNESS_ON){
+      res.writeHead(200); res.end(JSON.stringify({ok:false, enabled:false, hint:'WITNESS=1 で有効'}));
+      return;
+    }
+    const truth=q.get('truth')==='1';
+    const view=inc=>{
+      const o=truth ? inc : WIT.publicView(inc);
+      return {...o, said:(inc.seen||[]).map(sg=>({
+        by:sg.name, level:sg.level, q:sg.q,
+        ja:WIT.line(inc, sg, true), en:WIT.line(inc, sg, false)}))};
+    };
+    const id=q.get('id');
+    if(id){
+      const inc=WIT_STATE.log.find(x=>x.id===id);
+      if(!inc){ res.writeHead(404); res.end(JSON.stringify({ok:false, error:`no incident: ${id}`})); return; }
+      // 証言だけで何人まで絞れるか。**1人なら易しすぎ、0人なら証言が食い違っている。**
+      // 3〜8人くらいが、聞き込みで潰していく余地のある良い幅。
+      // ★ 絞り込むのは **いま街にいる人** だけ。転出した住民は候補に入らないので、
+      //   古い事件では真犯人が候補から抜けていることがある (転入転出のある街では
+      //   避けられない)。黙って別人が1人だけ残ると誤読するので、必ず添えて返す。
+      const now=agents.map(lookOf);
+      const pool=WIT.narrow(inc, now);
+      const stillHere=now.some(l=>l.aid===inc.culprit.aid);
+      res.writeHead(200);
+      res.end(JSON.stringify({ok:true, incident:view(inc),
+        suspects:pool.map(l=>l.name), suspectCount:pool.length,
+        solvedByTestimony:pool.length===1,
+        pool:{residentsNow:now.length, ageDays:gameDay()-inc.day,
+              culpritStillInTown:stillHere,
+              note:stillHere ? null : '犯人はすでに街を離れている (容疑者一覧に真犯人はいない)'}},
+        null, 1));
+      return;
+    }
+    const n=Math.max(1, Math.min(WIT_STATE.cfg.cap, +q.get('n') || 12));
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, enabled:true,
+      stats:WIT_STATE.stats, config:WIT_STATE.cfg,
+      incidents:WIT_STATE.log.slice(-n).reverse().map(view)}, null, 1));
+    return;
+  }
+
+  // ── /mystery : 事件を「謎として成立しているか」で採点する ──
+  //   /mystery           台帳の全事件を点数順に (これが報酬関数の出力)
+  //   /mystery?id=incN   1件ぶんの捜査経過
+  //   /mystery?best=1    いま一番良い1件を詳しく
+  // ── /hash : 世界の状態をひとつの数で。決定性の確認に使う ──
+  if(urlPath==='/hash'){
+    res.setHeader('Content-Type','application/json'); res.writeHead(200);
+    res.end(JSON.stringify({ok:true, hash:stateHash(), ticks:_simTicks,
+      day:gameDay(), hour:+gameHour().toFixed(3), seed:SIM_SEED, rng:RNG.state()}));
+    return;
+  }
+
+  if(urlPath==='/mystery'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!WITNESS_ON){
+      res.writeHead(200); res.end(JSON.stringify({ok:false, enabled:false, hint:'WITNESS=1 で有効'}));
+      return;
+    }
+    const detail=inc=>{
+      const r=investigate(inc);
+      return {id:inc.id, day:inc.day, hour:inc.hour, kind:inc.kind, place:inc.place,
+        score:r.grade.score, verdict:r.grade.verdict, parts:r.grade.parts,
+        trace:MYS.explain(inc, r.sol, true),
+        suspects:r.sol.suspects.map(l=>{
+          const al=r.sol.alibi[l.aid], m=r.sol.motive[l.aid];
+          const g=r.sol.gain[l.aid];
+          const jump=(g && g.complete && g.max!=null) ? g.max : null;
+          return {name:l.name,
+            alibi: al ? (al.ok ? `${al.by.join('・')} が裏付け`
+                   : (({nodata:'記録なし', alone:'一人だった', weak:'裏取りが足りない',
+                        scene:'現場に居た', ok:'裏は取れている'})[al.why] || al.why)
+                     + (al.gaps?` (${al.gaps}/${al.span}スロットが空白)`:'')) : null,
+            cash: jump==null ? '記録なし' : (jump>0 ? `最大 +${jump}` : '増えていない'),
+            motive: m && m.score>0 ? m.why : null};
+        }),
+        redHerrings:r.sol.redHerrings,
+        naive:r.naive,
+        answer:r.sol.answer ? r.sol.answer.name : null,
+        // 真相は truth=1 のときだけ。既定では伏せる (台帳と同じ作法)。
+        truth: q.get('truth')==='1' ? inc.culprit.name : undefined};
+    };
+    const id=q.get('id');
+    if(id){
+      const inc=WIT_STATE.log.find(x=>x.id===id);
+      if(!inc){ res.writeHead(404); res.end(JSON.stringify({ok:false, error:`no incident: ${id}`})); return; }
+      res.writeHead(200); res.end(JSON.stringify({ok:true, incident:detail(inc)}, null, 1));
+      return;
+    }
+    const scored=WIT_STATE.log.map(inc=>({inc, r:investigate(inc)}))
+      .sort((a,b)=>b.r.grade.score-a.r.grade.score);
+    if(q.get('best')==='1'){
+      if(!scored.length){ res.writeHead(200); res.end(JSON.stringify({ok:true, incident:null})); return; }
+      res.writeHead(200); res.end(JSON.stringify({ok:true, incident:detail(scored[0].inc)}, null, 1));
+      return;
+    }
+    const tally={};
+    for(const x of scored) tally[x.r.grade.verdict]=(tally[x.r.grade.verdict]||0)+1;
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, weights:MYS.W, chain:[MYS.CHAIN_MIN, MYS.CHAIN_MAX],
+      counted:scored.length, verdicts:tally,
+      alibi:{enabled:ALIBI_ON, slotMin:AL_STATE.cfg.slotMin, days:AL_STATE.cfg.days,
+             recorded:AL_STATE.stats.slots},
+      incidents:scored.slice(0, Math.max(1, Math.min(64, +q.get('n')||20))).map(x=>({
+        id:x.inc.id, day:x.inc.day, kind:x.inc.kind,
+        score:x.r.grade.score, verdict:x.r.grade.verdict,
+        suspects:x.r.sol.suspects.length, chain:x.r.sol.chain,
+        redHerrings:x.r.sol.redHerrings.length}))}, null, 1));
     return;
   }
 
@@ -13981,7 +15060,7 @@ tick(); setInterval(tick, ${ms});
             wait:+(c.wait||0).toFixed(1), hold:+(c.hold||0).toFixed(1)}))},
         jobless:agents.reduce((n,a)=>n+((a.jobless||0)>=MOVEOUT_JOBLESS?1:0),0),
         wantOut:agents.reduce((n,a)=>n+(moveOutScore(a)>0?1:0),0),
-        resetAt:POP_MAX, resetPending:_popResetAt ? Math.max(0, Math.round((_popResetAt-Date.now())/1000)) : null,
+        resetAt:POP_MAX, resetPending:_popResetAt ? Math.max(0, Math.round((_popResetAt-simNow())/1000)) : null,
         workCap:workplaceCapacity(),
         homeless:agents.reduce((n,a)=>n+(a.home?0:1),0),
         homes:openStructsOf(HOME_IDX).map(st=>({label:BLDG_TYPES[st.typeIdx].label, cell:[st.r,st.c],
@@ -14273,6 +15352,12 @@ let simRunning = false;
 function stepOneSecond(){
   stepSocial(1); stepNeeds(1); stepOutings(1); stepPastime(1); stepEvents(1);
   stepPolice(); stepDelivery(); retargetOnNeedChange();
+  stepDisguise(1);         // 手配されている人は顔を隠す
+  stepLure(1);             // 恨んでいる相手を人気のない場所へ誘い出す (孤立を「作る」)
+  stepGrudgeCrime(1);      // 恨んでいる相手が近くに居たら狙う (stepNeeds の後 = 近傍が新しい)
+  stepPlotWatch();         // 誘い出しが効いているかを数える
+  stepBodies();            // 死体が見つかる = 街が事件を知る瞬間
+  stepAlibi();
 }
 
 // ── 早送り (SIM_FAST=1) ────────────────────────────────────────────────────
@@ -14282,9 +15367,123 @@ function stepOneSecond(){
 //     「粗い街」になっていた (実測: 1日160tick / 来店0.1件)。ここでは
 //     **1日あたりの tick 数は通常運転と同じまま**、それを速く消化する。
 //   ★ 目的は「入れた仕掛けが効いているか」を一晩で確かめられるようにすること。
+let _branchStartDay = 0;          // 分岐が始まった日 (それ以前の事件は前の周から引き継いだもの)
 const SIM_FAST      = process.env.SIM_FAST === '1';
 const SIM_FAST_DAYS = Math.max(1, envNum('SIM_FAST_DAYS', 30));
 const SIM_FAST_EVERY= Math.max(1, envNum('SIM_FAST_REPORT_DAYS', 5));  // 何日ごとに報告するか
+
+// 世界の状態をひとつの数にする。**決定性の確認に使う**。
+//   同じ種・同じ地点から回して、同じ tick 数でここが一致すれば再現できている。
+//   ★ 文字列 (ニュース) と実時計に触れるものは入れない。中身は同じでも
+//     並びや時刻が違うだけで不一致になり、本当のずれが見つけられなくなる。
+// 部位ごとの指紋。全体が食い違ったとき **どの種類の状態が違うのか** を切り分ける。
+//   同じ乱数消費・同じ人口で hash だけ違う、という形は「順序」か「復元した値」の
+//   どちらかでしか起きない。部位が分かれば探す範囲が一気に狭まる。
+function stateParts(){
+  const mk=()=>{ let h=2166136261; return {
+    mix(v){ h^=(v|0); h=Math.imul(h,16777619); },
+    mixf(v){ this.mix(Math.round((v||0)*1000)); },
+    str(s){ for(let i=0;i<s.length;i++) this.mix(s.charCodeAt(i)); },
+    get(){ return (h>>>0).toString(16).padStart(8,'0'); } }; };
+  const P={who:mk(), pos:mk(), need:mk(), money:mk(), place:mk(), rel:mk(), pref:mk(),
+           mask:mk(), chron:mk(), city:mk(), wit:mk(), withour:mk(), ticks:mk()};
+  const sorted=[...agents].sort((a,b)=>a.aid<b.aid?-1:a.aid>b.aid?1:0);
+  for(const a of sorted){
+    P.who.str(a.aid);
+    P.pos.str(a.aid); P.pos.mixf(a.x); P.pos.mixf(a.y); P.pos.mixf(a.th);
+    P.need.str(a.aid); P.need.mixf(a.hunger); P.need.mixf(a.fatigue);
+    P.need.mixf(a.supply); P.need.mixf(a.bored); P.need.mixf(a.sick);
+    P.money.str(a.aid); P.money.mixf(a.cash); P.money.mixf(a.desper);
+    P.money.mixf(a.wanted); P.money.mix(a.crimes||0); P.money.mix(a.jail||0);
+    P.place.str(a.aid); P.place.mix(a.home?a.home[0]*997+a.home[1]:0);
+    P.place.mix(a.work?a.work[0]*997+a.work[1]:0);
+    P.place.mix(a.indoors?a.indoors[0]*997+a.indoors[1]:0);
+    for(const k of Object.keys(a.rel||{}).sort()){
+      P.rel.str(a.aid); P.rel.str(k);
+      P.rel.mixf(a.rel[k].s); P.rel.mixf(a.rel[k].g||0); P.rel.mix(a.rel[k].n||0);
+    }
+    for(const k of Object.keys(a.pref||{}).sort()){ P.pref.str(a.aid); P.pref.str(k); P.pref.mixf(a.pref[k].s); }
+    P.mask.str(a.aid); P.mask.mix(a.seenMask||0);
+    P.chron.str(a.aid); P.chron.mix((a.marks||[]).length); P.chron.mix((a.log||[]).length);
+  }
+  if(CITY){
+    P.city.mixf(CITY.econ); P.city.mix(CITY.level);
+    for(const k of Object.keys(CITY.stats).sort()) P.city.mix(CITY.stats[k]|0);
+    for(const st of CITY.structs){ P.city.mix(st.r*997+st.c); P.city.mix(st.typeIdx); P.city.str(st.state); }
+  }
+  P.wit.mix(WIT_STATE.seq);
+  for(const inc of WIT_STATE.log){ P.wit.mix(inc.day); P.wit.str(inc.culprit.aid); P.wit.mix((inc.seen||[]).length); }
+  for(const inc of WIT_STATE.log) P.withour.mix(Math.round(inc.hour*10));
+  P.ticks.mix(_simTicks);
+  const o={}; for(const k in P) o[k]=P[k].get();
+  return o;
+}
+
+function stateHash(){
+  let h=2166136261;
+  const mix=v=>{ h^=(v|0); h=Math.imul(h,16777619); };
+  const mixf=v=>mix(Math.round((v||0)*1000));
+  const sorted=[...agents].sort((a,b)=>a.aid<b.aid?-1:a.aid>b.aid?1:0);
+  for(const a of sorted){
+    for(let i=0;i<a.aid.length;i++) mix(a.aid.charCodeAt(i));
+    mixf(a.x); mixf(a.y); mixf(a.th);
+    mixf(a.hunger); mixf(a.fatigue); mixf(a.supply); mixf(a.bored); mixf(a.sick);
+    mixf(a.cash); mixf(a.desper); mixf(a.wanted);
+    mix(a.crimes||0); mix(a.jail||0); mix(a.seenMask||0);
+    mix(a.home?a.home[0]*997+a.home[1]:0);
+    mix(a.work?a.work[0]*997+a.work[1]:0);
+    mix(a.indoors?a.indoors[0]*997+a.indoors[1]:0);
+    // ★ 人間関係と好みも入れる。ここを外していたころは、rel だけがずれた状態を
+    //   「一致」と報告してしまい、**次の周で初めて食い違う**という追いにくい形で出た。
+    //   状態のごく一部しか見ない指紋は、無いより悪い。
+    for(const k of Object.keys(a.rel||{}).sort()){
+      for(let i=0;i<k.length;i++) mix(k.charCodeAt(i));
+      mixf(a.rel[k].s); mixf(a.rel[k].g||0); mix(a.rel[k].n||0);
+    }
+    for(const k of Object.keys(a.pref||{}).sort()){
+      for(let i=0;i<k.length;i++) mix(k.charCodeAt(i));
+      mixf(a.pref[k].s);
+    }
+    mix((a.marks||[]).length); mix((a.log||[]).length);
+  }
+  if(CITY){
+    mixf(CITY.econ); mix(CITY.level); mix(CITY.structs.length);
+    for(const k of Object.keys(CITY.stats).sort()) mix(CITY.stats[k]|0);
+    for(const st of CITY.structs){ mix(st.r*997+st.c); mix(st.typeIdx);
+      for(let i=0;i<st.state.length;i++) mix(st.state.charCodeAt(i)); }
+  }
+  mix(WIT_STATE.seq); mix(_simTicks);
+  for(const inc of WIT_STATE.log){
+    mix(inc.day); mix(Math.round(inc.hour*10)); mix((inc.seen||[]).length);
+    for(let i=0;i<inc.culprit.aid.length;i++) mix(inc.culprit.aid.charCodeAt(i));
+  }
+  return (h>>>0).toString(16).padStart(8,'0');
+}
+
+// 台帳を採点して、この分岐でいちばん良かった事件を返す。分岐探索の得点。
+//   ★ sinceDay を渡すと **その日以降に起きた事件だけ** を見る。分岐は前の周から
+//     台帳を引き継ぐので、これが無いと「どの枝も同じ古い事件が最高得点」になって
+//     枝の優劣が出ない (実際にそうなった: 全枝が同じ事件7件のまま並んだ)。
+function bestStory(sinceDay){
+  if(!WITNESS_ON || !WIT_STATE.log.length) return null;
+  let best=null;
+  for(const inc of WIT_STATE.log){
+    if(sinceDay!=null && inc.day < sinceDay) continue;
+    const r=investigate(inc);
+    if(!best || r.grade.score>best.score)
+      best={id:inc.id, day:inc.day, hour:inc.hour, kind:inc.kind,
+            score:r.grade.score, verdict:r.grade.verdict, parts:r.grade.parts,
+            chain:r.sol.chain, suspects:r.sol.suspects.length,
+            redHerrings:r.sol.redHerrings.length,
+            // ★ 点数だけでなく **話そのもの** を持たせる。分岐探索は別プロセスなので、
+            //   ここに入れておかないと「良い枝が見つかった」で終わって中身が読めない。
+            trace:MYS.explain(inc, r.sol, true),
+            who:{culprit:inc.culprit.name, victim:inc.victim?inc.victim.name:null,
+                 answer:r.sol.answer?r.sol.answer.name:null, naive:r.naive,
+                 herrings:r.sol.redHerrings}};
+  }
+  return best;
+}
 
 async function fastRun(){
   const perSec  = Math.max(1, Math.round(1000/TICK));            // 1秒 = 何tick
@@ -14293,6 +15492,11 @@ async function fastRun(){
   console.log(`[Fast] 早送り開始: ${SIM_FAST_DAYS}日 = ${total.toLocaleString()}tick`
     + ` (1日 ${perDay.toLocaleString()}tick / 通常運転と同じ密度)`);
   const t0=Date.now();
+  _branchStartDay=gameDay();     // この枝で「新しく起きた事件」の境目
+  // 復元し終わった直後の指紋。**回す前**に一致しているかを別に見られるようにする。
+  // これが違えば復元の問題、これが同じで最後だけ違えば回し方の問題、と切り分く。
+  console.log('[InitJSON] '+JSON.stringify({hash:stateHash(), pop:agents.length,
+    day:gameDay(), hour:+gameHour().toFixed(4), rng:RNG.state()}));
   let acc=0, lastDay=gameDay();
   for(let i=0;i<total;i++){
     await stepAll();
@@ -14307,6 +15511,13 @@ async function fastRun(){
     const d=gameDay();
     if(d!==lastDay){                       // 日が変わった瞬間だけ (二重に出さない)
       lastDay=d;
+      // 1日ごとの指紋。**どの日から食い違ったか**が分かれば、原因の範囲が
+      // 1日ぶんの出来事まで狭まる。最後の1個だけ比べても何も分からない。
+      console.log('[DayParts] '+d+' '+JSON.stringify(stateParts()));
+      console.log(`[DayHash] ${d} ${stateHash()} pop=${agents.length} `
+        + `shops=${CITY.structs.filter(x=>x.state==='open').length} `
+        + `con=${CITY.structs.filter(x=>x.state==='construction').length} `
+        + `inc=${WIT_STATE.log.length} rng=${RNG.draws()}`);
       if((d-CITY.dayBase)%SIM_FAST_EVERY===0) fastReport(d, t0);
     }
   }
@@ -14329,6 +15540,26 @@ async function fastRun(){
     econ:Math.round(CITY?CITY.econ:0),
     unmet:+CATS.reduce((n,c)=>n+(CITY?CITY.unmet[c]:0),0).toFixed(0),
     secs:+((Date.now()-t0)/1000).toFixed(0),
+    hash:stateHash(),                   // 決定性の確認用 (tools/determinism-check.js)
+  }));
+  // 分岐探索が拾う1行。**この分岐でいちばん良かった事件**が得点になる。
+  const story=bestStory(_branchStartDay);
+  const verdicts={};
+  let fresh=0;
+  if(WITNESS_ON) for(const inc of WIT_STATE.log){
+    if(inc.day < _branchStartDay) continue;
+    fresh++;
+    const v=investigate(inc).grade.verdict; verdicts[v]=(verdicts[v]||0)+1;
+  }
+  console.log(`[PlotDiag] 犯人が現場に居た秒=${_plotSeen} / 相手も居た=${_plotPairs} / 二人きり=${_plotAlone}`);
+  console.log('[MurderDiag] '+JSON.stringify(_mrDiag)
+    + `  (恨み>=${MURDER_GRUDGE} 追込>=${MURDER_DESPER} 孤立半径${MURDER_ALONE_R})`);
+  console.log('[StoryJSON] '+JSON.stringify({
+    seed:SIM_SEED, days:SIM_FAST_DAYS, hash:stateHash(),
+    fromDay:_branchStartDay, toDay:gameDay(),
+    incidents:fresh, carried:WIT_STATE.log.length-fresh,
+    verdicts, best:story,
+    feuds:(CITY&&CITY.stats.feuds)||0, pop:agents.length,
   }));
   console.log(`[Fast] 完了 ${( (Date.now()-t0)/1000 ).toFixed(0)}秒`);
 }

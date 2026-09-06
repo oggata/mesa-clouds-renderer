@@ -167,16 +167,23 @@ function candidates(ctx) {
   return out;
 }
 
+// ── 乱数 ────────────────────────────────────────────────────────────────────
+// 既定は Math.random。**シミュレーションから使うときは setRng(RNG.R) で
+// 差し替える** (rng.js を参照)。差し替え忘れると、他が全部決定的でも
+// この一本だけで世界が毎回ずれる。症状が「たまに再現しない」なので厄介。
+let _rnd = Math.random;
+const setRng = fn => { _rnd = fn || Math.random; };
+
 /** 候補から 1 つ選ぶ。ペルソナごとの偏りは持たせない (誰が何をしても良い街にする)。 */
 function pick(ctx, rnd) {
   const c = candidates(ctx);
   if (!c.length) return null;
-  return c[Math.floor((rnd || Math.random)() * c.length)];
+  return c[Math.floor((rnd || _rnd)() * c.length)];
 }
 
 /** 続く長さ (秒)。 */
 function duration(A, rnd) {
-  const r = (rnd || Math.random)();
+  const r = (rnd || _rnd)();
   return A.secs[0] + r * (A.secs[1] - A.secs[0]);
 }
 
@@ -184,7 +191,7 @@ function duration(A, rnd) {
 function line(A, ja) {
   const arr = (ja ? A.ja_l : A.en_l) || [];
   if (!arr.length) return null;
-  return arr[Math.floor(Math.random() * arr.length)];
+  return arr[Math.floor(_rnd() * arr.length)];
 }
 
 const label  = (A, ja) => (ja ? A.ja : A.en);
@@ -192,4 +199,4 @@ const label  = (A, ja) => (ja ? A.ja : A.en);
 const doing  = (A, ja) => (ja ? (A.jaIng || (A.ja + 'をしている')) : ('is ' + A.en));
 const doingN = (A, ja, n) => ja ? doing(A, true) : ((n>1?'are ':'is ') + A.en);
 
-module.exports = { ACTS, byId, candidates, pick, duration, line, label, doing, doingN };
+module.exports = { ACTS, byId, candidates, pick, duration, line, label, doing, doingN, setRng };

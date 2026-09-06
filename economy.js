@@ -79,9 +79,16 @@ function createState(opts){
   };
 }
 
+// ── 乱数 ────────────────────────────────────────────────────────────────────
+// 既定は Math.random。**シミュレーションから使うときは setRng(RNG.R) で
+// 差し替える** (rng.js を参照)。ここを差し替え忘れると、他が全部決定的でも
+// この一本だけで世界が毎回ずれる — しかも症状は「たまに再現しない」なので、
+// 気づくのに一番時間が掛かる種類のバグになる。
+let _rnd = Math.random;
+const setRng = fn => { _rnd = fn || Math.random; };
 // ── 住民1人ぶんの初期化 ────────────────────────────────────────────────────
 function initAgent(S, a){
-  if(a.cash==null)    a.cash = S.cfg.startCash*(0.6+Math.random()*0.8);
+  if(a.cash==null)    a.cash = S.cfg.startCash*(0.6+_rnd()*0.8);
   if(a.desper==null)  a.desper = 0;
   if(a.wanted==null)  a.wanted = 0;
   // jobless は「職を失ってから何日目か」の待ち時間カウンタ。
@@ -122,17 +129,27 @@ function pay(S, a, kind){
 // 追い詰められ度が正直さを上回ったときだけ。ここが人物差になる。
 //   Social Marco (honesty 0.8) は相当追い詰められないと手を出さない。
 //   Night-shift Mika (0.35) は早い。
-function willOffend(S, a){
+//
+// ── bias = 「この相手なら」の上乗せ ──
+// **誰から盗るかは、それまで無関係だった。** 立ち話の相手から機械的に抜くので、
+// 被害者はいつもただの通りすがりになり、犯人と被害者のあいだに何の因縁も無い。
+// これだと動機を街にいくら仕込んでも、事件と噛み合わない
+// (実測: 遺恨が90組あっても、被害者に恨みを持つ容疑者は1件も出なかった)。
+//   恨んでいる相手・自分に貸しのある相手が目の前にいるときは、同じ困窮度でも
+//   手が伸びやすい。呼ぶ側が bias を渡して、正直さの敷居を下げる。
+//   ★ 追い詰められていない人は bias があっても手を出さない (crimeMin は据え置き)。
+//     「恨んでいるだけで盗む」ようにはしない。
+function willOffend(S, a, bias){
   if(inJail(a)) return false;
   const d=a.desper||0;
   if(d < S.cfg.crimeMin) return false;
-  return d > honestyOf(a);
+  return d + (bias||0) > honestyOf(a);
 }
 
 // 見咎められたか。疑われている人ほど見られている。
 function caught(S, a, rng){
   const p=Math.min(0.9, S.cfg.caughtBase + (a.wanted||0)*0.5);
-  return (rng||Math.random)() < p;
+  return (rng||_rnd)() < p;
 }
 
 // 犯行後の共通処理
@@ -310,7 +327,7 @@ function restoreAgent(a, sv){
 }
 
 module.exports = {
-  DEFAULTS, createState, initAgent,
+  DEFAULTS, createState, setRng, initAgent,
   honestyOf, priceOf, isBroke, isJobless, isStudent, inJail, pay,
   willOffend, caught, shoplift, pickpocket, arrest,
   stepDay, unrest, mostDesperate,

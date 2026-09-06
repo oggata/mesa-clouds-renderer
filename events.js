@@ -152,6 +152,13 @@ const EVENTS = [
 //   pick … 相手の選び方 ('near' = 近くの誰か / 'friend' = 友人優先)
 //   then … 相手に起きること。honesty (正直さ) で分岐するものは good/bad の二択
 // 分岐の材料はすべて既にある (economy.js の honestyOf、social.js の rel)。
+//
+// ── 恨みを残す連鎖 ──
+//   grudge … {a: きっかけを起こした側が相手を恨む量, b: 相手が起こした側を恨む量}
+//   quiet  … true なら見出しに出さない (数が多い出来事。節目だけ server 側が出す)
+// **恨みは「相手が誰か分かっている」ときにしか立たない。** 財布を持ち去られた側に
+// 恨みが立たないのはこのためで、被害者は誰が拾ったかを知らない。
+// 面と向かってもめた / すっぽかされた、のように**相手の顔が見えている**ものだけ。
 const PAIRS = [
   { from:'wallet_lost', pick:'near', honesty:true,
     good:{ id:'found_wallet', icon:'👛', ja:'落ちていた財布を届けた', en:'returned a lost wallet',
@@ -166,7 +173,10 @@ const PAIRS = [
            fx:{bored:-0.15, desper:-0.08} },
     backGood:{ icon:'😌', ja:'同僚に助けてもらった', en:'was helped by a colleague',
                fx:{desper:-0.18} } },
-  { from:'scam', pick:'friend',
+  // 貸し借りは**関係として残る**。ここで金が動くだけだと、翌日には誰も覚えていない。
+  //   lend を書いておくと server 側が借用書 (social.js の debt) を作り、
+  //   返さないまま日が経つほど貸した側の恨みが育つ。**取り立てが動機になる。**
+  { from:'scam', pick:'friend', lend:12,
     good:{ id:'lent_money', icon:'💸', ja:'友達にお金を貸した', en:'lent money to a friend',
            fx:{cashFlat:-12, bored:-0.10} },
     backGood:{ icon:'🤝', ja:'友達がお金を貸してくれた', en:'was lent money by a friend',
@@ -176,12 +186,36 @@ const PAIRS = [
            fx:{bored:-0.18} },
     backGood:{ icon:'🙇', ja:'通りがかりの人に助けられた', en:'was helped by a passer-by',
                fx:{sickAdd:-0.15} } },
+  // ── ここから下は「恨み」を残す連鎖 ──────────────────────────────────────
+  // 言い合いは**双方に**遺恨を残す。街で動機が生まれる主な場所がここ。
+  //   0.24/0.20 は **3回もめてようやく** grudgeEnemy (0.45) を越える値
+  //   (飽和加算なので 0.24 → 0.42 → 0.56)。動機は積み重ねでしか生まれない。
+  //   起こした側のほうが少しだけ強く恨む (言い出した側は自分が正しいと思っている)。
+  { from:'argument', pick:'near', quiet:true,
+    good:{ id:'argued_back', icon:'💢', ja:'言い返した', en:'argued back',
+           fx:{bored:+0.22, desper:+0.08} },
+    grudge:{ a:0.24, b:0.20 } },
+  // すっぽかし。**片方向**にしか恨みが立たないのがこれの値打ちで、
+  // 待たされた側だけが恨み、忘れた側は恨まれていることを知らない。
+  //   ★ 相手は「近くの誰か」から引く。財布を拾うのが通りすがりなのと同じ割り切りで、
+  //     約束の相手をモデル化していない以上、ここは近接で代用する。
+  { from:'forgot', pick:'friend', quiet:true,
+    good:{ id:'stood_up', icon:'🕰', ja:'待ちぼうけを食わされた', en:'was left waiting',
+           fx:{bored:+0.28, desper:+0.06} },
+    grudge:{ b:0.24 } },
 ];
 const pairOf = id => PAIRS.find(p => p.from === id) || null;
 
 const byId = {};
 for (const e of EVENTS) byId[e.id] = e;
 
+// ── 乱数 ────────────────────────────────────────────────────────────────────
+// 既定は Math.random。**シミュレーションから使うときは setRng(RNG.R) で
+// 差し替える** (rng.js を参照)。ここを差し替え忘れると、他が全部決定的でも
+// この一本だけで世界が毎回ずれる — しかも症状は「たまに再現しない」なので、
+// 気づくのに一番時間が掛かる種類のバグになる。
+let _rnd = Math.random;
+const setRng = fn => { _rnd = fn || Math.random; };
 /** 条件を満たすか。ctx は server.js が組む。 */
 function ok(E, ctx) {
   for (const r of E.req) {
@@ -212,7 +246,7 @@ function weightOf(E, ctx) {
 
 /** 条件を満たすものから重み付きで 1 つ選ぶ。 */
 function pick(ctx, rnd) {
-  const R = rnd || Math.random;
+  const R = rnd || _rnd;
   let total = 0;
   const pool = [];
   for (const E of EVENTS) {
@@ -229,4 +263,4 @@ function pick(ctx, rnd) {
 
 const label = (E, ja) => (ja ? E.ja : E.en);
 
-module.exports = { EVENTS, PAIRS, pairOf, byId, ok, weightOf, pick, label };
+module.exports = { EVENTS, PAIRS, pairOf, byId, ok, weightOf, pick, label, setRng };
