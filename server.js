@@ -115,11 +115,23 @@ catch(e) { console.warn('[ONNX] not found — random mode'); }
 //   例:  ASPECT=wide QUALITY=L node server.js
 // WIDTH/HEIGHT/FPS/JPEG_Q/YT_VIDEO_BITRATE_K を個別指定した場合はそちらが優先される。
 const STREAM_ASPECTS = { square: 1/1, wide: 16/9 };
+// ★ ytk は **解像度と fps に見合った値**にすること。ここがずれると YouTube の
+//   管理画面に「ビットレートが推奨値より高い」と警告が出る。高すぎても画質は
+//   上がらず、上り帯域を無駄に使うだけ (回線が細いと送信側が詰まる原因になる)。
+//   目安は「画素数 x fps」あたりのビット数で、H と M はどちらも約 0.09 bits/px:
+//     H  1280x720 x30 = 27.6M px/s → 2500k → 0.090 bits/px
+//     M   960x540 x30 = 15.6M px/s → 1500k → 0.097 bits/px
+//     L   924x520 x15 =  7.2M px/s → 線形換算では 650〜700k
+//   L は 15fps でコマ間の変化が大きく、1コマあたりに要るビットは 30fps より
+//   多いので、線形換算より少し上の 800k を採る (音声 128k と合わせて約 950kbps)。
 const STREAM_PRESETS = {
   //     h = 縦解像度(px) / fps / jpeg品質(0-100) / ytk = YouTube動画ビットレート(kbps)
   H: { h:720, fps:30, jpeg:95, ytk:2500 },   // 高画質 (回線良好時)
   M: { h:540, fps:30, jpeg:85, ytk:1500 },   // 中
-  L: { h:520, fps:15, jpeg:80, ytk:1500  },   // 低負荷 (回線が不安定なとき)
+  // ★ 以前ここが M と同じ 1500 だった。fps を 30→15 に下げたときに ytk を
+  //   下げ忘れたもので、実測 1704kbps (映像1500k + 音声128k + FLV分) に対し
+  //   YouTube から「750k を推奨」と警告が出ていた。
+  L: { h:520, fps:15, jpeg:80, ytk:800  },   // 低負荷 (回線が不安定なとき)
 };
 const ASPECT  = STREAM_ASPECTS[process.env.ASPECT]  ? process.env.ASPECT  : 'wide';
 const QUALITY = STREAM_PRESETS[process.env.QUALITY] ? process.env.QUALITY : 'L';
