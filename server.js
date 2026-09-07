@@ -11569,7 +11569,7 @@ function pursueAction(a, move, rot){
   const gb=Math.atan2(a.gy-a.y, a.gx-a.x);                 // ゴールへの絶対方位
   const wrap=x=>Math.atan2(Math.sin(x),Math.cos(x));
   // だいたいゴール方向(±50°)で前方が通れるなら、完全整列を待たず前進 (曲がりながら進む)
-  if(Math.abs(wrap(gb-a.th))<0.87 && passableToward(a.x,a.y,a.th,move)) return 0;
+  if(Math.abs(wrap(gb-a.th))<0.87 && passableToward(a.x,a.y,a.th,move)){ a.walkWhy='go'; return 0; }
   let bestK=null, bestErr=Infinity;
   for(let k=0;k<=6;k++){
     for(const sgn of (k===0?[0]:[-1,1])){
@@ -11579,9 +11579,11 @@ function pursueAction(a, move, rot){
       if(err<bestErr){ bestErr=err; bestK=sgn*k; }
     }
   }
-  if(bestK===null) return (a.aid.charCodeAt(0)&1)?1:2;      // 全方位ふさがり → 回頭
-  if(bestK===0) return 0;                                   // 現在向きが通れて最もゴール寄り → 前進
-  return bestK>0 ? 2 : 1;                                   // ゴール側の通れる向きへ回頭
+  // 全方位ふさがり → 回頭。自然歩行側の 'blocked' と同じ状況なので同じ印を付ける
+  if(bestK===null){ a.walkWhy='blocked'; return (a.aid.charCodeAt(0)&1)?1:2; }
+  if(bestK===0){ a.walkWhy='go'; return 0; }                // 現在向きが通れて最もゴール寄り → 前進
+  a.walkWhy='turn';                                         // その場で回頭 = 前へ進まない
+  return bestK>0 ? 2 : 1;
 }
 
 function unstickAction(a, move, rot){
@@ -15485,6 +15487,12 @@ tick(); setInterval(tick, ${ms});
       nearPairs:pairs, tooClose, tooClosePct:+(tooClose/Math.max(1,pairs)*100).toFixed(1),
       waitingForCar:waiting, slowing:slow, avgSpeed:+(sum/n).toFixed(2),
       why:(()=>{const c={};for(const a of out)c[a.walkWhy||'-']=(c[a.walkWhy||'-']||0)+1;return c;})(),
+      // 前へ進めていない割合。従来は blocked+turn、自然歩行は blocked+car が該当する。
+      //   ★ 従来には「その場で回頭」があるので、blocked だけを比べると
+      //     従来を実際より良く見せてしまう。止まっている人の割合で比べること。
+      stuckPct:(()=>{let n=0;for(const a of out)
+        if(a.walkWhy==='blocked'||a.walkWhy==='turn'||a.walkWhy==='car') n++;
+        return +(n/Math.max(1,out.length)*100).toFixed(1);})(),
       threshold:R}));
     return;
   }
