@@ -4745,6 +4745,34 @@ function enterOpenPlace(a, dst){
   return true;
 }
 
+// 建物に着いたときの見せ方。**着いた瞬間に消さない。**
+//   ★ 以前は onArrive (「カフェに到着しました」の一言) の直後に MW.enterBuilding を
+//     呼んでいたので、アナウンスと同時に姿が消えていた。視聴者からは用事が
+//     完了したように見えず、しかも広場だけは外に留まるので「中に入ったり外に
+//     いたりまちまち」に見えていた。
+//   ★ 玄関で建物のほうを向いて一拍おいてから入る。これで
+//     「着いた → 入口で立ち止まった → 入っていった」が読める。
+//     広場 (屋根が無い) は従来どおり外に留まる。挙動の違いは残るが、
+//     どちらも「一度は外で立ち止まる」ので見え方は揃う。
+const ARRIVE_POSE_MS = Math.max(0, envNum('ARRIVE_POSE_SEC', 3.5))*1000;
+
+// 戻り値 true = ここで面倒を見たので呼び出し側は enterWander しないこと。
+function arriveAtBuilding(a, dst){
+  onArrive(a, dst);
+  // 配達員は玄関先に荷物を置くのが仕事。中に入ると本人も荷物も見えなくなる。
+  if(!WORLD.solidBuildings || !dst || a.deliv) return false;
+  if(enterOpenPlace(a, dst)) return true;          // 広場: 屋外に留まる
+  if(ARRIVE_POSE_MS<=0){                            // 一拍を切ったら従来どおり即入館
+    MW.enterBuilding(a, dst[0], dst[1]);
+    return MW.isIndoors(a);
+  }
+  a.path=null; a.pathIdx=0;
+  a.th = Math.atan2(dst[1]+0.5-a.y, dst[0]+0.5-a.x);   // 建物のほうを向く
+  a.mode='hold';
+  a.atDoor = { r:dst[0], c:dst[1], until: simNow()+ARRIVE_POSE_MS };
+  return true;
+}
+
 // ── 屋根の無い場所 (公園 / グラウンド) ──────────────────────────────────────
 // 公園を「緑の箱」として建てると、street から見て**壁**にしかならない。
 // 平らな敷地として描く: 地面の板 + 縁石 + それらしい中身。
@@ -10316,7 +10344,7 @@ function delivEndRun(a){
   a.deliv=null;
   a.rally=false;
   if(a.mode==='hold') a.mode='wander';
-  a.linger=null;
+  a.linger=null; a.atDoor=null;
   if(!MW.isIndoors(a)) enterWander(a);
 }
 
@@ -11473,8 +11501,16 @@ async function stepAll(){
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
     if(a.mode==='hold'){
+      // 玄関で一拍おいたら中へ入る (arriveAtBuilding が立てた待ち)
+      if(a.atDoor){
+        if(simNow()>=a.atDoor.until){
+          const d=a.atDoor; a.atDoor=null;
+          MW.enterBuilding(a, d.r, d.c);
+          if(!MW.isIndoors(a)) enterWander(a);   // 入れなかった (満室など) → 次へ
+        }
+      }
       // 広場での滞在は時間で切れる (rally の静止は linger を持たないので従来どおり)
-      if(a.linger && simNow()>=a.linger){ a.linger=null; enterWander(a); }
+      else if(a.linger && simNow()>=a.linger){ a.linger=null; enterWander(a); }
       else continue;
     }
     // 立ち話の間は足を止めて相手を向く。歩行シェーダの振幅は「実際に進んだ距離」で
@@ -11566,12 +11602,8 @@ async function stepAll(){
         // ★ 広場に着いたときは**次の行き先を選ばせない**。enterOpenPlace が
         //   mode='hold' を立てても、直後に enterWander を呼ぶと即上書きされて
         //   一瞬も留まらない (実測: hold の住民が常に 0 人だった)。
-        let stayed=false;
-        if(WORLD.solidBuildings && a.navDest && !a.deliv){
-          stayed=enterOpenPlace(a, a.navDest);
-          if(!stayed) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
-        }
-        if(a.rally) a.mode='hold';   // rally: 集合点に到着したら静止 (解除は /rally?off=1)
+        const stayed = arriveAtBuilding(a, a.navDest);
+        if(a.rally){ a.mode='hold'; a.atDoor=null; }   // rally: 集合点で静止 (解除は /rally?off=1)
         else if(!stayed && !MW.isIndoors(a)) enterWander(a);
       }
     }else{
@@ -11579,12 +11611,7 @@ async function stepAll(){
       a.goalZ=null;
       if(a.path){
         if(stepNavigate(a)){
-          onArrive(a, a.navDest);
-          let stayed=false;
-          if(WORLD.solidBuildings && a.navDest){
-            stayed=enterOpenPlace(a, a.navDest);
-            if(!stayed) MW.enterBuilding(a, a.navDest[0], a.navDest[1]);
-          }
+          const stayed = arriveAtBuilding(a, a.navDest);
           if(!stayed && !MW.isIndoors(a)) enterWander(a);   // 到着 → 次の行き先を選び直す
         }
       }else{
@@ -11597,12 +11624,9 @@ async function stepAll(){
           || (dst && WORLD.solidBuildings && MAP[dst[0]][dst[1]]===BUILDING
               && MW.hasArrived(WORLD, Math.floor(a.x), Math.floor(a.y), dst[0], dst[1]));
         if(arrived){
-          onArrive(a, dst);
-          let stayed=false;
-          if(WORLD.solidBuildings && dst && MAP[dst[0]][dst[1]]===BUILDING){
-            stayed=enterOpenPlace(a, dst);
-            if(!stayed) MW.enterBuilding(a, dst[0], dst[1]);
-          }
+          const stayed = (dst && MAP[dst[0]][dst[1]]===BUILDING)
+            ? arriveAtBuilding(a, dst)
+            : (onArrive(a, dst), false);
           if(!stayed && !MW.isIndoors(a)) enterWander(a);
         }else if(noProgress(a, dg)){
           enterWander(a);   // 近づけないまま歩き続けている → 行き先を選び直す (周回の打ち切り)
@@ -13946,7 +13970,10 @@ const CAM_TRIP        = process.env.CAM_TRIP !== '0';
 // 保険。道に迷う / 目的地が消える等で永久に着かないことがあるので上限を置く。
 const CAM_TRIP_MAX_MS = parseInt(process.env.CAM_TRIP_MAX_MS) || 80000;
 // 到着してから切り替えるまでの間 (「着いた」を読ませる時間)
-const CAM_ARRIVE_MS   = parseInt(process.env.CAM_ARRIVE_MS)   || 3200;
+// 「着いた」を読ませる間。**玄関で立ち止まる時間 (ARRIVE_POSE_SEC) より長く取ること。**
+//   短いと、入口で立ち止まっている最中にカメラが別人へ移ってしまい、
+//   結局「用事が完了したところ」が映らない。既定は一拍3.5秒 + 入っていく間1.7秒。
+const CAM_ARRIVE_MS   = parseInt(process.env.CAM_ARRIVE_MS)   || (ARRIVE_POSE_MS + 1700);
 let _camArrivedAt = 0;      // 追跡中の人が着いた時刻 (0 = 着いていない)
 let _camTripNeed  = null;   // その移動の目的 (到着の一言に使う)
 
@@ -14112,6 +14139,40 @@ function stepCamMark(S, a, show){
   _camMark.material.opacity = 0.40 + 0.25*(0.5+0.5*Math.sin(t*2.2));
 }
 
+// 追跡中の人が**どの建物へ向かっているか**を地面に示す。
+//   ★ 「〇〇に到着しました」と出ても、視聴者にはどれが対象の建物か分からなかった。
+//     住民の足元のリング (stepCamMark) と対になる、行き先側のしるし。
+//   ★ 色で状態を出す: 向かっている間は琥珀色でゆっくり明滅、着いたら緑で点灯。
+const DEST_MARK = process.env.DEST_MARK !== '0';
+let _destMark = null;
+function stepDestMark(S, a, show){
+  if(!DEST_MARK || !S) return;
+  if(!_destMark){
+    // 建物の足元を囲む枠。1セルより少し大きく取って輪郭が建物に隠れないようにする。
+    const g=new THREE.RingGeometry(CELL*0.52, CELL*0.62, 4);
+    _destMark=new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+      color:0xffb020, transparent:true, opacity:0.7, depthWrite:false,
+      blending:THREE.AdditiveBlending, fog:false, side:THREE.DoubleSide }));
+    _destMark.rotation.z = Math.PI/4;      // 四角形を建物の向きに合わせる
+    _destMark.renderOrder=2;
+    _destMark.frustumCulled=false;
+    S.add(_destMark);
+  }
+  // 行き先: 歩いている間は navDest、玄関で待っている間は atDoor
+  const d = a && (a.atDoor ? [a.atDoor.r, a.atDoor.c] : a.navDest);
+  _destMark.visible = !!show && !!d;
+  if(!_destMark.visible) return;
+  _destMark.position.set(d[1]*CELL+CELL*.5, d[0]*CELL+CELL*.5, 0.04);
+  const t=Date.now()/1000;
+  if(a.atDoor){                            // 着いた: 緑で強く点灯 (明滅させない)
+    _destMark.material.color.setHex(0x30e070);
+    _destMark.material.opacity = 0.85;
+  }else{                                   // 向かっている: 琥珀でゆっくり明滅
+    _destMark.material.color.setHex(0xffb020);
+    _destMark.material.opacity = 0.35 + 0.25*(0.5+0.5*Math.sin(t*2.2));
+  }
+}
+
 function updateTrackingCamera(cam) {
   // 遅れの計算に要る実時間。描画ループの dt をそのまま使うと、重いフレームで
   // カメラが飛ぶ (dt が跳ねる) ので、ここで測って上限をかける。
@@ -14145,7 +14206,7 @@ function updateTrackingCamera(cam) {
     cam.position.set(fx, fx, fs*CAM_OVERVIEW);
     cam.lookAt(fx, fx + 1, 0);
     _camLookAt.set(fx, fx, 0);
-    stepCamMark(scene, null, false);
+    stepCamMark(scene, null, false); stepDestMark(scene, null, false);
   } else {
     const a = agents[camTargetIdx - 1];
     if (!a) return;
@@ -14172,7 +14233,7 @@ function updateTrackingCamera(cam) {
       cam.position.set(tx + dwx*fwd, ty + dwy*fwd, eyeZ);
       cam.lookAt(tx + dwx*(fwd+4), ty + dwy*(fwd+4), eyeZ*0.85);   // 進行方向やや下向き
       _camLookAt.set(tx + dwx*(fwd+4), ty + dwy*(fwd+4), 0);
-      stepCamMark(scene, a, false);
+      stepCamMark(scene, a, false); stepDestMark(scene, a, false);
     } else {
       // ── 追跡カメラ (固定方位のオービット) ──
       //   ★ 住民の向きには**追従しない**。カメラが回るのは視線が建物に遮られた
@@ -14239,7 +14300,7 @@ function updateTrackingCamera(cam) {
                        _camPos0.z+Math.sin(T*0.47+1.3)*A*0.7);
       cam.lookAt(_camAim0.x, _camAim0.y, _camAim0.z);
       _camLookAt.set(tx, ty, 0);
-      stepCamMark(scene, a, true);
+      stepCamMark(scene, a, true);  stepDestMark(scene, a, true);
     }
   }
 }
@@ -15194,6 +15255,9 @@ tick(); setInterval(tick, ${ms});
         supply:+(a.supply||0).toFixed(2), bored:+(a.bored||0).toFixed(2),
         sick:+(a.sick||0).toFixed(2),
         need:needOf(a), emoji:NEED_EMOJI[needOf(a)]||null,
+        // 行動の状態。玄関で一拍おいている最中かどうかも出す (到着の見え方の確認用)
+        mode:a.mode, door:a.atDoor?[a.atDoor.r,a.atDoor.c]:null,
+        dest:a.navDest||null,
         pos:[+a.x.toFixed(1),+a.y.toFixed(1)]}))}));
     return;
   }
