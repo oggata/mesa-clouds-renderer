@@ -210,7 +210,12 @@ const SEG_GATE = process.env.SEG_GATE === '1';
 const YT_STREAM_KEY = process.env.YT_STREAM_KEY || '';
 const YT_RTMP_BASE  = process.env.YT_RTMP_URL || 'rtmp://a.rtmp.youtube.com/live2';
 const YT_BITRATE_K  = parseInt(process.env.YT_VIDEO_BITRATE_K) || _preset.ytk;
-const YT_ENABLED    = Boolean(YT_STREAM_KEY);
+// 配信の安全弁。**検証で立ち上げるときは必ずこれを付ける。**
+//   .env に YT_STREAM_KEY があると、何も指定しなくても本番へ送出が始まる。
+//   実際に検証用サーバが本番の配信に割り込み、映像を壊した (孤児 ffmpeg が11個)。
+//   親プロセスを kill しても **ffmpeg は生き残る** ので、気づかないまま積み上がる。
+const NO_STREAM     = process.env.NO_STREAM === '1';
+const YT_ENABLED    = Boolean(YT_STREAM_KEY) && !NO_STREAM;
 
 // ─── Sim constants ────────────────────────────────────────────────────────────
 // 環境変数の数値読み。`parseInt(x)||既定` は 0 を指定できないので使わない。
@@ -316,6 +321,8 @@ const MYS = require('./mystery.js');   // 事件を「謎として解ける形�
 // GLB (glTF) から静的なジオメトリだけ読む最小の読み取り。
 // three の GLTFLoader は ESM で CommonJS から require できないため自前で持つ。
 const GLB = require('./glb.js');
+// 歩き方 (人をよける / 車を待つ / 曲がりながら歩く)。経路のたどり方とは別。
+const WALK = require('./walk.js');
 // お金・仕事・追い詰められ度・犯罪。犯罪だけ足すと飾りになるので、
 // 「失業 → 無一文 → 犯行 → 店の売上減 → さらに失業」の環ごと持たせる。
 const ECO = require('./economy.js');
@@ -1097,6 +1104,20 @@ function buildAux(agent, meta){
       }
       aux[9+k]=Math.min(1, hitD/oMax*OBST_BOLD);
     }
+  }
+  // walk(4): 歩行のための追加観測。**auxDim>=16 のモデルにだけ渡す**ので、
+  //   既存モデル (aux_dim=12) の入力は1つも変わらない。
+  //   ここは walk.js (ロジック歩行) が見ているものと同じ信号にしてある。
+  //   ロジックだけが知っている情報があると、その挙動は模倣で再現できないため。
+  //     crowd_left / crowd_right … 前方の錐の左右それぞれの混み具合 [0,1]
+  //     car_ttc                  … 前方の車への到達時間 (1=遠い/居ない, 0=直前)
+  //     curb_ahead               … 一歩先が車道なら1 (踏み出す前に気づけるように)
+  if(meta.auxDim>=16){
+    aux[12]=agent.crowdL||0;
+    aux[13]=agent.crowdR||0;
+    aux[14]=(agent.carTtc==null)?1:agent.carTtc;
+    const sx=agent.x+Math.cos(agent.th)*WALK_CURB_LOOK, sy=agent.y+Math.sin(agent.th)*WALK_CURB_LOOK;
+    aux[15]=onRoadwayAt(sx, sy) ? 1 : 0;
   }
   return aux;
 }
@@ -2014,6 +2035,10 @@ function updateOcclusionFade(){
       treeSetFaded(scene, key.slice(0,-2), should);
       continue;
     }
+    // 公園/広場は透かさない。高さがほとんど無いので視界を塞がないし、
+    // 透かすと芝が消えて地面に穴が空いたように見える。
+    // (追跡だけはする — occluders に居ないと取り壊しでメッシュが残る)
+    if(o.noFade) continue;
     if(key.endsWith('_b') && _batchMode){
       const sk=key.slice(0,-2);
       if(batchSetHidden(sk, should)) o.mesh.visible = should;
@@ -4927,8 +4952,12 @@ function addStructMesh(S, st){
     markShadow(mesh, true, false);
     mesh.userData.hVis=hVis; mesh.userData.zRest=0;
     S.add(mesh);
-    // ★ occluders に入れない。高さがほとんど無いので視界を塞がず、
-    //   近接フェードで透かす必要も無い (透かすと芝が消えて穴に見える)。
+    // ★ **追跡はする。** 視界を塞がないので近接フェードの対象にはしないが
+    //   (fadeOnly=false のまま透かすと芝が消えて穴に見える)、occluders に
+    //   登録しておかないと removeStructMesh が拾えず、公園や広場を潰しても
+    //   板がシーンに残り続ける。
+    occluders[st.r+'_'+st.c+'_b']={mesh,cx,cy,faded:false,noFade:true};
+    _occStamp=-1;
     markBatchDirty(st);
     return;
   }
@@ -5220,7 +5249,23 @@ function rebuildMapTrees(S){
 function stepMapTrees(S){
   if(!_mapTreeDirty) return;
   _mapTreeDirty=false;
+  // ★ **作り直す前にゴーストを全部戻す。**
+  //   透けた木のゴーストは cellKey 照合で解放されるが、フェード中にその木が
+  //   消えると (建物が建つ / 道になる) 解放が呼ばれず、visible=true のまま
+  //   その場に residue として残り続けていた。しかも key が埋まったままなので
+  //   使い回されず、_treeGhosts が際限なく増える。
+  //   実測: 25秒ごとに +8 前後、高さ0.3〜1.5帯 (木の高さ) のメッシュが増加。
+  //   次のフレームで必要なぶんはまた透けるので、ここで戻して困らない。
+  releaseTreeGhosts();
   rebuildMapTrees(S);
+}
+
+// ゴーストを全部しまう (見えなくして、使い回せる状態に戻す)
+function releaseTreeGhosts(){
+  for(const g of _treeGhosts){
+    g.key=null;
+    g.trunk.visible=false; g.cone.visible=false;
+  }
 }
 
 // ── 透ける木 (ゴースト) ────────────────────────────────────────────────────
@@ -11466,6 +11511,60 @@ function passableToward(x, y, th, move){
 //   前方が空いていれば前進、塞がっていれば左右で空いている側へ、両方塞がれば回頭を続ける。
 // 目的地(gx,gy)へ向かう決定論コントローラ。通れる候補向きのうち、ゴール方位に最も近いものを選ぶ。
 //   前方(現在向き)が通れてゴール方向に十分近ければ前進、そうでなければゴール側の通れる向きへ回頭。
+// ── 自然な歩行 ────────────────────────────────────────────────────────────
+// walk.js の設定。**ここで使う情報は方策が観測できるものに限る** (模倣の元にするため)。
+const WALK_NATURAL = process.env.WALK_NATURAL !== '0';
+const WALK_CURB_LOOK = envNum('WALK_CURB_LOOK', 0.6);   // 何セル先を「一歩先」とみなすか
+const WALK_CFG = Object.assign({}, WALK.DEFAULTS, {
+  sepRange:  envNum('WALK_SEP_RANGE', WALK.DEFAULTS.sepRange),
+  sepGain:   envNum('WALK_SEP_GAIN',  WALK.DEFAULTS.sepGain),
+  keepSide:  envNum('WALK_KEEP_SIDE', WALK.DEFAULTS.keepSide),
+  keepGain:  envNum('WALK_KEEP_GAIN', WALK.DEFAULTS.keepGain),
+  slowMin:   envNum('WALK_SLOW_MIN',  WALK.DEFAULTS.slowMin),
+  turnSlow:  envNum('WALK_TURN_SLOW', WALK.DEFAULTS.turnSlow),
+  carTtc:    envNum('WALK_CAR_TTC',   WALK.DEFAULTS.carTtc),
+  turnRate:  envNum('WALK_TURN_RATE', WALK.DEFAULTS.turnRate),
+});
+const _walkNear=[], _walkCars=[];
+// その点が車道か (縁石で待つ判定)。歩行者専用路と交差点は「車道」とみなさない。
+function onRoadwayAt(x, y){
+  if(!CITY || !CITY.roadClass) return false;
+  const r=Math.floor(x), c=Math.floor(y);
+  if(r<0||r>=GRID||c<0||c>=GRID || MAP[r][c]!==ROAD) return false;
+  const cls=CITY.roadClass[r*GRID+c];
+  if(cls===RD.PATH) return false;
+  const mask=RD.roadMask(MAP,r,c,ROAD);
+  if(RD.maskDegree(mask)>=3) return false;      // 交差点は横断歩道がある
+  const fu=y-c, fv=x-r;
+  return RD.groundKind(ROAD, cls, mask, fu, fv, MW)===RD.GROUND.ROADWAY;
+}
+
+// 自然な歩行。向きと速度を決めて a に書き、行動 0 (前進) を返す。
+//   ★ 待っているときは stall を進めない。足を止めているのは詰まりではないので、
+//     ここを混同すると「縁石で待つ → 詰まり判定 → 経路引き直し」で永久に渡れなくなる。
+function naturalWalk(a, move, rot){
+  SOC.neighbors(SOC_STATE, a, _walkNear, 8);
+  _walkCars.length=0;
+  if(cars && cars.length){
+    for(const c of cars){
+      if(Math.abs(c.x-a.x)<WALK_CFG.carLook && Math.abs(c.y-a.y)<WALK_CFG.carLook)
+        _walkCars.push(c);
+    }
+  }
+  const r=WALK.step(WALK_CFG, a, {
+    near:_walkNear, cars:_walkCars, move, rot,
+    onRoadway:onRoadwayAt,
+    passable:(x,y,th,d)=>passableToward(x,y,th,d),
+  });
+  a.th=(r.th+Math.PI*2)%(Math.PI*2);
+  a.walkMul=r.speed;
+  a.walkWait=r.wait;
+  // 方策にも同じ信号を渡すため取っておく (buildAux が読む)
+  a.crowdL=r.crowdL; a.crowdR=r.crowdR; a.carTtc=r.ttc; a.walkWhy=r.why;
+  if(r.wait){ a.stall=0; return 0; }   // 待つ = 詰まりではない
+  return 0;
+}
+
 function pursueAction(a, move, rot){
   const gb=Math.atan2(a.gy-a.y, a.gx-a.x);                 // ゴールへの絶対方位
   const wrap=x=>Math.atan2(Math.sin(x),Math.cos(x));
@@ -11540,8 +11639,10 @@ async function stepAll(){
       move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/sub;
       rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/sub;
     }
+    a.walkMul=1;
     if(usePursuit){
-      action=pursueAction(a, move, rot);                   // 決定論の目的地追従 (推論不要)
+      action = WALK_NATURAL ? naturalWalk(a, move, rot)    // 人をよけ、車を待ち、曲がりながら歩く
+                            : pursueAction(a, move, rot);  // 従来の決定論追従
     }else{
       action=selectAction(a);                              // 学習方策
       if(a.stall>=UNSTICK_STALL){                          // 詰まり救出 (policyモードのみ)
@@ -11552,8 +11653,10 @@ async function stepAll(){
     if(action===1)a.th-=rot;else if(action===2)a.th+=rot;
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
-      const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*move));
-      const ny=Math.max(0.01,Math.min(GRID-0.01,a.y+Math.sin(a.th)*move));
+      // 自然歩行のときは速度倍率が乗る (詰まったら緩め、縁石では 0 になる)
+      const mv=move*(a.walkMul==null?1:a.walkMul);
+      const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*mv));
+      const ny=Math.max(0.01,Math.min(GRID-0.01,a.y+Math.sin(a.th)*mv));
       const r=Math.max(0,Math.min(GRID-1,Math.floor(nx)));
       const c=Math.max(0,Math.min(GRID-1,Math.floor(ny)));
       // 通行判定: 既定は実マップ配列(=前方セルが道路/建物か)。確実で、
@@ -11580,12 +11683,16 @@ async function stepAll(){
     a.steps++;
     // stall 判定の閾値も毎tick移動量に比例させる (INFER_EVERY 非依存に)。固定0.05だと
     // 高INFER_EVERY(=毎tick量が小)のとき移動中でも stall 誤検出してしまう。
-    const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>move*0.5;
+    // 実際に出した速度を基準にする。減速中 (walkMul<1) に固定閾値で見ると、
+    // 歩いているのに「足踏み」と誤判定して経路を引き直してしまう。
+    const effMove=move*(a.walkMul==null?1:a.walkMul);
+    const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>effMove*0.5;
     // 回頭 (action 1/2) は移動しないが「進むための準備」なので足踏みには数えない。
     // 数えていた頃は 8tick=64° 回るだけで REPLAN_STALL が発火して経路が引き直され、
     // 先読み点が左右に飛ぶ → また回る、を繰り返して同じ場所を周回する原因になっていた。
     // 1周ぶん回っても抜けられないときだけ本当の詰まりとして数える。
-    if(moved){ a.stall=0; a.spin=0; }
+    if(a.walkWait){ a.stall=0; a.spin=0; }        // 縁石で車を待っている = 詰まりではない
+    else if(moved){ a.stall=0; a.spin=0; }
     else if(action!==0){
       a.spin=(a.spin||0)+1;
       if(a.spin*rot > Math.PI*2) a.stall=Math.min(a.stall+1,10);
@@ -14365,7 +14472,8 @@ const httpServer=http.createServer(async (req,res)=>{
              walkableEmpty:WORLD.walkableEmpty},
       aux: auxv.map(v=>+v.toFixed(4)),
       auxNames:['compass_sin','compass_cos','compass_dist','visit_f','visit_l','visit_r',
-                'visit_b','social_x','social_y','obst_front','obst_left','obst_right'],
+                'visit_b','social_x','social_y','obst_front','obst_left','obst_right',
+                'crowd_left','crowd_right','car_ttc','curb_ahead'].slice(0, meta.auxDim||12),
       stall:a.stall, viols:a.viols, trips:a.trips,
     };
     if(q.get('raw')==='1'){
@@ -15240,6 +15348,66 @@ tick(); setInterval(tick, ${ms});
     return;
   }
 
+  // シーンに残っているオブジェクトと、生きている建物の突き合わせ。
+  //   ★ 「取り壊したのにメッシュが残っていないか」を数で確かめるための窓口。
+  //     occluders は追跡できている建物、scene.children は実際に描かれている物。
+  //     建物を消しても children が減らないなら、追跡の外に出ているメッシュがある。
+  if(urlPath==='/scene'){
+    const byState={};
+    for(const st of (CITY?CITY.structs:[])) byState[st.state]=(byState[st.state]||0)+1;
+    const kinds={};
+    // occluders が握っているメッシュの集合 (追跡できている物)
+    const tracked=new Set();
+    for(const k in occluders) if(occluders[k] && occluders[k].mesh) tracked.add(occluders[k].mesh);
+    // 追跡外のメッシュを z (高さ) 別に数える。空中に浮いた置き忘れはここに出る。
+    const untrackedByZ={};
+    let untracked=0;
+    if(scene) for(const o of scene.children){
+      const k=o.type + (o.name?(':'+o.name):'');
+      kinds[k]=(kinds[k]||0)+1;
+      if(o.isMesh && !tracked.has(o)){
+        untracked++;
+        // ★ position.z ではなくジオメトリの境界で測る。頂点に絶対座標を持つ
+        //   メッシュ (街灯/信号/電線) は position が原点のままなので、
+        //   position.z を見ると「地面にある」と誤判定する。
+        let top=0;
+        try{
+          if(!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+          top=o.geometry.boundingBox.max.z + o.position.z;
+        }catch(e){}
+        const band = top<0.3 ? '地面(<0.3)' : top<1.5 ? '低(0.3-1.5)' : top<4 ? '中(1.5-4)' : '高(>4)';
+        untrackedByZ[band]=(untrackedByZ[band]||0)+1;
+      }
+    }
+    // 建物(_b)と木(_t)は別勘定。生きている建物と突き合わせて「孤児」を数える。
+    const live=new Set(), openLot=new Set();
+    for(const st of (CITY?CITY.structs:[])){
+      if(st.state==='gone') continue;
+      live.add(st.r+'_'+st.c);
+      const bt=BLDG_TYPES[st.typeIdx%BLDG_TYPES.length];
+      if(bt && bt.open) openLot.add(st.r+'_'+st.c);
+    }
+    let occB=0, occT=0; const orphans=[];
+    for(const k in occluders){
+      if(k.endsWith('_t')){ occT++; continue; }
+      occB++;
+      const rc=k.slice(0,-2);
+      if(!live.has(rc)) orphans.push(rc);      // 建物は消えたのにメッシュが残っている
+    }
+    res.setHeader('Content-Type','application/json');
+    return res.end(JSON.stringify({ ok:true,
+      sceneChildren: scene?scene.children.length:0,
+      kinds, untracked, untrackedByZ,
+      occluderBuildings: occB, occluderTrees: occT,
+      orphanMeshes: orphans.length, orphanAt: orphans.slice(0,12),
+      // 公園/広場は occluders に入らないので、メッシュを消す手立てが無い
+      openLots: openLot.size,
+      structsByState: byState,
+      structsTotal: (CITY?CITY.structs:[]).length,
+      anims: structAnims.size,
+      lit: litStructs.size }));
+  }
+
   if(urlPath==='/life'){
     res.setHeader('Content-Type','application/json');
     const h=gameHour();
@@ -15288,6 +15456,39 @@ tick(); setInterval(tick, ${ms});
   }
 
   // ── 住民一覧ページ ──
+  // ── /walkstat : 歩行の質を数字で見る ──
+  //   すり抜け (近すぎる組) が減っているか、車待ちが起きているか、を確かめる。
+  //   自然歩行を入れる前後で比べるためのもの。
+  if(urlPath==='/walkstat'){
+    res.setHeader('Content-Type','application/json');
+    const out=agents.filter(a=>!MW.isIndoors(a));
+    let tooClose=0, pairs=0, waiting=0, slow=0, sum=0;
+    const R=envNum('WALK_STAT_R', 0.55);          // これより近い組を「すり抜け」とみなす
+    // 空間ハッシュで近傍だけ見る (全ペアは重い)
+    SOC.buildGrid(SOC_STATE, out);
+    const near=[];
+    for(const a of out){
+      SOC.neighbors(SOC_STATE, a, near, 0);
+      for(const o of near){
+        if(a.aid>=o.aid) continue;
+        pairs++;
+        if(Math.hypot(a.x-o.x, a.y-o.y) < R) tooClose++;
+      }
+      if(a.walkWait) waiting++;
+      const m=(a.walkMul==null?1:a.walkMul);
+      sum+=m; if(m<0.9) slow++;
+    }
+    const n=Math.max(1,out.length);
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, natural:WALK_NATURAL,
+      outdoors:out.length, cars:cars.length,
+      nearPairs:pairs, tooClose, tooClosePct:+(tooClose/Math.max(1,pairs)*100).toFixed(1),
+      waitingForCar:waiting, slowing:slow, avgSpeed:+(sum/n).toFixed(2),
+      why:(()=>{const c={};for(const a of out)c[a.walkWhy||'-']=(c[a.walkWhy||'-']||0)+1;return c;})(),
+      threshold:R}));
+    return;
+  }
+
   if(urlPath==='/residents'){
     return serveFile(res, path.join(__dirname,'residents.html'));
   }
