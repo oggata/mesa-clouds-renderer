@@ -22,7 +22,12 @@
 // ja    … 一覧に出す短い名前 / jaIng … 「〜している」の自然な言い方
 //         (「ラジオを聴く をしている」のような不自然な連結を避けるため両方持つ)
 // where … 'home'=自宅の中 / 'out'=屋外 / 'any'=どちらでも
-// group … 必要な人数 (1 = ひとりでできる)
+// group … **必要な人数** (1 = ひとりでできる)。mates が足りなければ候補から外れる。
+//         屋外の遊びは人数が足りないと絵として不自然になるので、ここで縛る。
+// where … 'home'   = 自宅に居るときだけ
+//         'indoor' = 屋根の下ならどこでも (卓が要る遊び。屋外でやると不自然)
+//         'out'    = 屋外だけ
+//         'any'    = どちらでも成立する
 // secs  … 続く長さの範囲 (実時間の秒)
 // bored … 終えたときに退屈がどれだけ晴れるか (0-1)
 // when  … 'day' / 'night' / null(いつでも)
@@ -38,7 +43,7 @@ const ACTS = [
   { id:'stretch',   ja:'ストレッチ', jaIng:'ストレッチしている',      en:'stretching',         icon:'🤸', where:'any',  group:1, secs:[15,30], bored:0.15,
     ja_l:['肩が凝ったなあ','うーん、伸びる'],
     en_l:['My shoulders are stiff.','That feels better.'] },
-  { id:'origami',   ja:'折り紙', jaIng:'折り紙を折っている',         en:'folding origami',    icon:'🦢', where:'any',  group:1, secs:[25,55], bored:0.32,
+  { id:'origami',   ja:'折り紙', jaIng:'折り紙を折っている',         en:'folding origami',    icon:'🦢', where:'indoor',  group:1, secs:[25,55], bored:0.32,
     ja_l:['鶴はやっぱり難しい','角がうまく合わない'],
     en_l:['Cranes are still hard.','The corners never line up.'] },
   { id:'doodle',    ja:'落書き', jaIng:'落書きしている',         en:'doodling',           icon:'✏️', where:'any',  group:1, secs:[20,50], bored:0.30,
@@ -47,7 +52,7 @@ const ACTS = [
   { id:'daydream',  ja:'ぼんやりする', jaIng:'ぼんやりしている',    en:'daydreaming',        icon:'💭', where:'any',  group:1, secs:[20,50], bored:0.20,
     ja_l:['……何を考えてたんだっけ','たまにはこういう時間もいい'],
     en_l:['...what was I thinking about?','Sometimes doing nothing is fine.'] },
-  { id:'rainsound', ja:'雨音を聴く', jaIng:'雨音を聴いている',      en:'listening to the rain', icon:'🌧', where:'any', group:1, secs:[25,60], bored:0.30, wx:'rain',
+  { id:'rainsound', ja:'雨音を聴く', jaIng:'雨音を聴いている',      en:'listening to the rain', icon:'🌧', where:'indoor', group:1, secs:[25,60], bored:0.30, wx:'rain',
     ja_l:['雨の音、嫌いじゃない','しばらく止みそうにないね'],
     en_l:["I don't mind the sound of rain.","Doesn't look like it'll stop soon."] },
 
@@ -116,13 +121,13 @@ const ACTS = [
   { id:'chatting',  ja:'おしゃべり', jaIng:'おしゃべりしている',      en:'chatting',           icon:'💬', where:'any',  group:2, secs:[25,60], bored:0.40, social:0.5,
     ja_l:['そういえば聞いた?','それでね、その後どうなったと思う?','話し込んじゃったね'],
     en_l:['Did you hear about it?','So then, guess what happened.','We really got talking.'] },
-  { id:'cards',     ja:'トランプ', jaIng:'トランプをしている',        en:'playing cards',      icon:'🃏', where:'any',  group:2, secs:[35,80], bored:0.50, social:0.4,
+  { id:'cards',     ja:'トランプ', jaIng:'トランプをしている',        en:'playing cards',      icon:'🃏', where:'indoor',  group:2, secs:[35,80], bored:0.50, social:0.4,
     ja_l:['今の、無しね','よし、勝った','配り直そう'],
     en_l:["That one doesn't count.",'Ha, I win.',"Let's deal again."] },
   { id:'fortune',   ja:'占い', jaIng:'占いをしている',           en:'telling fortunes',   icon:'🔮', where:'any',  group:2, secs:[25,55], bored:0.38, social:0.4,
     ja_l:['今日の運勢、見てあげる','あんまり良くないかも','いいことありそうだよ'],
     en_l:["Let me read your fortune.","It's not looking great.",'Something good is coming.'] },
-  { id:'shogi',     ja:'将棋', jaIng:'将棋を指している',           en:'playing shogi',      icon:'♟', where:'any',  group:2, secs:[40,90], bored:0.48, social:0.35,
+  { id:'shogi',     ja:'将棋', jaIng:'将棋を指している',           en:'playing shogi',      icon:'♟', where:'indoor',  group:2, secs:[40,90], bored:0.48, social:0.35,
     ja_l:['長考します','待った、今のは無し','参りました'],
     en_l:["I need to think.",'Wait, let me take that back.','I resign.'] },
   { id:'shiritori', ja:'しりとり', jaIng:'しりとりをしている',        en:'a word game',        icon:'🔤', where:'any',  group:2, secs:[20,45], bored:0.32, social:0.35,
@@ -154,8 +159,9 @@ function candidates(ctx) {
   const night = ctx.hour < 6 || ctx.hour >= 20;
   const out = [];
   for (const A of ACTS) {
-    if (A.where === 'home' && !ctx.atHome) continue;
-    if (A.where === 'out'  && ctx.indoors) continue;
+    if (A.where === 'home'   && !ctx.atHome) continue;
+    if (A.where === 'indoor' && !ctx.indoors) continue;   // 家でなくてよいが屋根の下
+    if (A.where === 'out'    && ctx.indoors) continue;
     if (A.when === 'night' && !night) continue;
     if (A.when === 'day'   && night) continue;
     if (A.wx === 'rain' && !ctx.raining) continue;

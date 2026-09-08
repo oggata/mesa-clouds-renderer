@@ -156,6 +156,39 @@ function bodyParts() {
 }
 
 // ── 歩行のパラメータ ────────────────────────────────────────────────────────
+// ── しぐさ (歩行以外の姿勢) ──────────────────────────────────────────────────
+// 歩いていないときに載せる姿勢。歩行 (WALK) とは **振幅で混ぜる**:
+// 歩き出すと amp が上がり、しぐさは自然に消える。
+//   角度の符号は WALK と同じ (X軸まわり)。thigh は前に振ると負、
+//   knee は曲げると正、shd は腕を前に上げると負。
+//   yaw … 胴ごとの左右の首振り (Z軸)。head は TORSO と同じ骨なので胴で回す。
+//   dz  … 体の上下 (身長 H 比)。座る/屈むで沈める。
+//   osc … 1 のとき poseTime で揺らす (立ち話の手振り、ダンス、見回し)
+const POSE = {
+  none:   0,
+  sit:    1,   // 座り込む
+  talk:   2,   // 立ち話
+  look:   3,   // 周りを見回す
+  carry:  4,   // 何かを持つ
+  phone:  5,   // 携帯をいじる
+  sick:   6,   // 具合が悪そう
+  crouch: 7,   // 腰を屈める
+  dance:  8,   // 踊る
+  wave:   9,   // 手を振る
+};
+// GLSL へそのまま流し込む係数。**ここを直せば見た目が変わる** (シェーダは自動生成)。
+const POSE_DEF = {
+  sit:    { thigh:-1.45, knee:1.65, shd:-0.25, elb:0.55, lean:0.12, dz:-0.215, yaw:0,    osc:0 },
+  talk:   { thigh:0,     knee:0.05, shd:-0.35, elb:0.95, lean:0.05, dz:0,      yaw:0.10, osc:1 },
+  look:   { thigh:0,     knee:0.03, shd:-0.05, elb:0.20, lean:0,    dz:0,      yaw:0.55, osc:1 },
+  carry:  { thigh:0,     knee:0.03, shd:-0.45, elb:1.45, lean:0.06, dz:0,      yaw:0,    osc:0 },
+  phone:  { thigh:0,     knee:0.03, shd:-0.15, elb:0.35, lean:0.10, dz:0,      yaw:0.06, osc:1 },
+  sick:   { thigh:-0.10, knee:0.30, shd:0.10,  elb:0.30, lean:0.42, dz:-0.035, yaw:0.05, osc:1 },
+  crouch: { thigh:-1.05, knee:1.55, shd:-0.55, elb:0.85, lean:0.50, dz:-0.130, yaw:0,    osc:0 },
+  dance:  { thigh:0,     knee:0.22, shd:-1.05, elb:1.15, lean:0,    dz:0,      yaw:0.30, osc:1 },
+  wave:   { thigh:0,     knee:0.03, shd:-0.25, elb:0.35, lean:0,    dz:0,      yaw:0.08, osc:1 },
+};
+
 const WALK = {
   thigh:      0.62,   // 腿の振れ角 (rad)
   kneeSwing:  1.15,   // 遊脚期の膝の曲げ
@@ -258,6 +291,6 @@ function jointSpheres() {
   return out;
 }
 
-module.exports = { J, BONE, COL, BONES, JOINTS, WALK, HEAD_R, BONE_R, JOINT_R,
+module.exports = { POSE, POSE_DEF, J, BONE, COL, BONES, JOINTS, WALK, HEAD_R, BONE_R, JOINT_R,
                    PART, SKIN_TONES, HAIR_TONES, PANTS, SHOE_COL, bodyParts,
                    limbAngles, rotX, poseVertex, boneSegments, jointSpheres };

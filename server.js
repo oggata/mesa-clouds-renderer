@@ -2888,6 +2888,7 @@ const WALK_RATE  = Math.PI*2 / WALK_CYCLE;
 const _f = v => v.toFixed(5);
 const WALK_ANGLES_GLSL = `
   float _ph=aWalk.x, _am=aWalk.y;
+  float _pid=aWalk.z, _pt=aWalk.w;          // しぐさの種類と時間
   // 骨番号: 1,2=左脚 3,4=右脚 5,6=左腕 7,8=右腕 0=胴と頭
   float _isL = (aBone==1.0||aBone==2.0||aBone==5.0||aBone==6.0) ? 1.0 : -1.0;
   float _p  = _ph + (_isL>0.0 ? 0.0 : 3.14159265);
@@ -2898,6 +2899,37 @@ const WALK_ANGLES_GLSL = `
   float _shd   = ${_f(SK.WALK.arm)}*_am*sin(_pa);
   float _elb   = _am*(${_f(SK.WALK.elbowBase)} + ${_f(SK.WALK.elbowSwing)}*max(0.0,sin(_pa)));
   float _lean  = ${_f(SK.WALK.lean)}*_am;
+  float _yaw   = 0.0, _dz = 0.0;
+  // ── しぐさ ──────────────────────────────────────────────────────────────
+  // 歩行と**振幅で混ぜる**。歩き出す (_am が上がる) と自然に消える。
+  if(_pid > 0.5){
+    float _pTh=0.0,_pKn=0.0,_pSh=0.0,_pEl=0.0,_pLn=0.0,_pDz=0.0,_pYw=0.0,_pOs=0.0;
+  if(_pid > 0.5 && _pid < 1.5) { _pTh=-1.4500; _pKn=1.6500; _pSh=-0.2500; _pEl=0.5500; _pLn=0.1200; _pDz=-0.2150; _pYw=0.0000; _pOs=0.0; }
+  if(_pid > 1.5 && _pid < 2.5) { _pTh=0.0000; _pKn=0.0500; _pSh=-0.3500; _pEl=0.9500; _pLn=0.0500; _pDz=0.0000; _pYw=0.1000; _pOs=1.0; }
+  if(_pid > 2.5 && _pid < 3.5) { _pTh=0.0000; _pKn=0.0300; _pSh=-0.0500; _pEl=0.2000; _pLn=0.0000; _pDz=0.0000; _pYw=0.5500; _pOs=1.0; }
+  if(_pid > 3.5 && _pid < 4.5) { _pTh=0.0000; _pKn=0.0300; _pSh=-0.4500; _pEl=1.4500; _pLn=0.0600; _pDz=0.0000; _pYw=0.0000; _pOs=0.0; }
+  if(_pid > 4.5 && _pid < 5.5) { _pTh=0.0000; _pKn=0.0300; _pSh=-0.1500; _pEl=0.3500; _pLn=0.1000; _pDz=0.0000; _pYw=0.0600; _pOs=1.0; }
+  if(_pid > 5.5 && _pid < 6.5) { _pTh=-0.1000; _pKn=0.3000; _pSh=0.1000; _pEl=0.3000; _pLn=0.4200; _pDz=-0.0350; _pYw=0.0500; _pOs=1.0; }
+  if(_pid > 6.5 && _pid < 7.5) { _pTh=-1.0500; _pKn=1.5500; _pSh=-0.5500; _pEl=0.8500; _pLn=0.5000; _pDz=-0.1300; _pYw=0.0000; _pOs=0.0; }
+  if(_pid > 7.5 && _pid < 8.5) { _pTh=0.0000; _pKn=0.2200; _pSh=-1.0500; _pEl=1.1500; _pLn=0.0000; _pDz=0.0000; _pYw=0.3000; _pOs=1.0; }
+  if(_pid > 8.5 && _pid < 9.5) { _pTh=0.0000; _pKn=0.0300; _pSh=-0.2500; _pEl=0.3500; _pLn=0.0000; _pDz=0.0000; _pYw=0.0800; _pOs=1.0; }
+    float _w = 1.0 - min(1.0, _am*2.0);       // 歩いている間はしぐさを引っ込める
+    float _s = sin(_pt), _s2 = sin(_pt*1.7);
+    // 揺らし。片腕だけ動かすしぐさ (手を振る/携帯) は右腕を主役にする
+    float _oneR = (_isL>0.0) ? 0.0 : 1.0;
+    float _armOsc = _pOs*(0.35*_s);
+    // 手を振る(9)と携帯(5)は右腕だけ大きく上げる
+    float _solo = (_pid>8.5) ? 1.0 : (_pid>4.5 && _pid<5.5) ? 1.0 : 0.0;
+    float _shSolo = _solo*_oneR*((_pid>8.5) ? -1.55 : -1.05);
+    float _elSolo = _solo*_oneR*((_pid>8.5) ? (1.35+0.55*_s) : 1.95);
+    _thigh += _w*_pTh;
+    _knee  += _w*_pKn;
+    _shd   += _w*(_pSh + _armOsc*(1.0-_solo) + _shSolo);
+    _elb   += _w*(_pEl + _pOs*0.25*_s2*(1.0-_solo) + _elSolo);
+    _lean  += _w*(_pLn + _pOs*0.04*_s2);
+    _yaw    = _w*_pYw*(_pOs>0.5 ? _s : 1.0);
+    _dz     = _w*_pDz*${_f(AGENT_H_GEO)};
+  }
   // X 軸まわりの回転は合成が「角度の和」になるので、法線はこの 1 個で回せる
   // (位置だけは支点が違うので連鎖が要る)。
   float _ang = (aBone==2.0||aBone==4.0) ? (_knee+_thigh)
@@ -2936,12 +2968,16 @@ const WEAR_COLOR_GLSL = `
 function addWalkShader(mat){
   mat.onBeforeCompile = (sh)=>{
     sh.vertexShader =
-      'attribute vec2 aWalk;\nattribute float aBone;\n'
+      'attribute vec4 aWalk;\nattribute float aBone;\n'
     + 'attribute float aPart;\nattribute vec4 aWear;\n'
     + glslPick('mesaSkin', SK.SKIN_TONES) + glslPick('mesaHair', SK.HAIR_TONES)
     + 'vec3 mesaRotX(vec3 p, float pz, float a){\n'
     + '  float s=sin(a), c=cos(a); float y=p.y, z=p.z-pz;\n'
     + '  return vec3(p.x, y*c - z*s, pz + y*s + z*c);\n}\n'
+    // 首振り (Z軸)。頭は胴と同じ骨なので、腰から上をまとめて回す。
+    + 'vec3 mesaRotZ(vec3 p, float a){\n'
+    + '  float s=sin(a), c=cos(a);\n'
+    + '  return vec3(p.x*c - p.y*s, p.x*s + p.y*c, p.z);\n}\n'
     + sh.vertexShader;
     // 法線。角度の和 1 個で回すだけ。
     sh.vertexShader = sh.vertexShader.replace('#include <beginnormal_vertex>',
@@ -2951,6 +2987,12 @@ function addWalkShader(mat){
         objectNormal = vec3(objectNormal.x,
                             objectNormal.y*_c - objectNormal.z*_s,
                             objectNormal.y*_s + objectNormal.z*_c);
+        if(_yaw != 0.0){
+          float _ys=sin(_yaw), _yc=cos(_yaw);
+          objectNormal = vec3(objectNormal.x*_yc - objectNormal.y*_ys,
+                              objectNormal.x*_ys + objectNormal.y*_yc,
+                              objectNormal.z);
+        }
       }`);
     // 位置。支点が違うので関節の連鎖で回す。
     sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
@@ -2972,6 +3014,9 @@ function addWalkShader(mat){
           transformed = mesaRotX(transformed, ${_f(SKZ('pelvis'))}, _lean);
         }
         transformed.z += ${_f(SK.WALK.bob*AGENT_H_GEO)}*_am*cos(2.0*_ph);
+        // しぐさの首振りと沈み込み。**腰から上だけ**回す (足は床に残す)。
+        if(_yaw != 0.0 && transformed.z > ${_f(SKZ('pelvis'))}) transformed = mesaRotZ(transformed, _yaw);
+        transformed.z += _dz;
       }`);
     // three 既定の色経路 (頂点カラー × instanceColor) は使わず、部位で選ぶ。
     sh.vertexShader = sh.vertexShader.replace('#include <color_vertex>',
@@ -3495,7 +3540,8 @@ function initAgentInstances(S){
   if(!S) return;
   buildAgentGeos();
   // インスタンス属性。aWalk=(位相,振幅) / aWear=(下衣RGB, 肌と髪の番号)。
-  const walk=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*2), 2);
+  // aWalk=(位相, 振幅, しぐさ番号, しぐさ時間)。しぐさの分で 2→4 成分に増やした。
+  const walk=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*4), 4);
   const wear=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*4), 4);
   walk.setUsage(THREE.DynamicDrawUsage); wear.setUsage(THREE.DynamicDrawUsage);
   _agentGeo.setAttribute('aWalk', walk);
@@ -3587,7 +3633,8 @@ function syncAgentInstances(){
       wr[k*4]=_acol.r; wr[k*4+1]=_acol.g; wr[k*4+2]=_acol.b; wr[k*4+3]=we.tone;
       _slotWear[k]=we.key; wearDirty=true;
     }
-    w[k*2]=o.userData.ph||0; w[k*2+1]=o.userData.amp||0;
+    w[k*4]=o.userData.ph||0;   w[k*4+1]=o.userData.amp||0;
+    w[k*4+2]=o.userData.pose||0; w[k*4+3]=o.userData.poseT||0;
     k++;
   }
   M.count=k;
@@ -3691,12 +3738,23 @@ async function rgbaToJpeg(rgba, width, height){
 // 以前は毎フレーム 2 本の TypedArray を確保しており GC 圧の原因になっていた。
 const _pxBuf=new Uint8ClampedArray(RENDER_W*RENDER_H*4);
 const _flBuf=new Uint8ClampedArray(RENDER_W*RENDER_H*4);
+let _shotReady=false;   // 1枚でも描けたか (/shot 用)
+// /shot は「視聴者もYT配信も無ければ読み出しを省く」最適化を1枚だけ迂回する。
+// 待っている人が居る間だけ読み出しを走らせ、描けたら起こす。
+let _shotWaiters=[];
+const shotWanted = () => _shotWaiters.length>0;
+function shotResolve(){
+  if(!_shotWaiters.length) return;
+  const w=_shotWaiters; _shotWaiters=[];
+  for(const fn of w) { try{ fn(); }catch(_){} }
+}
 // GL から画素を読み出して上下を反転する。SSAA>1 のときは**描いた解像度で**読む
 // (縮小は sharp にやらせる。ここで自前に平均すると、そのループが JPEG より重くなる)。
 function readPixels(glCtx){
   glCtx.readPixels(0,0,RENDER_W,RENDER_H,glCtx.RGBA,glCtx.UNSIGNED_BYTE,_pxBuf);
   const row=RENDER_W*4;
   for(let y=0;y<RENDER_H;y++)_flBuf.set(_pxBuf.subarray((RENDER_H-1-y)*row,(RENDER_H-y)*row),y*row);
+  _shotReady=true;
   return _flBuf;
 }
 
@@ -4779,7 +4837,9 @@ function enterOpenPlace(a, dst){
 //     「着いた → 入口で立ち止まった → 入っていった」が読める。
 //     広場 (屋根が無い) は従来どおり外に留まる。挙動の違いは残るが、
 //     どちらも「一度は外で立ち止まる」ので見え方は揃う。
-const ARRIVE_POSE_MS = Math.max(0, envNum('ARRIVE_POSE_SEC', 3.5))*1000;
+//   ★ 3.5秒だと住民8人の街では「玄関で待機中」が同時に2〜4人になり、
+//     絵から動きが消えた (実測)。読める長さは保ちつつ2.5秒に詰めてある。
+const ARRIVE_POSE_MS = Math.max(0, envNum('ARRIVE_POSE_SEC', 2.5))*1000;
 
 // 戻り値 true = ここで面倒を見たので呼び出し側は enterWander しないこと。
 function arriveAtBuilding(a, dst){
@@ -7013,10 +7073,12 @@ function assignHomes(){
 //   これが無いと「夜になっても昼に決めた遠い目的地へ歩き続ける」→ 帰宅できず疲労が飽和する。
 //   navigate(rally) 中は命令優先なので触らない。
 function retargetOnNeedChange(){
+  // 待ち合わせ中の人は行き先を変えない (変えると相手が待ちぼうけになる)
   for(const a of agents){
     const n=needOf(a);
     if(n===a.lastNeed) continue;
     a.lastNeed=n;
+    if(a.meet) continue;          // 待ち合わせ中は横取りしない
     // gx/gy を差し替えるだけでは効かない。経路追従中は stepNavigate が毎tick
     // 先読み点で gx/gy を上書きするので、住民は古い目的地へ歩き続けていた。
     // 行き先の抽選から経路の引き直しまでを enterWander に任せる。
@@ -7111,6 +7173,12 @@ const PASTIME_P      = envNum('PASTIME_P', 0.05);      // 暇な1秒あたりに
 const PASTIME_TALK_P = envNum('PASTIME_TALK_P', 0.30); // 始めたとき会話ログに出す確率
 const PASTIME_NEWS_SEC = envNum('PASTIME_NEWS_SEC', 90); // ニュースに出す最短間隔
 const PASTIME_MATE_R = envNum('PASTIME_MATE_R', 2);    // 一緒に遊ぶ相手を探す半径 (セル)
+// 屋外で同時に遊んでいてよい割合。**配信は動きがあるほうがよい。**
+//   ★ 娯楽は平均41秒あり、暇なら約20秒で始まるので、放っておくと
+//     41/(41+20) = **暇な人の67%が常に静止**する。実測でも屋外8人中3〜5人が
+//     娯楽で止まっていて、歩いているのは2人だけだった。
+//   ★ 屋内の娯楽は姿が見えないので絵に影響しない。**屋外だけ**に上限をかける。
+const PASTIME_OUT_MAX = Math.max(0, Math.min(1, envNum('PASTIME_OUT_MAX', 0.25)));
 let _ptNewsAt = 0;
 const _ptBuf = [];
 
@@ -7146,6 +7214,14 @@ function startPastime(a, A, mates){
 function stepPastime(dtSec){
   if(!PASTIME_ON) return;
   const now=simNow(), h=gameHour(), raining=!!(CITY && CITY.weather==='rain');
+  // 屋外で遊んでいる人数と、屋外に居る人数。上限の判定に使う (1回だけ数える)
+  let outTotal=0, outPlaying=0;
+  for(const a of agents){
+    if(MW.isIndoors(a)) continue;
+    outTotal++;
+    if(ptActive(a)) outPlaying++;
+  }
+  const outCap = Math.floor(outTotal * PASTIME_OUT_MAX);
   for(const a of agents){
     // 終わった娯楽を片づけて、退屈を晴らす
     if(a.pastime && a.pastime.until<=now){
@@ -7159,9 +7235,12 @@ function stepPastime(dtSec){
     }
     if(ptActive(a) || !ptIdle(a)) continue;
     if(RNG.R() >= PASTIME_P*dtSec) continue;
+    // 屋外はもう十分遊んでいる → この人は歩かせる (絵の動きを優先)
+    if(!MW.isIndoors(a) && outPlaying >= outCap) continue;
 
     const r=Math.floor(a.x), c=Math.floor(a.y);
     const indoors=MW.isIndoors(a);
+    if(!indoors) outPlaying++;      // この人が始めるぶんを勘定に入れる
     const atHome = !!a.home && (indoors
       ? (a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1])
       : (Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1));
@@ -7272,6 +7351,15 @@ const OUTING_P   = envNum('OUTING_P', 0.02);     // 暇な1秒あたりに誘う
 const OUTING_R   = envNum('OUTING_R', 3);        // 誘える距離 (セル)
 let _outingAt=0;
 const OUTING_COOL_SEC = envNum('OUTING_COOL_SEC', 25);
+// ── 待ち合わせ ──────────────────────────────────────────────────────────────
+// 以前は「誘った瞬間に二人が別々の場所から同じ店へ向かう」だけで、道中は
+// 無関係に歩いていた。絵として「一緒に出かけた」感が出ないので、**中間地点で
+// 落ち合ってから一緒に向かう**ようにする。合流の瞬間が見せ場になる。
+const MEET_ON      = process.env.MEET !== '0';
+const MEET_CALL_R  = envNum('MEET_CALL_R', 14);   // 連絡できる距離 (携帯なので広い)
+const MEET_R       = envNum('MEET_R', 1.6);       // 落ち合えたとみなす距離 (セル)
+const MEET_WAIT_SEC= envNum('MEET_WAIT_SEC', 45); // これを過ぎたら諦めて単独で向かう
+const MEET_SCAN    = envNum('MEET_SCAN', 3);      // 中間地点の探索半径 (セル)
 
 // 業種から誘い文句を決める。屋台/ラーメンは「飲みに」、カフェは「お茶しに」。
 function outingVerb(typeIdx){
@@ -7279,6 +7367,93 @@ function outingVerb(typeIdx){
   if(n==='kiosk' || n==='ramen' || n==='gyudon') return ['飲みに行った', 'went out for a drink'];
   if(n==='cafe')                                 return ['お茶しに行った', 'went out for coffee'];
   return ['食べに行った', 'went out to eat'];
+}
+
+// 二人の中間あたりで、双方から歩いて行ける通行可能セルを選ぶ。道を優先する
+// (草地の真ん中で落ち合うより、道端のほうが待ち合わせらしい)。
+function midMeetCell(a, b){
+  const mr=Math.round((a.x+b.x)/2), mc=Math.round((a.y+b.y)/2);
+  let best=null, bestScore=-1;
+  for(let dr=-MEET_SCAN; dr<=MEET_SCAN; dr++)for(let dc=-MEET_SCAN; dc<=MEET_SCAN; dc++){
+    const r=mr+dr, c=mc+dc;
+    if(r<0||r>=GRID||c<0||c>=GRID) continue;
+    if(!PASSABLE.has(MAP[r][c])) continue;
+    // 中間からの近さ + 道ボーナス
+    const near = 1 - Math.hypot(dr,dc)/(MEET_SCAN+1);
+    const score = near + (MAP[r][c]===ROAD ? 0.5 : 0);
+    if(score<=bestScore) continue;
+    // **両方から到達できること。** 片方だけ行ける場所だと永久に合流しない
+    if(!planPath(Math.floor(a.x), Math.floor(a.y), r, c)) continue;
+    if(!planPath(Math.floor(b.x), Math.floor(b.y), r, c)) continue;
+    bestScore=score; best=[r,c];
+  }
+  return best;
+}
+
+// 待ち合わせ地点に着いたら「歩き出さずに待つ」。
+//   ★ ここが無いと、到着処理が enterWander を呼び、それが meet を落として
+//     しまう (相手側から見ると「相手が来られなくなった」)。実測で待ち合わせの
+//     大半がこれで流れていた。建物への到着と違い、待ち合わせ地点は
+//     **着いてからが本番**なので、到着で行き先を選び直してはいけない。
+function holdForMeet(a){
+  if(!a.meet) return false;
+  a.path=null; a.pathIdx=0; a.mode='hold'; a.rally=false;
+  return true;
+}
+
+// 待ち合わせの進行 (1秒ごと)。
+function stepMeetups(){
+  if(!MEET_ON) return;
+  const now=simNow();
+  for(const a of agents){
+    const m=a.meet; if(!m) continue;
+    const b=agents.find(x=>x.aid===m.with);
+    // 相手が居ない / 相手が降りた → 単独で目的地へ
+    if(!b || !b.meet || b.meet.with!==a.aid){ meetGiveUp(a, '相手が来られなくなった'); continue; }
+    const d=Math.hypot(a.x-b.x, a.y-b.y);
+    if(d<=MEET_R){                       // ── 合流した ──
+      const st=structAt(m.dest[0], m.dest[1]);
+      a.meet=null; b.meet=null;
+      a.mode='wander'; b.mode='wander'; a.rally=false; b.rally=false;
+      if(!st || !sendToBuilding(a, m.dest[0], m.dest[1])){ enterWander(a); enterWander(b); continue; }
+      if(!sendToBuilding(b, m.dest[0], m.dest[1])){ enterWander(b); continue; }
+      a.mode='navigate'; b.mode='navigate';
+      const place=shopNameOf(st);
+      news('life', `🤝 ${a.name} と ${b.name} が落ち合って ${place} へ向かった`,
+                   `${a.name} met up with ${b.name}, heading to the ${place}`);
+      pushTalkLine(b.name, JA_HUD ? 'おまたせ' : 'Sorry to keep you waiting.');
+      a._wave = b._wave = simNow() + 3000;   // 合流の瞬間は手を振る
+      continue;
+    }
+    if(now >= m.until){ meetGiveUp(a, '待ちくたびれた'); continue; }
+    // 先に着いたほうは待つ。**相手のほうを向いて立つ** (棒立ちに見えないように)
+    const arrived = Math.hypot(a.x-(m.cell[0]+0.5), a.y-(m.cell[1]+0.5)) < 1.2;
+    if(arrived){
+      if(a.mode!=='hold'){ a.path=null; a.pathIdx=0; a.mode='hold'; a.rally=false; }
+      a.th=Math.atan2(b.y-a.y, b.x-a.x);      // 相手が近づいてくる向きを追う
+      continue;
+    }
+    // まだ着いていないのに待ち合わせ地点を向いていない = 途中で行き先を
+    // 変えられた (欲求の変化や経路の引き直し)。**戻す。**
+    const heading = a.mode==='navigate' && a.navDest
+                 && a.navDest[0]===m.cell[0] && a.navDest[1]===m.cell[1];
+    if(!heading && enterNavigateTo(a, m.cell[0], m.cell[1])!=='ok') meetGiveUp(a, '行けなくなった');
+  }
+}
+
+// 待ち合わせを諦める。**両方まとめて降ろす** (片方だけ残すと永久に待つ)。
+function meetGiveUp(a, why){
+  const m=a.meet; if(!m) return;
+  const b=agents.find(x=>x.aid===m.with);
+  a.meet=null; if(b) b.meet=null;
+  for(const p of [a,b]){
+    if(!p) continue;
+    if(p.mode==='hold') p.mode='wander';
+    p.rally=false;
+    if(!sendToBuilding(p, m.dest[0], m.dest[1])) enterWander(p);
+    else p.mode='navigate';
+  }
+  if(CHAT_LOG) console.log(`[Meet] ${a.name} の待ち合わせ中止 (${why}) → 単独で向かう`);
 }
 
 function stepOutings(dtSec){
@@ -7290,15 +7465,22 @@ function stepOutings(dtSec){
   //   瞬間がほとんど無く、外出が永久に起きなかった (実測: 暇17人中、遊んでいない
   //   のは9人で、その中に近くの友達が居ることは稀)。友達に誘われたら本を閉じて
   //   出かける、というほうが自然でもある。**誰かと遊んでいる最中は誘わない。**
-  const free = x => ptIdle(x) && !MW.isIndoors(x)
+  //   ★ **既に約束している人は誘わない。** meet を見ずに選んでいたので、
+  //     待ち合わせ中の人が別の誘いで上書きされ、元の相手からは「相手が
+  //     来られなくなった」になっていた (実測: 誘い9件中8件がこれで流れた)。
+  const free = x => ptIdle(x) && !MW.isIndoors(x) && !x.meet
     && !(ptActive(x) && (x.pastime.mates||[]).length);   // group の遊びは邪魔しない
   for(const a of agents){
     if(!free(a)) continue;
     if(RNG.R() >= OUTING_P*dtSec) continue;
     _evBuf.length=0;
     SOC.neighbors(SOC_STATE, a, _evBuf, 4);
-    const fr=_evBuf.filter(b=>b!==a && free(b)
-      && Math.abs(b.x-a.x)<=OUTING_R && Math.abs(b.y-a.y)<=OUTING_R
+    // ★ 携帯で連絡する想定なので、隣に居る必要はない。**中間地点で落ち合う**ので
+    //   離れているほうがむしろ絵になる (合流の場面ができる)。
+    //   MEET が無効なときだけ従来の「近くの人」に戻す。
+    const callR = MEET_ON ? MEET_CALL_R : OUTING_R;
+    const fr=agents.filter(b=>b!==a && free(b)
+      && Math.abs(b.x-a.x)<=callR && Math.abs(b.y-a.y)<=callR
       && SOC.relOf(a, b.aid) >= SOC_STATE.cfg.relFriend);
     if(!fr.length) continue;
     const b=fr[(RNG.R()*fr.length)|0];
@@ -7308,8 +7490,19 @@ function stepOutings(dtSec){
     const g=cells[(RNG.R()*cells.length)|0];
     const gr=Math.round(g[0]), gc=Math.round(g[1]);
     const st=structAt(gr, gc); if(!st) continue;
-    if(!sendToBuilding(a, gr, gc)) continue;
-    if(!sendToBuilding(b, gr, gc)){ enterWander(a); continue; }   // 片方だけ行かせない
+    const mid = MEET_ON ? midMeetCell(a, b) : null;
+    if(mid){
+      // 中間地点へそれぞれ向かわせ、着いたほうが待つ (stepMeetups が面倒を見る)
+      if(enterNavigateTo(a, mid[0], mid[1])!=='ok') continue;
+      if(enterNavigateTo(b, mid[0], mid[1])!=='ok'){ enterWander(a); continue; }
+      const until=now+MEET_WAIT_SEC*1000;
+      a.meet={with:b.aid, cell:mid, dest:[gr,gc], until};
+      b.meet={with:a.aid, cell:mid, dest:[gr,gc], until};
+    }else{
+      // 中間地点が取れない (道が繋がっていない等) → 従来どおり直接向かう
+      if(!sendToBuilding(a, gr, gc)) continue;
+      if(!sendToBuilding(b, gr, gc)){ enterWander(a); continue; }   // 片方だけ行かせない
+    }
     a.pastime=null; b.pastime=null;      // 読みかけの本を閉じて出かける
     _outingAt=now;
     const [vj, ve]=outingVerb(st.typeIdx);
@@ -7320,7 +7513,8 @@ function stepOutings(dtSec){
     CH.push(a, {day, icon:'🍻', ja:`${b.name} と ${place} へ ${vj}`, en:`${ve} with ${b.name}`});
     CH.push(b, {day, icon:'🍻', ja:`${a.name} と ${place} へ ${vj}`, en:`${ve} with ${a.name}`});
     pushTalkLine(a.name, JA_HUD ? `${place} でも行く?` : `Fancy going to the ${place}?`);
-    pushTalkLine(b.name, JA_HUD ? 'いいね、行こう' : "Sure, let's go.");
+    pushTalkLine(b.name, mid ? (JA_HUD ? 'いいね、途中で落ち合おう' : "Sure — let's meet halfway.")
+                             : (JA_HUD ? 'いいね、行こう' : "Sure, let's go."));
     return;                                        // 1回につき1組だけ
   }
 }
@@ -11033,7 +11227,18 @@ function resetNavWatch(a){ a.bestD=null; a.noProg=0; a.replans=0; a.spin=0; }
 
 // A: 自由行動へ。z=0 + ランダム建物を compass の的にする (現状の既定動作)。
 function enterWander(a){
-  a.mode='wander'; a.goalZ=null; a.rally=false;
+  // ★ **atDoor を必ず落とすこと。** 玄関で待っている人に enterWander が掛かると
+  //   mode が 'wander' に変わり、解除処理 (mode==='hold' の中にある) へ二度と
+  //   到達しない。結果 atDoor が残り続け、建物にも入らないまま「玄関で待機中」
+  //   として数えられ、カメラ候補からも外れる。実測: 設定2.5秒に対して
+  //   実際の滞在が 3 / 7 / **27** 秒だった。
+  //   ★ **meet はここで消さない。** 道中には enterWander を呼ぶ経路がいくつも
+  //     あり (欲求変化での行き先変更、経路の引き直し上限、到達不能)、消すと
+  //     そのたびに待ち合わせが壊れて相手が「来られなくなった」と諦める
+  //     (実測: 誘い10件が全部これで流れた)。meet は MEET_WAIT_SEC の時間切れで
+  //     必ず畳まれるので、抱えたままでも取り残しにはならない。
+  //     行き先を変えられてしまった人は stepMeetups が待ち合わせ地点へ戻す。
+  a.mode='wander'; a.goalZ=null; a.rally=false; a.atDoor=null;
   // 内部状態(空腹/疲労/時刻)で行き先を決める。該当が無ければ従来のランダム建物。
   const g=pickLifeGoal(a, [Math.floor(a.x),Math.floor(a.y)]);
   // ★ 行き先の建物タイプで z を立てる。BC学習した「compassに従って目的地へ行く」挙動(感度~1.0)を
@@ -11598,18 +11803,30 @@ function unstickAction(a, move, rot){
 async function stepAll(){
   if(paused || !scene) return;   // ★ scene null ガード
   stepCount++;
+  // 重なりほどきは**毎tick**。1秒に1回だと、住民が毎秒約1セル歩くのに対して
+  // 補正が粗すぎる (実測: 1Hz で重なり 3.7%→1.1%、まだ残る)。歩行側の分離
+  // (WALK.separation) と同じ頻度にする。
+  stepDeclump();
   await prefetchAllActions(MAP, agents);
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
+    // 玄関で一拍おいている人は **移動処理をまるごと飛ばす**。
+    //   ★ ここを通していたのが致命的だった。arriveAtBuilding は mode='hold' に
+    //     して経路を捨てるが navDest は残るので、下の直線フォールバックが毎tick
+    //     「もう着いている」と判定して arriveAtBuilding を呼び直す。until が
+    //     毎回上書きされ、**残り時間が 2.5 秒のまま永久に減らない**。
+    //     実測: 同じ玄関に 9〜31 秒立ち尽くし、建物にも入らなかった。
+    //   ★ 解除は mode に依存させない。hold の中だけで見ていると、途中で mode が
+    //     変わったときに取り残される (enterWander が atDoor を落とすのはそのため)。
+    if(a.atDoor){
+      if(simNow() < a.atDoor.until) continue;    // まだ待つ (歩かせない)
+      const d=a.atDoor; a.atDoor=null;
+      MW.enterBuilding(a, d.r, d.c);
+      if(!MW.isIndoors(a)) enterWander(a);       // 入れなかった (満室など) → 次へ
+      continue;                                  // 入った直後のtickは動かさない
+    }
     if(a.mode==='hold'){
-      // 玄関で一拍おいたら中へ入る (arriveAtBuilding が立てた待ち)
-      if(a.atDoor){
-        if(simNow()>=a.atDoor.until){
-          const d=a.atDoor; a.atDoor=null;
-          MW.enterBuilding(a, d.r, d.c);
-          if(!MW.isIndoors(a)) enterWander(a);   // 入れなかった (満室など) → 次へ
-        }
-      }
+      if(a.atDoor){ /* まだ玄関で待っている (上で期限を見ている) */ }
       // 広場での滞在は時間で切れる (rally の静止は linger を持たないので従来どおり)
       else if(a.linger && simNow()>=a.linger){ a.linger=null; enterWander(a); }
       else continue;
@@ -11713,7 +11930,7 @@ async function stepAll(){
         //   一瞬も留まらない (実測: hold の住民が常に 0 人だった)。
         const stayed = arriveAtBuilding(a, a.navDest);
         if(a.rally){ a.mode='hold'; a.atDoor=null; }   // rally: 集合点で静止 (解除は /rally?off=1)
-        else if(!stayed && !MW.isIndoors(a)) enterWander(a);
+        else if(!stayed && !MW.isIndoors(a) && !holdForMeet(a)) enterWander(a);
       }
     }else{
       // A: wander。生活の行き先へ A* 経路追従 (z=0 のまま = 学習時 GOAL_NONE regime)。
@@ -11721,7 +11938,7 @@ async function stepAll(){
       if(a.path){
         if(stepNavigate(a)){
           const stayed = arriveAtBuilding(a, a.navDest);
-          if(!stayed && !MW.isIndoors(a)) enterWander(a);   // 到着 → 次の行き先を選び直す
+          if(!stayed && !MW.isIndoors(a) && !holdForMeet(a)) enterWander(a);   // 到着 → 次の行き先
         }
       }else{
         // 経路なし = 直線 fallback。ALIGNED では建物セルに立てないので「建物中心まで 0.8」に
@@ -11736,7 +11953,7 @@ async function stepAll(){
           const stayed = (dst && MAP[dst[0]][dst[1]]===BUILDING)
             ? arriveAtBuilding(a, dst)
             : (onArrive(a, dst), false);
-          if(!stayed && !MW.isIndoors(a)) enterWander(a);
+          if(!stayed && !MW.isIndoors(a) && !holdForMeet(a)) enterWander(a);
         }else if(noProgress(a, dg)){
           enterWander(a);   // 近づけないまま歩き続けている → 行き先を選び直す (周回の打ち切り)
         }
@@ -14143,9 +14360,16 @@ function pickCameraTarget() {
     // 限れば 33% で、確率そのものは最初から効いていた。
     const outdoor = [], moving = [];
     for (let i = 0; i < agents.length; i++) {
-      if (MW.isIndoors(agents[i])) continue;
+      const a = agents[i];
+      if (MW.isIndoors(a)) continue;
       outdoor.push(i);
-      if (agents[i].stall <= 1) moving.push(i);
+      // ★ **stall だけでは「歩いている人」を選べない。**
+      //   stall は「進もうとして進めなかった回数」なので、娯楽中・玄関で待機中・
+      //   広場で滞在中の人は *そもそも進もうとしていない* ぶん stall=0 になり、
+      //   「動いている人」として選ばれてしまう。実測で追跡対象が立ち止まったまま
+      //   になる主因がこれだった。**意図して止まっている人は除く。**
+      const parked = a.mode === 'hold' || !!a.atDoor || ptActive(a);
+      if (a.stall <= 1 && !parked) moving.push(i);
     }
     // 夜など全員が屋内の時間帯は誰も居なくなるので、そのときは屋内でも動いて
     // いる人を拾う (下の「誰も動いていない」分岐に落ちて俯瞰になるより良い)。
@@ -15354,6 +15578,29 @@ tick(); setInterval(tick, ${ms});
   //   ★ 「取り壊したのにメッシュが残っていないか」を数で確かめるための窓口。
   //     occluders は追跡できている建物、scene.children は実際に描かれている物。
   //     建物を消しても children が減らないなら、追跡の外に出ているメッシュがある。
+  // いま描いている画をそのまま PNG で返す。**見た目の確認用。**
+  //   配信を見なくても、しぐさや街の様子を1枚で確かめられる。
+  //   ?scale=2 で拡大。POSE_FORCE=n と併せると各しぐさを確認できる。
+  if(urlPath==='/shot'){
+    const sq=new URL(req.url,'http://x').searchParams;
+    const sc=Math.max(1,Math.min(3,parseInt(sq.get('scale'))||1));
+    const send=()=>{
+    const raw=_flBuf;
+    if(!raw || !_shotReady){ res.writeHead(503); return res.end('まだ描けていません'); }
+    const rgba=Buffer.from(raw.buffer, raw.byteOffset, raw.length);
+    sharp(rgba,{raw:{width:RENDER_W,height:RENDER_H,channels:4}})
+      .resize(RENDER_W*sc, RENDER_H*sc, {kernel:'nearest'}).png().toBuffer()
+      .then(png=>{ res.writeHead(200,{'Content-Type':'image/png','Cache-Control':'no-store'}); res.end(png); })
+      .catch(e=>{ res.writeHead(500); res.end('render error: '+e.message); });
+    };
+    // 次のフレームが読み出されるまで待つ (最大2秒)
+    let done=false;
+    const once=()=>{ if(done) return; done=true; send(); };
+    _shotWaiters.push(once);
+    setTimeout(once, 2000);
+    return;
+  }
+
   if(urlPath==='/scene'){
     const byState={};
     for(const st of (CITY?CITY.structs:[])) byState[st.state]=(byState[st.state]||0)+1;
@@ -15425,10 +15672,18 @@ tick(); setInterval(tick, ${ms});
         supply:+(a.supply||0).toFixed(2), bored:+(a.bored||0).toFixed(2),
         sick:+(a.sick||0).toFixed(2),
         need:needOf(a), emoji:NEED_EMOJI[needOf(a)]||null,
-        // 行動の状態。玄関で一拍おいている最中かどうかも出す (到着の見え方の確認用)
+        // 行動の状態。**「なぜ歩いていないか」を切り分けられるだけ出す。**
+        //   絵として動きが欲しいので、止まっている理由の内訳が要る。
         mode:a.mode, door:a.atDoor?[a.atDoor.r,a.atDoor.c]:null,
         dest:a.navDest||null,
-        pos:[+a.x.toFixed(1),+a.y.toFixed(1)]}))}));
+        indoors:MW.isIndoors(a), stall:a.stall|0,
+        doorLeft: a.atDoor ? +((a.atDoor.until-simNow())/1000).toFixed(1) : null,
+        pastime: ptActive(a) ? (a.pastime.key||true) : null,
+        linger: a.linger? Math.max(0, Math.round((a.linger-simNow())/1000)) : 0,
+        hasPath: !!a.path,
+        // ★ 小数1桁だと 0.1 セル未満の差が消え、重なりの計測ができない (実際
+        //   「最小距離0.00」は丸めの産物だった)。診断用に3桁で出す。
+        pos:[+a.x.toFixed(3),+a.y.toFixed(3)]}))}));
     return;
   }
 
@@ -15632,11 +15887,159 @@ wss.on('connection',ws=>{
 
 // sim ループ
 let simRunning = false;
+// ── 立ち止まっている人どうしの重なりをほどく ────────────────────────────────
+// **分離 (WALK.separation) は naturalWalk の中にしかない = 歩いている人専用。**
+//   娯楽中・玄関で待機中・広場で滞在中の人は素通りなので、同じ場所に
+//   立った二人がぴったり重なって 1 人に見える。静止する挙動を増やしたぶん
+//   目立つようになった。歩いている人は既存の分離に任せ、ここでは
+//   **止まっている人だけ**をそっと離す。
+const CLUMP_R    = Math.max(0.1, envNum('CLUMP_R', 0.55));   // これより近ければ離す (セル)
+const CLUMP_PUSH = Math.max(0, Math.min(1, envNum('CLUMP_PUSH', 0.5)));  // 1回で詰める割合
+const _clumpBuf = [];
+const _isParked = a => a.mode==='hold' || !!a.atDoor || ptActive(a);
+
+function stepDeclump(){
+  for(const a of agents){
+    if(MW.isIndoors(a)) continue;
+    // 歩いている人にも効かせる。WALK.separation は**操舵**なので、同じ経路を
+    // 並んで歩く二人はすれ違わずに寄り続けることがある (実測: 重なりの大半が
+    // 歩行中どうしだった)。歩行側は弱めに押して、操舵と喧嘩させない。
+    const parkedA=_isParked(a);
+    _clumpBuf.length=0;
+    SOC.neighbors(SOC_STATE, a, _clumpBuf, 6);
+    for(const b of _clumpBuf){
+      if(b===a || MW.isIndoors(b)) continue;
+      let dx=b.x-a.x, dy=b.y-a.y;
+      let d=Math.hypot(dx,dy);
+      if(d>CLUMP_R) continue;
+      // 完全に重なっていると押す向きが決まらない。適当な向きを与える
+      if(d<1e-3){ dx=RNG.R()-0.5; dy=RNG.R()-0.5; d=Math.hypot(dx,dy)||1; }
+      const parkedB=_isParked(b);
+      const push=(CLUMP_R-d)*CLUMP_PUSH*0.5;
+      const ux=dx/d, uy=dy/d;
+      const wA = parkedA ? 1 : 0.35;      // 歩行中は弱く (操舵に任せる)
+      const wB = parkedB ? 1 : 0.35;
+      // ★ **通れるセルにしか置かない。** 建物セルへ押し込むと二度と動けなくなる
+      //   (ALIGNED では建物は通行不可)。動かせない側はそのままにする。
+      const tryMove=(p, sx, sy)=>{
+        const nx=p.x+sx, ny=p.y+sy;
+        const r=Math.floor(nx), c=Math.floor(ny);
+        if(r<0||r>=GRID||c<0||c>=GRID) return;
+        if(!PASSABLE.has(MAP[r][c])) return;
+        p.x=nx; p.y=ny;
+      };
+      tryMove(a, -ux*push*wA, -uy*push*wA);
+      tryMove(b,  ux*push*wB,  uy*push*wB);
+    }
+  }
+}
+
+// ── しぐさの割り当て ────────────────────────────────────────────────────────
+// 「いま何をしているか」から姿勢を選ぶ。**歩き出すとシェーダ側で自動的に
+// 引っ込む** (振幅で混ぜている) ので、ここでは歩行との排他を気にしなくてよい。
+//   ★ 優先順位は「絵として強いもの」から。具合が悪いのに踊っていては困る。
+const POSE_ON = process.env.POSE !== '0';
+// 娯楽 → しぐさ。書いていないものは既定 (立ち止まっているだけ)。
+const PT_POSE = {
+  // 座ってやること
+  reading:'sit', origami:'sit', doodle:'sit', daydream:'sit', sunbath:'sit',
+  stargaze:'sit', clouds:'sit', cards:'sit', shogi:'sit', fortune:'sit',
+  rainsound:'sit', tea:'sit', diary:'sit', letter:'sit', mending:'sit',
+  // 立ち話の類
+  chat:'talk', gossip:'talk', memories:'talk', consult:'talk',
+  shiritori:'talk', janken:'talk',
+  // 見回す
+  watching:'look', catsearch:'look', windowshop:'look',
+  // 屈む
+  plants:'crouch', tidy:'crouch', cooking:'crouch',
+  // 踊る/揺れる
+  humming:'dance', whistle:'dance', stretch:'dance',
+  // 持つ
+  homegame:'phone', radio:'carry',
+};
+
+// 全員を指定のしぐさにする (見た目の確認用)。POSE_FORCE=3 のように使う。
+const POSE_FORCE = Math.max(0, parseInt(process.env.POSE_FORCE)||0);
+function poseOf(a){
+  if(!POSE_ON) return 0;
+  if(POSE_FORCE) return POSE_FORCE;
+  const P=SK.POSE;
+  // ① 具合が悪い (病気は他の何より優先して見せる)
+  if((a.sick||0) > 0.55) return P.sick;
+  // ② 荷物を担いでいる配達員
+  if(a.deliv) return P.carry;
+  // ③ 待ち合わせ: 連絡した直後は携帯、待っている間は見回す
+  if(a.meet){
+    const held = a.mode==='hold';
+    return held ? P.look : P.phone;
+  }
+  // ④ 玄関で一拍おいている / 合流の直後 → 手を振る
+  if(a._wave && simNow() < a._wave) return P.wave;
+  // ⑤ 娯楽
+  if(ptActive(a)){
+    const k=PT_POSE[a.pastime.id];
+    if(k) return P[k];
+    return (a.pastime.mates||[]).length ? P.talk : P.sit;
+  }
+  // ⑥ 立ち話 (社交)
+  if(a.talk && a.talk.until > simNow()) return P.talk;   // social.js の立ち話
+  // ⑦ 広場で滞在中は座る
+  if(a.mode==='hold' && a.linger) return P.sit;
+  return 0;
+}
+
+// ── 動けなくなった住民の救出 ────────────────────────────────────────────────
+// **配信は動きがあるほうがよい**ので、屋外で止まっている人は積極的に歩かせる。
+//   ★ 既存の復帰は経路追従の中にあり、NOPROG_REPLAN(60tick=9秒) x MAX_REPLAN(4)
+//     で、最悪 36 秒も「近づけないまま」立ち尽くす。実測でも屋外8人のうち
+//     1〜3人が stall 3〜7 のまま止まっていた。
+//   ★ ここは経路や意図に関係なく「**実際に動いたか**」だけを見る。壁に挟まれた
+//     のか信号待ちなのかを区別しようとすると取りこぼすので、動いていない事実で
+//     判定する。屋内・玄関で待機中・集合中・配達中は対象外 (止まるのが仕事)。
+const STUCK_SEC  = Math.max(2, envNum('STUCK_SEC', 6));   // 屋外でこの秒数動けなければ介入
+const STUCK_MOVE = envNum('STUCK_MOVE', 0.08);            // 「動いた」とみなす距離 (セル)
+function stepUnstickWatch(){
+  for(const a of agents){
+    // 止まっているのが自然な状態は見張らない
+    if(MW.isIndoors(a) || a.mode==='hold' || a.rally || a.deliv || ptActive(a) || a.meet){
+      a._sx=a.x; a._sy=a.y; a._stuck=0; continue;
+    }
+    const dx=a.x-(a._sx==null?a.x:a._sx), dy=a.y-(a._sy==null?a.y:a._sy);
+    if(Math.hypot(dx,dy) > STUCK_MOVE){        // 動けている
+      a._sx=a.x; a._sy=a.y; a._stuck=0; continue;
+    }
+    a._stuck=(a._stuck||0)+1;
+    if(a._stuck < STUCK_SEC) continue;
+    a._sx=a.x; a._sy=a.y;
+    if(a._stuck < STUCK_SEC*2){
+      enterWander(a);                          // まず行き先を選び直す
+      continue;
+    }
+    // それでも動かない = 地形に食い込んでいる。通れる隣のセルへ寄せる。
+    //   最後の手段。位置を触るので**通れるセルだけ**に置くこと (建物セルへ
+    //   入れると二度と動けなくなる)。
+    a._stuck=0;
+    const r=Math.floor(a.x), c=Math.floor(a.y);
+    for(const [dr,dc] of [[0,1],[0,-1],[1,0],[-1,0],[1,1],[1,-1],[-1,1],[-1,-1]]){
+      const nr=r+dr, nc=c+dc;
+      if(nr<0||nr>=GRID||nc<0||nc>=GRID) continue;
+      if(!PASSABLE.has(MAP[nr][nc])) continue;
+      a.x=nr+0.5; a.y=nc+0.5;
+      a.path=null; a.pathIdx=0; a.stall=0;
+      enterWander(a);
+      if(CHAT_LOG) console.log(`[Unstick] ${a.name} を (${r},${c}) → (${nr},${nc}) へ寄せました`);
+      break;
+    }
+  }
+}
+
 // 「ゲーム内で1秒ぶん」の生活処理。通常運転は setInterval、早送りは tick 数で呼ぶ。
 // **両方から同じものを呼ぶ**ので、早送りで挙動がズレない。
 function stepOneSecond(){
   stepSocial(1); stepNeeds(1); stepOutings(1); stepPastime(1); stepEvents(1);
   stepPolice(); stepDelivery(); retargetOnNeedChange();
+  stepMeetups();               // 待ち合わせの合流/時間切れ
+  stepUnstickWatch();          // 屋外で止まっている人を歩かせる
   stepDisguise(1);         // 手配されている人は顔を隠す
   stepLure(1);             // 恨んでいる相手を人気のない場所へ誘い出す (孤立を「作る」)
   stepGrudgeCrime(1);      // 恨んでいる相手が近くに居たら狙う (stepNeeds の後 = 近傍が新しい)
@@ -16027,6 +16430,12 @@ async function renderLoop(){
       const sp=moved;
       m.userData.ph=(m.userData.ph||0)+sp*WALK_RATE;
       m.userData.amp=(m.userData.amp||0)*0.75 + Math.min(1, sp/WALK_FULL)*0.25;
+      // しぐさ。番号は行動から引き、時間は実時間で進める (揺れの速さは
+      // 歩幅と無関係なので simNow ではなく描画の dt でよい)。
+      m.userData.pose = poseOf(a);
+      m.userData.poseT = (m.userData.poseT||0) + dt*2.6;
+      // 確認用: しぐさを強制するときは歩行振幅も殺す (歩くとしぐさが引っ込むため)
+      if(POSE_FORCE) m.userData.amp = 0;
       if(process.env.CRAB_DEBUG==='1' && sp>CELL*0.004){
         // 体の向きと実際に進んだ向きのズレ (度)。
         // ★ **体が向いている先はモデルの +Y** なので (-sinφ, cosφ)。ここを +X で
@@ -16088,11 +16497,12 @@ async function renderLoop(){
     frameCount++;
 
     // WebSocket 視聴者も YouTube 配信も無ければ読み出し/エンコード自体を省略
-    if(clients.size===0 && !YT.ready) return;
+    if(clients.size===0 && !YT.ready && !shotWanted()) return;
 
     const _t3=PERF_LOG?Date.now():0;
     const rgba=await downscale(readPixels(glCtx));
     if(PERF_LOG) _perf.pixels+=Date.now()-_t3;
+    shotResolve();                       // /shot が待っていれば起こす
     // YouTube: 生RGBAフレームを直接 ffmpeg へ (JPEGを経由しない)
     if(YT.ready) setYtFrame(rgba);
     // ブラウザ視聴者がいる時だけ JPEG 化して送る (視聴者0なら JPEGエンコードもしない)
