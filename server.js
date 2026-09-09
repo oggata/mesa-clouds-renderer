@@ -2225,8 +2225,8 @@ const FOG_NEAR_K = envNum('FOG_NEAR_K', 0.85);
 const FOG_FAR_K  = envNum('FOG_FAR_K', 3.2);
 
 const NEED_ICONS = process.env.NEED_ICONS === '1';
-const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱'};
-const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈'};
+const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱', rest:'☕'};
+const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈', rest:'ひと休みしたい'};
 const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
                    sick:0xff5a5a, shop:0xffd23a, bored:0xb07aff};
 const ICON_PX=72;
@@ -3809,6 +3809,17 @@ const SICK_HEAL     = 1/(4*60);    // 病院/薬局での回復速度
 const BUY_RECOVER   = 0.85;        // 店に着いたときの補充量
 const FUN_RECOVER   = 0.5;         // 娯楽施設での退屈解消
 const SICK_HI       = 0.35;        // これを超えたら病院へ (低めの閾値=すぐ向かう)
+// ── 日中の休憩 ──────────────────────────────────────────────────────────────
+// **疲れたら家に帰る、しか無かった。** 実測で日中の10人中4人が「眠い」のまま
+// 勤務にも行かず、絵として何も起きていなかった (needOf が疲労を勤務より先に
+// 見るため)。人は日中に疲れたら仮眠を取るしカフェで休む。その道を作る。
+//   ・NEED_HI(0.62) を超えたら、昼は **休憩** (カフェ/娯楽/公園)、夜は帰宅
+//   ・SLEEP_HI を超えたら昼でも帰宅 (仮眠では追いつかない疲れ)
+//   ・休憩の回復には**下限がある** = 仮眠は一晩の睡眠の代わりにならない
+const REST_ON       = process.env.REST !== '0';
+const SLEEP_HI      = envNum('SLEEP_HI', 0.88);   // これを超えたら昼でも帰宅
+const REST_RECOVER  = envNum('REST_RECOVER', 0.10);  // 休憩1秒あたりの回復
+const REST_FLOOR    = envNum('REST_FLOOR', 0.30);    // 休憩ではここまでしか回復しない
 
 // 建物カテゴリ → 正準index (BLDG_TYPES から動的に引く。名前変更に強い)
 const IDX_OF   = n => BLDG_NAME_TO_IDX[n];
@@ -4872,6 +4883,19 @@ function isOpenCell(r,c){
   if(r==null) return false;
   const ti=BUILDING_TYPES[r+'_'+c];
   return isOpenType(ti);
+}
+
+// 屋根の無い場所 (公園/広場) のセル一覧。日中の休憩先の候補に使う。
+//   cityStamp で作り直すだけの軽いキャッシュ (建物が変わったときだけ)。
+let _openLots=null, _openLotStamp=-1;
+function openLotCells(){
+  if(_openLotStamp===cityStamp && _openLots) return _openLots;
+  _openLotStamp=cityStamp; _openLots=[];
+  for(const st of (CITY?CITY.structs:[])){
+    if(st.state!=='open' || !isOpenType(st.typeIdx)) continue;
+    _openLots.push([st.r, st.c]);
+  }
+  return _openLots;
 }
 
 let openLotCache = {};
@@ -7131,8 +7155,23 @@ function stepNeeds(dtSec){
         if(tt!=null && CARE_IDX.includes(tt)){ a.sick = Math.max(0, a.sick - SICK_HEAL*dtSec); dr=dc=2; }
       }
     }
+    // 休憩。飲食店 / 娯楽 / 屋根の無い場所 に居れば疲れが取れる。
+    //   ★ **REST_FLOOR までしか下がらない。** 仮眠は一晩の睡眠の代わりにならないので、
+    //     日中に休んでも夜はちゃんと帰る。ここを 0 にすると誰も家に帰らなくなる。
+    if(REST_ON && a.fatigue > REST_FLOOR){
+      const restHere = (t!=null && (FOOD_IDX.includes(t) || FUN_IDX.includes(t)))
+                    || isOpenCell(r, c);
+      if(restHere) a.fatigue = Math.max(REST_FLOOR, a.fatigue - REST_RECOVER*dtSec);
+    }
     // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
-    if(a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1)
+    //   ★ **屋内に居るときは a.indoors で判定する。** 屋内の住民の x,y は玄関の
+    //     ままなので、生の座標で見ると自宅に入っていても判定が外れる。上の
+    //     建物種別 t は a.indoors を見ているのに、ここだけ生の座標だった。
+    //     実測: 24人中9人が「自宅に屋内で居るのに回復せず、疲労1.00で飽和」し、
+    //     日中ずっと『眠い』のまま動かなかった。**これが主因。**
+    const hr = MW.isIndoors(a) ? a.indoors[0] : r;
+    const hc = MW.isIndoors(a) ? a.indoors[1] : c;
+    if(a.home && Math.abs(hr-a.home[0])<=1 && Math.abs(hc-a.home[1])<=1)
       a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
     else if(!a.home && t!=null && HOME_IDX.includes(t))
       a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);   // 家なしは住居に居れば休める
@@ -7604,7 +7643,11 @@ const isStudent    = a => !!a.school;
 function needOf(a){
   const h=gameHour();
   if((a.sick   ||0) > SICK_HI)                 return 'sick';
-  if((a.fatigue||0) > NEED_HI || h<6 || h>=22) return 'sleep';
+  const fa=a.fatigue||0;
+  // 夜 / 限界まで疲れた → 帰って寝る
+  if(h<6 || h>=22 || fa > SLEEP_HI)            return 'sleep';
+  // 昼に疲れた → 家まで帰らず、ひと休みする (カフェ・娯楽・公園)
+  if(fa > NEED_HI)                             return REST_ON ? 'rest' : 'sleep';
   if((a.hunger ||0) > NEED_HI)                 return 'eat';
   if(isStudent(a))
     return (!isWeekend() && h>=SCHOOL_FROM && h<SCHOOL_TO) ? 'work' : nonWorkNeed(a, h);
@@ -7692,6 +7735,17 @@ function pickLifeGoal(a, ex){
     // これが無いと、家なしの住民は疲労が 1.0 で飽和したまま永久に徘徊する。
     if(a.home) return [...a.home];
     const h=nearestHome(a); if(h) return h;
+  }
+  if(n==='rest'){
+    // 休める場所 = 飲食店 / 娯楽施設 / 屋根の無い場所 (公園のベンチ)。
+    // 近い順に選ぶ (休憩は「近くで済ませる」もの。好みは効かせない)。
+    const spots=[].concat(buildingsOfTypes(FOOD_IDX), buildingsOfTypes(FUN_IDX), openLotCells());
+    if(spots.length){
+      spots.sort((p,q)=>(Math.hypot(p[0]-a.x,p[1]-a.y))-(Math.hypot(q[0]-a.x,q[1]-a.y)));
+      return spots[0];
+    }
+    if(a.home) return [...a.home];               // 休める所が無ければ帰る
+    const h2=nearestHome(a); if(h2) return h2;
   }
   if(n==='work'  && a.school) return [...a.school];   // 学生は学校へ
   if(n==='work'  && a.work) return [...a.work];
@@ -8990,6 +9044,9 @@ function lifeLineEn(a){
     case 'sick':  return _pick([`${N} fell ill and is heading to ${to||'get treatment'}`,
                                 `${N} is not feeling well and is looking for ${to||'a clinic'}`,
                                 `${N} caught something and is on the way to ${to||'get help'}`]);
+    case 'rest':  return _pick([`${N} is tired and looking for ${to||'somewhere to sit'}`,
+                                `${N} needs a break and is heading to ${to||'rest a while'}`,
+                                `${N} is taking a breather at ${to||'a quiet spot'}`]);
     case 'sleep': return _pick([`${N} is sleepy and heading home`,
                                 `${N} is worn out and walking home`,
                                 `${N} has had a long day and is going home`]);
@@ -11822,8 +11879,21 @@ async function stepAll(){
       if(simNow() < a.atDoor.until) continue;    // まだ待つ (歩かせない)
       const d=a.atDoor; a.atDoor=null;
       MW.enterBuilding(a, d.r, d.c);
-      if(!MW.isIndoors(a)) enterWander(a);       // 入れなかった (満室など) → 次へ
+      // ★ **mode を 'hold' のままにしない。** 屋内の住民は下の
+      //   「建物から出る判定」で外に出るが、hold は手前の分岐で continue して
+      //   しまうのでそこへ到達しない。実測: 24人全員が屋内に籠もったまま
+      //   疲労だけが 1.0 まで上がり、日中ずっと『眠い』になっていた。
+      if(MW.isIndoors(a)) a.mode='wander';
+      else enterWander(a);                       // 入れなかった (満室など) → 次へ
       continue;                                  // 入った直後のtickは動かさない
+    }
+    // ── 屋内は物理と方策の外 ──
+    //   ★ **hold の判定より先に置くこと。** 後ろに置くと、屋内かつ hold の住民が
+    //     hold 側の continue に食われて「建物から出る判定」に永久に到達しない。
+    //     欲求だけ溜まり続けて街から人が消える。
+    if(MW.isIndoors(a)){
+      if(shouldLeaveBuilding(a) && MW.exitBuilding(a, MAP, WORLD)) enterWander(a);
+      continue;
     }
     if(a.mode==='hold'){
       if(a.atDoor){ /* まだ玄関で待っている (上で期限を見ている) */ }
@@ -11837,14 +11907,6 @@ async function stepAll(){
     // 娯楽の最中は歩かない (散歩など walk:true のものは歩かせたままにする)。
     // stall を 0 に保つのは立ち話と同じ理由 — 追跡カメラに見捨てられないため。
     if(ptActive(a) && !a.pastime.walk){ a.stall=0; continue; }
-    // ── 屋内は物理と方策の外 ──
-    // 建物セルは通行不可なので、屋内エージェントに推論や移動を適用すると
-    // 「壁の中で前進が常に失敗する」状態になる。欲求だけ進めて、外出条件が
-    // 立ったら玄関に出す。欲求の更新は stepNeeds が別インターバルで回している。
-    if(MW.isIndoors(a)){
-      if(shouldLeaveBuilding(a) && MW.exitBuilding(a, MAP, WORLD)) enterWander(a);
-      continue;
-    }
     const px=a.x,py=a.y;
     const meta=personaMeta[a.def.id];
     let action;
@@ -14323,10 +14385,12 @@ function arriveBanner(a, dest, need){
   const st = dest ? structAt(dest[0], dest[1]) : null;
   const place = st ? (JA_HUD ? BLDG_TYPES[st.typeIdx].label : enOf(st.typeIdx)) : null;
   if(JA_HUD){
+    if(need==='rest')  return `${a.name} がひと休みしている`;
     if(need==='sleep') return `${a.name} が帰宅した`;
     return place ? `${a.name} が ${place} ${ARRIVE_JA[need]||'に着いた'}`
                  : `${a.name} が目的地に着いた`;
   }
+  if(need==='rest')  return `${a.name} is taking a break`;
   if(need==='sleep') return `${a.name} made it home`;
   return place ? `${a.name} ${ARRIVE_EN[need]||'arrived at'} the ${place}`
                : `${a.name} arrived`;
@@ -15983,7 +16047,9 @@ function poseOf(a){
   }
   // ⑥ 立ち話 (社交)
   if(a.talk && a.talk.until > simNow()) return P.talk;   // social.js の立ち話
-  // ⑦ 広場で滞在中は座る
+  // ⑦ ひと休み中は座る (カフェの中は見えないので、効くのは公園のベンチ等)
+  if(needOf(a)==='rest' && (a.mode==='hold' || a.linger)) return P.sit;
+  // ⑧ 広場で滞在中は座る
   if(a.mode==='hold' && a.linger) return P.sit;
   return 0;
 }
