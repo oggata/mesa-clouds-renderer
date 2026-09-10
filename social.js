@@ -112,6 +112,39 @@ function neighbors(S, a, out, limit){
   return out;
 }
 
+// 歩行・接触回避向けの近傍取得。
+//
+// neighbors() は社交用なので、密集時にも毎回同じ相手だけと出会わないよう
+// バケツ内の開始位置をランダムにずらしている。これを歩行に流用すると、すぐ
+// 目の前にいる人より少し離れた人を選ぶことがあり、回避方向が tick ごとに
+// ふらつく。歩くときに必要なのは公平さではなく「いま最も近い障害物」なので、
+// 指定半径の近い順に安定して返す別の入口を持つ。
+//
+// limit は小さい値 (歩行側は 12 以下) を想定。全候補を sort せず、常に最大
+// limit 人だけを距離順に保つため、混雑した街でも配列確保とソートを増やさない。
+function neighborsClosest(S, a, out, limit, radius){
+  out.length=0;
+  const cs=S._cell, R=radius==null ? S.cfg.meetRadius : radius;
+  const R2=R*R, br=Math.floor(a.x/cs), bc=Math.floor(a.y/cs);
+  const ds=[];
+  const max=limit||0;
+  for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+    const arr=S._grid.get((br+dr)+','+(bc+dc));
+    if(!arr) continue;
+    for(const o of arr){
+      if(o===a) continue;
+      const dx=o.x-a.x, dy=o.y-a.y, d2=dx*dx+dy*dy;
+      if(d2>R2) continue;
+      let at=ds.length;
+      while(at>0 && d2<ds[at-1]) at--;
+      if(max && at>=max) continue;
+      ds.splice(at,0,d2); out.splice(at,0,o);
+      if(max && out.length>max){ out.pop(); ds.pop(); }
+    }
+  }
+  return out;
+}
+
 // ── 関係グラフ ──────────────────────────────────────────────────────────────
 function relOf(a, bid){ return (a.rel && a.rel[bid]) ? a.rel[bid].s : 0; }
 // 恨み。相手を覚えていなければ 0。
@@ -410,7 +443,7 @@ function restoreAgent(a, saved){
 
 module.exports = {
   DEFAULTS, createState, setRng,
-  buildGrid, neighbors,
+  buildGrid, neighbors, neighborsClosest,
   relOf, grudgeOf, feelOf, salience, bumpRel, bumpGrudge,
   lend, repay, debtOf, debts,
   friendsOf, enemiesOf, feuds, degreeOf, topConnected, compat,

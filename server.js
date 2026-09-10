@@ -11537,6 +11537,7 @@ function spawnAgent(S, ident){
   const a={aid, name:agentDisplayName(seq,def),
     x:b[0]+0.5, y:b[1]+0.5, th:RNG.R()*Math.PI*2, gx:g[0]+0.5, gy:g[1]+0.5,
     trips:0, viols:0, steps:0, stall:0, def, ti:allocTrailSlot(), active:true,
+    walkPace:baseWalkPace(def, aid), // 年齢・個体差から決まる基準歩幅 (再起動しても同じ)
     visited:new Set(), explored:0, visMem:new Map(),
     // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
     mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
@@ -11764,10 +11765,16 @@ function pullToSidewalk(a){
 }
 
 function passableToward(x, y, th, move){
-  const nx=x+Math.cos(th)*move, ny=y+Math.sin(th)*move;
-  const r=Math.floor(nx), c=Math.floor(ny);
-  if(r<0||r>=GRID||c<0||c>=GRID) return false;
-  return PASSABLE.has(MAP[r][c]);
+  // 終点セルだけを見ていると、建物/木の角を斜めに「すり抜ける」線分が
+  // 通ってしまう。歩幅は最大でも約0.3セルだが、壁際ではその一歩で十分に
+  // 起きるため、短い区間を刻んで全体が通れることを確かめる。
+  const n=Math.max(1, Math.ceil(move/0.08));
+  const dx=Math.cos(th)*move/n, dy=Math.sin(th)*move/n;
+  for(let i=1;i<=n;i++){
+    const r=Math.floor(x+dx*i), c=Math.floor(y+dy*i);
+    if(r<0||r>=GRID||c<0||c>=GRID || !PASSABLE.has(MAP[r][c])) return false;
+  }
+  return true;
 }
 // 詰まったエージェントを通れる向きへ回頭させる行動を返す (0=前進,1=左,2=右)。
 //   前方が空いていれば前進、塞がっていれば左右で空いている側へ、両方塞がれば回頭を続ける。
@@ -11777,6 +11784,36 @@ function passableToward(x, y, th, move){
 // walk.js の設定。**ここで使う情報は方策が観測できるものに限る** (模倣の元にするため)。
 const WALK_NATURAL = process.env.WALK_NATURAL !== '0';
 const WALK_CURB_LOOK = envNum('WALK_CURB_LOOK', 0.6);   // 何セル先を「一歩先」とみなすか
+// 人ごとの歩幅。経路や方策の意図は変えず、同じ道を全員が完全に同じ速度で
+// 滑っていく不自然さだけを取り除く。pursuit のみに掛けるので、学習済み方策の
+// action_repeat / 観測分布は変えない。
+const WALK_PACE_ON = process.env.WALK_PACE !== '0';
+const WALK_PACE_JITTER = Math.max(0, Math.min(0.18, envNum('WALK_PACE_JITTER', 0.055)));
+const WALK_PACE_MIN = Math.max(0.45, Math.min(1, envNum('WALK_PACE_MIN', 0.58)));
+function baseWalkPace(def, aid){
+  if(!WALK_PACE_ON) return 1;
+  const age=Number.isFinite(def&&def.age) ? def.age : 32;
+  // 子どもは歩幅が短く、高校生〜若い大人は少し速く、高齢になるほどゆっくり。
+  // 個体差も aid から決めるので、再起動しても同じ人の歩く速さは変わらない。
+  let p=age<6 ? 0.78 : age<=12 ? 0.96 : age<=19 ? 1.07
+        : age<=34 ? 1.02 : age<=59 ? 1.00 : age<=69 ? 0.90
+        : age<=79 ? 0.80 : 0.70;
+  if(def && (def.id==='N' || def.id==='F')) p*=1.04; // 運動部・活発な子は軽く速足
+  let h=2166136261;
+  for(const ch of String(aid||'')) h=Math.imul(h^ch.charCodeAt(0),16777619)>>>0;
+  const j=(((h>>>8)&0xffff)/0xffff*2-1)*WALK_PACE_JITTER;
+  return Math.max(WALK_PACE_MIN, Math.min(1.18, p*(1+j)));
+}
+function walkPaceNow(a){
+  if(!WALK_PACE_ON) return 1;
+  let p=a.walkPace==null ? 1 : a.walkPace;
+  // 疲れ・病気・雨では少しずつ歩幅を落とす。行き先の選択とは独立なので、
+  // 「疲れたら途中で立ち尽くす」のでなく、休憩先まで自然にゆっくり歩ける。
+  p*=1-0.16*Math.max(0, Math.min(1, a.fatigue||0));
+  p*=1-0.30*Math.max(0, Math.min(1, a.sick||0));
+  if(CITY && CITY.weather==='rain') p*=0.94;
+  return Math.max(WALK_PACE_MIN, Math.min(1.18, p));
+}
 const WALK_CFG = Object.assign({}, WALK.DEFAULTS, {
   sepRange:  envNum('WALK_SEP_RANGE', WALK.DEFAULTS.sepRange),
   sepGain:   envNum('WALK_SEP_GAIN',  WALK.DEFAULTS.sepGain),
@@ -11787,6 +11824,7 @@ const WALK_CFG = Object.assign({}, WALK.DEFAULTS, {
   carTtc:    envNum('WALK_CAR_TTC',   WALK.DEFAULTS.carTtc),
   turnRate:  envNum('WALK_TURN_RATE', WALK.DEFAULTS.turnRate),
 });
+const WALK_NEAR_MAX=12;
 const _walkNear=[], _walkCars=[];
 // その点が車道か (縁石で待つ判定)。歩行者専用路と交差点は「車道」とみなさない。
 function onRoadwayAt(x, y){
@@ -11805,7 +11843,9 @@ function onRoadwayAt(x, y){
 //   ★ 待っているときは stall を進めない。足を止めているのは詰まりではないので、
 //     ここを混同すると「縁石で待つ → 詰まり判定 → 経路引き直し」で永久に渡れなくなる。
 function naturalWalk(a, move, rot){
-  SOC.neighbors(SOC_STATE, a, _walkNear, 8);
+  // 社交用のランダムな近傍抽出ではなく、最も近い人を安定して拾う。
+  // 混雑時にも目の前の相手を確実に避けられ、進行方向が tick ごとに揺れない。
+  SOC.neighborsClosest(SOC_STATE, a, _walkNear, WALK_NEAR_MAX, WALK_CFG.sepRange);
   _walkCars.length=0;
   if(cars && cars.length){
     for(const c of cars){
@@ -11860,6 +11900,11 @@ function unstickAction(a, move, rot){
 async function stepAll(){
   if(paused || !scene) return;   // ★ scene null ガード
   stepCount++;
+  // 歩行は 150ms ごと、生活・社交の更新は 1秒ごと。以前は後者でしか
+  // 空間ハッシュを作り直していなかったため、歩いてセルをまたいだ人が最大1秒
+  // 古いバケツに残り、直前の人を検出できないことがあった。O(N) の再配置だけで
+  // 近傍検索そのものは従来どおり局所なので、毎tick最新にする価値がある。
+  SOC.buildGrid(SOC_STATE, agents);
   // 重なりほどきは**毎tick**。1秒に1回だと、住民が毎秒約1セル歩くのに対して
   // 補正が粗すぎる (実測: 1Hz で重なり 3.7%→1.1%、まだ残る)。歩行側の分離
   // (WALK.separation) と同じ頻度にする。
@@ -11921,8 +11966,10 @@ async function stepAll(){
       rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/sub;
     }
     a.walkMul=1;
+    a.walkWait=false;
+    const gait=usePursuit ? walkPaceNow(a) : 1;
     if(usePursuit){
-      action = WALK_NATURAL ? naturalWalk(a, move, rot)    // 人をよけ、車を待ち、曲がりながら歩く
+      action = WALK_NATURAL ? naturalWalk(a, move*gait, rot) // 人をよけ、車を待ち、曲がりながら歩く
                             : pursueAction(a, move, rot);  // 従来の決定論追従
     }else{
       action=selectAction(a);                              // 学習方策
@@ -11935,7 +11982,7 @@ async function stepAll(){
     a.th=(a.th+Math.PI*2)%(Math.PI*2);
     if(action===0){
       // 自然歩行のときは速度倍率が乗る (詰まったら緩め、縁石では 0 になる)
-      const mv=move*(a.walkMul==null?1:a.walkMul);
+      const mv=move*gait*(a.walkMul==null?1:a.walkMul);
       const nx=Math.max(0.01,Math.min(GRID-0.01,a.x+Math.cos(a.th)*mv));
       const ny=Math.max(0.01,Math.min(GRID-0.01,a.y+Math.sin(a.th)*mv));
       const r=Math.max(0,Math.min(GRID-1,Math.floor(nx)));
@@ -11944,8 +11991,9 @@ async function stepAll(){
       // 学習時(マップ配列で通行判定)とも一致するため「seg誤判定で止まる」を防ぐ。
       // SEG_GATE=1 かつ seg_head ありのときだけ seg 判定を使う。
       const useSeg = SEG_GATE && segSession && meta && meta.dino;
+      const mapPassable=passableToward(a.x, a.y, a.th, mv);
       const passable = FREE_MOVE ? true
-                     : (useSeg ? (segPassCache[a.aid] ?? true) : PASSABLE.has(MAP[r][c]));
+                     : (useSeg ? (segPassCache[a.aid] ?? mapPassable) : mapPassable);
       if(passable){
         a.x=nx;a.y=ny;
         pullToSidewalk(a);        // 車道に出ていたら歩道帯へ寄せる
@@ -11966,7 +12014,7 @@ async function stepAll(){
     // 高INFER_EVERY(=毎tick量が小)のとき移動中でも stall 誤検出してしまう。
     // 実際に出した速度を基準にする。減速中 (walkMul<1) に固定閾値で見ると、
     // 歩いているのに「足踏み」と誤判定して経路を引き直してしまう。
-    const effMove=move*(a.walkMul==null?1:a.walkMul);
+    const effMove=move*gait*(a.walkMul==null?1:a.walkMul);
     const moved=(Math.abs(a.x-px)+Math.abs(a.y-py))>effMove*0.5;
     // 回頭 (action 1/2) は移動しないが「進むための準備」なので足踏みには数えない。
     // 数えていた頃は 8tick=64° 回るだけで REPLAN_STALL が発火して経路が引き直され、
@@ -15970,7 +16018,9 @@ function stepDeclump(){
     // 歩行中どうしだった)。歩行側は弱めに押して、操舵と喧嘩させない。
     const parkedA=_isParked(a);
     _clumpBuf.length=0;
-    SOC.neighbors(SOC_STATE, a, _clumpBuf, 6);
+    // 歩行と同じく近い順。社交用のランダム抽出だと、重なっている相手より
+    // 遠い相手を先に拾ってしまい、密集した場所ほどほどけにくくなる。
+    SOC.neighborsClosest(SOC_STATE, a, _clumpBuf, 12, CLUMP_R);
     for(const b of _clumpBuf){
       if(b===a || MW.isIndoors(b)) continue;
       let dx=b.x-a.x, dy=b.y-a.y;
