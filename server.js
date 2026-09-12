@@ -1229,8 +1229,8 @@ function updateDayNight(S){
 //     実装は丸ごと残してあるので、復活させるときは NEED_ICONS を true にするか
 //     環境変数 NEED_ICONS=1 で起動するだけでよい (呼び出し側の2か所がこれを見ている)。
 const NEED_ICONS = process.env.NEED_ICONS === '1';
-const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱'};
-const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈'};
+const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱', learn:'📖'};
+const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈', learn:'学びたい'};
 const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
                    sick:0xff5a5a, shop:0xffd23a, bored:0xb07aff};
 const ICON_PX=72;
@@ -1293,7 +1293,7 @@ function updateNeedIcons(cam){
 const HUD_ON        = process.env.HUD !== '0';
 // 配信画面に焼き込む文字は **ASCII だけ**。本番 (Linux) に日本語フォントが無いと
 // 豆腐になるため。表示領域も控えめにして街を隠さないようにする。
-const HUD_DAY_W     = 250, HUD_DAY_H = 54;
+const HUD_DAY_W     = 250, HUD_DAY_H = 74;   // 3行 (日付 / 人口・規模・天気 / 時代)
 const HUD_TICKER_H  = 30;
 const HUD_SPEED     = envNum('HUD_SPEED', 90);      // ティッカーの流れる速さ (px/秒)
 // 絵文字フォントを最後に足しておかないと 💊 や 🏛 が豆腐になる (欲求アイコンと同じ理由)。
@@ -1341,6 +1341,7 @@ async function initHud(){
   // (以前は日本語を描いていて、フォントの無い環境で全部豆腐になっていた)
   await refreshHudDay();
   await refreshHudCam();
+  await refreshHudEra();
   await refreshHudTicker();
   console.log('[HUD] Day カウンタ / ニュースティッカーを配信画面に描画');
 }
@@ -1351,11 +1352,12 @@ function hudDayLines(){
   const h=gameHour();
   const hh=String(Math.floor(h)).padStart(2,'0'), mm=String(Math.floor(h%1*60)).padStart(2,'0');
   return [`DAY ${gameDay()+1}  ${hh}:${mm}`,
-          CITY ? `POP ${agents.length}  ${levelSpec().en}  ${weatherNow().en}` : ''];
+          CITY ? `POP ${agents.length}  ${levelSpec().en}  ${weatherNow().en}` : '',
+          (CITY && ERA_ON) ? `ERA ${eraIndex()+1}/${ERA_DEFS.length}  ${eraSpec().en}` : ''];
 }
 async function refreshHudDay(){
-  const [l1,l2]=hudDayLines();
-  const txt=l1+'|'+l2;
+  const [l1,l2,l3]=hudDayLines();
+  const txt=l1+'|'+l2+'|'+l3;
   if(txt===hudDayText || !hudScene) return;
   hudDayText=txt;
   const {tex}=await svgTexture(
@@ -1364,7 +1366,9 @@ async function refreshHudDay(){
     +`<text x="12" y="24" font-size="17" font-weight="bold" fill="#00d2a0"`
     +` font-family="${HUD_MONO}">${_esc(_ascii(l1))}</text>`
     +`<text x="12" y="43" font-size="13" fill="#9fd8c8"`
-    +` font-family="${HUD_MONO}">${_esc(_ascii(l2))}</text></svg>`);
+    +` font-family="${HUD_MONO}">${_esc(_ascii(l2))}</text>`
+    +`<text x="12" y="63" font-size="13" font-weight="bold" fill="#ffd36b"`
+    +` font-family="${HUD_MONO}">${_esc(_ascii(l3))}</text></svg>`);
   if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
   hudDay=hudPlane(HUD_DAY_W, HUD_DAY_H, tex);
   hudDay.position.set(-WIDTH/2+HUD_DAY_W/2+12, HEIGHT/2-HUD_DAY_H/2-10, 1);
@@ -1385,6 +1389,8 @@ async function refreshHudTicker(){
     if(city.length) items.push(city.shift());
     if(life.length) items.push(life.shift());
   }
+  const eraLine=eraTickerLine();
+  if(eraLine) items.push(eraLine);
   const txt=items.length ? items.join('   *   ') : 'No records yet in this town';
   // 文字幅の見積り (ASCII のみ)。板の幅がズレると途中で切れる。
   const w=Math.min(6000, Math.max(WIDTH, Math.ceil(40 + txt.length*8.6)));
@@ -1418,7 +1424,7 @@ function camStateShort(a){
   const dest=a.goalType!=null ? enOf(a.goalType) : null;
   const n=needOf(a);
   const NEED_EN={eat:'hungry', sleep:'sleepy', work:'commuting', shop:'shopping',
-                 bored:'bored', sick:'unwell'};
+                 bored:'bored', sick:'unwell', learn:'studying'};
   const st=NEED_EN[n]||'walking';
   return dest ? `${st} - ${dest}` : st;
 }
@@ -1455,6 +1461,69 @@ async function refreshHudCam(){
   hudCam2=hudPlane(HUD_CAM_W, HUD_CAM_H, tex);
   hudCam2.position.set(WIDTH/2-HUD_CAM_W/2-12, HEIGHT/2-HUD_CAM_H/2-10, 1);
   hudScene.add(hudCam2);
+}
+
+// ── 次の時代までのゴール (左下に常時表示) ──────────────────────────────────
+//   別ページを見に行く視聴者はいない。「いまどの時代で、次に何が要るか」は
+//   配信画面の中だけで完結させる。研究の進み方は棒、足りない物は数で出す。
+const HUD_ERA_W = 286, HUD_ERA_H = 88;   // 見出し + 最大3行 (研究 + 足りない物2つ)
+let hudEra=null, hudEraText='', hudEraBusy=false, hudEraAt=0;
+
+function hudEraLines(){
+  if(!CITY || !ERA_ON) return null;
+  const E=eraSpec(), n=eraNext();
+  if(!n) return {head:`${E.en} - the last era`, rows:[], pct:1, ready:false};
+  const pct=eraProgress(), gaps=eraGaps();
+  const ready = pct>=1 && !gaps.length;
+  const rows=[['RESEARCH', `${Math.floor(pct*100)}%`]];
+  for(const g of gaps.slice(0,2)) rows.push([g.key.slice(0,10), `${g.have}/${g.need}`]);
+  return {head: ready ? `READY - ${n.invention}` : `NEXT: ${ERA_DEFS[eraIndex()+1].en}`,
+          rows, pct, ready};
+}
+
+async function refreshHudEra(){
+  if(!hudScene) return;
+  const L=hudEraLines();
+  if(!L){ hudEraText=''; return; }
+  // 作り直しは文字が変わったときだけ。棒は5%刻みに丸めて再生成を減らす。
+  const key=L.head+'|'+L.rows.map(r=>r.join(' ')).join('|')+'|'+Math.round(L.pct*20);
+  if(key===hudEraText) return;
+  hudEraText=key;
+  const barW=120, barX=104, accent=L.ready?'#ffd36b':'#00d2a0';
+  let body='';
+  L.rows.forEach(([k,v],i)=>{
+    const y=42+i*18;
+    body+=`<text x="14" y="${y}" font-size="12" fill="#9fd8c8" font-family="${HUD_MONO}">${_esc(_ascii(k))}</text>`;
+    if(i===0){
+      body+=`<rect x="${barX}" y="${y-9}" width="${barW}" height="9" rx="2" fill="#123" fill-opacity="0.9"/>`
+          + `<rect x="${barX}" y="${y-9}" width="${Math.max(2,Math.round(barW*L.pct))}" height="9" rx="2" fill="${accent}"/>`;
+    }
+    body+=`<text x="${HUD_ERA_W-14}" y="${y}" font-size="12" fill="#dfeee9" text-anchor="end"`
+        + ` font-family="${HUD_MONO}">${_esc(_ascii(v))}</text>`;
+  });
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_ERA_W}" height="${HUD_ERA_H}">`
+    +`<rect width="${HUD_ERA_W}" height="${HUD_ERA_H}" rx="6" fill="#050b10" fill-opacity="0.58"/>`
+    +`<rect x="0" y="0" width="3" height="${HUD_ERA_H}" fill="${accent}"/>`
+    +`<text x="14" y="22" font-size="14" font-weight="bold" fill="${accent}"`
+    +` font-family="${HUD_MONO}">${_esc(_ascii(L.head))}</text>`
+    + body + `</svg>`);
+  if(hudEra){ hudScene.remove(hudEra); hudEra.material.map.dispose(); hudEra.material.dispose(); hudEra.geometry.dispose(); }
+  hudEra=hudPlane(HUD_ERA_W, HUD_ERA_H, tex);
+  hudEra.position.set(-WIDTH/2+HUD_ERA_W/2+12, -HEIGHT/2+HUD_TICKER_H+16+HUD_ERA_H/2, 1);
+  hudScene.add(hudEra);
+}
+
+// ティッカーにも時代の状況を混ぜる。パネルを見つけられなかった視聴者でも
+// 1周のうちに「いまどの時代で、次に何が要るか」が流れてくるようにする。
+function eraTickerLine(){
+  if(!CITY || !ERA_ON) return null;
+  const E=eraSpec(), n=eraNext();
+  if(!n) return _ascii(`${E.en} - ${E.tag}`);
+  const gaps=eraGaps();
+  const need = gaps.length ? gaps.map(g=>`${g.key} ${g.have}/${g.need}`).join(', ')
+                           : `research ${Math.floor(eraProgress()*100)}%`;
+  return _ascii(`${E.en}: ${E.tag}. NEXT ${ERA_DEFS[eraIndex()+1].en} needs ${need}`);
 }
 
 // ── イベントの一言バナー ────────────────────────────────────────────────────
@@ -1510,6 +1579,11 @@ function updateHud(dt){
       hudDayBusy=true; hudDayAt=now;
       refreshHudDay().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudDayBusy=false;});
     }
+  }
+  // 次の時代までのゴール (最短2秒に1回。研究の進みはゆっくりなので頻繁に要らない)
+  if(!hudEraBusy && now-hudEraAt>2000){
+    hudEraBusy=true; hudEraAt=now;
+    refreshHudEra().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudEraBusy=false;});
   }
   // いま何を映しているか (最短1秒に1回だけ作り直す)
   if(!hudCamBusy && now-hudCamAt>1000){
@@ -1684,6 +1758,9 @@ const WORK_IDX = ['office','tower','bank','post','cityhall'].map(IDX_OF).filter(
 const CARE_IDX = ['hospital','pharmacy'].map(IDX_OF).filter(v=>v!=null);        // 病気
 const BUY_IDX  = ['conbini','supermarket','shop','mall'].map(IDX_OF).filter(v=>v!=null); // 買い物
 const FUN_IDX  = ['stadium','temple','museum','library'].map(IDX_OF).filter(v=>v!=null);  // 退屈しのぎ
+// 学び舎。ここに住民が居た時間が研究点になり、時代 (ERA) を進める。
+// 学校は今までどの欲求カテゴリにも入っておらず、建っても誰も使わない建物だった。
+const LEARN_IDX = ['school','library'].map(IDX_OF).filter(v=>v!=null);
 
 // ゲーム内時刻 [0,24)。起動時刻は START_HOUR から始まる (既定 8時 = 朝の活動時間)。
 //   実時間に直接紐づけると、起動タイミング次第で深夜(=全員sleep)から始まってしまうため。
@@ -1821,13 +1898,150 @@ function stepWeather(){
 }
 
 // 需要カテゴリ (欲求 → 建物カテゴリ)
-const CATS      = ['eat','shop','fun','care'];
-const BUILD_CATS= ['home','work','eat','shop','fun','care'];   // 建てられるもの (優先順)
-const NEED_CAT  = { eat:'eat', shop:'shop', bored:'fun', sick:'care' };
+const CATS      = ['eat','shop','fun','care','learn'];
+const BUILD_CATS= ['home','work','eat','shop','fun','care','learn'];   // 建てられるもの (優先順)
+const NEED_CAT  = { eat:'eat', shop:'shop', bored:'fun', sick:'care', learn:'learn' };
 const CAT_IDX   = { eat:FOOD_IDX, shop:BUY_IDX, fun:FUN_IDX, care:CARE_IDX,
-                    home:HOME_IDX, work:WORK_IDX };
+                    home:HOME_IDX, work:WORK_IDX, learn:LEARN_IDX };
 const CAT_LABEL = { eat:'飲食店', shop:'買い物する場所', fun:'遊ぶ場所', care:'医療',
-                    home:'住むところ', work:'働くところ' };
+                    home:'住むところ', work:'働くところ', learn:'学ぶところ' };
+
+// ═══ 時代 (ERA) ═════════════════════════════════════════════════════════════
+// Age of Empires の時代進行を現代史に置き換えたもの。
+//     アナログ → パソコン(1995) → スマホ → AI
+// 時代が変えるのは3つ。どれも JS の定数の差し替えで、**ONNX の再学習は要らない**。
+//   1. 建てられる建物   typeAllowed()  … 時代ごとに解禁 / 引退する業種
+//   2. 人の流れ         needOf() / stepNeeds() … 夜更かし・在宅勤務・家で買い物
+//   3. 歩き方           personaVec のブレンドと歩幅 … 時代が進むほど「まっすぐ・速く」
+//
+// 進むのは時間ではなく **発明**。住民が学び舎 (学校/図書館) に居た時間が研究点になり、
+// 必要な人口と建物が揃ったところで発明が起きて時代が変わる。
+// 「時間で勝手に上がる」と視聴者にとって何も起きていないのと同じなので、
+// 必ず「誰が・どこで発明したか」が出る離散イベントとして提示する。
+const ERA_ON    = process.env.ERA !== '0';
+const ERAS_FILE = process.env.ERAS_FILE || path.join(__dirname,'eras.json');
+// 必要な研究点をまとめて増減する。**動作確認は ERA_SCALE=0.05 (20倍速)** が目安。
+const ERA_SCALE = envNum('ERA_SCALE', 1);
+// 学びたさの蓄積。速すぎると全員が学校へ通い詰めて他の用事が消えるので、
+// 「2ゲーム日に1回くらい学び舎へ寄る」くらいに抑えてある。
+const CURIOUS_RATE    = envNum('CURIOUS_RATE_INV', 45) > 0 ? 1/(envNum('CURIOUS_RATE_INV',45)*60) : 0;
+// 学び舎での滞在の長さを決める。大きいと「着いた瞬間に満足して出ていく」ので
+// 研究がほとんど溜まらない。**時代の進む速さはほぼこの値で決まる**。
+const LEARN_RECOVER   = envNum('LEARN_RECOVER', 0.012);
+const RESEARCH_BASE   = envNum('RESEARCH_BASE', 0.012);  // 学び舎が無くても進む最低分 (人・ゲーム日/人/日)
+const ERA_FLOW_DEF = { nightStart:22, nightEnd:6, workFrom:9, workTo:17,
+                       homeShop:0, remoteWork:0, funBias:1, learnRate:1, speed:1, persona:null };
+
+// eras.json が無い / 壊れているときに使う既定。ファイル側と同じ内容を持つ。
+const ERA_FALLBACK = [
+  { id:'analog', en:'ANALOG', ja:'アナログ時代', tag:'letters, cash and legwork',
+    buildings:['house','post','bank','cityhall','conbini','kiosk','ramen','gyudon','bento','cafe',
+               'shop','pharmacy','temple','office','hospital','school','library'],
+    retire:[],
+    flow:{ nightStart:21, nightEnd:6, workFrom:9, workTo:17, homeShop:0, remoteWork:0,
+           funBias:0.7, learnRate:0.7, speed:0.95, persona:{as:'E', mix:0.25} },
+    next:{ invention:'THE COMPUTER', inventionJa:'計算機', research:30, minDays:3,
+           requires:{ pop:10 } } },
+  { id:'pc', en:'PC ERA', ja:'パソコンの時代', tag:'everyone commutes to an office',
+    buildings:['apartment','supermarket','station','stadium','museum'], retire:[],
+    flow:{ nightStart:22, nightEnd:6, workFrom:9, workTo:18, homeShop:0.05, remoteWork:0,
+           funBias:1.0, learnRate:1.0, speed:1.05, persona:{as:'D', mix:0.35} },
+    next:{ invention:'THE WIRELESS NETWORK', inventionJa:'無線ネットワーク', research:115, minDays:4,
+           requires:{ pop:18, buildings:{ school:1 } } } },
+  { id:'smartphone', en:'SMARTPHONE', ja:'スマホの時代', tag:'people go out less, and stay up late',
+    buildings:['mall','hotel','tower'], retire:['post','bank'],
+    flow:{ nightStart:23, nightEnd:7, workFrom:9, workTo:18, homeShop:0.45, remoteWork:0.15,
+           funBias:1.3, learnRate:1.2, speed:1.1, persona:{as:'D', mix:0.5} },
+    next:{ invention:'THE MODEL', inventionJa:'モデル', research:160, minDays:5,
+           requires:{ pop:28, buildings:{ library:1, office:2 } } } },
+  { id:'ai', en:'AI ERA', ja:'AIの時代', tag:'nobody commutes; the town is a place to be',
+    buildings:[], retire:['office'],
+    flow:{ nightStart:23, nightEnd:8, workFrom:10, workTo:17, homeShop:0.7, remoteWork:0.65,
+           funBias:1.6, learnRate:1.4, speed:1.0, persona:{as:'B', mix:0.45} },
+    next:null },
+];
+
+// eras.json を読む。1つでも欠けた項目は既定で埋める (設定ファイルを部分的に書ける)。
+function loadEraDefs(){
+  let raw=ERA_FALLBACK, src='内蔵の既定';
+  try{
+    if(fs.existsSync(ERAS_FILE)){
+      const j=JSON.parse(fs.readFileSync(ERAS_FILE,'utf8'));
+      const arr=Array.isArray(j)?j:j.eras;
+      if(Array.isArray(arr) && arr.length){ raw=arr; src=ERAS_FILE; }
+      else console.warn(`[Era] ${ERAS_FILE} に eras 配列が無い → 内蔵の既定を使う`);
+    }
+  }catch(e){ console.warn(`[Era] ${ERAS_FILE} を読めない (${e.message}) → 内蔵の既定を使う`); }
+  const defs=raw.map((e,i)=>({
+    id: e.id || `era${i}`,
+    en: _ascii(e.en || e.id || `ERA ${i+1}`).toUpperCase() || `ERA ${i+1}`,
+    ja: e.ja || e.id || `第${i+1}期`,
+    tag: _ascii(e.tag||''),
+    buildings: Array.isArray(e.buildings)?e.buildings:[],
+    retire:    Array.isArray(e.retire)?e.retire:[],
+    flow: Object.assign({}, ERA_FLOW_DEF, e.flow||{}),
+    next: e.next ? {
+      invention:   _ascii(e.next.invention||'A NEW IDEA') || 'A NEW IDEA',
+      inventionJa: e.next.inventionJa || e.next.invention || '新しい発明',
+      research:    Math.max(0, +e.next.research || 0),
+      minDays:     Math.max(0, +e.next.minDays || 0),
+      requires:    e.next.requires || {},
+    } : null,
+  }));
+  defs[defs.length-1].next=null;                 // 最後の時代からは進まない
+  const bad=defs.flatMap(e=>[...e.buildings,...e.retire]).filter(n=>BLDG_NAME_TO_IDX[n]==null);
+  if(bad.length) console.warn(`[Era] 知らない建物名: ${[...new Set(bad)].join(' ')} (無視する)`);
+  console.log(`[Era] ${defs.length}時代を読み込み (${src}) : `
+    + defs.map(e=>e.en).join(' -> ') + ` / ERA_SCALE=${ERA_SCALE}`);
+  return defs;
+}
+const ERA_DEFS = loadEraDefs();
+
+const eraIndex = () => (CITY && ERA_ON) ? Math.max(0, Math.min(ERA_DEFS.length-1, CITY.era|0)) : 0;
+const eraSpec  = () => ERA_DEFS[eraIndex()];
+const eraFlow  = () => ERA_ON ? eraSpec().flow : ERA_FLOW_DEF;
+const eraNext  = () => ERA_ON ? eraSpec().next : null;
+// 必要な研究点 (人・ゲーム日)。1.0 = 住民1人が学び舎に1ゲーム日こもったぶん。
+const eraNeedResearch = () => { const n=eraNext(); return n ? Math.max(0.1, n.research*ERA_SCALE) : 0; };
+
+// その時代に建てられる業種の集合。**時代0から現在までの buildings を足し、retire を引く**。
+// (時代が進んでも前の時代の建物が建てられなくなるわけではない = 積み上げ)
+let _eraSetIdx=-1, _eraSet=null;
+function eraBuildSet(){
+  const i=eraIndex();
+  if(_eraSetIdx!==i){
+    const set=new Set();
+    for(let k=0;k<=i;k++){
+      for(const n of ERA_DEFS[k].buildings){ const t=BLDG_NAME_TO_IDX[n]; if(t!=null) set.add(t); }
+      for(const n of ERA_DEFS[k].retire)   { const t=BLDG_NAME_TO_IDX[n]; if(t!=null) set.delete(t); }
+    }
+    _eraSet=set; _eraSetIdx=i;
+  }
+  return _eraSet;
+}
+
+// 営業中の建物を業種名で数える (時代の条件判定と HUD で共用)
+function countOpenType(name){
+  const t=BLDG_NAME_TO_IDX[name];
+  if(t==null || !CITY) return 0;
+  let n=0; for(const st of CITY.structs) if(st.state==='open' && st.typeIdx===t) n++;
+  return n;
+}
+// 次の時代に足りていないもの。空配列 = 条件は揃っている。
+function eraGaps(){
+  const n=eraNext(); if(!n) return [];
+  const req=n.requires||{}, gaps=[];
+  for(const name in (req.buildings||{})){
+    const need=req.buildings[name], have=countOpenType(name);
+    if(have<need) gaps.push({key:_ascii(BLDG_EN[name]||name).toUpperCase(), have, need});
+  }
+  if(req.pop && agents.length<req.pop) gaps.push({key:'POP', have:agents.length, need:req.pop});
+  return gaps;
+}
+const eraProgress = () => {
+  const need=eraNeedResearch();
+  return need ? Math.max(0, Math.min(1, ((CITY&&CITY.research)||0)/need)) : 1;
+};
 
 // 配信画面 (HUD) は英語で描く。Linux に日本語フォントが無いと豆腐になるため、
 // 焼き込む文字は ASCII に統一する。ログ / /city / WebSocket は日本語のまま。
@@ -1854,6 +2068,11 @@ function cityLevel(){
 const levelSpec = () => CITY_LEVELS[cityLevel()];
 function typeAllowed(t){
   const bt=BLDG_TYPES[t], L=levelSpec();
+  // 時代のゲート: その業種がまだ発明されていない / もう建てられなくなった
+  if(ERA_ON && !eraBuildSet().has(t)) return false;
+  // 学び舎だけは発展段階の 2x2 制限を免除する。学校も図書館も footprint=2 なので、
+  // 「町」まで解禁されない → 研究が進まない → 時代が上がらない、で永久に止まるため。
+  if(ERA_ON && LEARN_IDX.includes(t)) return true;
   return bt.height <= L.maxH+1e-6 && (bt.footprint===1 || L.fp2);
 }
 const foundableTypes = cat => (CAT_IDX[cat]||[]).filter(typeAllowed);
@@ -2161,6 +2380,7 @@ function cityToJSON(){
     version:1, seed:CITY.seed, grid:GRID, savedAt:Date.now(),
     day:gameDay(), bornAt:CITY.bornAt,
     econ:CITY.econ, level:CITY.level, pop:agents.length, size:CITY.size, weather:CITY.weather,
+    era:CITY.era|0, research:+(CITY.research||0).toFixed(3), eraDay:CITY.eraDay|0, eraLog:CITY.eraLog||[],
     map:MAP.map(row=>row.join('')),
     structs:CITY.structs.map(st=>({...st})),
     foot:Array.from(CITY.foot),
@@ -2256,6 +2476,8 @@ function freshCity(){
   return {
     seed:CITY_SEED, dayBase:-daysSinceBoot(), bornAt:Date.now(),
     econ:0, level:0, pop:0, size,    // 経済活動の累計 / 発展段階 / 人口 / フィールドの一辺
+    // 時代 (ERA)。research は「人・ゲーム日」= 住民が学び舎に居た時間の累計。
+    era:0, research:0, eraDay:0, eraAt:Date.now(), eraLog:[],
     weather:'sunny', weatherUntil:0,
     structs,
     foot:new Int32Array(GRID*GRID),
@@ -2287,6 +2509,9 @@ function initCity(){
     CITY = {
       seed:CITY_SEED, dayBase:j.day||0, bornAt:j.bornAt||Date.now(),
       econ:j.econ||0, level:j.level||0, pop:j.pop||0, size:j.size||GRID,
+      // 時代。古い保存ファイル (era を持たない) はアナログ時代から始まる。
+      era:Math.max(0, Math.min(ERA_DEFS.length-1, j.era|0)), research:+j.research||0,
+      eraDay:+j.eraDay||0, eraAt:j.eraAt||Date.now(), eraLog:j.eraLog||[],
       weather:j.weather||'sunny', weatherUntil:0,
       structs:j.structs.map(st=>({...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st})),
       foot:Int32Array.from(j.foot||[]),
@@ -2312,6 +2537,13 @@ function initCity(){
   for(const st of CITY.structs) if(st.state==='demolishing') st.state='closed';
   syncCity();
   rebuildBuildings(MAP);
+  if(ERA_ON){
+    const E=eraSpec(), n=eraNext();
+    console.log(`[Era] いまは ${E.ja} (${eraIndex()+1}/${ERA_DEFS.length}) `
+      + `研究 ${(CITY.research||0).toFixed(1)}/${eraNeedResearch().toFixed(1)}`
+      + (n?` → 次は ${n.inventionJa} の発明`:' (最後の時代)')
+      + ` / 建てられる業種 ${eraBuildSet().size}種`);
+  }
   const L=levelSpec();
   console.log(`[City] 発展段階 ${cityLevel()}:${L.name} (高さ≤${L.maxH} 2x2:${L.fp2?'可':'不可'}) `
     + `経済 ${Math.round(CITY.econ)} / 建てられる業種 `
@@ -2397,8 +2629,8 @@ function retargetOnNeedChange(){
 
 // 内部状態を進める (1秒ごと)。到着していれば回復させる。
 function stepNeeds(dtSec){
-  const h=gameHour();
-  const night = (h<6 || h>=22);
+  const h=gameHour(), F=eraFlow(), daySec=DAY_MINUTES*60;
+  const night = (h<F.nightEnd || h>=F.nightStart);
   for(const a of agents){
     a.hunger  = Math.min(1, (a.hunger ||0) + HUNGER_RATE *dtSec);
     // 夜は疲れやすい / 自宅に居るときは休息
@@ -2415,7 +2647,10 @@ function stepNeeds(dtSec){
         if(CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec) gossip(a, o);
         break;
       } }
-    a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
+    // 退屈の溜まる速さは時代で変わる (娯楽が増えるほど「出かけたくなる」)
+    a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?(F.funBias||1):-1.5)));
+    // 学びたさ。学び舎で解消し、その時間が街の研究点になる。
+    a.curious = Math.min(1, (a.curious||0) + CURIOUS_RATE*dtSec*(F.learnRate||1));
     // 病気: 低確率で発症。疲労が高いほどかかりやすい (内部状態同士の因果)
     if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
       a.sick = 0.6 + Math.random()*0.4;
@@ -2428,6 +2663,11 @@ function stepNeeds(dtSec){
       if(FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
       if(BUY_IDX.includes(t))  a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec);
       if(FUN_IDX.includes(t))  a.bored  = Math.max(0, a.bored  - FUN_RECOVER*dtSec);
+      // 学び舎に居る = 研究している。1人が1ゲーム日こもると研究点 +1.0 (人・ゲーム日)。
+      if(MW.isIndoors(a) && LEARN_IDX.includes(t)){
+        a.curious = Math.max(0, a.curious - LEARN_RECOVER*dtSec);
+        if(CITY && ERA_ON) CITY.research += dtSec/daySec;
+      }
     }
     // 病院/薬局は隣接でも受診とみなす (建物セル中心に完全に乗れず治らないのを防ぐ)
     if((a.sick||0) > 0){
@@ -2436,6 +2676,11 @@ function stepNeeds(dtSec){
         if(tt!=null && CARE_IDX.includes(tt)){ a.sick = Math.max(0, a.sick - SICK_HEAL*dtSec); dr=dc=2; }
       }
     }
+    // 通販/ネットスーパー: 家に居るだけで日用品が満たされる時代がある。
+    // 買い物に出る用事が減り、街から人が減っていく (スマホ→AI時代の見どころ)。
+    if(F.homeShop>0 && MW.isIndoors(a) && a.home
+       && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1])
+      a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec*F.homeShop);
     // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
     if(a.home && Math.abs(r-a.home[0])<=1 && Math.abs(c-a.home[1])<=1)
       a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
@@ -2461,6 +2706,10 @@ function stepNeeds(dtSec){
       }
     }
   }
+  // 学び舎が無くても、街ぐるみのゆるやかな学習で研究は少しだけ進む。
+  // これが無いと「2x2 の学校が建てられない小さな村 → 永久に時代が上がらない」で詰む。
+  // 学び舎があるほうが桁違いに速い、という差だけを残す。
+  if(CITY && ERA_ON) CITY.research += agents.length*RESEARCH_BASE*dtSec/daySec;
 }
 
 // 屋内から出るべきか。needOf() が示す用事と、いま居る建物が合っているかで決める。
@@ -2474,8 +2723,12 @@ function shouldLeaveBuilding(a){
   if(n===null) return true;                                   // 用事なし → 外へ
   if(n==='sleep') return a.home ? !(br===a.home[0] && bc===a.home[1])
                                 : !HOME_IDX.includes(t);   // 家なしは住居なら留まる
-  if(n==='work')  return !(a.work && br===a.work[0] && bc===a.work[1]);
+  if(n==='work'){
+    const w=(a.remote && a.home) ? a.home : a.work;   // 在宅勤務なら家に居るのが「勤務中」
+    return !(w && br===w[0] && bc===w[1]);
+  }
   if(t==null) return true;
+  if(n==='learn') return !LEARN_IDX.includes(t);               // 学び舎に居るなら留まる
   if(n==='eat')   return !FOOD_IDX.includes(t);               // 飲食店に居るなら留まる
   if(n==='shop')  return !BUY_IDX.includes(t);
   if(n==='bored') return !FUN_IDX.includes(t);
@@ -2486,12 +2739,16 @@ function shouldLeaveBuilding(a){
 // いま何を求めているか (アイコン表示と目的地抽選で共用)
 //   優先順位: 病気 > 睡眠 > 空腹 > 勤務 > 買い物 > 退屈 (生命に関わる順、最後は暇つぶし)
 function needOf(a){
-  const h=gameHour();
+  const h=gameHour(), F=eraFlow();
   if((a.sick   ||0) > SICK_HI)                 return 'sick';
-  if((a.fatigue||0) > NEED_HI || h<6 || h>=22) return 'sleep';
+  // 寝る時間帯・働く時間帯は時代で変わる (スマホ時代は夜更かし / AI時代は朝が遅い)。
+  // ここを動かすだけで「夜の街に人が居るか」が変わり、時代の差が絵に出る。
+  if((a.fatigue||0) > NEED_HI || h<F.nightEnd || h>=F.nightStart) return 'sleep';
   if((a.hunger ||0) > NEED_HI)                 return 'eat';
-  if(h>=9 && h<17)                             return 'work';
+  if(h>=F.workFrom && h<F.workTo)              return 'work';
   if((a.supply ||0) > NEED_HI)                 return 'shop';
+  // 学び舎がある街でだけ立つ用事。無い街で立てると永久に叶わない用事になる。
+  if((a.curious||0) > NEED_HI && catCount('learn')>0) return 'learn';
   if((a.bored  ||0) > NEED_HI)                 return 'bored';
   return null;
 }
@@ -2515,6 +2772,7 @@ function describeActivity(a){
   if((a.sick||0)>0 && near(CARE_IDX)) return '🏥 病院・薬局で治療を受けている';
   if(t!=null && FOOD_IDX.includes(t)) return `${BLDG_TYPES[t].label} で食事をしている`;
   if(t!=null && BUY_IDX.includes(t))  return `${BLDG_TYPES[t].label} で買い物をしている`;
+  if(t!=null && LEARN_IDX.includes(t)) return `${BLDG_TYPES[t].label} で勉強している`;
   if(t!=null && FUN_IDX.includes(t))  return `${BLDG_TYPES[t].label} で過ごしている`;
   if(atWork && h>=9 && h<17)          return '💼 職場で働いている';
   if(atHome)                          return '🏠 自宅で休んでいる';
@@ -2548,9 +2806,13 @@ function pickLifeGoal(a, ex){
     if(a.home) return [...a.home];
     const h=nearestHome(a); if(h) return h;
   }
-  if(n==='work'  && a.work) return [...a.work];
+  // 在宅勤務の住民は職場へ行かない。AI時代でオフィスから人が消えるのはここ。
+  if(n==='work'){
+    const w=(a.remote && a.home) ? a.home : a.work;
+    if(w) return [...w];
+  }
   // 欲求 → 行き先カテゴリ。近い方から数軒のランダムで選ぶ (最寄り固定だと往復しやすい)
-  const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX}[n];
+  const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX, learn:LEARN_IDX}[n];
   if(CAT){
     const f=buildingsOfTypes(CAT);
     if(f.length){
@@ -2931,7 +3193,8 @@ function maybeFound(day){
   }
   const pop=agents.length;
   const hcap=housingCapacity(), wcap=workplaceCapacity();
-  let workers=0; for(const a of agents) if(!a.owns) workers++;
+  // 在宅勤務の住民は職場の定員を食わない (AI時代にオフィスを建て続けてしまう)
+  let workers=0; for(const a of agents) if(!a.owns && !a.remote) workers++;
 
   if(pop >= hcap*HOME_PRESSURE && foundableTypes('home').length){
     if(foundCategory('home', day)){
@@ -3328,6 +3591,7 @@ function lifeLineEn(a){
       return _pick([`${N} is working at the ${at}`, `${N} is on shift at the ${at}`]);
     if(t!=null && FOOD_IDX.includes(t)) return _pick([`${N} is having a meal at a ${at}`, `${N} is eating at a ${at}`]);
     if(t!=null && BUY_IDX.includes(t))  return _pick([`${N} is shopping at a ${at}`, `${N} is picking up supplies at a ${at}`]);
+    if(t!=null && LEARN_IDX.includes(t)) return _pick([`${N} is studying at the ${at}`, `${N} is reading at the ${at}`]);
     if(t!=null && FUN_IDX.includes(t))  return _pick([`${N} is spending time at the ${at}`, `${N} is killing time at the ${at}`]);
     if(t!=null && CARE_IDX.includes(t)) return _pick([`${N} is getting treatment at the ${at}`, `${N} is seeing a doctor at the ${at}`]);
     return `${N} stepped inside a ${at}`;
@@ -3353,6 +3617,8 @@ function lifeLineEn(a){
     }
     case 'shop':  return _pick([`${N} ran out of supplies and is heading to ${to||'the shops'}`,
                                 `${N} needs to restock and is walking to ${to||'a shop'}`]);
+    case 'learn': return _pick([`${N} is heading to ${to||'the school'} to study`,
+                                `${N} wants to learn something and is walking to ${to||'the library'}`]);
     case 'bored': return _pick([`${N} is bored and heading to ${dest?`the ${dest}`:'find something to do'}`,
                                 `${N} has nothing to do and is wandering toward ${dest?`the ${dest}`:'somewhere'}`]);
   }
@@ -3574,9 +3840,90 @@ function dailyRollover(day){
 }
 
 // 1秒ごと: 日付の切り替わりを検出して日次処理を1回だけ走らせる + 工事の完了確認
+// ── 時代の進行 ──────────────────────────────────────────────────────────────
+// 条件が揃ったら「発明」が起きて次の時代へ。1秒ごと (cityTick) に見る。
+//   研究点  … 住民が学び舎に居た時間 (stepNeeds が加算)
+//   必要物  … 人口と、その時代に要る建物 (eraGaps)
+//   最短日数… 立て続けに時代が飛ばないように
+function stepEra(){
+  if(!CITY || !ERA_ON) return;
+  const n=eraNext(); if(!n) return;                            // 最後の時代
+  if((CITY.research||0) < eraNeedResearch()) return;
+  if(eraGaps().length) return;
+  if(n.minDays && gameDay()-(CITY.eraDay||0) < n.minDays) return;
+  advanceEra(n);
+}
+
+// 学び舎のセル (カメラを寄せる先)。無ければ街の真ん中。
+function learnSite(){
+  if(CITY) for(const st of CITY.structs)
+    if(st.state==='open' && LEARN_IDX.includes(st.typeIdx)) return [st.r, st.c];
+  const mid=Math.round((fieldLo()+fieldHi())/2);
+  return [mid, mid];
+}
+
+function advanceEra(n){
+  const prev=eraSpec();
+  // 発明者 = いま学び舎に居る住民。居なければ「いちばん学びたがっていた人」。
+  // 「街が発明した」より「Rex が発明した」のほうが物語になるので、必ず誰かの名前にする。
+  let who=agents.find(a=>MW.isIndoors(a)
+    && LEARN_IDX.includes(BUILDING_TYPES[a.indoors[0]+'_'+a.indoors[1]]));
+  if(!who && agents.length){
+    who=agents.reduce((b,a)=>((a.curious||0)>((b&&b.curious)||0)?a:b), null);
+  }
+  const site = (who && MW.isIndoors(who)) ? who.indoors : learnSite();
+
+  CITY.era=eraIndex()+1;
+  CITY.research=0;
+  CITY.eraDay=gameDay();
+  CITY.eraAt=Date.now();
+  const E=eraSpec();
+  CITY.eraLog.push({era:E.id, day:gameDay(), by:who?who.name:null, invention:n.invention});
+  while(CITY.eraLog.length>32) CITY.eraLog.shift();
+  applyEraPersona();          // 歩き方と在宅勤務を新しい時代のものに入れ替える
+  cityStamp++;                // 建てられる業種が変わったのでキャッシュを捨てる
+
+  const byJa=who?`${who.name} が`:'街が';
+  news('era', `💡 ${byJa} ${n.inventionJa} を発明した — ${prev.ja} が終わり ${E.ja} が始まった`,
+       `${who?who.name:'The town'} invented ${n.invention.toLowerCase()} - the ${E.en} begins`);
+  showBanner(`${n.invention} - invented by ${who?_ascii(who.name):'the town'}`, 9);
+  showCityEvent(site[0], site[1], `${E.en} BEGINS - ${E.tag}`, 12, null, {wide:true});
+  console.log(`[Era] ${prev.ja} → ${E.ja} (Day${gameDay()+1}) 発明:${n.inventionJa}`
+    + ` 発明者:${who?who.name:'-'} / 次の必要研究点 ${eraNeedResearch().toFixed(1)}`);
+}
+
+// 時代ごとの「歩き方」を全住民に反映する。
+//   性格ベクトル (persona_multi.onnx) があれば、その時代の性格へ連続ブレンドする。
+//   無いモデルでは在宅勤務の抽選だけ行う (歩き方は既定のまま)。
+function applyEraPersonaTo(a){
+  const F=eraFlow();
+  a.remote = Math.random() < (F.remoteWork||0);      // 在宅勤務になる人
+  const p=F.persona;
+  const meta=personaMeta[(PERSONA_DEFS[0]||{}).id];
+  const PV=meta&&meta.personaVectors, P=meta&&meta.personaDim;
+  if(!P || !PV || !p || !PV[p.as]) return;
+  const mix=Math.max(0, Math.min(1, p.mix||0));
+  const base=PV[a.def.id]||new Array(P).fill(0), tgt=PV[p.as];
+  a.personaVec=Float32Array.from({length:P},(_,i)=>base[i]*(1-mix)+tgt[i]*mix);
+}
+function applyEraPersona(){
+  if(!ERA_ON) return;
+  for(const a of agents) applyEraPersonaTo(a);
+  const F=eraFlow(), p=F.persona;
+  const remote=agents.reduce((n,a)=>n+(a.remote?1:0),0);
+  console.log(`[Era] 歩き方を更新: ${p?`persona→${p.as} mix=${p.mix}`:'既定'}`
+    + ` / 歩幅x${F.speed} / 在宅勤務 ${remote}人`);
+}
+
+let _eraApplied=false;
 function cityTick(){
   if(!CITY) return;
+  // 起動直後に1回だけ、いまの時代の歩き方を全住民へ反映する。
+  // spawnAgent でも与えているが、起動時は ONNX の読み込みが終わる前に住民が
+  // 作られることがあり、そのときは性格ベクトルがまだ無い。
+  if(!_eraApplied && agents.length){ _eraApplied=true; applyEraPersona(); }
   stepWeather();
+  stepEra();
   const d=gameDay();
   if(_lastDay===null) _lastDay=d;
   else if(d!==_lastDay){ _lastDay=d; dailyRollover(d); }
@@ -3893,9 +4240,11 @@ function spawnAgent(S, i){
     // 屋内状態 (solidBuildings)。null=屋外 / [r,c]=その建物の中。
     indoors:null,
     hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
-    supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0};
+    supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0,
+    curious:Math.random()*0.4, remote:false};   // 学びたさ / 在宅勤務か (時代で決まる)
   agents.push(a);
   agentMeshes.push(createAgentMesh(S, def.color));
+  applyEraPersonaTo(a);        // いまの時代の歩き方と働き方を与える (転入者にも効く)
   return a;
 }
 
@@ -4081,6 +4430,9 @@ async function stepAll(){
       move=((meta&&meta.fwdPerDecision)||FWD_PER_DECISION_DEF)/sub;
       rot =((meta&&meta.rotPerDecision)||ROT_PER_DECISION_DEF)/sub;
     }
+    // 時代の歩幅。時代が進むほど少しだけ速く歩く (せわしなくなる)。
+    // 観測は変えないので再学習は不要。WP_REACH に対して十分小さい範囲だけ動かす。
+    move *= (eraFlow().speed||1);
     if(usePursuit){
       action=pursueAction(a, move, rot);                   // 決定論の目的地追従 (推論不要)
     }else{
@@ -5519,6 +5871,16 @@ tick(); setInterval(tick, ${ms});
         // 実際に MAP が空くのは沈みきってから (数秒後)
         done=`decluttering ${done2} building(s) — before: walkability ${w0.toFixed(3)}`
            + ` density ${d0.toFixed(3)} (再度 /city で結果を確認してください)`;
+      }else if(force==='era'){
+        // 演出の確認用: 条件を無視して時代を1つ進める
+        const n=eraNext();
+        if(n){ advanceEra(n); done=`era -> ${eraSpec().en}`; }
+        else done=null;
+      }else if(force==='research'){
+        // 研究点だけ足す (/city?force=research&n=10)
+        const add=Math.max(0, parseFloat(q.get('n'))||eraNeedResearch());
+        CITY.research=(CITY.research||0)+add;
+        done=`research ${CITY.research.toFixed(1)} / ${eraNeedResearch().toFixed(1)}`;
       }else if(force==='close'){
         const cands=CITY.structs.filter(x=>x.state==='open' && isClosable(x.typeIdx))
                                 .sort((a,b)=>a.ema-b.ema);
@@ -5563,6 +5925,16 @@ tick(); setInterval(tick, ${ms});
         limits:{maxDensity:BUILD_MAX_DENS, minWalkability:WALK_MIN},
         buildingPaused: fieldDensity()>=BUILD_MAX_DENS || walkability()<WALK_MIN,
         expandAt:{density:EXPAND_DENSITY, freeLots:EXPAND_FREE}},
+      era:(()=>{ const E=eraSpec(), n=eraNext();
+        return {index:eraIndex()+1, of:ERA_DEFS.length, id:E.id, name:E.ja, en:E.en,
+          enabled:ERA_ON, scale:ERA_SCALE,
+          research:+(CITY.research||0).toFixed(2), need:+eraNeedResearch().toFixed(2),
+          progress:+eraProgress().toFixed(3),
+          sinceDays:gameDay()-(CITY.eraDay||0),
+          next: n ? {era:ERA_DEFS[eraIndex()+1].ja, invention:n.inventionJa,
+                     minDays:n.minDays, missing:eraGaps()} : null,
+          flow:eraFlow(), log:CITY.eraLog||[]};
+      })(),
       level:{index:cityLevel(), name:levelSpec().name, econ:Math.round(CITY.econ),
         maxHeight:levelSpec().maxH, fp2:levelSpec().fp2,
         next:CITY_LEVELS[cityLevel()+1]?{name:CITY_LEVELS[cityLevel()+1].name,

@@ -1,0 +1,89 @@
+{
+  "_about": "時代 (ERA) の設定。Age of Empires の時代進行を現代史に置き換えたもの。server.js の ERA_FALLBACK と同じ内容で、このファイルがあればこちらが優先される。ERAS_FILE でパス変更可。",
+  "_tuning": "必要な研究点は ERA_SCALE 倍される (ERA_SCALE=0.05 なら 20倍速で時代が進む = 動作確認用)。research の単位は「人・ゲーム日」= 住民1人が学び舎に1ゲーム日こもると 1.0。",
+  "_flow": "nightStart/nightEnd=寝る時間帯, workFrom/workTo=勤務時間, homeShop=家に居るだけで日用品が満たされる割合 (通販), remoteWork=在宅勤務になる住民の割合, funBias=退屈の溜まる速さ, learnRate=学びたくなる速さ, speed=歩く速さ, persona={as,mix}=全住民の性格ベクトルをこのペルソナへブレンドする量 (ONNX の再学習は不要)",
+  "eras": [
+    {
+      "id": "analog",
+      "en": "ANALOG",
+      "ja": "アナログ時代",
+      "tag": "letters, cash and legwork",
+      "buildings": ["house", "post", "bank", "cityhall", "conbini", "kiosk", "ramen", "gyudon", "bento", "cafe", "shop", "pharmacy", "temple", "office", "hospital", "school", "library"],
+      "retire": [],
+      "flow": {
+        "nightStart": 21, "nightEnd": 6,
+        "workFrom": 9, "workTo": 17,
+        "homeShop": 0.0, "remoteWork": 0.0,
+        "funBias": 0.7, "learnRate": 0.7, "speed": 0.95,
+        "persona": { "as": "E", "mix": 0.25 }
+      },
+      "next": {
+        "invention": "THE COMPUTER",
+        "inventionJa": "計算機",
+        "research": 30,
+        "minDays": 3,
+        "requires": { "pop": 10 }
+      }
+    },
+    {
+      "id": "pc",
+      "en": "PC ERA",
+      "ja": "パソコンの時代",
+      "tag": "everyone commutes to an office",
+      "buildings": ["apartment", "supermarket", "station", "stadium", "museum"],
+      "retire": [],
+      "flow": {
+        "nightStart": 22, "nightEnd": 6,
+        "workFrom": 9, "workTo": 18,
+        "homeShop": 0.05, "remoteWork": 0.0,
+        "funBias": 1.0, "learnRate": 1.0, "speed": 1.05,
+        "persona": { "as": "D", "mix": 0.35 }
+      },
+      "next": {
+        "invention": "THE WIRELESS NETWORK",
+        "inventionJa": "無線ネットワーク",
+        "research": 115,
+        "minDays": 4,
+        "requires": { "pop": 18, "buildings": { "school": 1 } }
+      }
+    },
+    {
+      "id": "smartphone",
+      "en": "SMARTPHONE",
+      "ja": "スマホの時代",
+      "tag": "people go out less, and stay up late",
+      "buildings": ["mall", "hotel", "tower"],
+      "retire": ["post", "bank"],
+      "flow": {
+        "nightStart": 23, "nightEnd": 7,
+        "homeShop": 0.45, "remoteWork": 0.15,
+        "workFrom": 9, "workTo": 18,
+        "funBias": 1.3, "learnRate": 1.2, "speed": 1.1,
+        "persona": { "as": "D", "mix": 0.5 }
+      },
+      "next": {
+        "invention": "THE MODEL",
+        "inventionJa": "モデル",
+        "research": 160,
+        "minDays": 5,
+        "requires": { "pop": 28, "buildings": { "library": 1, "office": 2 } }
+      }
+    },
+    {
+      "id": "ai",
+      "en": "AI ERA",
+      "ja": "AIの時代",
+      "tag": "nobody commutes; the town is a place to be",
+      "buildings": [],
+      "retire": ["office"],
+      "flow": {
+        "nightStart": 23, "nightEnd": 8,
+        "workFrom": 10, "workTo": 17,
+        "homeShop": 0.7, "remoteWork": 0.65,
+        "funBias": 1.6, "learnRate": 1.4, "speed": 1.0,
+        "persona": { "as": "B", "mix": 0.45 }
+      },
+      "next": null
+    }
+  ]
+}
