@@ -1,6 +1,7 @@
 {
   "_about": "時代 (ERA) の設定。Age of Empires の時代進行を現代史に置き換えたもの。server.js の ERA_FALLBACK と同じ内容で、このファイルがあればこちらが優先される。ERAS_FILE でパス変更可。",
   "_tuning": "必要な研究点は ERA_SCALE 倍される (ERA_SCALE=0.05 なら 20倍速で時代が進む = 動作確認用)。research の単位は「人・ゲーム日」= 住民1人が学び舎に1ゲーム日こもると 1.0。",
+  "_board": "board=実験結果の届き方。gossip(すれ違った人にだけ) / place(学び舎に居るときだけ全部読める) / anywhere(いつでも読める) / ai(いつでも読める+0/2だった組み合わせから候補を論理的に絞れる)。時代が進むほど集合知の探索が速くなる。",
   "_flow": "nightStart/nightEnd=寝る時間帯, workFrom/workTo=勤務時間, homeShop=家に居るだけで日用品が満たされる割合 (通販), remoteWork=在宅勤務になる住民の割合, funBias=退屈の溜まる速さ, learnRate=学びたくなる速さ, speed=歩く速さ, persona={as,mix}=全住民の性格ベクトルをこのペルソナへブレンドする量 (ONNX の再学習は不要)",
   "eras": [
     {
@@ -14,7 +15,7 @@
         "nightStart": 21, "nightEnd": 6,
         "workFrom": 9, "workTo": 17,
         "homeShop": 0.0, "remoteWork": 0.0,
-        "funBias": 0.7, "learnRate": 0.7, "speed": 0.95,
+        "funBias": 0.7, "learnRate": 0.7, "speed": 0.95, "board": "gossip",
         "persona": { "as": "E", "mix": 0.25 }
       },
       "next": {
@@ -36,7 +37,7 @@
         "nightStart": 22, "nightEnd": 6,
         "workFrom": 9, "workTo": 18,
         "homeShop": 0.05, "remoteWork": 0.0,
-        "funBias": 1.0, "learnRate": 1.0, "speed": 1.05,
+        "funBias": 1.0, "learnRate": 1.0, "speed": 1.05, "board": "place",
         "persona": { "as": "D", "mix": 0.35 }
       },
       "next": {
@@ -58,7 +59,7 @@
         "nightStart": 23, "nightEnd": 7,
         "homeShop": 0.45, "remoteWork": 0.15,
         "workFrom": 9, "workTo": 18,
-        "funBias": 1.3, "learnRate": 1.2, "speed": 1.1,
+        "funBias": 1.3, "learnRate": 1.2, "speed": 1.1, "board": "anywhere",
         "persona": { "as": "D", "mix": 0.5 }
       },
       "next": {
@@ -80,7 +81,7 @@
         "nightStart": 23, "nightEnd": 8,
         "workFrom": 10, "workTo": 17,
         "homeShop": 0.7, "remoteWork": 0.65,
-        "funBias": 1.6, "learnRate": 1.4, "speed": 1.0,
+        "funBias": 1.6, "learnRate": 1.4, "speed": 1.0, "board": "ai",
         "persona": { "as": "B", "mix": 0.45 }
       },
       "next": null

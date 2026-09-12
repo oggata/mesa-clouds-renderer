@@ -158,11 +158,14 @@ const VOID = 4;
 // 【既定を ALIGNED にした理由】街の進化 (docs/city-evolution-spec.md) は
 // 「人が空き地を踏む → 踏み跡が道になる」が起点なので、空き地が通行不可な
 // LEGACY では踏み跡が1つも付かず、機能が原理的に成立しない。
-// なお MOVE_MODE='pursuit' 固定のあいだ ONNX 方策は移動に使われない
+// MOVE_MODE=pursuit (既定) のあいだ ONNX 方策は移動に使われない
 // (prefetchAllActions が即 return する) ため、「LEGACY で学習した重みが
-// ALIGNED で壊れる」問題は現構成では起きない。policy モードへ戻すときは
-// ALIGNED で学習し直した重みが要る (理想は meta.json から
-// MW.worldFromMeta(meta) で自動判定する形)。
+// ALIGNED で壊れる」問題は起きない。**MOVE_MODE=policy で動かすなら、
+// ALIGNED (solid_buildings=true) で学習した重みが要る。**
+// meta.json の solid_buildings / walkable_empty / visible_trees を
+// MW.worldFromMeta(meta) で読み、この WORLD と食い違っていれば起動時に警告する
+// (checkMetaWorld)。Colab 側は build_pro_onnx_by_persona.ipynb の
+// WORLD_ALIGNED で学習世界を切り替え、その値を meta に書き出す。
 // WORLD_ALIGNED=0 で従来の LEGACY に戻せる。
 const WORLD = process.env.WORLD_ALIGNED === '0' ? MW.LEGACY : MW.ALIGNED;
 const PASSABLE = MW.passableSet(WORLD);
@@ -335,8 +338,30 @@ async function loadSharedSessions(){
   }
 }
 
+// 学習時の世界設定 (meta) と、このサーバの WORLD が食い違っていないか。
+//   MOVE_MODE=policy のときだけ致命的。pursuit では方策を使わないので情報として出す。
+//   LEGACY で学習した方策を ALIGNED で走らせると「建物を通り抜けようとして壁に詰まる」。
+let _worldWarned=false;
+function checkMetaWorld(m, tag){
+  if(_worldWarned || !m) return;
+  const w=MW.worldFromMeta(m);
+  const same = w.solidBuildings===WORLD.solidBuildings
+            && w.walkableEmpty ===WORLD.walkableEmpty
+            && w.visibleTrees  ===WORLD.visibleTrees;
+  if(same) return;
+  _worldWarned=true;
+  const d=x=>`solid=${x.solidBuildings} empty可=${x.walkableEmpty} 木可視=${x.visibleTrees}`;
+  const msg=`[World] ${tag} の学習世界 (${d(w)}) がサーバ (${d(WORLD)}) と違う`;
+  if(MOVE_MODE==='policy')
+    console.warn(`${msg}\n         → MOVE_MODE=policy では建物の通行判定がズレて詰まりやすい。`
+      + ` Colab の WORLD_ALIGNED を合わせて学習し直すか、MOVE_MODE=pursuit で運用してください。`);
+  else
+    console.log(`${msg} (MOVE_MODE=pursuit なので方策は使われない。policy で使う前に学習し直すこと)`);
+}
+
 // meta(JSON) → personaMeta エントリ。個別モデル / 1モデル化 で共通に使う。
 function buildPersonaMeta(m){
+  checkMetaWorld(m, 'persona_multi.onnx');
   const iw=m.img_w||IMG_W, ih=m.img_h||IMG_H, ic=m.img_ch||IMG_CH;
   const isize=m.input_size||(iw*ih*ic);
   const div=v=>v/255;
@@ -1342,6 +1367,7 @@ async function initHud(){
   await refreshHudDay();
   await refreshHudCam();
   await refreshHudEra();
+  await refreshHudBoard();
   await refreshHudTicker();
   console.log('[HUD] Day カウンタ / ニュースティッカーを配信画面に描画');
 }
@@ -1423,8 +1449,11 @@ function camStateShort(a){
   }
   const dest=a.goalType!=null ? enOf(a.goalType) : null;
   const n=needOf(a);
+  if(a.quest) return questReporting(a)
+    ? `reporting ${comboShort(a.quest.combo)}`
+    : `testing ${comboLabel(a.quest.combo)} (${a.quest.leg}/${a.quest.combo.length})`;
   const NEED_EN={eat:'hungry', sleep:'sleepy', work:'commuting', shop:'shopping',
-                 bored:'bored', sick:'unwell', learn:'studying'};
+                 bored:'bored', sick:'unwell', learn:'studying', quest:'experimenting'};
   const st=NEED_EN[n]||'walking';
   return dest ? `${st} - ${dest}` : st;
 }
@@ -1473,12 +1502,15 @@ function hudEraLines(){
   if(!CITY || !ERA_ON) return null;
   const E=eraSpec(), n=eraNext();
   if(!n) return {head:`${E.en} - the last era`, rows:[], pct:1, ready:false};
-  const pct=eraProgress(), gaps=eraGaps();
-  const ready = pct>=1 && !gaps.length;
-  const rows=[['RESEARCH', `${Math.floor(pct*100)}%`]];
-  for(const g of gaps.slice(0,2)) rows.push([g.key.slice(0,10), `${g.have}/${g.need}`]);
+  const pct=eraProgress(), gaps=eraGaps(), q=questOf();
+  const solved = !q || q.solved;
+  const ready = pct>=1 && !gaps.length && solved;
+  const rows=[];
+  if(q) rows.push(['RECIPE', q.solved ? 'SOLVED' : `${Object.keys(q.tried).length} tried`]);
+  rows.push(['RESEARCH', `${Math.floor(pct*100)}%`]);
+  for(const g of gaps.slice(0, 3-rows.length)) rows.push([g.key.slice(0,10), `${g.have}/${g.need}`]);
   return {head: ready ? `READY - ${n.invention}` : `NEXT: ${ERA_DEFS[eraIndex()+1].en}`,
-          rows, pct, ready};
+          rows, pct, ready, barRow: q?1:0};
 }
 
 async function refreshHudEra(){
@@ -1494,7 +1526,7 @@ async function refreshHudEra(){
   L.rows.forEach(([k,v],i)=>{
     const y=42+i*18;
     body+=`<text x="14" y="${y}" font-size="12" fill="#9fd8c8" font-family="${HUD_MONO}">${_esc(_ascii(k))}</text>`;
-    if(i===0){
+    if(i===L.barRow){
       body+=`<rect x="${barX}" y="${y-9}" width="${barW}" height="9" rx="2" fill="#123" fill-opacity="0.9"/>`
           + `<rect x="${barX}" y="${y-9}" width="${Math.max(2,Math.round(barW*L.pct))}" height="9" rx="2" fill="${accent}"/>`;
     }
@@ -1520,10 +1552,70 @@ function eraTickerLine(){
   if(!CITY || !ERA_ON) return null;
   const E=eraSpec(), n=eraNext();
   if(!n) return _ascii(`${E.en} - ${E.tag}`);
-  const gaps=eraGaps();
+  const gaps=eraGaps(), q=questOf();
   const need = gaps.length ? gaps.map(g=>`${g.key} ${g.have}/${g.need}`).join(', ')
                            : `research ${Math.floor(eraProgress()*100)}%`;
-  return _ascii(`${E.en}: ${E.tag}. NEXT ${ERA_DEFS[eraIndex()+1].en} needs ${need}`);
+  // 探索中は「何通り試したか / 最良の手応え」を添える。視聴者が進み具合を掴めるように。
+  const quest = (q && !q.solved)
+    ? `  *  residents are testing pairs of buildings to find ${ERA_DEFS[eraIndex()+1].en}'s`
+      + ` invention: ${Object.keys(q.tried).length} tried, best ${q.best}/${q.recipe.length}`
+    : (q && q.solved ? `  *  the recipe is solved${q.solvedBy?` by ${_ascii(q.solvedBy)}`:''}` : '');
+  return _ascii(`${E.en}: ${E.tag}. NEXT ${ERA_DEFS[eraIndex()+1].en} needs ${need}${quest}`);
+}
+
+// ── 研究の掲示板 (右下に常時表示) ──────────────────────────────────────────
+//   誰が何を試して、どれだけ手応えがあったか。街の集合知がここに見える。
+//   ** = 正解 / *. = 片方当たり / .. = はずれ。記号だけで伝わるようにしてある。
+const HUD_BOARD_W = 306, HUD_BOARD_H = 92;
+let hudBoard=null, hudBoardText='', hudBoardBusy=false, hudBoardAt=0;
+
+const _shortName = t => _ascii(BLDG_EN[BLDG_TYPES[t].name]||BLDG_TYPES[t].name)
+                        .replace(/[^A-Za-z]/g,'').slice(0,7);
+const comboShort = c => c.map(_shortName).join('+');
+const scoreMark  = (sc,n) => '*'.repeat(sc) + '.'.repeat(Math.max(0,n-sc));
+
+function hudBoardLines(){
+  const q=questOf();
+  if(!q) return null;
+  const rows=q.board.slice(-3).reverse().map(p=>[
+    _ascii(p.by).slice(0,8), comboShort(p.combo), scoreMark(p.score, p.combo.length)]);
+  const tries=Object.keys(q.tried).length;
+  return {head:`RESEARCH BOARD  ${tries} tried`, rows, solved:q.solved};
+}
+
+async function refreshHudBoard(){
+  if(!hudScene) return;
+  const L=hudBoardLines();
+  if(!L){
+    if(hudBoard){ hudScene.remove(hudBoard); hudBoard.material.map.dispose();
+                  hudBoard.material.dispose(); hudBoard.geometry.dispose(); hudBoard=null; }
+    hudBoardText=''; return;
+  }
+  const key=L.head+'|'+L.rows.map(r=>r.join(' ')).join('|')+(L.solved?'|S':'');
+  if(key===hudBoardText) return;
+  hudBoardText=key;
+  const accent=L.solved?'#ffd36b':'#7fb6ff';
+  let body='';
+  L.rows.forEach(([who,combo,mark],i)=>{
+    const y=40+i*17;
+    body+=`<text x="14" y="${y}" font-size="11" fill="#9fd8c8" font-family="${HUD_MONO}">${_esc(who)}</text>`
+        + `<text x="82" y="${y}" font-size="11" fill="#dfeee9" font-family="${HUD_MONO}">${_esc(combo)}</text>`
+        + `<text x="${HUD_BOARD_W-14}" y="${y}" font-size="12" font-weight="bold" text-anchor="end"`
+        + ` fill="${mark.startsWith('**')?'#ffd36b':'#7fb6ff'}" font-family="${HUD_MONO}">${_esc(mark)}</text>`;
+  });
+  if(!L.rows.length)
+    body+=`<text x="14" y="40" font-size="11" fill="#6d8a86" font-family="${HUD_MONO}">nobody has tried anything yet</text>`;
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_BOARD_W}" height="${HUD_BOARD_H}">`
+    +`<rect width="${HUD_BOARD_W}" height="${HUD_BOARD_H}" rx="6" fill="#050b10" fill-opacity="0.58"/>`
+    +`<rect x="${HUD_BOARD_W-3}" y="0" width="3" height="${HUD_BOARD_H}" fill="${accent}"/>`
+    +`<text x="14" y="21" font-size="12" font-weight="bold" fill="${accent}"`
+    +` font-family="${HUD_MONO}">${_esc(_ascii(L.head))}</text>`
+    + body + `</svg>`);
+  if(hudBoard){ hudScene.remove(hudBoard); hudBoard.material.map.dispose(); hudBoard.material.dispose(); hudBoard.geometry.dispose(); }
+  hudBoard=hudPlane(HUD_BOARD_W, HUD_BOARD_H, tex);
+  hudBoard.position.set(WIDTH/2-HUD_BOARD_W/2-12, -HEIGHT/2+HUD_TICKER_H+16+HUD_BOARD_H/2, 1);
+  hudScene.add(hudBoard);
 }
 
 // ── イベントの一言バナー ────────────────────────────────────────────────────
@@ -1584,6 +1676,11 @@ function updateHud(dt){
   if(!hudEraBusy && now-hudEraAt>2000){
     hudEraBusy=true; hudEraAt=now;
     refreshHudEra().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudEraBusy=false;});
+  }
+  // 研究の掲示板 (最短2秒に1回)
+  if(!hudBoardBusy && now-hudBoardAt>2000){
+    hudBoardBusy=true; hudBoardAt=now;
+    refreshHudBoard().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudBoardBusy=false;});
   }
   // いま何を映しているか (最短1秒に1回だけ作り直す)
   if(!hudCamBusy && now-hudCamAt>1000){
@@ -1929,8 +2026,11 @@ const CURIOUS_RATE    = envNum('CURIOUS_RATE_INV', 45) > 0 ? 1/(envNum('CURIOUS_
 // 研究がほとんど溜まらない。**時代の進む速さはほぼこの値で決まる**。
 const LEARN_RECOVER   = envNum('LEARN_RECOVER', 0.012);
 const RESEARCH_BASE   = envNum('RESEARCH_BASE', 0.012);  // 学び舎が無くても進む最低分 (人・ゲーム日/人/日)
+// board = 実験結果の届き方。gossip(すれ違いだけ) / place(学び舎で読める) /
+//         anywhere(いつでも読める) / ai(いつでも+矛盾しない候補に絞れる)
 const ERA_FLOW_DEF = { nightStart:22, nightEnd:6, workFrom:9, workTo:17,
-                       homeShop:0, remoteWork:0, funBias:1, learnRate:1, speed:1, persona:null };
+                       homeShop:0, remoteWork:0, funBias:1, learnRate:1, speed:1,
+                       board:'anywhere', persona:null };
 
 // eras.json が無い / 壊れているときに使う既定。ファイル側と同じ内容を持つ。
 const ERA_FALLBACK = [
@@ -1939,25 +2039,25 @@ const ERA_FALLBACK = [
                'shop','pharmacy','temple','office','hospital','school','library'],
     retire:[],
     flow:{ nightStart:21, nightEnd:6, workFrom:9, workTo:17, homeShop:0, remoteWork:0,
-           funBias:0.7, learnRate:0.7, speed:0.95, persona:{as:'E', mix:0.25} },
+           funBias:0.7, learnRate:0.7, speed:0.95, board:'gossip', persona:{as:'E', mix:0.25} },
     next:{ invention:'THE COMPUTER', inventionJa:'計算機', research:30, minDays:3,
            requires:{ pop:10 } } },
   { id:'pc', en:'PC ERA', ja:'パソコンの時代', tag:'everyone commutes to an office',
     buildings:['apartment','supermarket','station','stadium','museum'], retire:[],
     flow:{ nightStart:22, nightEnd:6, workFrom:9, workTo:18, homeShop:0.05, remoteWork:0,
-           funBias:1.0, learnRate:1.0, speed:1.05, persona:{as:'D', mix:0.35} },
+           funBias:1.0, learnRate:1.0, speed:1.05, board:'place', persona:{as:'D', mix:0.35} },
     next:{ invention:'THE WIRELESS NETWORK', inventionJa:'無線ネットワーク', research:115, minDays:4,
            requires:{ pop:18, buildings:{ school:1 } } } },
   { id:'smartphone', en:'SMARTPHONE', ja:'スマホの時代', tag:'people go out less, and stay up late',
     buildings:['mall','hotel','tower'], retire:['post','bank'],
     flow:{ nightStart:23, nightEnd:7, workFrom:9, workTo:18, homeShop:0.45, remoteWork:0.15,
-           funBias:1.3, learnRate:1.2, speed:1.1, persona:{as:'D', mix:0.5} },
+           funBias:1.3, learnRate:1.2, speed:1.1, board:'anywhere', persona:{as:'D', mix:0.5} },
     next:{ invention:'THE MODEL', inventionJa:'モデル', research:160, minDays:5,
            requires:{ pop:28, buildings:{ library:1, office:2 } } } },
   { id:'ai', en:'AI ERA', ja:'AIの時代', tag:'nobody commutes; the town is a place to be',
     buildings:[], retire:['office'],
     flow:{ nightStart:23, nightEnd:8, workFrom:10, workTo:17, homeShop:0.7, remoteWork:0.65,
-           funBias:1.6, learnRate:1.4, speed:1.0, persona:{as:'B', mix:0.45} },
+           funBias:1.6, learnRate:1.4, speed:1.0, board:'ai', persona:{as:'B', mix:0.45} },
     next:null },
 ];
 
@@ -2038,6 +2138,376 @@ function eraGaps(){
   if(req.pop && agents.length<req.pop) gaps.push({key:'POP', have:agents.length, need:req.pop});
   return gaps;
 }
+// ═══ 発明の探索 (QUEST) ══════════════════════════════════════════════════════
+// 次の時代の発明には**隠されたレシピ**(建物タイプ2つの組み合わせ)がある。
+// 住民はそれを知らない。候補を選んで2軒を巡り、結果として「部分一致スコア」を得て、
+// 掲示板に投稿する。他の住民はその投稿を読んで次の候補を絞る。
+//   0/2 … はずれ  1/2 … 片方は当たり  2/2 … 発明
+// 部分一致が返るのが肝で、これが勾配になる。これが無いと総当たり (C(n,2)) になり
+// 数十ゲーム日では収束しない。逆にこれがあると「片方ずつ当てて交差させる」ことができ、
+// **掲示板が無いと解けず、あると解ける**という状態を作れる。
+//
+// ペルソナごとに候補の選び方 (探索戦略) が違う。探索は多様性が無いと局所解で止まるので、
+// 「探索専門」と「活用専門」と「乱数」が混ざっている必要がある。
+const QUEST_ON      = process.env.QUEST !== '0';
+const QUEST_DAYS    = envNum('QUEST_DAYS', 3);      // 1回の実験の期限 (ゲーム日)。過ぎたら諦めて選び直す
+const QUEST_BOARD_MAX = 60;                          // 掲示板に残す投稿数
+const QUEST_RESEARCH  = envNum('QUEST_RESEARCH', 0.6); // 実験1回で入る研究点 (人・ゲーム日)
+// 探索が停滞したときのヒント。**詰み回避の中心**なので既定で有効。
+// 実験に出るのは「研究者気質」の住民だけ。全員が実験すると数ゲーム日で総当たりが
+// 終わってしまい、探索が見どころにならない。誰が研究者かは aid から決まるので、
+// 再起動しても同じ顔ぶれになる (視聴者が特定の住民を追える)。
+const QUEST_SHARE = envNum('QUEST_SHARE', 0.4);
+const QUEST_HINT_DAYS = envNum('QUEST_HINT_DAYS', 6);  // 最高スコアが何ゲーム日更新されなければヒントを出すか
+const QUEST_MAX_DAYS  = envNum('QUEST_MAX_DAYS', 40);  // これを超えたら探索を待たずに時代を進める (最後の保険)
+
+// ペルソナ → 探索戦略。personas.json が別の id でも、並び順で5戦略に割り振る。
+const QUEST_STRATS = ['explore','near','social','ucb','random'];
+const QUEST_STRAT_BY_ID = { A:'explore', B:'near', C:'social', D:'ucb', E:'random' };
+const QUEST_STRAT_JA = { explore:'未知を試す', near:'近場で試す', social:'掲示板に従う',
+                         ucb:'期待値が高い順', random:'でたらめに試す' };
+function questStrategy(a){
+  const id=(a.def&&a.def.id)||'';
+  if(QUEST_STRAT_BY_ID[id]) return QUEST_STRAT_BY_ID[id];
+  const i=Math.max(0, PERSONA_DEFS.findIndex(p=>p.id===id));
+  return QUEST_STRATS[i % QUEST_STRATS.length];
+}
+
+const comboKey = c => c.slice().sort((x,y)=>x-y).join(',');
+const comboLabel = c => c.map(t=>_ascii(BLDG_EN[BLDG_TYPES[t].name]||BLDG_TYPES[t].name)).join(' + ');
+const comboLabelJa = c => c.map(t=>BLDG_TYPES[t].label).join(' + ');
+
+// レシピの候補になる建物タイプ = いまこの街に営業中で1軒以上あるもの。
+// 街に無いタイプを答えにすると誰も試せない (= 詰み) ので、必ずここから選ぶ。
+function questTypes(){
+  if(!CITY) return [];
+  const seen=new Set();
+  for(const st of CITY.structs) if(st.state==='open') seen.add(st.typeIdx);
+  // 自宅と職場は「割り当てられた場所」で毎日行くので、実験の対象から外す (当たり判定が濁る)
+  return [...seen].filter(t=>!HOME_IDX.includes(t));
+}
+
+// 街と時代から決まる乱数 (同じ街・同じ時代なら同じレシピ = 実験の再現性のため)
+function questRng(salt){
+  let x=((CITY?CITY.seed:1)|0) * 2654435761 + (eraIndex()+1)*97 + (salt|0)*31;
+  x=x>>>0;
+  return ()=>{ x=(x*1664525+1013904223)>>>0; return x/4294967296; };
+}
+
+// いまの時代の探索を作り直す。建物が消えてレシピが試せなくなったときにも呼ぶ。
+function newQuest(reason){
+  if(!CITY || !QUEST_ON) return null;
+  const types=questTypes();
+  if(types.length<2){ CITY.quest=null; return null; }
+  const rnd=questRng((CITY.quest&&CITY.quest.rerolls||0)+1);
+  const pick=()=>types[Math.floor(rnd()*types.length)];
+  let a=pick(), b=pick(), guard=0;
+  while(b===a && guard++<50) b=pick();
+  if(b===a) return null;
+  const prev=CITY.quest;
+  CITY.quest={
+    recipe:[a,b].sort((x,y)=>x-y),
+    tried:{},                 // key -> {score, n, by}
+    board:[],                 // 掲示板の投稿 (新しい順に表示)
+    best:0, bestAt:gameDay(), // 最高スコアと、それが出た日 (停滞の検出に使う)
+    hints:0, rerolls:(prev&&prev.rerolls||0)+(reason==='reroll'?1:0),
+    solved:false, solvedBy:null, startDay:gameDay(), experiments:0,
+  };
+  console.log(`[Quest] ${eraSpec().ja} の発明を探索開始`
+    + ` (候補${types.length}種 = ${types.length*(types.length-1)/2}通り`
+    + ` / 答え: ${comboLabelJa(CITY.quest.recipe)})`
+    + (reason?` [${reason}]`:''));
+  return CITY.quest;
+}
+const questOf = () => (QUEST_ON && CITY) ? CITY.quest : null;
+
+// 組み合わせの採点。レシピと何個一致しているか (0..2)。
+function scoreCombo(combo){
+  const q=questOf(); if(!q) return 0;
+  return combo.filter(t=>q.recipe.includes(t)).length;
+}
+
+// 学び舎の掲示板を読んで覚える。place モードではこれが唯一の情報源になるので、
+// 「学校へ行った人だけが街の知識を持ち帰る」という形になる。
+function absorbBoard(a){
+  const q=questOf(); if(!q) return 0;
+  // アナログ時代 (gossip) には掲示板そのものが無い。学び舎へ行っても、
+  // そこに居合わせた人の話しか聞けない = questGossip だけが情報源。
+  if((eraFlow().board||'gossip')==='gossip') return 0;
+  const set=(a.qKnown=a.qKnown||new Set());
+  let n=0;
+  for(const p of q.board) if(!set.has(p.key)){ set.add(p.key); n++; }
+  return n;
+}
+
+// その住民が「読める」投稿。時代によって情報の届き方が変わる。
+//   gossip   … 自分の実験と、すれ違って聞いた話だけ (アナログ)
+//   place    … 学び舎に居るときだけ街じゅうの投稿が読める (PC)
+//   anywhere … いつでも読める (スマホ)
+//   ai       … いつでも読める + 矛盾しない候補に絞れる (AI)
+function boardFor(a){
+  const q=questOf(); if(!q) return [];
+  const mode=eraFlow().board||'gossip';
+  if(mode==='gossip'){
+    if(!a.qKnown) return [];
+    return q.board.filter(p=>a.qKnown.has(p.key));
+  }
+  if(mode==='place'){
+    // 学び舎で読んで**持ち帰った**ぶんだけ使える (absorbBoard が写し取る)。
+    // 「その場に居る間だけ読める」にすると、候補を選ぶ瞬間 (外を歩いている) には
+    // 何も読めておらず、掲示板が一切効かなくなる。
+    return a.qKnown ? q.board.filter(p=>a.qKnown.has(p.key)) : [];
+  }
+  return q.board;                                               // anywhere / ai
+}
+
+// 読めた投稿から「建物タイプごとの当たりらしさ」を作る。これが探索の勾配。
+//   ある組み合わせが 1/2 だったなら、その2つのどちらかが当たり。
+//   多くの投稿を重ねるほど、当たりのタイプのスコアだけが上がっていく。
+function typeScores(posts){
+  const sum={}, n={};
+  for(const p of posts) for(const t of p.combo){
+    sum[t]=(sum[t]||0)+p.score; n[t]=(n[t]||0)+1;
+  }
+  const out={};
+  for(const t in sum) out[t]={avg:sum[t]/n[t], n:n[t]};
+  return out;
+}
+
+// 次に試す組み合わせを選ぶ。ここがペルソナごとの探索戦略。
+function pickCombo(a){
+  const q=questOf(); if(!q) return null;
+  let types=questTypes();
+  if(types.length<2) return null;
+  const posts=boardFor(a), ts=typeScores(posts);
+  const strat=questStrategy(a);
+  // AI時代の推論: 0/2 だった組み合わせは「両方とも不正解」と確定できる。
+  // 矛盾しない候補だけに絞れるので、探索が一気に二分探索的になる。
+  // (これが「発明が次の発明を速くする」= 街に複利が生まれるところ)
+  if((eraFlow().board||'gossip')==='ai'){
+    const dead=new Set();
+    for(const p of posts) if(p.score===0) p.combo.forEach(t=>dead.add(t));
+    const narrowed=types.filter(t=>!dead.has(t));
+    if(narrowed.length>=2) types=narrowed;
+  }
+  const seen=new Set(posts.map(p=>p.key));
+  const untried=[];
+  for(let i=0;i<types.length;i++) for(let j=i+1;j<types.length;j++){
+    const k=comboKey([types[i],types[j]]);
+    if(!seen.has(k) && !(a.qTried&&a.qTried.has(k))) untried.push([types[i],types[j]]);
+  }
+  const rnd=()=>Math.random();
+  const rank=()=>types.slice().sort((x,y)=>
+    ((ts[y]?ts[y].avg:0)+(ts[y]?0:0.3)) - ((ts[x]?ts[x].avg:0)+(ts[x]?0:0.3)));
+  switch(strat){
+    case 'explore':   // A: 誰も試していない組み合わせを優先する (純粋探索)
+      if(untried.length) return untried[Math.floor(rnd()*untried.length)];
+      break;
+    case 'near': {    // B: 自分の行動圏にあるタイプだけで組む (近場で確かめる)
+      const near=types.filter(t=>buildingsOfTypes([t])
+        .some(b=>Math.hypot(b[0]-a.x, b[1]-a.y) < 8));
+      if(near.length>=2){
+        const i=Math.floor(rnd()*near.length); let j=Math.floor(rnd()*near.length);
+        if(j===i) j=(j+1)%near.length;
+        return [near[i], near[j]];
+      }
+      break;
+    }
+    case 'social': {  // C: 掲示板で評判の良い2つを掛け合わせる (集合知に乗る)
+      const top=rank().filter(t=>ts[t] && ts[t].avg>0).slice(0,4);
+      if(top.length>=2){
+        const i=Math.floor(rnd()*top.length); let j=Math.floor(rnd()*top.length);
+        if(j===i) j=(j+1)%top.length;
+        return [top[i], top[j]];
+      }
+      break;
+    }
+    case 'ucb': {     // D: 期待値 + 試行回数の少なさ (UCB1 風) で上位2つ
+      const N=Math.max(1, posts.length);
+      const sc=t=>{ const e=ts[t]; return (e?e.avg:0) + Math.sqrt(2*Math.log(N+1)/((e?e.n:0)+1)); };
+      const ord=types.slice().sort((x,y)=>sc(y)-sc(x));
+      if(ord.length>=2) return [ord[0], ord[1]];
+      break;
+    }
+  }
+  // random(E) と、上の戦略が候補を作れなかったときの共通の逃げ道
+  if(untried.length) return untried[Math.floor(rnd()*untried.length)];
+  const i=Math.floor(rnd()*types.length); let j=Math.floor(rnd()*types.length);
+  if(j===i) j=(j+1)%types.length;
+  return i===j ? null : [types[i], types[j]];
+}
+
+// ── 実験の実行 ──────────────────────────────────────────────────────────────
+// 住民は「候補の2軒を順に巡る」ことで実験する。移動は既存のナビ (pickLifeGoal →
+// enterWander → A*/方策) をそのまま使うので、ロジックモードでもポリシーモードでも動く。
+// その住民が実験に出る性質か (aid から決まる固定の性質)
+function isResearcher(a){
+  if(a._res==null){
+    const k=String(a.aid||a.name||'');
+    let h=2166136261>>>0;
+    for(let i=0;i<k.length;i++){ h^=k.charCodeAt(i); h=Math.imul(h,16777619)>>>0; }
+    a._res = (h%1000)/1000 < QUEST_SHARE;
+  }
+  return a._res;
+}
+function startExperiment(a){
+  const q=questOf(); if(!q || q.solved || a.quest) return false;
+  if(!isResearcher(a)) return false;      // 研究者でない住民は学び舎で勉強する (研究点になる)
+  const combo=pickCombo(a);
+  if(!combo) return false;
+  a.quest={combo, leg:0, until:gameDay()+QUEST_DAYS};
+  return true;
+}
+function abandonExperiment(a, why){
+  if(!a.quest) return;
+  a.quest=null;
+  a.curious=Math.min(1, (a.curious||0)*0.6);   // すぐには再挑戦しない
+}
+// いま向かうべき建物 (実験の現在の脚)。無ければ null。
+function questLegType(a){
+  return (a.quest && a.quest.combo[a.quest.leg]!=null) ? a.quest.combo[a.quest.leg] : null;
+}
+// 2軒を巡り終えたら「学び舎へ報告に行く」。結果が掲示板に載るのはそのとき。
+//   これで学校が探索の輪の中に入る (学び舎が無い街では結果が共有されない)。
+//   実験1回が3脚になるので、街じゅうの総当たりが一瞬で終わることも防げる。
+const questReporting = a => !!(a.quest && a.quest.leg >= a.quest.combo.length);
+// 到着したとき (onArrive から)。目的の種類なら次の脚へ。
+function questArrive(a, st){
+  const q=questOf(); if(!q || !a.quest || !st) return;
+  if(questReporting(a)){                                 // 報告の脚
+    if(LEARN_IDX.includes(st.typeIdx)){
+      absorbBoard(a);                                    // ついでに他の人の結果も読む
+      finishExperiment(a);
+    }
+    return;
+  }
+  if(st.typeIdx !== a.quest.combo[a.quest.leg]) return;   // 別の用事で寄っただけ
+  a.quest.leg++;
+  // 学び舎が街に無いなら報告に行けないので、その場で結果を共有する (詰み回避)
+  if(questReporting(a) && !catCount('learn')) finishExperiment(a);
+}
+// 掲示板への投稿。街の集合知はここに溜まる。
+function postBoard(a, combo, score, key){
+  const q=questOf(); if(!q) return;
+  key=key||comboKey(combo);
+  const prev=q.tried[key];
+  q.tried[key]={score, n:(prev?prev.n:0)+1, by:(prev?prev.by:a.name)};
+  q.board=q.board.filter(p=>p.key!==key);
+  q.board.push({key, by:a.name, combo:combo.slice(), score, day:gameDay(),
+                strat:questStrategy(a)});
+  while(q.board.length>QUEST_BOARD_MAX) q.board.shift();
+  (a.qKnown=a.qKnown||new Set()).add(key);
+  if(score>q.best){ q.best=score; q.bestAt=gameDay(); }
+  hudNewsDirty=true;
+}
+function finishExperiment(a){
+  const q=questOf(); if(!q || !a.quest) return;
+  const combo=a.quest.combo, key=comboKey(combo), sc=scoreCombo(combo);
+  a.quest=null;
+  a.curious=0;                                   // 一仕事終えた
+  (a.qTried=a.qTried||new Set()).add(key);
+  q.experiments++;
+  if(CITY && ERA_ON) CITY.research += QUEST_RESEARCH;   // 実験そのものが研究を進める
+  const known=!!(q.tried[key] && q.tried[key].n>1);
+  postBoard(a, combo, sc, key);
+  if(sc>=combo.length && !q.solved){ solveQuest(a, combo); return; }
+  // 配信のティッカーに流す。全部流すと埋まるので「新しい発見」だけ。
+  if(!known){
+    const mark=sc===0?'no luck':(sc===1?'one of them looks right':'');
+    lifeNews.push({day:gameDay(), shape:'quest',
+      en:`${_ascii(a.name)} tested ${comboLabel(combo)} - ${mark} (${sc}/${combo.length})`,
+      ja:`${a.name} が ${comboLabelJa(combo)} を試した — ${sc===0?'はずれ':'片方は当たりらしい'}`});
+    while(lifeNews.length>12) lifeNews.shift();
+    hudNewsDirty=true;
+  }
+}
+// 正解にたどり着いた。時代が進む条件のひとつが埋まる (研究点と必要な建物は別に要る)。
+function solveQuest(a, combo){
+  const q=questOf(); if(!q || q.solved) return;
+  q.solved=true; q.solvedBy=a?a.name:null; q.solvedDay=gameDay();
+  const n=eraNext();
+  const inv=n?n.inventionJa:'新しい発明';
+  news('quest', `🔬 ${a?a.name:'誰か'} が ${comboLabelJa(combo)} の組み合わせを突き止めた — ${inv}の目処が立った`,
+       `${a?_ascii(a.name):'Someone'} cracked it: ${comboLabel(combo)} - ${n?n.invention.toLowerCase():'the next step'} is within reach`);
+  showBanner(`SOLVED: ${comboLabel(combo)} by ${a?_ascii(a.name):'the town'}`, 9);
+  const st=CITY && CITY.structs.find(x=>x.state==='open' && x.typeIdx===combo[0]);
+  if(st) showCityEvent(st.r, st.c, `${comboLabel(combo)} - the missing link`, 10, null);
+  console.log(`[Quest] 正解 ${comboLabelJa(combo)} / 発見者 ${a?a.name:'-'}`
+    + ` / 実験${q.experiments}回 / ${gameDay()-q.startDay}日`);
+}
+// すれ違ったときに投稿をひとつ教える (アナログ時代の唯一の共有手段)。
+function questGossip(a, o){
+  const q=questOf(); if(!q || !q.board.length) return;
+  const src=boardFor(o);
+  if(!src.length) return;
+  const p=src[Math.floor(Math.random()*src.length)];
+  const set=(a.qKnown=a.qKnown||new Set());
+  if(set.has(p.key)) return;
+  set.add(p.key);
+}
+
+// ── 詰み回避 ────────────────────────────────────────────────────────────────
+// 探索は「絶対に止まらない」ことが最優先。止まると街の時間が止まって配信が死ぬ。
+// 4段構えで、どこかで必ず前に進む。
+function stepQuest(){
+  if(!CITY || !QUEST_ON || !ERA_ON) return;
+  if(!eraNext()){ CITY.quest=null; return; }            // 最後の時代は探索しない
+  const q=CITY.quest;
+  if(!q){ newQuest('start'); return; }
+  if(q.solved) return;
+  const day=gameDay(), types=questTypes();
+  // ⓪ 最後の保険を最初に見る。時代が長引きすぎたら探索を待たずに進ませる。
+  //    ここが他の分岐の return に邪魔されると「保険が効かない」ことがある。
+  if(day-(CITY.eraDay||0) > QUEST_MAX_DAYS){
+    news('quest', '🍀 長い試行錯誤のすえ、偶然その組み合わせにたどり着いた',
+         'After a long search, the town stumbled onto it by accident');
+    solveQuest(agents.reduce((b,x)=>((x.curious||0)>((b&&b.curious)||0)?x:b), null), q.recipe);
+    return;
+  }
+  // ① レシピの建物が街から消えた → 誰も試せない。答えを作り直す。
+  if(!q.recipe.every(t=>types.includes(t))){
+    news('quest', '🔁 手がかりの建物が街から消えた — 研究の方向が変わった',
+         'A building behind the current lead is gone - the research changed direction');
+    newQuest('reroll');
+    return;
+  }
+  // ② 停滞 → 街の長老がヒントを出す。QUEST_HINT_DAYS ごとに1つずつ正解を明かす。
+  const stale=day-(q.bestAt||q.startDay);
+  const want=Math.min(q.recipe.length-1, Math.floor(stale/QUEST_HINT_DAYS));
+  if(want>q.hints){
+    q.hints=want; q.bestAt=day;
+    const hintType=q.recipe[q.hints-1];
+    const others=types.filter(t=>!q.recipe.includes(t));
+    for(let i=0;i<2 && others.length;i++){
+      const o=others[Math.floor(Math.random()*others.length)];
+      const combo=[hintType,o], key=comboKey(combo);
+      if(q.tried[key]) continue;
+      q.tried[key]={score:scoreCombo(combo), n:1, by:'town elder'};
+      q.board=q.board.filter(p=>p.key!==key);
+      q.board.push({key, by:'town elder', combo, score:scoreCombo(combo), day, strat:'hint'});
+    }
+    hudNewsDirty=true;
+    const lbl=BLDG_TYPES[hintType].label, en=_ascii(BLDG_EN[BLDG_TYPES[hintType].name]||'');
+    news('quest', `💬 街の長老が「${lbl} が関係あるらしい」と言い出した (手がかり${q.hints})`,
+         `An old resident recalls that the ${en.toLowerCase()} has something to do with it`);
+    showBanner(`HINT: the ${en.toLowerCase()} is involved`, 8);
+    console.log(`[Quest] 停滞${stale}日 → ヒント${q.hints}: ${lbl}`);
+    return;
+  }
+  // ③ 組み合わせを試し尽くした → いちばん手応えのあったものを答えにする。
+  const total=types.length*(types.length-1)/2;
+  if(total>0 && Object.keys(q.tried).length>=total){
+    let best=null;
+    for(const p of q.board) if(!best || p.score>best.score) best=p;
+    const who=best ? agents.find(x=>x.name===best.by) : null;
+    news('quest', '🧩 街じゅうの組み合わせを試し尽くした — 最も手応えのあった線に賭ける',
+         'The town has tried every combination - betting on the strongest lead');
+    if(best) q.recipe=best.combo.slice();
+    solveQuest(who||agents[0]||null, best?best.combo:q.recipe);
+    return;
+  }
+}
+
 const eraProgress = () => {
   const need=eraNeedResearch();
   return need ? Math.max(0, Math.min(1, ((CITY&&CITY.research)||0)/need)) : 1;
@@ -2381,6 +2851,7 @@ function cityToJSON(){
     day:gameDay(), bornAt:CITY.bornAt,
     econ:CITY.econ, level:CITY.level, pop:agents.length, size:CITY.size, weather:CITY.weather,
     era:CITY.era|0, research:+(CITY.research||0).toFixed(3), eraDay:CITY.eraDay|0, eraLog:CITY.eraLog||[],
+    quest:CITY.quest||null,
     map:MAP.map(row=>row.join('')),
     structs:CITY.structs.map(st=>({...st})),
     foot:Array.from(CITY.foot),
@@ -2478,6 +2949,7 @@ function freshCity(){
     econ:0, level:0, pop:0, size,    // 経済活動の累計 / 発展段階 / 人口 / フィールドの一辺
     // 時代 (ERA)。research は「人・ゲーム日」= 住民が学び舎に居た時間の累計。
     era:0, research:0, eraDay:0, eraAt:Date.now(), eraLog:[],
+    quest:null,                     // 発明のレシピ探索 (stepQuest が作る)
     weather:'sunny', weatherUntil:0,
     structs,
     foot:new Int32Array(GRID*GRID),
@@ -2512,6 +2984,7 @@ function initCity(){
       // 時代。古い保存ファイル (era を持たない) はアナログ時代から始まる。
       era:Math.max(0, Math.min(ERA_DEFS.length-1, j.era|0)), research:+j.research||0,
       eraDay:+j.eraDay||0, eraAt:j.eraAt||Date.now(), eraLog:j.eraLog||[],
+      quest:j.quest||null,          // 探索の途中経過 (掲示板ごと引き継ぐ)
       weather:j.weather||'sunny', weatherUntil:0,
       structs:j.structs.map(st=>({...newStruct(st.r,st.c,st.fp,st.typeIdx,st.born), ...st})),
       foot:Int32Array.from(j.foot||[]),
@@ -2645,12 +3118,21 @@ function stepNeeds(dtSec){
         alone=false;
         // すれ違いざまに「行きつけ」の話をする (低確率)
         if(CITY_EVOLVE && Math.random()<GOSSIP_P*dtSec) gossip(a, o);
+        // 実験の結果を教え合う。アナログ時代はこれが唯一の共有手段なので、
+        // 行きつけの口コミより起こりやすくしてある。
+        if(QUEST_ON && Math.random()<GOSSIP_P*3*dtSec) questGossip(a, o);
         break;
       } }
     // 退屈の溜まる速さは時代で変わる (娯楽が増えるほど「出かけたくなる」)
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?(F.funBias||1):-1.5)));
     // 学びたさ。学び舎で解消し、その時間が街の研究点になる。
     a.curious = Math.min(1, (a.curious||0) + CURIOUS_RATE*dtSec*(F.learnRate||1));
+    // 実験: 学びたさが溜まったら「確かめたい組み合わせ」を1つ決めて出かける。
+    // 期限を切ってあるので、行けない組み合わせを引いても必ず抜けられる (詰み回避)。
+    if(QUEST_ON){
+      if(a.quest && gameDay() > a.quest.until) abandonExperiment(a, 'timeout');
+      else if(!a.quest && (a.curious||0) > NEED_HI) startExperiment(a);
+    }
     // 病気: 低確率で発症。疲労が高いほどかかりやすい (内部状態同士の因果)
     if(!(a.sick>0) && Math.random() < SICK_PROB*dtSec*(1+(a.fatigue||0)))
       a.sick = 0.6 + Math.random()*0.4;
@@ -2667,6 +3149,7 @@ function stepNeeds(dtSec){
       if(MW.isIndoors(a) && LEARN_IDX.includes(t)){
         a.curious = Math.max(0, a.curious - LEARN_RECOVER*dtSec);
         if(CITY && ERA_ON) CITY.research += dtSec/daySec;
+        if(QUEST_ON) absorbBoard(a);       // 学び舎の掲示板を読んで持ち帰る
       }
     }
     // 病院/薬局は隣接でも受診とみなす (建物セル中心に完全に乗れず治らないのを防ぐ)
@@ -2728,6 +3211,7 @@ function shouldLeaveBuilding(a){
     return !(w && br===w[0] && bc===w[1]);
   }
   if(t==null) return true;
+  if(n==='quest') return true;                                 // 実験中は次の脚へすぐ出る
   if(n==='learn') return !LEARN_IDX.includes(t);               // 学び舎に居るなら留まる
   if(n==='eat')   return !FOOD_IDX.includes(t);               // 飲食店に居るなら留まる
   if(n==='shop')  return !BUY_IDX.includes(t);
@@ -2747,6 +3231,8 @@ function needOf(a){
   if((a.hunger ||0) > NEED_HI)                 return 'eat';
   if(h>=F.workFrom && h<F.workTo)              return 'work';
   if((a.supply ||0) > NEED_HI)                 return 'shop';
+  // 実験中 = 発明のレシピを確かめに行く途中。生きるための用事より下、暇つぶしより上。
+  if(a.quest && questOf())                     return 'quest';
   // 学び舎がある街でだけ立つ用事。無い街で立てると永久に叶わない用事になる。
   if((a.curious||0) > NEED_HI && catCount('learn')>0) return 'learn';
   if((a.bored  ||0) > NEED_HI)                 return 'bored';
@@ -2777,6 +3263,11 @@ function describeActivity(a){
   if(atWork && h>=9 && h<17)          return '💼 職場で働いている';
   if(atHome)                          return '🏠 自宅で休んでいる';
 
+  if(a.quest){
+    const t=questLegType(a);
+    return `🔬 ${comboLabelJa(a.quest.combo)} を確かめている`
+         + (t!=null ? ` (${BLDG_TYPES[t].label} へ)` : ' (結果を報告しに行く)');
+  }
   // 移動中: 目的地の建物と、その理由になっている欲求があれば添える
   const bldg = a.goalType!=null ? BLDG_TYPES[a.goalType] : null;
   const need = needOf(a);
@@ -2810,6 +3301,16 @@ function pickLifeGoal(a, ex){
   if(n==='work'){
     const w=(a.remote && a.home) ? a.home : a.work;
     if(w) return [...w];
+  }
+  // 実験中は「いま確かめたい種類の建物」へ。無ければ実験を諦める (詰み回避)。
+  if(n==='quest' && a.quest){
+    const t=questLegType(a);
+    const list=(t!=null) ? buildingsOfTypes([t]) : buildingsOfTypes(LEARN_IDX);  // null=報告の脚
+    if(list.length){
+      list.sort((p,q2)=>((p[0]-a.x)**2+(p[1]-a.y)**2)-((q2[0]-a.x)**2+(q2[1]-a.y)**2));
+      return [...list[Math.floor(Math.random()*Math.min(3,list.length))]];
+    }
+    abandonExperiment(a, 'no-building');
   }
   // 欲求 → 行き先カテゴリ。近い方から数軒のランダムで選ぶ (最寄り固定だと往復しやすい)
   const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX, learn:LEARN_IDX}[n];
@@ -3617,6 +4118,10 @@ function lifeLineEn(a){
     }
     case 'shop':  return _pick([`${N} ran out of supplies and is heading to ${to||'the shops'}`,
                                 `${N} needs to restock and is walking to ${to||'a shop'}`]);
+    case 'quest': return a.quest
+      ? _pick([`${N} is testing whether ${comboLabel(a.quest.combo)} is the answer`,
+               `${N} set out to check ${comboLabel(a.quest.combo)}`])
+      : `${N} is running an experiment`;
     case 'learn': return _pick([`${N} is heading to ${to||'the school'} to study`,
                                 `${N} wants to learn something and is walking to ${to||'the library'}`]);
     case 'bored': return _pick([`${N} is bored and heading to ${dest?`the ${dest}`:'find something to do'}`,
@@ -3748,6 +4253,8 @@ function gossip(a, other){
 // 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
 function onArrive(a, dest){
   a.trips++;
+  // 実験の脚の到着。CITY_EVOLVE に関係なく動かす (探索は街の進化とは独立の仕組み)。
+  if(dest && a.quest){ const qst=structAt(dest[0], dest[1]); if(qst) questArrive(a, qst); }
   if(!CITY_EVOLVE || !CITY || !dest) return;
   const st=structAt(dest[0], dest[1]);
   if(!st) return;
@@ -3850,6 +4357,8 @@ function stepEra(){
   const n=eraNext(); if(!n) return;                            // 最後の時代
   if((CITY.research||0) < eraNeedResearch()) return;
   if(eraGaps().length) return;
+  // 発明のレシピを誰かが突き止めていること。stepQuest が4段構えで必ず解けるようにしている。
+  { const q=questOf(); if(q && !q.solved) return; }
   if(n.minDays && gameDay()-(CITY.eraDay||0) < n.minDays) return;
   advanceEra(n);
 }
@@ -3881,6 +4390,9 @@ function advanceEra(n){
   CITY.eraLog.push({era:E.id, day:gameDay(), by:who?who.name:null, invention:n.invention});
   while(CITY.eraLog.length>32) CITY.eraLog.shift();
   applyEraPersona();          // 歩き方と在宅勤務を新しい時代のものに入れ替える
+  // 次の時代の発明は別のレシピ。住民の「試した/聞いた」もリセットする。
+  CITY.quest=null;
+  for(const x of agents){ x.quest=null; x.qTried=null; x.qKnown=null; }
   cityStamp++;                // 建てられる業種が変わったのでキャッシュを捨てる
 
   const byJa=who?`${who.name} が`:'街が';
@@ -3923,6 +4435,7 @@ function cityTick(){
   // 作られることがあり、そのときは性格ベクトルがまだ無い。
   if(!_eraApplied && agents.length){ _eraApplied=true; applyEraPersona(); }
   stepWeather();
+  stepQuest();
   stepEra();
   const d=gameDay();
   if(_lastDay===null) _lastDay=d;
@@ -3962,8 +4475,12 @@ const UNSTICK_MODE = (process.env.UNSTICK_MODE==='release') ? 'release' : 'steer
 // 移動の駆動方式: 既定は 'policy'。MOVE_MODE=pursuit で決定論の目的地追従へ戻せる。
 // persona_multi.onnx または必要なDINOv2が無いペルソナは、モデル未配備時にランダム化せず
 // stepAll() で pursuit へ安全フォールバックする。
-//const MOVE_MODE = (process.env.MOVE_MODE==='pursuit') ? 'pursuit' : 'pursuit';
-const MOVE_MODE = 'pursuit';
+// MOVE_MODE=policy で学習方策 (persona_multi.onnx) が操縦する。既定は pursuit (ロジック)。
+//   policy を指定してもモデル/DINOv2 が無いペルソナは hasUsablePolicy() が false になり、
+//   そのペルソナだけ pursuit にフォールバックする (街全体が止まらないように)。
+//   時代 (ERA) と発明の探索 (QUEST) は「どこへ行くか」を決める層なので、
+//   どちらのモードでも同じように動く。違うのは「そこへどう歩くか」だけ。
+const MOVE_MODE = (process.env.MOVE_MODE==='policy') ? 'policy' : 'pursuit';
 const PURSUIT_SUB = parseFloat(process.env.PURSUIT_SUB)||5;   // pursuit の per-tick 分割 (小=速い)。5→0.5セル/8°/tick
 console.log(`[Move] mode=${MOVE_MODE} (missing model → pursuit fallback)`);
 
@@ -4241,7 +4758,8 @@ function spawnAgent(S, i){
     indoors:null,
     hunger:Math.random()*0.4, fatigue:Math.random()*0.4,
     supply:Math.random()*0.4, bored:Math.random()*0.4, sick:0,
-    curious:Math.random()*0.4, remote:false};   // 学びたさ / 在宅勤務か (時代で決まる)
+    curious:Math.random()*0.4, remote:false,    // 学びたさ / 在宅勤務か (時代で決まる)
+    quest:null, qTried:null, qKnown:null};     // 実験中の組み合わせ / 試した / 聞いた
   agents.push(a);
   agentMeshes.push(createAgentMesh(S, def.color));
   applyEraPersonaTo(a);        // いまの時代の歩き方と働き方を与える (転入者にも効く)
@@ -5876,6 +6394,15 @@ tick(); setInterval(tick, ${ms});
         const n=eraNext();
         if(n){ advanceEra(n); done=`era -> ${eraSpec().en}`; }
         else done=null;
+      }else if(force==='quest'){
+        // 演出の確認用: 探索を即座に解く / やり直す (/city?force=quest&reroll=1)
+        const qq=questOf();
+        if(!qq) done=null;
+        else if(q.get('reroll')==='1'){ newQuest('force'); done='quest rerolled'; }
+        else {
+          solveQuest(agents[0]||null, qq.recipe);
+          done=`quest solved: ${qq.recipe.map(t=>BLDG_TYPES[t].name).join('+')}`;
+        }
       }else if(force==='research'){
         // 研究点だけ足す (/city?force=research&n=10)
         const add=Math.max(0, parseFloat(q.get('n'))||eraNeedResearch());
@@ -5934,6 +6461,20 @@ tick(); setInterval(tick, ${ms});
           next: n ? {era:ERA_DEFS[eraIndex()+1].ja, invention:n.inventionJa,
                      minDays:n.minDays, missing:eraGaps()} : null,
           flow:eraFlow(), log:CITY.eraLog||[]};
+      })(),
+      quest:(()=>{ const q=questOf(); if(!q) return null;
+        const types=questTypes();
+        const running=agents.filter(x=>x.quest).length;
+        return {enabled:QUEST_ON, board:eraFlow().board,
+          recipe:q.solved?q.recipe.map(t=>BLDG_TYPES[t].name):'(隠されている)',
+          solved:q.solved, solvedBy:q.solvedBy, best:q.best,
+          candidates:types.length, combinations:types.length*(types.length-1)/2,
+          tried:Object.keys(q.tried).length, experiments:q.experiments,
+          hints:q.hints, rerolls:q.rerolls, days:gameDay()-q.startDay, running,
+          strategies:Object.fromEntries(QUEST_STRATS.map(st=>[st,
+            agents.filter(x=>questStrategy(x)===st).length])),
+          posts:q.board.slice(-12).reverse().map(pp=>({by:pp.by, strat:pp.strat,
+            combo:pp.combo.map(t=>BLDG_TYPES[t].name), score:pp.score, day:pp.day+1}))};
       })(),
       level:{index:cityLevel(), name:levelSpec().name, econ:Math.round(CITY.econ),
         maxHeight:levelSpec().maxH, fp2:levelSpec().fp2,
