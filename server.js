@@ -1254,8 +1254,8 @@ function updateDayNight(S){
 //     実装は丸ごと残してあるので、復活させるときは NEED_ICONS を true にするか
 //     環境変数 NEED_ICONS=1 で起動するだけでよい (呼び出し側の2か所がこれを見ている)。
 const NEED_ICONS = process.env.NEED_ICONS === '1';
-const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱', learn:'📖'};
-const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈', learn:'学びたい'};
+const NEED_EMOJI={eat:'🍚', sleep:'😴', work:'💼', sick:'🤒', shop:'🛒', bored:'🥱', learn:'📖', quest:'🔬'};
+const NEED_LABEL_JA={eat:'お腹が空いている', sleep:'眠い', work:'仕事中', sick:'体調が悪い', shop:'買い物に行きたい', bored:'退屈', learn:'学びたい', quest:'実験中'};
 const ICON_COLORS={eat:0xff8c3a, sleep:0x4a7bff, work:0x35c07a,
                    sick:0xff5a5a, shop:0xffd23a, bored:0xb07aff};
 const ICON_PX=72;
@@ -1567,7 +1567,12 @@ function eraTickerLine(){
 //   誰が何を試して、どれだけ手応えがあったか。街の集合知がここに見える。
 //   ** = 正解 / *. = 片方当たり / .. = はずれ。記号だけで伝わるようにしてある。
 const HUD_BOARD_W = 306, HUD_BOARD_H = 92;
+// 左下の時代パネルと左右に並べるので、横幅が足りない画面 (ASPECT=square の低解像度など)
+// では出さない。掲示板の内容はティッカーにも流れているので情報は失われない。
+const HUD_BOARD_ON = WIDTH >= HUD_ERA_W + HUD_BOARD_W + 48;
 let hudBoard=null, hudBoardText='', hudBoardBusy=false, hudBoardAt=0;
+if(HUD_ON && !HUD_BOARD_ON)
+  console.log(`[HUD] 画面が狭い (${WIDTH}px) ので掲示板パネルは出さない (ティッカーには流れる)`);
 
 const _shortName = t => _ascii(BLDG_EN[BLDG_TYPES[t].name]||BLDG_TYPES[t].name)
                         .replace(/[^A-Za-z]/g,'').slice(0,7);
@@ -1584,7 +1589,7 @@ function hudBoardLines(){
 }
 
 async function refreshHudBoard(){
-  if(!hudScene) return;
+  if(!hudScene || !HUD_BOARD_ON) return;
   const L=hudBoardLines();
   if(!L){
     if(hudBoard){ hudScene.remove(hudBoard); hudBoard.material.map.dispose();
@@ -1678,7 +1683,7 @@ function updateHud(dt){
     refreshHudEra().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudEraBusy=false;});
   }
   // 研究の掲示板 (最短2秒に1回)
-  if(!hudBoardBusy && now-hudBoardAt>2000){
+  if(HUD_BOARD_ON && !hudBoardBusy && now-hudBoardAt>2000){
     hudBoardBusy=true; hudBoardAt=now;
     refreshHudBoard().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudBoardBusy=false;});
   }
@@ -2179,12 +2184,17 @@ const comboLabelJa = c => c.map(t=>BLDG_TYPES[t].label).join(' + ');
 
 // レシピの候補になる建物タイプ = いまこの街に営業中で1軒以上あるもの。
 // 街に無いタイプを答えにすると誰も試せない (= 詰み) ので、必ずここから選ぶ。
+let _qTypes={stamp:-1, list:[]};
 function questTypes(){
   if(!CITY) return [];
-  const seen=new Set();
-  for(const st of CITY.structs) if(st.state==='open') seen.add(st.typeIdx);
-  // 自宅と職場は「割り当てられた場所」で毎日行くので、実験の対象から外す (当たり判定が濁る)
-  return [...seen].filter(t=>!HOME_IDX.includes(t));
+  // 建物の状態が変わったときだけ作り直す (毎秒 × 住民数 で呼ばれるため)
+  if(_qTypes.stamp!==cityStamp){
+    const seen=new Set();
+    for(const st of CITY.structs) if(st.state==='open') seen.add(st.typeIdx);
+    // 自宅は「割り当てられた場所」で毎日行くので実験の対象から外す (当たり判定が濁る)
+    _qTypes={stamp:cityStamp, list:[...seen].filter(t=>!HOME_IDX.includes(t))};
+  }
+  return _qTypes.list;
 }
 
 // 街と時代から決まる乱数 (同じ街・同じ時代なら同じレシピ = 実験の再現性のため)
@@ -2197,6 +2207,7 @@ function questRng(salt){
 // いまの時代の探索を作り直す。建物が消えてレシピが試せなくなったときにも呼ぶ。
 function newQuest(reason){
   if(!CITY || !QUEST_ON) return null;
+  _qTypes.stamp=-1;                       // 作り直すときは候補を引き直す
   const types=questTypes();
   if(types.length<2){ CITY.quest=null; return null; }
   const rnd=questRng((CITY.quest&&CITY.quest.rerolls||0)+1);
@@ -2408,7 +2419,7 @@ function finishExperiment(a){
   (a.qTried=a.qTried||new Set()).add(key);
   q.experiments++;
   if(CITY && ERA_ON) CITY.research += QUEST_RESEARCH;   // 実験そのものが研究を進める
-  const known=!!(q.tried[key] && q.tried[key].n>1);
+  const known=!!(q.tried[key] && q.tried[key].n>=1);   // 誰かが既に試していたか
   postBoard(a, combo, sc, key);
   if(sc>=combo.length && !q.solved){ solveQuest(a, combo); return; }
   // 配信のティッカーに流す。全部流すと埋まるので「新しい発見」だけ。
@@ -2456,6 +2467,9 @@ function stepQuest(){
   if(!q){ newQuest('start'); return; }
   if(q.solved) return;
   const day=gameDay(), types=questTypes();
+  // レシピの建物がいま実在するかは **キャッシュを通さず** 直接見る。
+  // 詰み回避の安全網が questTypes() のキャッシュ更新漏れに巻き込まれないように。
+  const alive = t => CITY.structs.some(st=>st.state==='open' && st.typeIdx===t);
   // ⓪ 最後の保険を最初に見る。時代が長引きすぎたら探索を待たずに進ませる。
   //    ここが他の分岐の return に邪魔されると「保険が効かない」ことがある。
   if(day-(CITY.eraDay||0) > QUEST_MAX_DAYS){
@@ -2465,7 +2479,7 @@ function stepQuest(){
     return;
   }
   // ① レシピの建物が街から消えた → 誰も試せない。答えを作り直す。
-  if(!q.recipe.every(t=>types.includes(t))){
+  if(!q.recipe.every(alive)){
     news('quest', '🔁 手がかりの建物が街から消えた — 研究の方向が変わった',
          'A building behind the current lead is gone - the research changed direction');
     newQuest('reroll');
@@ -3260,7 +3274,9 @@ function describeActivity(a){
   if(t!=null && BUY_IDX.includes(t))  return `${BLDG_TYPES[t].label} で買い物をしている`;
   if(t!=null && LEARN_IDX.includes(t)) return `${BLDG_TYPES[t].label} で勉強している`;
   if(t!=null && FUN_IDX.includes(t))  return `${BLDG_TYPES[t].label} で過ごしている`;
-  if(atWork && h>=9 && h<17)          return '💼 職場で働いている';
+  const _F=eraFlow();
+  if(atWork && h>=_F.workFrom && h<_F.workTo) return '💼 職場で働いている';
+  if(a.remote && atHome && h>=_F.workFrom && h<_F.workTo) return '💻 自宅で仕事をしている';
   if(atHome)                          return '🏠 自宅で休んでいる';
 
   if(a.quest){
