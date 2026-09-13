@@ -314,7 +314,19 @@ async function loadSharedSessions(){
       dinoClsOut=outs.find(n=>/cls/i.test(n))||outs[0];
       dinoPatchOut=outs.find(n=>/patch/i.test(n))||outs[1]||outs[0];
       console.log(`[ONNX] dinov2_vits14 OK  in=${dinoIn} out=${outs.join(',')}`);
-    }catch(e){console.warn('[ONNX] dinov2 load failed:',e.message);dinoSession=null;}
+    }catch(e){
+    console.warn('[ONNX] dinov2 load failed:', e.message);
+    // いちばん多い原因は「重みが .onnx.data (外部データ) 側に出ていて、
+    // .onnx だけを配備した」ケース。DINOv2 が無いと policy モードは全員
+    // pursuit にフォールバックする (= 方策が一切使われない) ので明示する。
+    if(/\.onnx\.data|external/i.test(e.message||''))
+      console.warn('         → 重みが外部ファイルに出ています。Colab 側で'
+        + ' onnx.save(..., save_as_external_data=False) して単一ファイルにし直してください'
+        + ' (ViT-S/14 なら 80MB 前後になります)');
+    if(MOVE_MODE==='policy')
+      console.warn('         → DINOv2 が無いので MOVE_MODE=policy でも全員 pursuit で動きます');
+    dinoSession=null;
+  }
   }else{
     console.warn('[ONNX] dinov2_vits14.onnx not found — DINOv2系ペルソナはランダムにフォールバック');
   }

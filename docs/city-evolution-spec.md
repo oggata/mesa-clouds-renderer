@@ -1605,6 +1605,31 @@ LEGACY 学習の方策は「建物は通り抜けられる」と思っている�
 **時代と探索はどちらのモードでも同じように動く。** これらは「どこへ行くか」を
 決める層で、移動そのものには触らないため。
 
+#### DINOv2 が単一ファイルになっていること
+
+`MOVE_MODE=policy` が実際に方策で歩くには DINOv2 が読める必要がある。
+`hasUsablePolicy()` は `dinoSession` が無いペルソナを pursuit に落とすので、
+**DINOv2 が読めないと policy 指定でも全員が pursuit で動く** (静かに何も起きない)。
+
+現在 `data/dinov2_vits14.onnx` は **898KB しかなく、重みが `dinov2_vits14.onnx.data`
+(外部データ) 側に出ている**。ViT-S/14 なら 80MB 前後が正常。
+
+```
+[ONNX] dinov2 load failed: cannot get file size ... data/dinov2_vits14.onnx.data
+```
+
+原因はノートブックの DINOv2 エクスポートが `save_as_external_data=False` を
+付けていなかったこと (persona 側は付いていた)。修正済みで、エクスポート直後に
+「`.data` が残っていないか」「サイズが 10MB 以上か」を assert する。
+
+**policy モードを使うまでの手順**:
+
+1. Colab で `WORLD_ALIGNED = True` を確認する (セル3)
+2. セル4b の自己診断が通ることを確認する
+3. 学習 → `persona_multi.onnx` / `_meta.json` / `dinov2_vits14.onnx` を出力
+4. 3ファイルを `data/` へ配置 (dinov2 が 80MB 前後あることを確認)
+5. `MOVE_MODE=policy npm start` — 起動ログに `[World] ... 違う` が出なければ整合
+
 ### 17.7 パラメータ
 
 | 環境変数 | 既定 | 意味 |
