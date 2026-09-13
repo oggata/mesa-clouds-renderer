@@ -1576,6 +1576,14 @@ if(HUD_ON && !HUD_BOARD_ON)
 
 const _shortName = t => _ascii(BLDG_EN[BLDG_TYPES[t].name]||BLDG_TYPES[t].name)
                         .replace(/[^A-Za-z]/g,'').slice(0,7);
+// 掲示板に出す名前。"Retired Artist Haru #1" のような表示名をそのまま切ると
+// 役職だけが残って誰か分からなくなる。個人名 + 通し番号を残す。
+function shortWho(name){
+  const t=_ascii(name||'');
+  const m=t.match(/^(.*?)\s*#(\d+)\s*$/);
+  const base=(m?m[1]:t).trim().split(/\s+/).pop() || t;
+  return (base + (m?'#'+m[2]:'')).slice(0,10);
+}
 const comboShort = c => c.map(_shortName).join('+');
 const scoreMark  = (sc,n) => '*'.repeat(sc) + '.'.repeat(Math.max(0,n-sc));
 
@@ -1583,7 +1591,7 @@ function hudBoardLines(){
   const q=questOf();
   if(!q) return null;
   const rows=q.board.slice(-3).reverse().map(p=>[
-    _ascii(p.by).slice(0,8), comboShort(p.combo), scoreMark(p.score, p.combo.length)]);
+    shortWho(p.by), comboShort(p.combo), scoreMark(p.score, p.combo.length)]);
   const tries=Object.keys(q.tried).length;
   return {head:`RESEARCH BOARD  ${tries} tried`, rows, solved:q.solved};
 }
@@ -1604,7 +1612,7 @@ async function refreshHudBoard(){
   L.rows.forEach(([who,combo,mark],i)=>{
     const y=40+i*17;
     body+=`<text x="14" y="${y}" font-size="11" fill="#9fd8c8" font-family="${HUD_MONO}">${_esc(who)}</text>`
-        + `<text x="82" y="${y}" font-size="11" fill="#dfeee9" font-family="${HUD_MONO}">${_esc(combo)}</text>`
+        + `<text x="94" y="${y}" font-size="11" fill="#dfeee9" font-family="${HUD_MONO}">${_esc(combo)}</text>`
         + `<text x="${HUD_BOARD_W-14}" y="${y}" font-size="12" font-weight="bold" text-anchor="end"`
         + ` fill="${mark.startsWith('**')?'#ffd36b':'#7fb6ff'}" font-family="${HUD_MONO}">${_esc(mark)}</text>`;
   });
@@ -2442,7 +2450,8 @@ function solveQuest(a, combo){
        `${a?_ascii(a.name):'Someone'} cracked it: ${comboLabel(combo)} - ${n?n.invention.toLowerCase():'the next step'} is within reach`);
   showBanner(`SOLVED: ${comboLabel(combo)} by ${a?_ascii(a.name):'the town'}`, 9);
   const st=CITY && CITY.structs.find(x=>x.state==='open' && x.typeIdx===combo[0]);
-  if(st) showCityEvent(st.r, st.c, `${comboLabel(combo)} - the missing link`, 10, null);
+  // 右上のカメラ欄は34文字で切れるので短縮形で出す
+  if(st) showCityEvent(st.r, st.c, `${comboShort(combo)} - the missing link`, 10, null);
   console.log(`[Quest] 正解 ${comboLabelJa(combo)} / 発見者 ${a?a.name:'-'}`
     + ` / 実験${q.experiments}回 / ${gameDay()-q.startDay}日`);
 }
