@@ -342,6 +342,16 @@ const CHARMESH = require('./charmesh.js');   // 型紙 → three のジオメト
 // 車の出入口・経路・走行。住民 (ONNX 推論・欲求・屋内状態) とは別系統にする。
 // three にも server.js にも依存しない計算なので単体で検証できる。
 const TR = require('./traffic.js');
+// ── 階層方策 (HLP / LLP) ────────────────────────────────────────────────────
+// 「いま何をするか」(options.js/hlp.js) と「行き先の仕様をどのセルに落とすか」
+// (llp.js) を server.js の外へ出す。**ウェイポイント→前進/左/右 の変換だけは
+// stepAll() に残す** — そこが MOVE_MODE=pursuit/policy の分岐点で、分岐を
+// 2箇所に増やすより既にある1箇所を使うほうが安全だから。
+//   仕様: docs/hierarchical-policy-spec.md
+//   検証: node tools/hlp-equiv.js  (既存 needOf/pickLifeGoal と総当たりで一致)
+const OPTS = require('./options.js');
+const HLP  = require('./hlp.js');
+const LLP  = require('./llp.js');
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
 //   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
@@ -642,6 +652,16 @@ function buildPersonaMeta(m){
     goalDim: m.goal_dim||0,             // >0 なら goal条件付け (cls+z)。0=従来(clsのみ)
     goalClasses: m.goal_classes||[],    // z の index が意味する建物名の並び (モデル固有)
     bldgToZ: buildBldgToZ(m.goal_classes||[]),  // 正準index -> z index (名前で対応。-1=未対応)
+    // ── z の作り方 ──
+    //   'onehot'         … 従来。建物タイプの one-hot。**知らない型は指せない**
+    //   'text_embedding' … 建物の説明文の埋め込み。名前で引くので、街に新しい型が
+    //                      増えても goal_embeddings に1行足すだけで指せる
+    goalMode: m.goal_mode||'onehot',
+    goalEmb: (()=>{                     // 建物名 -> Float32Array(goal_dim)
+      const src=m.goal_embeddings; if(!src) return null;
+      const o={}; for(const k in src) o[k]=Float32Array.from(src[k]); return o;
+    })(),
+    goalProjection: m.goal_projection||null,   // 未知の建物を後から同じ座標系へ写すため
     auxDim: m.aux_dim||0,               // >0 なら補助観測 (compass/visited/social/obstacle) 付き
     visitR: m.visit_radius||5,
     visitWin: m.visit_window_ticks||4000,
@@ -1113,6 +1133,13 @@ function buildAux(agent, meta){
   //     car_ttc                  … 前方の車への到達時間 (1=遠い/居ない, 0=直前)
   //     curb_ahead               … 一歩先が車道なら1 (踏み出す前に気づけるように)
   if(meta.auxDim>=16){
+    // ★ **naturalWalk が走っていないなら、ここで作る。**
+    //   crowd/ttc を書いているのは naturalWalk() だが、それは pursuit のときしか
+    //   走らない。MOVE_MODE=policy では a.crowdL / a.carTtc が**前の値のまま**に
+    //   なり、方策には「誰も居ない・車も居ない」が入り続ける。学習側 env には
+    //   人も車も居るので、これは train/deploy の静かなズレになる (落ちも警告も
+    //   出ないので気づけない)。式は walk.js に1本化してあるのでズレようがない。
+    if(agent.walkTick!==stepCount) computeWalkAux(agent);
     aux[12]=agent.crowdL||0;
     aux[13]=agent.crowdR||0;
     aux[14]=(agent.carTtc==null)?1:agent.carTtc;
@@ -2018,6 +2045,16 @@ function updateOcclusionFade(){
   //   ループそのものが効いてくる (V8 の for...in は Map の走査より重い)。
   //   いま透けている集合 (_fadedKeys) を持っておき、**状態が変わるものだけ**触る。
   //   near も _fadedKeys も普段は数件なので、建物が何軒あっても一定コストになる。
+  // ★ **追跡中の人が入った軒だけは透かさない。** いま「この家に帰った」と
+  //   見せている相手なので、透けると何に入ったのか分からなくなる。中に居る人は
+  //   そもそも描いていない (m.visible=false) ので、透かして得るものも無い。
+  if(camTargetIdx>0 && agents[camTargetIdx-1]){
+    const ca=agents[camTargetIdx-1];
+    if(MW.isIndoors(ca)){
+      const st=structAt(ca.indoors[0], ca.indoors[1]);
+      if(st) near.delete(st.r+'_'+st.c+'_b');
+    }
+  }
   const changed=[];
   for(const key of near) if(!_fadedKeys.has(key)) changed.push(key);
   for(const key of _fadedKeys) if(!near.has(key)) changed.push(key);
@@ -4730,7 +4767,17 @@ function stepBldgLights(d){
     const t=Math.max(0, Math.min(1, (0.55+u.phase-d)/0.40));
     const e=t*t*(3-2*t);                            // smoothstep: 夕方にじわっと点く
     const sf=sleepFactor(u, h);                     // 住宅は深夜に一軒ずつ消える
-    if(u.facade) u.facade.emissiveIntensity=e*sf*NIGHT_LIT*BLDG_GLOW;
+    // 誰かが入った直後の軒は、時刻に関わらず窓を点ける (帰宅した家が分かる)。
+    //   ★ **max で底上げする** — 掛けると夜しか効かず、昼に帰った人の家が
+    //     光らない。減衰は線形で十分 (点いてから消えるまでが読めればよい)。
+    let warm=0;
+    if(u.warmT0){
+      const k=1-(Date.now()-u.warmT0)/(ARRIVE_GLOW_SEC*1000);
+      // 明るいうちは控えめに。真昼に窓だけ強く光ると「点いた」ではなく
+      // 描画の不具合に見える (暗いほど効かせたい合図なので、これで十分)。
+      if(k<=0) u.warmT0=0; else warm=k*ARRIVE_GLOW_AMT*Math.max(0.25, 1-d);
+    }
+    if(u.facade) u.facade.emissiveIntensity=Math.max(e*sf, warm)*NIGHT_LIT*BLDG_GLOW;
     if(u.sign)   u.sign.emissiveIntensity=(0.25+e*1.25)*sf*BLDG_GLOW;  // 看板は薄暮から
   }
 }
@@ -4854,19 +4901,49 @@ const ARRIVE_POSE_MS = Math.max(0, envNum('ARRIVE_POSE_SEC', 2.5))*1000;
 
 // 戻り値 true = ここで面倒を見たので呼び出し側は enterWander しないこと。
 function arriveAtBuilding(a, dst){
-  onArrive(a, dst);
+  // 到着の一言は「中に入るのか、外に留まるのか」が決まるまで保留する。
+  // 保留したものは、この関数を抜けるまでに必ず流す (camArriveFlush) か、
+  // 玄関で待つ人については stepAll の玄関ブロックが入館後に流す。
+  _arriveHold = true;
+  try { onArrive(a, dst); } finally { _arriveHold = false; }
   // 配達員は玄関先に荷物を置くのが仕事。中に入ると本人も荷物も見えなくなる。
-  if(!WORLD.solidBuildings || !dst || a.deliv) return false;
-  if(enterOpenPlace(a, dst)) return true;          // 広場: 屋外に留まる
+  if(!WORLD.solidBuildings || !dst || a.deliv){ camArriveFlush(); return false; }
+  if(enterOpenPlace(a, dst)){ camArriveFlush(); return true; }   // 広場: 屋外に留まる
   if(ARRIVE_POSE_MS<=0){                            // 一拍を切ったら従来どおり即入館
+    onEnterBuilding(a, dst[0], dst[1]);
     MW.enterBuilding(a, dst[0], dst[1]);
+    camArriveFlush();
     return MW.isIndoors(a);
   }
   a.path=null; a.pathIdx=0;
   a.th = Math.atan2(dst[1]+0.5-a.y, dst[0]+0.5-a.x);   // 建物のほうを向く
   a.mode='hold';
   a.atDoor = { r:dst[0], c:dst[1], until: simNow()+ARRIVE_POSE_MS };
-  return true;
+  return true;                                        // 一言は入った瞬間まで持ち越し
+}
+
+// ── 帰ってきた家の明かりを点ける ───────────────────────────────────────────
+// 「どの家に帰ったのか分からない」への一番素直な答え。**その人の自宅に**
+// 帰り着いたときだけ窓を灯す。街の側の表現なので、カメラが誰を追っていようと
+// 成立する (帰宅ラッシュの時間帯は、家が一軒ずつ点いていく画になる)。
+//   ★ 夜の明かり (stepBldgLights) と同じ emissive を一時的に底上げするだけ。
+//     メッシュも描画呼びも増えない。
+//   ★ **自宅に限る。** どの建物でも点けると、客の出入りのたびに店の窓が
+//     明滅して、意味のある合図ではなくなる。
+const ARRIVE_GLOW     = process.env.ARRIVE_GLOW !== '0';
+const ARRIVE_GLOW_SEC = envNum('ARRIVE_GLOW_SEC', 7);
+const ARRIVE_GLOW_AMT = Math.max(0, Math.min(1, envNum('ARRIVE_GLOW_AMT', 0.85)));
+function onEnterBuilding(a, r, c){
+  // ★ **MW.enterBuilding より前に呼ぶこと。** 入った瞬間に a.x,a.y は
+  //   建物セルの中心へ移されるので、あとからでは玄関の位置が分からない。
+  //   カメラは「玄関が見える方位」で構えるのにこれを使う。
+  a.doorAt = [a.x, a.y];
+  if(!ARRIVE_GLOW || ARRIVE_GLOW_SEC<=0) return;
+  if(!(a.home && a.home[0]===r && a.home[1]===c)) return;   // 自宅だけ
+  const o=occluders[r+'_'+c+'_b'];
+  const u=o && o.mesh && o.mesh.userData.lit;
+  if(!u) return;                       // 工事中/閉店中は lit を持たない
+  u.warmT0 = Date.now();
 }
 
 // ── 屋根の無い場所 (公園 / グラウンド) ──────────────────────────────────────
@@ -6702,6 +6779,7 @@ function agentSnap(a){
     hu:_r3(a.hunger), fa:_r3(a.fatigue), su:_r3(a.supply), bo:_r3(a.bored), sk:_r3(a.sick),
     hm:a.home||null, wk:a.work||null, sc:a.school||null, ind:a.indoors||null,
     md:a.mode||null, gt:a.goalType||null, gz:(a.goalZ==null?null:a.goalZ),
+    op:(a.opt&&a.opt.id)||null,   // いまの Option (分岐どうしを同じ地点から始めるため)
   };
 }
 function applyAgentSnap(a, sn){
@@ -6717,6 +6795,11 @@ function applyAgentSnap(a, sn){
   if(sn.sc) a.school=[...sn.sc];
   if(sn.ind) a.indoors=[...sn.ind];
   a.mode=sn.md||'wander'; a.goalType=sn.gt||null; a.goalZ=(sn.gz==null?null:sn.gz);
+  a.opt = (sn.op && OPTS.byId[sn.op]) ? {id:sn.op, since:0, tries:0} : null;
+  // 見張りも復元した Option に合わせる。ここがずれると、復元直後の1回だけ
+  // 余計な引き直しが走り、分岐どうしが同じ地点から始まらなくなる。
+  a.lastOptId = sn.op || undefined;
+  a.percepts=null; a.optSpec=null;
   a.path=null; a.pathIdx=0; a.navDest=null;   // 経路は次の tick で引き直される
   a._snapped=true;
   return true;
@@ -7096,7 +7179,7 @@ function assignHomes(){
 // 欲求が切り替わった wander エージェントの行き先を選び直す。
 //   これが無いと「夜になっても昼に決めた遠い目的地へ歩き続ける」→ 帰宅できず疲労が飽和する。
 //   navigate(rally) 中は命令優先なので触らない。
-function retargetOnNeedChange(){
+function retargetOnNeedChange_legacy(){
   // 待ち合わせ中の人は行き先を変えない (変えると相手が待ちぼうけになる)
   for(const a of agents){
     const n=needOf(a);
@@ -7130,6 +7213,15 @@ function stepNeeds(dtSec){
     // 以前は全員を総当たりしていて、300人で9万回/tick の走査になっていた。
     SOC.neighbors(SOC_STATE, a, _nearBuf, 1);   // 居るかどうかだけ分かればよい
     const alone = _nearBuf.length===0;
+    // ひとりで過ごした時間 (街の中の分)。学習側 env の alone と同じ意味。
+    // 実時間 dtSec → 街の中の分。1日 = DAY_MINUTES 分の実時間で 24h 進むので
+    // 1実秒 = (24*60)/(DAY_MINUTES*60) 分。
+    if(HLP_NET) a.aloneMin = alone
+      ? Math.min(1440, (a.aloneMin||0) + dtSec*(1440/(DAY_MINUTES*60)))
+      : 0;
+    // 歩きながらの気づきを HLP へ上げる (PERCEPT=off の既定では何も走らない)。
+    // **新しい走査は足さない** — いま埋めたばかりの _nearBuf を渡すだけ。
+    if(HLP_ON) hlpScan(a, _nearBuf);
     if(!alone && CITY_EVOLVE && RNG.R()<GOSSIP_P*dtSec)
       gossip(a, _nearBuf[0]);      // すれ違いざまに「行きつけ」の話をする (低確率)
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
@@ -7597,7 +7689,7 @@ function stepEvents(dtSec){
 // 屋内から出るべきか。needOf() が示す用事と、いま居る建物が合っているかで決める。
 //   自宅で寝ている間は sleep が解消するまで出ない。飲食店で食べ終えたら出る。
 //   用事が無い (need=null) なら出て徘徊する。
-function shouldLeaveBuilding(a){
+function shouldLeaveBuilding_legacy(a){
   if(!MW.isIndoors(a)) return true;
   const [br,bc]=a.indoors;
   // ★ 誘い出された先では留まる。用事が無い建物 (郵便局など) は needOf が null に
@@ -7640,7 +7732,359 @@ const isWeekend    = () => (gameDay() % WEEK_LEN) >= (WEEK_LEN-WEEKEND_DAYS);
 const SCHOOL_FROM  = envNum('SCHOOL_FROM', 8);
 const SCHOOL_TO    = envNum('SCHOOL_TO', 15);
 const isStudent    = a => !!a.school;
-function needOf(a){
+// ═══ 階層方策 (HLP) の配線 ═════════════════════════════════════════════════
+// 行動決定を options.js / hlp.js / llp.js へ移す。**Phase A の既定は「挙動が
+// 1ミリも変わらない」** — 性格ボーナスも追加Optionも割り込みも既定OFFで、
+// 選択も行き先も既存 needOf()/pickLifeGoal() と総当たりで一致する
+// (node tools/hlp-equiv.js: 選択48万通り / 行き先2万通り / 乱数消費まで一致)。
+//
+// ★ MOVE_MODE とは無関係。ここは ONNX も DINOv2 も触らないので、
+//   配信 (MOVE_MODE=pursuit) の負荷は変わらない。重いのは llp の vision 版だけで、
+//   それは GOAL_RESOLVE=vision / PERCEPT=vision のときしか動かない。
+const HLP_ON      = process.env.HLP !== '0';           // 既定ON。HLP=0 で従来の梯子へ丸ごと戻せる
+const HLP_LIVE    = process.env.HLP_LIVE === '1';      // 下の3つをまとめて入れる実験用スイッチ
+// ── ここから下を1つでも入れると「既存と同じ」ではなくなる。入れるときは計測すること ──
+const HLP_PERSONA = HLP_LIVE || process.env.HLP_PERSONA === '1';  // 性格ボーナス
+const HLP_EXTRA   = HLP_LIVE || process.env.HLP_EXTRA   === '1';  // 追加Option (探検/食べ歩き)
+const HLP_TEMP    = envNum('HLP_TEMP', 0);             // softmax温度。0=決定論 (既定)
+// 行き先の解決と割り込みの出所。**既定は配信で回せる側**。
+const GOAL_RESOLVE = process.env.GOAL_RESOLVE === 'vision' ? 'vision' : 'map';
+const PERCEPT_MODE = HLP_LIVE ? 'geom'
+                   : ({off:'off', geom:'geom', vision:'vision'}[process.env.PERCEPT] || 'off');
+const PERCEPT_EVERY   = Math.max(1, envNum('PERCEPT_EVERY', 4));   // 何tickに1回見回すか
+const PERCEPT_SIGHT_R = Math.max(0, envNum('PERCEPT_SIGHT_R', 4)); // 「知らない店」を探す半径(セル)
+const PERCEPT_FRIEND  = envNum('PERCEPT_FRIEND', 0.35);            // これ以上の関係を「知り合い」とする
+if(HLP_ON && HLP_EXTRA) OPTS.registerExtras();
+console.log(`[HLP] ${HLP_ON?'on':'off'} persona=${HLP_PERSONA?1:0} extra=${HLP_EXTRA?1:0} `
+          + `temp=${HLP_TEMP} goal=${GOAL_RESOLVE} percept=${PERCEPT_MODE}`
+          + (HLP_ON && !HLP_PERSONA && !HLP_EXTRA && PERCEPT_MODE==='off' ? '  (既存挙動と一致)' : '  ★既存挙動と異なる'));
+
+// ── ctx ─────────────────────────────────────────────────────────────────────
+// hlp/llp は server.js を知らないので、判定に要るものを全部ここで詰める。
+// **オブジェクトは使い回す** (毎tick×人数ぶん作ると GC が動く)。中身の
+// 3つのスカラーだけ引き直す — gameHour() は割り算1回なので毎回で構わない。
+const _hctx = {
+  hour:0, weekend:false, now:0,
+  thr:{ needHi:0, sleepHi:0, sickHi:0 },
+  school:{ from:0, to:0 }, work:{ from:9, to:17 },
+  IDX:null, prefWeight:0, teachBonus:0,
+  isStudent, isCourier:a=>isCourier(a), onDeliveryDuty:a=>onDeliveryDuty(a),
+  // 屋内に居て、その建物が (r,c) か。**生の x,y で見てはいけない** —
+  // 屋内の住民の座標は玄関のままなので、自宅に入っていても判定が外れる。
+  indoorsAt:(a,r,c)=> MW.isIndoors(a) && a.indoors[0]===r && a.indoors[1]===c,
+  personaOn:false, temp:0, resolveMode:'map', perceptMode:'off',
+  // 性格 → 傾き [0,1]。**まだ本物の trait フィールドが無い**ので、既存の
+  // persona_pool の値から導いた暫定値。Phase D で学習した trait に差し替える口。
+  trait:(a,k)=>{
+    const d=a.def||{};
+    if(k==='curiosity') return Math.max(0, Math.min(1, (d.enterprise||0)*0.6 + (d.sociability||0)*0.4));
+    if(k==='gourmet')   return Math.max(0, Math.min(1, 1-(d.honesty||0.5)*0.4 + (d.sociability||0)*0.2));
+    return 0;
+  },
+  // 勧められた店へ向かうときのログ (元 pickLifeGoal の中にあった一行)
+  onTaught:(a,st)=>{ if(CHAT_LOG) console.log(`[Learn] ${a.name} は勧められた ${BLDG_TYPES[st.typeIdx].name} (${st.r},${st.c}) へ向かう`); },
+  scoreHook:null,   // Phase B/D: f(state)·g(embed(option)) を差す口
+};
+function hlpCtx(){
+  _hctx.hour=gameHour(); _hctx.weekend=isWeekend(); _hctx.now=simNow();
+  _hctx.restOn=REST_ON;
+  _hctx.thr.needHi=NEED_HI; _hctx.thr.sleepHi=SLEEP_HI; _hctx.thr.sickHi=SICK_HI;
+  _hctx.school.from=SCHOOL_FROM; _hctx.school.to=SCHOOL_TO;
+  _hctx.IDX=_hIDX; _hctx.prefWeight=PREF_WEIGHT; _hctx.teachBonus=TEACH_BONUS;
+  _hctx.personaOn=HLP_PERSONA; _hctx.temp=HLP_TEMP;
+  _hctx.resolveMode=GOAL_RESOLVE; _hctx.perceptMode=PERCEPT_MODE;
+  // 学習方策があるならスコアはそちらが決める。まだ推論が回っていない住民には
+  // null を返し、hlp.js が手書きの段で埋める (起動直後の1周だけ)。
+  _hctx.netScore = hlpSession ? _netScore : null;
+  return _hctx;
+}
+function _netScore(o, a){
+  const sc=a.optScores;
+  return (sc && o.idx!=null && o.idx<sc.length) ? sc[o.idx] : null;
+}
+// カテゴリ表は起動後に確定するので、初回参照時に組み立てる。
+let _hIDX=null;
+function hlpAttach(){
+  _hIDX={ food:FOOD_IDX, home:HOME_IDX, care:CARE_IDX, buy:BUY_IDX, fun:FUN_IDX };
+  HLP.setRng(RNG.R); LLP.setRng(RNG.R);
+  // 学習方策があるなら、行動の一覧も**メタから作り直す**。JS 側に書き写さない。
+  if(hlpNetMeta && Array.isArray(hlpNetMeta.options)){
+    const n=OPTS.registerFromMeta(hlpNetMeta, {
+      catIdx:{ food:FOOD_IDX, buy:BUY_IDX, fun:FUN_IDX, care:CARE_IDX, home:HOME_IDX, work:WORK_IDX },
+      typeIndexOf: nm => { const i=BLDG_TYPES.findIndex(b=>b.name===nm); return i<0?null:i; },
+      hasCat: c => { const L={food:FOOD_IDX,buy:BUY_IDX,fun:FUN_IDX,care:CARE_IDX,home:HOME_IDX,work:WORK_IDX}[c];
+                     return !!(L && buildingsOfTypes(L).length); },
+      hasType: t => buildingsOfTypes([t]).length>0,
+    });
+    console.log(`[HLP] 行動カタログを hlp_meta.json から作った (${n}種)`);
+  }
+  LLP.attach({
+    buildingsOfTypes, structAt, structByKey:key=>cellStruct[key]||null,
+    prefKey, prefOf, openLotCells, nearestHome, randB,
+    typeAt:(r,c)=> (BUILDING_TYPES[r+'_'+c]!=null ? BUILDING_TYPES[r+'_'+c] : null),
+    losClear,
+  });
+}
+
+// ── 互換の要: needOf() ──────────────────────────────────────────────────────
+// UI・カメラ・配達判定など **25箇所**がこの戻り値を見ている。Option の側に
+// need 名を持たせてあるので、呼び口は一切変えずに済む。
+//   ★ a.opt を読むのではなく毎回 choose() し直す。**そうしないと、決定と決定の
+//     あいだに閾値をまたいだ欲求が1tick遅れて見え、既存挙動と一致しなくなる。**
+//     候補8個の precond は数値比較だけなので、これで十分に安い。
+function needOf(a){ return HLP_ON ? HLP.choose(a, hlpCtx()).opt.need : needOf_legacy(a); }
+
+// ── 行き先 ──────────────────────────────────────────────────────────────────
+// Option は targetSpec (「飲食カテゴリを好み込みで上位3軒から」) までしか
+// 決めず、どのセルかは llp.js が解決する。**ここを混ぜると「視覚で目的地を
+// 確かめる」が原理的に成立しなくなる** (座標を渡した時点で確認が儀式になる)。
+function pickLifeGoal(a, ex){
+  if(!HLP_ON) return pickLifeGoal_legacy(a, ex);
+  const C=hlpCtx();
+  const o=HLP.choose(a, C).opt;
+  if(!a.opt || a.opt.id!==o.id){ HLP.adopt(a, o, C); hlpNoteAdopt(o.id); }
+  const sp=o.target(a, C);
+  a.optSpec=sp;                       // 到着時の照合 (llp.verifyArrival) に使う
+  const cell=LLP.resolve(a, sp, ex, C);
+  return cell || randB(ex);
+}
+
+// ── 屋内に留まるか ──────────────────────────────────────────────────────────
+function shouldLeaveBuilding(a){
+  if(!HLP_ON) return shouldLeaveBuilding_legacy(a);
+  if(!MW.isIndoors(a)) return true;
+  const [br,bc]=a.indoors;
+  // 誘い出された先では留まる (用事の無い建物だと着いた瞬間に出ていってしまう)
+  const pl=(a.plot && a.plot.until>simNow()) ? a.plot.place
+         : (a.lured && a.lured.until>simNow()) ? a.lured.place : null;
+  if(pl && br===pl[0] && bc===pl[1]) return false;
+  // 家で本を読んでいる/ゲームをしている最中に追い出さない
+  if(ptActive(a) && PT.byId[a.pastime.id] && PT.byId[a.pastime.id].where==='home') return false;
+  const C=hlpCtx();
+  const t=BUILDING_TYPES[br+'_'+bc];
+  return !HLP.choose(a, C).opt.stay(a, C, t==null?null:t);
+}
+
+// ── 選び直し ────────────────────────────────────────────────────────────────
+// 元 retargetOnNeedChange() は「needOf() が変わったら行き先を引き直す」だった。
+// HLP では「choose() の結果が変わったら / 割り込みが来たら」に置き換わる。
+// **性格OFF・温度0・割り込みOFF のときこの2つは同値**なので Phase A では
+// 挙動が変わらない。
+function retargetOnNeedChange(){
+  if(!HLP_ON) return retargetOnNeedChange_legacy();
+  const C=hlpCtx();
+  for(const a of agents){
+    const d=HLP.decide(a, C);
+    if(!d) continue;
+    a.lastOptId=d.opt.id;                                  // 見張りはここでしか書かない
+    if(d.changed){ HLP.adopt(a, d.opt, C); hlpNoteAdopt(d.opt.id); }
+    a.lastNeed=d.opt.need||null;                           // 互換 (診断・API が見る)
+    if(a.meet) continue;                                   // 待ち合わせ中は横取りしない
+    if(a.mode==='wander' && !MW.isIndoors(a)) enterWander(a);
+  }
+}
+
+// ── 割り込みの見回り (LLP → HLP) ────────────────────────────────────────────
+// **すでに計算済みのものしか見ない。** near は stepNeeds が毎tick埋めている
+// SOC.neighbors の結果をそのまま渡す。PERCEPT=off (既定) では何も走らない。
+const _pctx={ near:null, blocked:false, sightR:0, friendHi:0, perceptMode:'off',
+              relOf:(a,bid)=>SOC.relOf(a,bid),
+              seenType:(a,t)=>!!((a.seenMask||0)&(1<<t)) };
+function hlpScan(a, near){
+  if(PERCEPT_MODE==='off') return;
+  if((stepCount + (a.aid||0)) % PERCEPT_EVERY !== 0) return;   // 位相をずらして間引く
+  _pctx.near=near; _pctx.blocked=(a.stall||0)>=UNSTICK_STALL;
+  _pctx.sightR=PERCEPT_SIGHT_R; _pctx.friendHi=PERCEPT_FRIEND;
+  _pctx.perceptMode=PERCEPT_MODE;
+  LLP.scan(a, _pctx);
+}
+
+
+// ═══ 学習したハイポリシー (data/hlp.onnx) ══════════════════════════════════
+// これを入れると「いま何をするか」が**手書きの段ではなく学習した方策**になる。
+// 行動カタログも観測の並びも hlp_meta.json が唯一の真実で、JS 側には書き写さない
+// (書き写すと必ずズレる)。
+//
+// ★ 既定 OFF。**HLP_NET=1 のときだけ**読み込みも推論も走る。ハイポリシーは
+//   小さい MLP (視覚なし) なので配信でも常時回せるが、モデルが未配備の状態で
+//   既定を変えると街が動かなくなるので、明示的に入れてもらう。
+const HLP_NET       = process.env.HLP_NET === '1';
+// 何tickに1回スコアを引き直すか。1意思決定は街の中で数十分あるので、粗くてよい。
+const HLP_NET_EVERY = Math.max(1, envNum('HLP_NET_EVERY', 30));
+let hlpSession=null, hlpNetMeta=null, hlpOptEmbTensorDims=null, hlpOptEmbData=null;
+let hlpStateDim=0, hlpEmbDim=0, hlpNOpt=0, hlpInNames=null;
+
+async function loadHlpSession(){
+  if(!HLP_NET) return;
+  if(!ort){ console.warn('[HLP] onnxruntime-node が無いので学習方策は使えない'); return; }
+  const mp=path.join(__dirname,'data','hlp_meta.json');
+  const op=path.join(__dirname,'data','hlp.onnx');
+  if(!fs.existsSync(op) || !fs.existsSync(mp)){
+    console.warn(`[HLP] ${fs.existsSync(op)?'hlp_meta.json':'hlp.onnx'} が無い → 手書きの段のまま動く`);
+    return;
+  }
+  try{
+    hlpNetMeta=JSON.parse(fs.readFileSync(mp,'utf8'));
+    hlpSession=await ort.InferenceSession.create(op, ORT_OPTS);
+    hlpInNames=hlpSession.inputNames;
+    hlpStateDim=hlpNetMeta.state_dim; hlpEmbDim=hlpNetMeta.emb_dim;
+    hlpNOpt=(hlpNetMeta.options||[]).length;
+    // 候補の埋め込みは全員で共有する定数。1回だけ平らにしておく。
+    hlpOptEmbData=new Float32Array(hlpNOpt*hlpEmbDim);
+    hlpNetMeta.options.forEach((o,i)=>hlpOptEmbData.set(o.emb, i*hlpEmbDim));
+    hlpOptEmbTensorDims=[hlpNOpt, hlpEmbDim];
+    console.log(`[HLP] hlp.onnx を読み込んだ: 状態${hlpStateDim} 候補${hlpNOpt} 埋め込み${hlpEmbDim}`
+      + ` (学習: ${hlpNetMeta.train&&hlpNetMeta.train.updates}更新)`);
+    const v=hlpNetMeta.validation||{};
+    for(const k of ['persona_differentiation','unknown_action'])
+      if(Array.isArray(v[k]) && v[k].length)
+        console.warn(`[HLP] ⚠ 学習時の検証に未合格の項目: ${k} → ${v[k].join(' / ')}`);
+  }catch(e){
+    console.warn('[HLP] hlp.onnx の読み込みに失敗:', e.message);
+    hlpSession=null; hlpNetMeta=null;
+  }
+}
+
+// ── 性格ベクトル (8軸) ──────────────────────────────────────────────────────
+// persona_pool.json が持っているのは enterprise / sociability / honesty の3つだけ。
+// 残り5つは **住民ごとに決まる決定的な値**を作って埋める。年齢や職から少し寄せる
+// ので「子どもは好奇心が強い / 年配は出不精」くらいの傾きは出る。
+//   ★ これは暫定。persona_pool.json に本物の trait が入ったらそちらを優先する。
+//     (学習側 TRAITS の並びと必ず一致させること)
+const HLP_TRAITS=['curiosity','gourmet','sociability','diligence','thrift','enterprise','honesty','homebody'];
+function _traitHash(a, k){
+  let h=2166136261>>>0;
+  const src=`${a.def&&a.def.poolId}|${a.def&&a.def.nameIdx}|${k}`;
+  for(let i=0;i<src.length;i++){ h^=src.charCodeAt(i); h=Math.imul(h,16777619)>>>0; }
+  return (h>>>8)/16777216;                       // [0,1)
+}
+function traitsOf(a){
+  if(a._traits) return a._traits;
+  const d=a.def||{}, age=d.age||30;
+  const young=Math.max(0, Math.min(1, (30-age)/25));      // 若いほど1
+  const old  =Math.max(0, Math.min(1, (age-45)/35));      // 年配ほど1
+  const mix=(k,base)=>Math.max(0,Math.min(1, 0.55*_traitHash(a,k)+0.45*base));
+  const t=new Float32Array(8);
+  t[0]=mix('curiosity', 0.35+0.5*young);                  // 好奇心
+  t[1]=mix('gourmet',   0.45);                            // 食いしん坊
+  t[2]=Math.max(0,Math.min(1, d.sociability!=null?d.sociability:mix('sociability',0.5)));
+  t[3]=mix('diligence', d.school?0.35:0.6);               // 勤勉
+  t[4]=mix('thrift',    0.4+0.3*old);                     // 倹約
+  t[5]=Math.max(0,Math.min(1, d.enterprise!=null?d.enterprise:mix('enterprise',0.3)));
+  t[6]=Math.max(0,Math.min(1, d.honesty!=null?d.honesty:mix('honesty',0.7)));
+  t[7]=mix('homebody',  0.3+0.45*old);                    // 出不精
+  a._traits=t;
+  return t;
+}
+
+// ── 観測の組み立て ──────────────────────────────────────────────────────────
+// **学習側 HighLevelCityEnv.obs() と 1 要素も違ってはいけない。**
+// 並びは hlp_meta.json の state_layout に書いてあり、tools/hlp-state-check.js が
+// 次元と並びを突き合わせる。
+const HLP_CATS=['food','buy','fun','care','home','work','other'];
+const HLP_CAT_SRV={food:'eat', buy:'shop', fun:'fun', care:'care', home:'home', work:'work'};
+const _hstate=new Float32Array(64);
+function _nearestCatNorm(a, cat){
+  const list = (cat==='other') ? BUILDINGS : buildingsOfTypes(CAT_IDX[HLP_CAT_SRV[cat]]||[]);
+  if(!list || !list.length) return [1, 0];         // 街に無い → 距離1(遠い) / 在庫0
+  let best=Infinity;
+  for(const b of list){ const d=(b[0]-a.x)**2+(b[1]-a.y)**2; if(d<best) best=d; }
+  return [Math.min(1, Math.sqrt(best)/30), 1];
+}
+function buildHlpState(a){
+  const S=_hstate; S.fill(0);
+  let i=0;
+  const tr=traitsOf(a);            for(let k=0;k<8;k++) S[i++]=tr[k];
+  S[i++]=a.hunger||0; S[i++]=a.fatigue||0; S[i++]=a.supply||0; S[i++]=a.bored||0; S[i++]=a.sick||0;
+  S[i++]=Math.max(-1, Math.min(2, (a.cash||0)/400));
+  const h=gameHour(), we=isWeekend()?1:0;
+  S[i++]=Math.sin(h/24*2*Math.PI); S[i++]=Math.cos(h/24*2*Math.PI);
+  S[i++]=we; S[i++]=(h>=9&&h<17?1:0)*(1-we);
+  // 記憶 (8): 街をどれだけ知っているか / 今日めぐった飲食店の種類 / カテゴリ別の来店数
+  //   ★ known_frac は学習側が「訪れた建物の割合」、こちらは「歩いたセルの割合」。
+  //     **意味は同じだが分母が違う近似**。ここは train/deploy のズレとして残っている
+  //     ので、挙動がおかしいときは真っ先に疑うこと。
+  S[i++]=Math.min(1, (a.visited?a.visited.size:0)/Math.max(1, passableCount(MAP)));
+  S[i++]=Math.min(1, (a.foodToday||0)/5);
+  const cv=a.catVisits;
+  for(let c=0;c<6;c++) S[i++]=Math.min(8, cv?cv[c]:0)/8;
+  S[i++]=Math.min(1, (a.aloneMin||0)/360);       // ひとりの時間 (時間) / 6
+  const pq=a.percepts&&a.percepts.length?a.percepts:null;
+  const sawFriend = pq && pq.some(p=>p.kind==='saw-friend') ? 1 : 0;
+  const sawShop   = pq && pq.some(p=>p.kind==='saw-new-shop') ? 1 : 0;
+  S[i++]=sawFriend;
+  // 距離と在庫は同じ走査から出す (カテゴリごとに2回舐めない)
+  const _nc=HLP_CATS.map(c=>_nearestCatNorm(a,c));
+  for(let k=0;k<HLP_CATS.length;k++) S[i++]=_nc[k][0];
+  for(let k=0;k<HLP_CATS.length;k++) S[i++]=_nc[k][1];
+  S[i++]=sawFriend; S[i++]=sawShop;
+  // 学習側の percept[2] は「その行動で歩いた分数」。こちらは経路の進み具合を
+  // 学習側の歩行速度 (0.9 セル/分) で割って分に直す近似。
+  S[i++]=Math.min(1, ((a.pathIdx||0)/0.9)/30);
+  S[i++]=(a.sick||0)>0.5?1:0;
+  return S.subarray(0, i);
+}
+
+// ── スコアの先読み ──────────────────────────────────────────────────────────
+// ONNX の推論は非同期なので、choose() の中からは呼べない。**位相をずらして
+// 先に計算しておき、choose() はキャッシュを同期で読む。** 既存の
+// prefetchAllActions (ローポリシー) と同じ作りにしてある。
+let _hlpWarmed=false, _hlpErrLogged=false;
+async function inferHlpScores(a){
+  const st=buildHlpState(a);
+  if(st.length!==hlpStateDim){
+    if(!_hlpErrLogged){ _hlpErrLogged=true;
+      console.warn(`[HLP] 観測の次元が違う: 組み立て${st.length} vs meta ${hlpStateDim}`
+        + ' → 手書きの段で動かす。node tools/hlp-state-check.js で並びを確認すること'); }
+    return null;
+  }
+  const out=await hlpSession.run({
+    [hlpInNames[0]]: new ort.Tensor('float32', Float32Array.from(st), [1, hlpStateDim]),
+    [hlpInNames[1]]: new ort.Tensor('float32', hlpOptEmbData, hlpOptEmbTensorDims),
+  });
+  return Float32Array.from(out[hlpSession.outputNames[0]].data);
+}
+// 学習方策が本当に効いているかを毎日1行で出す。
+//   ・推論が回っていない (推論済 0人) → 配線が切れている
+//   ・1つの行動に張り付いている       → 観測がおかしい or 方策が退化している
+//   ・住民ごとの選択がばらけている     → 性格が効いている (ノートブックの検証と同じ見方)
+// ★ **「いまの Option」を数えてはいけない。** dailyRollover が走るのは日付が
+//   変わる深夜で、そこは precond が sleep しか通さない時刻なので、何を測っても
+//   sleep:全員 になる。1日のあいだに**選ばれた回数**を積んで出す。
+let _hlpDayMix={};
+const hlpNoteAdopt = id => { if(HLP_NET && id) _hlpDayMix[id]=(_hlpDayMix[id]||0)+1; };
+function hlpDailyReport(){
+  if(!hlpSession || !agents.length) return;
+  const scored=agents.filter(a=>a.optScores);
+  const ent=Object.entries(_hlpDayMix).sort((p,q)=>q[1]-p[1]);
+  const tot=ent.reduce((n,[,v])=>n+v,0)||1;
+  const top=ent.slice(0,7).map(([k,v])=>`${k}:${Math.round(v/tot*100)}%`).join(' ');
+  console.log(`[HLP] Day${gameDay()+1} 推論済 ${scored.length}/${agents.length}人  `
+            + `今日の行動 ${tot}回 (${ent.length}種): ${top||'(なし)'}`);
+  if(!scored.length) console.warn('[HLP] ⚠ 誰にもスコアが入っていない。観測の次元か推論を疑うこと');
+  else if(ent.length<=1) console.warn('[HLP] ⚠ 1種類の行動しか選ばれていない。観測か方策の退化を疑うこと');
+  _hlpDayMix={};
+}
+
+async function prefetchHlpScores(){
+  if(!hlpSession || !agents.length) return;
+  try{
+    if(!_hlpWarmed){                       // 初回だけ全員 (最初の1周が段のままになるのを防ぐ)
+      _hlpWarmed=true;
+      for(const a of agents) a.optScores=await inferHlpScores(a);
+      return;
+    }
+    const phase=stepCount % HLP_NET_EVERY;
+    for(let i=0;i<agents.length;i++){
+      if(i % HLP_NET_EVERY !== phase) continue;
+      agents[i].optScores=await inferHlpScores(agents[i]);
+    }
+  }catch(e){
+    if(!_hlpErrLogged){ _hlpErrLogged=true; console.warn('[HLP] 推論に失敗 → 手書きの段へ:', e.message); }
+  }
+}
+
+function needOf_legacy(a){
   const h=gameHour();
   if((a.sick   ||0) > SICK_HI)                 return 'sick';
   const fa=a.fatigue||0;
@@ -7728,7 +8172,7 @@ function nearestHome(a){
   return best?[...best]:null;
 }
 
-function pickLifeGoal(a, ex){
+function pickLifeGoal_legacy(a, ex){
   const n=needOf(a);
   if(n==='sleep'){
     // 家がある人は自宅へ。無い人は最寄りの住居へ (そこで休ませる)。
@@ -10901,12 +11345,33 @@ const CRIME_CAM_P         = envNum('CRIME_CAM_P', 0.5);
 
 // ── 機能D: 初回性 ──────────────────────────────────────────────────────────
 // 到着 = 来客。建物「タイプ」の初訪問だけを事件にする (建物単位だと多すぎてニュースが安くなる)。
+const _HLP_CAT_ORDER=['eat','shop','fun','care','home','work'];
+function _noteVisit(a, st){
+  if(!st) return;
+  if(!a.catVisits) a.catVisits=new Int16Array(6);
+  for(let k=0;k<6;k++){
+    const L=CAT_IDX[_HLP_CAT_ORDER[k]];
+    if(L && L.includes(st.typeIdx)){ a.catVisits[k]++; break; }
+  }
+  // 今日めぐった飲食店の「種類」。同じ店に何度行っても増えない
+  // (学習側の food_seen と同じ数え方)。
+  if(FOOD_IDX.includes(st.typeIdx)){
+    const bit=1<<st.typeIdx;
+    if(!((a.foodMaskToday||0)&bit)){ a.foodMaskToday=(a.foodMaskToday||0)|bit; a.foodToday=(a.foodToday||0)+1; }
+  }
+}
+
 function onArrive(a, dest){
+  // 着いた建物が本当に目的地だったか。map 版は地図を信じるので常に真、
+  // vision 版 (Phase B) だけが見た目と照合する。偽なら割り込みが上がり、
+  // HLP が選び直す。PERCEPT=off (既定) では走らせない = 既存挙動のまま。
+  if(HLP_ON && PERCEPT_MODE!=='off' && a.optSpec) LLP.verifyArrival(a, dest, a.optSpec, hlpCtx());
   a.trips++;
   cameraOnArrive(a, dest);   // 追跡中なら「着いた」を出して、ひと呼吸おいて次へ
   if(!CITY_EVOLVE || !CITY || !dest) return;
   const st=structAt(dest[0], dest[1]);
   if(!st) return;
+  if(HLP_NET) _noteVisit(a, st);                     // ハイポリシーの観測 (来店の記憶)
   learnFromVisit(a, st, a.path?a.path.length:null);   // 行きつけを覚える
   if(st.state==='open'){
     st.visits++; st.visitsToday++;
@@ -10936,6 +11401,12 @@ function onArrive(a, dest){
 function dailyRollover(day){
   if(!CITY || !CITY_EVOLVE) return;
   const t0=Date.now();
+  // ハイポリシーの「今日の記憶」を畳む。**学習側は1エピソード=1日**なので、
+  // ここでリセットしないと観測が学習時に無かった範囲まで伸びる。
+  if(HLP_NET){
+    hlpDailyReport();
+    for(const a of agents){ a.foodToday=0; a.foodMaskToday=0; if(a.catVisits) a.catVisits.fill(0); }
+  }
   rolloverVisits();                       // 先に EMA を更新してから閉店判定する
   if(SOCIAL_ON) SOC.dailyDecay(SOC_STATE, agents);   // 会わない相手との関係は薄れる
   stepDebts(day);                                   // 返済と取り立て (借金が恨みに育つ)
@@ -11267,6 +11738,17 @@ function pickBuildingOfType(a, T, k=NAV_PICK_K){
 function applyGoalZ(a){
   const meta=personaMeta[a.def.id];
   if(a.goalType==null || !meta || !meta.goalDim){ a.goalZ=null; return false; }
+  // ── 説明文の埋め込み ──────────────────────────────────────────────────
+  // **建物の「名前」で引く。** これが「新しい建物でも認知できる」の実体で、
+  // 学習時に無かった型でも meta.goal_embeddings に名前があれば指せる。
+  // 名前が無い型だけが従来どおり z=null (誘導なし) に落ちる。
+  if(meta.goalMode==='text_embedding'){
+    const bt=BLDG_TYPES[a.goalType];
+    const e=(bt && meta.goalEmb) ? meta.goalEmb[bt.name] : null;
+    if(!e || e.length!==meta.goalDim){ a.goalZ=null; return false; }
+    a.goalZ=e;                 // 使い回してよい (方策は読むだけ)
+    return true;
+  }
   const zi=(meta.bldgToZ&&meta.bldgToZ[a.goalType]!=null)?meta.bldgToZ[a.goalType]:-1;
   if(zi<0){ a.goalZ=null; return false; }
   const z=new Float32Array(meta.goalDim); z[zi]=1; a.goalZ=z;
@@ -11296,6 +11778,7 @@ function enterWander(a){
   //     必ず畳まれるので、抱えたままでも取り残しにはならない。
   //     行き先を変えられてしまった人は stepMeetups が待ち合わせ地点へ戻す。
   a.mode='wander'; a.goalZ=null; a.rally=false; a.atDoor=null;
+  camArriveDrop(a);          // 玄関から連れ出された = その到着は無かったことにする
   // 内部状態(空腹/疲労/時刻)で行き先を決める。該当が無ければ従来のランダム建物。
   const g=pickLifeGoal(a, [Math.floor(a.x),Math.floor(a.y)]);
   // ★ 行き先の建物タイプで z を立てる。BC学習した「compassに従って目的地へ行く」挙動(感度~1.0)を
@@ -11541,6 +12024,8 @@ function spawnAgent(S, ident){
     visited:new Set(), explored:0, visMem:new Map(),
     // 行動モード: 既定は A(自由)。/goal でタイプを指定すると B(ナビ) に入る。
     mode:'wander', goalType:null, goalZ:null, path:null, pathIdx:0, navDest:null, rally:false,
+    opt:null, optSpec:null, percepts:null, lastOptId:undefined,   // 階層方策: 実行中/行き先の仕様/割り込み/見張り
+    optScores:null, catVisits:null, foodToday:0, foodMaskToday:0, aloneMin:0, _traits:null,
     bestD:null, noProg:0, replans:0, spin:0,   // 目的地に近づけているかの監視 (周回の打ち切り)
     personaVec:null,   // 1モデル化: null=既定の性格 / セットすると実行時に性格を上書き
     // 生活シミュレーション用の内部状態 (= 一種の記憶。観測には入れず目的地抽選に効く)
@@ -11839,6 +12324,34 @@ function onRoadwayAt(x, y){
   return RD.groundKind(ROAD, cls, mask, fu, fv, MW)===RD.GROUND.ROADWAY;
 }
 
+// 方策に渡す walk 観測 (crowd_left / crowd_right / car_ttc) を作る。
+//   pursuit のときは naturalWalk() が副産物として同じ値を書くので呼ばれない。
+//   policy のときは buildAux から毎回ここを通る。**式は walk.js に1本化**。
+const _auxNear=[], _auxCars=[];
+function computeWalkAux(a){
+  SOC.neighborsClosest(SOC_STATE, a, _auxNear, WALK_NEAR_MAX, WALK_CFG.sepRange);
+  const cw=WALK.crowd(WALK_CFG, a, _auxNear);
+  a.crowdL=cw.left; a.crowdR=cw.right;
+  // 車は「車道へ踏み出す一歩の前でだけ」見る (walk.js step() と同じ条件)。
+  // 常時見ると、歩道を歩いているだけで ttc が動いて学習時と観測がズレる。
+  const move=((personaMeta[a.def.id]||{}).fwdPerDecision||FWD_PER_DECISION_DEF)/INFER_EVERY;
+  const stepAhead=move*1.5;
+  const fx=a.x+Math.cos(a.th)*stepAhead, fy=a.y+Math.sin(a.th)*stepAhead;
+  let ttc=1;
+  if(cars && cars.length && onRoadwayAt(fx, fy)){
+    _auxCars.length=0;
+    for(const c of cars){
+      if(Math.abs(c.x-a.x)<WALK_CFG.carLook && Math.abs(c.y-a.y)<WALK_CFG.carLook) _auxCars.push(c);
+    }
+    if(_auxCars.length){
+      const cc=WALK.carCheck(WALK_CFG, a, _auxCars, stepAhead);
+      ttc=Math.min(1, cc.ttc/(WALK_CFG.carTtc*2));
+    }
+  }
+  a.carTtc=ttc;
+  a.walkTick=stepCount;
+}
+
 // 自然な歩行。向きと速度を決めて a に書き、行動 0 (前進) を返す。
 //   ★ 待っているときは stall を進めない。足を止めているのは詰まりではないので、
 //     ここを混同すると「縁石で待つ → 詰まり判定 → 経路引き直し」で永久に渡れなくなる。
@@ -11863,6 +12376,7 @@ function naturalWalk(a, move, rot){
   a.walkWait=r.wait;
   // 方策にも同じ信号を渡すため取っておく (buildAux が読む)
   a.crowdL=r.crowdL; a.crowdR=r.crowdR; a.carTtc=r.ttc; a.walkWhy=r.why;
+  a.walkTick=stepCount;              // この tick は作り直さなくてよい印
   if(r.wait){ a.stall=0; return 0; }   // 待つ = 詰まりではない
   return 0;
 }
@@ -11910,6 +12424,7 @@ async function stepAll(){
   // (WALK.separation) と同じ頻度にする。
   stepDeclump();
   await prefetchAllActions(MAP, agents);
+  await prefetchHlpScores();          // ハイポリシーのスコア (視覚なし・小さいMLP)
   for(let i=0;i<agents.length;i++){
     const a=agents[i];
     // 玄関で一拍おいている人は **移動処理をまるごと飛ばす**。
@@ -11923,7 +12438,11 @@ async function stepAll(){
     if(a.atDoor){
       if(simNow() < a.atDoor.until) continue;    // まだ待つ (歩かせない)
       const d=a.atDoor; a.atDoor=null;
+      onEnterBuilding(a, d.r, d.c);       // 玄関の位置を控える + 窓を灯す
       MW.enterBuilding(a, d.r, d.c);
+      // ★ ここが「帰宅した」の瞬間。玄関で出していたころは道の上の一言だったが、
+      //   いまは**中に入りきってから**出るので、直前の画に入っていく姿が残る。
+      camArriveFlush();
       // ★ **mode を 'hold' のままにしない。** 屋内の住民は下の
       //   「建物から出る判定」で外に出るが、hold は手前の分岐で continue して
       //   しまうのでそこへ到達しない。実測: 24人全員が屋内に籠もったまま
@@ -12558,6 +13077,38 @@ function sightBlocked(cx, cy, cz, tx, ty, tz){
 
 const angWrap = a => Math.atan2(Math.sin(a), Math.cos(a));
 // いまの方位からいちばん近い「通る方位」。どこからも見えなければ null。
+// その点にカメラを置いたら建物の中か。**方位探しには視線だけでは足りない。**
+// 離れて構えると、視線は通っていてもカメラ自身が向かいの建物の中に入る
+// (実測: 壁のテクスチャで画面が埋まった)。
+function camInBuilding(wx, wy, wz){
+  const c=Math.floor(wx/CELL), r=Math.floor(wy/CELL);
+  if(r<0||r>=GRID||c<0||c>=GRID) return false;
+  if(MAP[r][c]!==BUILDING) return false;
+  const st=structAt(r,c);
+  return wz < (st ? structHeight(st) : CELL);
+}
+
+// 建物を丸ごと映すための構え (方位と距離)。狙点は建物、見通しを確かめる先は
+// **玄関** = その人が入っていった場所。密集した街区では望みの距離まで下がれない
+// ので、下がれる距離まで諦めていく。どの方位からも駄目なら null (呼び側は
+// 従来どおり遮蔽の機構に任せて、真上から屋根を見せる)。
+function framingFor(tx, ty, dx, dy, wantDist, high, curAz){
+  for(const k of [1, 0.72, 0.5]){
+    const dist=wantDist*k;
+    let best=null, bestD=Infinity;
+    for(let i=0;i<CAM_ORBIT_DIRS;i++){
+      const az=i/CAM_ORBIT_DIRS*Math.PI*2;
+      const cx=tx+Math.cos(az)*dist, cy=ty+Math.sin(az)*dist;
+      if(camInBuilding(cx, cy, high)) continue;
+      if(sightBlocked(cx, cy, high, dx, dy, CAM_AIM_Z)) continue;
+      const d=Math.abs(angWrap(az-curAz));
+      if(d<bestD){ bestD=d; best=az; }
+    }
+    if(best!=null) return {az:best, dist, high};
+  }
+  return null;
+}
+
 function clearAzimuth(tx, ty, curAz, high){
   const tz=CAM_AIM_Z;
   let best=null, bestD=Infinity;
@@ -14406,11 +14957,15 @@ const CAM_TRIP        = process.env.CAM_TRIP !== '0';
 // 保険。道に迷う / 目的地が消える等で永久に着かないことがあるので上限を置く。
 const CAM_TRIP_MAX_MS = parseInt(process.env.CAM_TRIP_MAX_MS) || 80000;
 // 到着してから切り替えるまでの間 (「着いた」を読ませる時間)
-// 「着いた」を読ませる間。**玄関で立ち止まる時間 (ARRIVE_POSE_SEC) より長く取ること。**
-//   短いと、入口で立ち止まっている最中にカメラが別人へ移ってしまい、
-//   結局「用事が完了したところ」が映らない。既定は一拍3.5秒 + 入っていく間1.7秒。
+//   ★ 起点は **建物に入った瞬間** (camArriveFire)。玄関で立ち止まっている
+//     2.5 秒は camOnTrip がそのまま粘るので、ここには含まれない。
+//     つまりこの時間はまるごと「入った軒を映している時間」で、
+//     枠 (stepDestMark) と灯った窓 (onEnterBuilding) を見せるための尺。
+//   ★ 短くしすぎると、入った直後に別人へ飛んで**どの家か分からないまま**終わる。
 const CAM_ARRIVE_MS   = parseInt(process.env.CAM_ARRIVE_MS)   || (ARRIVE_POSE_MS + 1700);
 let _camArrivedAt = 0;      // 追跡中の人が着いた時刻 (0 = 着いていない)
+let _camInsideK   = 0;      // 0=人を映している / 1=その人が入った建物を映している
+let _camWasInside = false;  // 前フレームで屋内を映していたか (切り替わりの検出)
 let _camTripNeed  = null;   // その移動の目的 (到着の一言に使う)
 
 // いま「用事のために移動している」か。
@@ -14445,15 +15000,39 @@ function arriveBanner(a, dest, need){
 }
 
 // 住民が目的地に着いた。**追跡中の本人のときだけ**カメラに知らせる。
+//   ★ **玄関に着いた瞬間には出さない。** 玄関 (= 建物の 4 近傍) は道の上なので、
+//     そこで「帰宅した」と出して切り替えると、視聴者には *道の真ん中で唐突に
+//     ショットが終わった* ようにしか見えない。どの家に入ったのかも分からない。
+//     中に入る住民については、**入った瞬間まで一言を保留する** (camArriveFlush)。
+//     玄関で立ち止まっている 2.5 秒は枠 (stepDestMark) だけで見せる。
+//   ★ 中に入らない到着 (広場・配達・満室で入れなかった) は従来どおり即座に出す。
+let _arriveHold = false;      // arriveAtBuilding の中だけ true
+let _camPend    = null;       // 保留中の到着 {a, dest}
 function cameraOnArrive(a, dest){
+  // ★ 用事 (_camTripNeed) は**保留に入れる時点で捕まえる**。玄関で立っている
+  //   2.5 秒のあいだに欲求が満たされて needOf が null になると、入った瞬間には
+  //   もう「何をしに来たのか」が分からず、一言が丸ごと消える。
+  if(_arriveHold){ _camPend={a, dest, need:_camTripNeed}; return; }
+  camArriveFire(a, dest, _camTripNeed);
+}
+function camArriveFlush(){ const p=_camPend; _camPend=null; if(p) camArriveFire(p.a, p.dest, p.need); }
+function camArriveDrop(a){ if(_camPend && (!a || _camPend.a===a)) _camPend=null; }
+function camArriveFire(a, dest, need){
   // 一人称ショットでも抜けないこと。ここで return すると _camArrivedAt が
   // 立たず、上限 (CAM_TRIP_MAX_MS) まで解除されない。
   if(!CAM_TRIP) return;
   if(camTargetIdx<=0 || agents[camTargetIdx-1]!==a) return;
+  // 前の到着の余韻が切れていたら畳んでおく。**指名 (focus) の間は
+  // pickCameraTarget が回らない**ので、ここで畳まないと _camArrivedAt が
+  // 立ちっぱなしになり、指名中の到着が二度と出なくなる。
+  if(_camArrivedAt && Date.now()-_camArrivedAt >= CAM_ARRIVE_MS) _camArrivedAt=0;
   if(_camArrivedAt) return;                       // 二重に出さない
-  const need=_camTripNeed;
+  // 用事は「移動を追い始めたときのもの」が本命だが、指名でカメラを止めている
+  // 間は _camTripNeed が更新されない。その場合は今の欲求から起こす。
+  need = need || _camTripNeed || needOf(a);
   if(!need) return;                               // 用事の無い到着は黙って通す
   _camArrivedAt=Date.now();
+  if(process.env.CAM_LOG==='1') console.log('[ArriveBanner]', a.name, need, JSON.stringify(dest), 'indoors=', MW.isIndoors(a));
   showBanner(arriveBanner(a, dest, need), 4);
 }
 
@@ -14572,7 +15151,9 @@ function stepCamMark(S, a, show){
     _camMark.frustumCulled=false;
     S.add(_camMark);
   }
-  _camMark.visible = !!show && !!a;
+  // 屋内の人は描いていない (m.visible=false)。輪だけ残すと、誰も居ない建物の
+  // 中で輪が光り続ける。入った軒は枠 (stepDestMark) のほうが示す。
+  _camMark.visible = !!show && !!a && !MW.isIndoors(a);
   if(!_camMark.visible) return;
   const m=agentMeshes[camTargetIdx-1];
   // 描画位置 (補間後) に合わせる。実座標だと輪だけ先に動いて足元からずれる。
@@ -14589,7 +15170,54 @@ function stepCamMark(S, a, show){
 //     住民の足元のリング (stepCamMark) と対になる、行き先側のしるし。
 //   ★ 色で状態を出す: 向かっている間は琥珀色でゆっくり明滅、着いたら緑で点灯。
 const DEST_MARK = process.env.DEST_MARK !== '0';
-let _destMark = null;
+let _destMark = null, _destCage = null, _destPin = null;
+
+// 行き先の建物の寸法。囲む枠と屋根の上の印を置くのに使う。
+//   ★ 中心は occluders が持っている cx,cy を使う。**敷地の中心ではない** —
+//     建物は通りに寄せて建つ (structOffset) ので、セル中心に置くと枠だけ
+//     半セルずれて建物の脇に立つ。
+function destBoxOf(d){
+  if(!d) return null;
+  const st = structAt(d[0], d[1]);
+  if(!st) return null;
+  const o = occluders[st.r+'_'+st.c+'_b'];
+  const h = (o && o.mesh && o.mesh.userData.hVis) || structHeight(st);
+  return { cx: o ? o.cx : st.c*CELL+st.fp*CELL*0.5,
+           cy: o ? o.cy : st.r*CELL+st.fp*CELL*0.5,
+           w:  st.fp*CELL*0.90, h: Math.max(CELL*0.3, h) };
+}
+
+// 敷地を囲む枠。**LineSegments では駄目だった**: WebGL の線幅は 1px 固定
+// (linewidth は無視される) で、924x520 に流すと建物の輪郭がほとんど見えない。
+// 四隅のブラケットを立体の細い棒で組む。24本 = 288三角形 = 1ドローコール。
+//   ★ 形は行き先が変わったときだけ作り直す (毎フレームではない)。
+function _boxTris(w, d, h, x, y, z, out){
+  const g=new THREE.BoxGeometry(w, d, h).toNonIndexed();
+  g.translate(x, y, z);
+  out.push(g.attributes.position.array);
+  g.dispose();
+}
+function setFrameGeo(mesh, w, h){
+  const key=w.toFixed(2)+'_'+h.toFixed(2);
+  if(mesh.userData.frameKey===key) return;
+  mesh.userData.frameKey=key;
+  const t   = Math.max(0.035, Math.min(w, h)*0.035);  // 棒の太さ
+  const arm = Math.min(w, h)*0.22;                    // 腕の長さ (角から伸ばす)
+  const hw=w*0.5, hh=h*0.5, parts=[];
+  for(const sx of [-1,1]) for(const sy of [-1,1]) for(const sz of [-1,1]){
+    _boxTris(t, t, arm, sx*hw, sy*hw, sz*(hh-arm*0.5), parts);   // 縦の腕
+    _boxTris(arm, t, t, sx*(hw-arm*0.5), sy*hw, sz*hh, parts);   // 横の腕 (x方向)
+    _boxTris(t, arm, t, sx*hw, sy*(hw-arm*0.5), sz*hh, parts);   // 横の腕 (y方向)
+  }
+  let n=0; for(const p of parts) n+=p.length;
+  const pos=new Float32Array(n);
+  let o=0; for(const p of parts){ pos.set(p, o); o+=p.length; }
+  mesh.geometry.dispose();
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  mesh.geometry=g;
+}
+
 function stepDestMark(S, a, show){
   if(!DEST_MARK || !S) return;
   if(!_destMark){
@@ -14602,20 +15230,54 @@ function stepDestMark(S, a, show){
     _destMark.renderOrder=2;
     _destMark.frustumCulled=false;
     S.add(_destMark);
+    // ★ 足元のリングは**建物そのものに隠れる**。追跡カメラは建物を見下ろす
+    //   高さから撮るので、地面の輪だけでは「どの一軒か」がまず読めない
+    //   (「帰宅した」と出ても、どの家に入ったのか分からない、の正体がこれ)。
+    //   軒を丸ごと囲む縦の枠と、屋根の上に浮く印を足す。どちらも 1 メッシュ。
+    // ★ **加算合成にしない。** 昼の街 (露出0.6のACES) では加算だと白に飛んで、
+    //   色 (琥珀=向かっている / 緑=着いた) の区別が消えるうえ、建物より目立つ
+    //   「光の棒」になる。通常合成なら色がそのまま出て、建物の陰にも正しく隠れる。
+    _destCage=new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
+      color:0xffb020, transparent:true, opacity:0.8, depthWrite:false,
+      fog:false, side:THREE.DoubleSide }));
+    _destCage.frustumCulled=false; _destCage.renderOrder=3;
+    S.add(_destCage);
+    // 屋根の上の印。**下向きの錐**にして、指している軒が一意に決まるようにする
+    //   (球やリングだと、どの建物の上に浮いているのか奥行きで迷う)。
+    const pg=new THREE.ConeGeometry(CELL*0.12, CELL*0.26, 4);
+    pg.rotateX(-Math.PI/2);                // 頂点を下 (建物側) へ向ける
+    _destPin=new THREE.Mesh(pg, new THREE.MeshBasicMaterial({
+      color:0xffb020, transparent:true, opacity:0.9, depthWrite:false, fog:false }));
+    _destPin.frustumCulled=false; _destPin.renderOrder=3;
+    S.add(_destPin);
   }
-  // 行き先: 歩いている間は navDest、玄関で待っている間は atDoor
-  const d = a && (a.atDoor ? [a.atDoor.r, a.atDoor.c] : a.navDest);
-  _destMark.visible = !!show && !!d;
-  if(!_destMark.visible) return;
+  // 行き先: 歩いている間は navDest、玄関で待っている間は atDoor。
+  //   ★ **中に入った後も消さない。** 入った瞬間に枠が消えると、一言 (「帰宅した」)
+  //     が出ている間、画の中にどの軒のことなのかを示すものが何も無くなる。
+  //     屋内に居るあいだは a.indoors がその軒そのものなので、それを指し続ける。
+  const inside = a && MW.isIndoors(a);
+  const d = a && (inside ? a.indoors : (a.atDoor ? [a.atDoor.r, a.atDoor.c] : a.navDest));
+  const vis = !!show && !!d;
+  _destMark.visible = vis;
+  _destCage.visible = vis; _destPin.visible = vis;
+  if(!vis) return;
   _destMark.position.set(d[1]*CELL+CELL*.5, d[0]*CELL+CELL*.5, 0.04);
   const t=Date.now()/1000;
-  if(a.atDoor){                            // 着いた: 緑で強く点灯 (明滅させない)
-    _destMark.material.color.setHex(0x30e070);
-    _destMark.material.opacity = 0.85;
-  }else{                                   // 向かっている: 琥珀でゆっくり明滅
-    _destMark.material.color.setHex(0xffb020);
-    _destMark.material.opacity = 0.35 + 0.25*(0.5+0.5*Math.sin(t*2.2));
+  // 着いた (玄関 or 屋内) = 緑で点灯 / 向かっている = 琥珀でゆっくり明滅
+  const there = inside || !!a.atDoor;
+  const col = there ? 0x30e070 : 0xffb020;
+  const op  = there ? 0.90 : 0.30 + 0.20*(0.5+0.5*Math.sin(t*2.2));
+  for(const m of [_destMark, _destCage, _destPin]){
+    m.material.color.setHex(col);
+    m.material.opacity = op;
   }
+  const b=destBoxOf(d);
+  if(!b){ _destCage.visible=false; _destPin.visible=false; return; }
+  setFrameGeo(_destCage, b.w, b.h);
+  _destCage.position.set(b.cx, b.cy, b.h*0.5);
+  // 屋根の少し上で上下に揺らす (静止した枠と違って、動くほうが目に留まる)
+  _destPin.position.set(b.cx, b.cy, b.h + CELL*0.26 + Math.sin(t*2.4)*CELL*0.06);
+  _destPin.rotation.z = t*0.9;
 }
 
 function updateTrackingCamera(cam) {
@@ -14655,8 +15317,9 @@ function updateTrackingCamera(cam) {
   } else {
     const a = agents[camTargetIdx - 1];
     if (!a) return;
-    const tx = a.y * CELL + CELL * .5;   // world X (=足元)
-    const ty = a.x * CELL + CELL * .5;   // world Y
+    let tx = a.y * CELL + CELL * .5;     // world X (=足元)
+    let ty = a.x * CELL + CELL * .5;     // world Y
+    let aimZ = CAM_AIM_Z;
     // 撮影中に建物へ入ったら一人称をやめる。ショットの途中で切れるが、
     // 壁の中を映し続けるよりは良い。次のターゲットまで追跡カメラで通す
     // (毎フレーム出入りで切り替わるとちらつくので、いったん降りたら戻さない)。
@@ -14685,7 +15348,40 @@ function updateTrackingCamera(cam) {
       //     ときだけで、そのときもいちばん近い通る方位へゆっくり回す。
       //   ★ どの方位からも見えないときは高さを上げて建物を越える (回り続けない)。
       cam.up.set(0, 0, 1);                        // 水平線を水平に保つ
-      const aimZ = CAM_AIM_Z;
+      // ★ **屋内に居るあいだは「その建物」を狙点にする。**
+      //   屋内の住民の座標は建物セルの中心なので狙点自体はほぼ同じだが、
+      //   敷地の寄せ (structOffset) と 2x2 の敷地ではズレる。ここを軒の実際の
+      //   中心に合わせておかないと、枠と画の中心が食い違う。
+      const inside = MW.isIndoors(a);
+      let box = null, frame = null;
+      if (inside) {
+        box = destBoxOf(a.indoors);
+        if (box) {
+          tx = box.cx; ty = box.cy; aimZ = Math.min(box.h*0.45, CELL*1.6);
+          // ★ 建物を狙うときの構えは**建物の大きさから決める。** 人と同じ 3.0 の
+          //   距離で 3 階建てを狙うと画面が壁で埋まり、「どの家か」どころか建物で
+          //   あることすら読めない (実測: 2x2 の共同住宅は 5.85 でも溢れた)。
+          // ★ 玄関の位置は onEnterBuilding が控えた a.doorAt。屋内に入ると
+          //   a.x,a.y は建物セルの中心へ移されるので、そこを狙うと「建物の中が
+          //   見えるか」を訊くことになり、答えは常に「見えない」になる。
+          const dz = a.doorAt || [a.x, a.y];
+          frame = framingFor(tx, ty, dz[1]*CELL+CELL*.5, dz[0]*CELL+CELL*.5,
+                             Math.max(CAM_ORBIT_DIST*1.4, box.w*1.55 + box.h*0.75),
+                             Math.max(CAM_ORBIT_HIGH, box.h*0.62 + CELL*0.45), _camAz);
+        }
+      }
+      // ★ 建物に入った**瞬間に構え直す。** 玄関に立っている間は建物が目の前に
+      //   あるので、たいてい遮蔽と判定されてカメラは真上へ逃げている。その姿勢の
+      //   まま屋内へ切り替わると、「帰宅した」の一言が出ている 4 秒間ずっと
+      //   **屋根を真上から**映すことになり、どの家かはやはり分からない。
+      //   ヒステリシス (CAM_BLOCK_WAIT) も方位のスルー (CAM_ORBIT_SLEW) も待たない。
+      if(inside && !_camWasInside){ _camBlockT=0; _camClearT=0; _camLostT=0;
+                                    _camHighWant=CAM_ORBIT_HIGH;
+                                    _camHigh=Math.min(_camHigh, CAM_ORBIT_HIGH);
+                                    if(frame){ _camAz=_camAzWant=frame.az; } }
+      _camWasInside = inside;
+      // 屋内へ寄る/離れるは 1 秒ほどかけて渡す (入った瞬間に画が飛ばない)
+      _camInsideK += ((frame ? 1 : 0) - _camInsideK) * Math.min(1, dtCam*1.4);
       const cxNow = tx + Math.cos(_camAz)*CAM_ORBIT_DIST;
       const cyNow = ty + Math.sin(_camAz)*CAM_ORBIT_DIST;
       // ★ 遮蔽の判定は**常に「通常の高さ」で**行う。
@@ -14694,10 +15390,17 @@ function updateTrackingCamera(cam) {
       //   住民が歩いているうちは位置が変わって輪が切れるが、**立ち止まると
       //   永久に往復する** = カメラが上下に揺れる。実際これが縦揺れの正体。
       //   判定用のカメラ姿勢を高さに依存させなければループは閉じない。
-      const blocked = sightBlocked(cxNow, cyNow, CAM_ORBIT_HIGH, tx, ty, aimZ);
+      //   ★ 建物を映しているとき (frame) は、その構えを framingFor が
+      //     「カメラが建物の中に入らず、玄関が見える」ところまで含めて選んで
+      //     いるので、この機構は動かさない。動かすと 3.0 の距離での判定結果で
+      //     方位が上書きされ、離れて構えた先が隣の建物の中になる。
+      const blocked = frame ? false
+                            : sightBlocked(cxNow, cyNow, CAM_ORBIT_HIGH, tx, ty, aimZ);
+      if (frame) { _camAzWant = frame.az; _camBlockT = 0; _camClearT = 0; _camLostT = 0; }
       _camBlockT = blocked ? _camBlockT + dtCam : 0;
       _camClearT = blocked ? 0 : _camClearT + dtCam;
-      if (_camBlockT > CAM_BLOCK_WAIT) {
+      if (frame) { /* 構えは framingFor が決めた */ }
+      else if (_camBlockT > CAM_BLOCK_WAIT) {
         const az = clearAzimuth(tx, ty, _camAz, CAM_ORBIT_HIGH);
         if (az != null) { _camAzWant = az; _camHighWant = CAM_ORBIT_HIGH; _camLostT = 0; }
         else { _camHighWant = CAM_ORBIT_LIFT; _camLostT += CAM_BLOCK_WAIT; } // 逃げ場が無い
@@ -14720,10 +15423,12 @@ function updateTrackingCamera(cam) {
       // 見下ろし 73 度になり、手前の建物の屋根で結局隠れる (実際そうなった)。
       const lift = Math.max(0, Math.min(1,
         (_camHigh - CAM_ORBIT_HIGH) / Math.max(0.001, CAM_ORBIT_LIFT - CAM_ORBIT_HIGH)));
-      const rad = CAM_ORBIT_DIST * (1 - 0.68*lift);
+      // 建物は人より大きいので、屋内を狙うぶんだけ引いて高く構える
+      const radOut = CAM_ORBIT_DIST * (1 - 0.68*lift);
+      const rad = frame ? radOut + (frame.dist - radOut)*_camInsideK : radOut;
       const wx = tx + Math.cos(_camAz)*rad;
       const wy = ty + Math.sin(_camAz)*rad;
-      const wz = _camHigh;
+      const wz = frame ? _camHigh + (frame.high - _camHigh)*_camInsideK : _camHigh;
       // ショットの切り替わり。**近くの人へ渡したときは飛ばさない** — カメラを
       // そのまま滑らせると、切替が「パン」に見えて画がつながる。
       const cut = camTargetIdx !== _camPrevTarget && !_camGlide;
@@ -16747,6 +17452,8 @@ function startLoops(){
   console.log('[Init] loading ONNX sessions...');
   await loadOnnxSessions();
   logMoveCadence();
+  await loadHlpSession();        // 学習したハイポリシー (HLP_NET=1 のときだけ)
+  hlpAttach();                   // HLP/LLP に世界と乱数を渡す
 
   console.log('[Init] preloading textures...');
   await preloadTextures();

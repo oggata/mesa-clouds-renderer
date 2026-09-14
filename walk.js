@@ -210,19 +210,30 @@ function step(cfg, a, ctx){
   speed *= 1 - cfg.turnSlow*Math.min(1, sharp);
   if(wait) speed=0;
 
-  // 左右の混み具合 (aux にも同じものを出す)
-  let crowdL=0, crowdR=0;
-  for(const o of near){
+  const cw = crowd(cfg, a, near);
+  return {th, speed:Math.max(0,Math.min(1,speed)), wait, ttc,
+          why: wait?'car':(speed<0.95?'slow':'go'),
+          crowdL:cw.left, crowdR:cw.right};
+}
+
+/**
+ * 左右の混み具合 [0,1]。**aux(12,13) に出るのと同じ値**。
+ *
+ * ★ 切り出してあるのは、`MOVE_MODE=policy` では step() が走らないから。
+ *   policy のとき server.js は buildAux から**これを直接呼ぶ**。ここを2箇所に
+ *   書くと、学習した観測と本番の観測が静かにズレる (症状が出ないので気づけない)。
+ */
+function crowd(cfg, a, near){
+  let left=0, right=0;
+  for(const o of near||[]){
     const dx=o.x-a.x, dy=o.y-a.y, d=Math.hypot(dx,dy);
     if(d<1e-4||d>cfg.sepRange) continue;
     const b=wrap(Math.atan2(dy,dx)-a.th);
     if(Math.abs(b)>cfg.sepFov*0.5) continue;
     const w=1-d/cfg.sepRange;
-    if(b<0) crowdL+=w; else crowdR+=w;
+    if(b<0) left+=w; else right+=w;
   }
-  return {th, speed:Math.max(0,Math.min(1,speed)), wait, ttc,
-          why: wait?'car':(speed<0.95?'slow':'go'),
-          crowdL:Math.min(1,crowdL), crowdR:Math.min(1,crowdR)};
+  return {left:Math.min(1,left), right:Math.min(1,right)};
 }
 
-module.exports = { DEFAULTS, step, separation, yieldBias, carCheck };
+module.exports = { DEFAULTS, step, separation, yieldBias, carCheck, crowd };
