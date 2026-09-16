@@ -1980,6 +1980,10 @@ const WORK_CAP        = envNum('WORK_CAP', 6);           // 1つの職場が受�
 const POP_GROWTH      = envNum('POP_GROWTH', 0.15);      // 1日の転入は人口の何割か
 const MOVEIN_MAX      = envNum('MOVEIN_MAX', 8);         // 1日の転入の上限
 const HOME_PRESSURE   = envNum('HOME_PRESSURE', 0.85);   // 定員のこの割合を超えたら住宅を建てる
+// 住居を何日続けて建てたら1日休むか。住居→転入→また不足 の輪が毎日の建設枠を
+// 取り切ってしまい、店も学び舎も建たない「住宅しかない街」になるのを防ぐ。
+// 家なしの住民が居る日はこの制限を無視する (路頭に迷わせない)。
+const HOME_STREAK_MAX = Math.max(1, envNum('HOME_STREAK_MAX', 2));
 const WORK_PRESSURE   = envNum('WORK_PRESSURE', 0.9);    // 同上 (職場)
 
 // 発展段階。経済活動 (店への来店の累計) が溜まると上がり、**背の高い建物と 2x2 が解禁**される。
@@ -2183,6 +2187,12 @@ const QUEST_RESEARCH  = envNum('QUEST_RESEARCH', 0.6); // 実験1回で入る研
 // 終わってしまい、探索が見どころにならない。誰が研究者かは aid から決まるので、
 // 再起動しても同じ顔ぶれになる (視聴者が特定の住民を追える)。
 const QUEST_SHARE = envNum('QUEST_SHARE', 0.4);
+// 探索を始めるのに必要な業種の数。実測すると、始まったばかりの村は業種が7種しか
+// 無いうえ、客の付かない店が数日で閉じて5種まで減る。そこで探索を始めると
+//   ・候補が10通りしかなく総当たりが一瞬で終わる (見どころにならない)
+//   ・レシピの建物が閉店して作り直しが多発する (掲示板が落ち着かない)
+// の両方が起きる。街に業種が揃うまでは研究点だけで時代を進める。
+const QUEST_MIN_TYPES = Math.max(2, envNum('QUEST_MIN_TYPES', 8));
 const QUEST_HINT_DAYS = envNum('QUEST_HINT_DAYS', 6);  // 最高スコアが何ゲーム日更新されなければヒントを出すか
 const QUEST_MAX_DAYS  = envNum('QUEST_MAX_DAYS', 40);  // これを超えたら探索を待たずに時代を進める (最後の保険)
 
@@ -2229,7 +2239,7 @@ function newQuest(reason){
   if(!CITY || !QUEST_ON) return null;
   _qTypes.stamp=-1;                       // 作り直すときは候補を引き直す
   const types=questTypes();
-  if(types.length<2){ CITY.quest=null; return null; }
+  if(types.length<QUEST_MIN_TYPES){ CITY.quest=null; return null; }
   const rnd=questRng((CITY.quest&&CITY.quest.rerolls||0)+1);
   const pick=()=>types[Math.floor(rnd()*types.length)];
   let a=pick(), b=pick(), guard=0;
@@ -2382,7 +2392,7 @@ function isResearcher(a){
   return a._res;
 }
 function startExperiment(a){
-  const q=questOf(); if(!q || q.solved || a.quest) return false;
+  const q=questOf(); if(!q || q.solved || q.paused || a.quest) return false;
   if(!isResearcher(a)) return false;      // 研究者でない住民は学び舎で勉強する (研究点になる)
   const combo=pickCombo(a);
   if(!combo) return false;
@@ -2498,6 +2508,22 @@ function stepQuest(){
          'After a long search, the town stumbled onto it by accident');
     solveQuest(agents.reduce((b,x)=>((x.curious||0)>((b&&b.curious)||0)?x:b), null), q.recipe);
     return;
+  }
+  // ①-a 街から業種が減りすぎた → 探索をいったん畳む。研究点だけで時代は進む。
+  //      作り直しを繰り返すより「まだ街が小さい」と割り切るほうが画面が落ち着く。
+  if(types.length < QUEST_MIN_TYPES){
+    if(!q.paused){
+      q.paused=true;
+      console.log(`[Quest] 業種が ${types.length}種まで減った (下限${QUEST_MIN_TYPES}) → 探索を保留`);
+      news('quest', '⏸ 街が小さくなり、研究の手がかりが足りなくなった',
+           'The town shrank - there is not enough variety to experiment with');
+      hudNewsDirty=true;
+    }
+    return;
+  }
+  if(q.paused){                            // 業種が戻った → 再開
+    q.paused=false;
+    console.log(`[Quest] 業種が ${types.length}種に戻った → 探索を再開`);
   }
   // ① レシピの建物が街から消えた → 誰も試せない。答えを作り直す。
   if(!q.recipe.every(alive)){
@@ -3209,7 +3235,12 @@ function stepNeeds(dtSec){
     //   近くに店があるのに空腹なのは供給不足ではない。**遠いのに欲しい**時間だけを
     //   足し込む。同時に「どこで不満だったか」をヒートマップに落とし、起業の立地に使う。
     if(CITY_EVOLVE && CITY && !MW.isIndoors(a)){
-      const cat=NEED_CAT[needOf(a)];
+      // needOf は「行ける用事」しか返さない。学び舎が街に1軒も無いと 'learn' が
+      // 立たないので、そのままだと **学校が無い → 学びたいという需要が記録されない
+      // → 学校が建たない** のデッドロックになる (実測: Day11 で学び舎 0軒のまま)。
+      // 用事として立つかどうかとは別に、学びたさが溜まっていれば需要に数える。
+      const wantLearn = (a.curious||0) > NEED_HI && !catCount('learn');
+      const cat = wantLearn ? 'learn' : NEED_CAT[needOf(a)];
       if(cat){
         const d=nearestCatDist(a, cat);   // 該当が街に1軒も無ければ Infinity → 重み1
         const w=Math.max(0, Math.min(1, (d-DEMAND_D_OK)/(DEMAND_D_FAR-DEMAND_D_OK)));
@@ -3734,11 +3765,27 @@ function maybeFound(day){
   // 在宅勤務の住民は職場の定員を食わない (AI時代にオフィスを建て続けてしまう)
   let workers=0; for(const a of agents) if(!a.owns && !a.remote) workers++;
 
-  if(pop >= hcap*HOME_PRESSURE && foundableTypes('home').length){
+  // 住居が建設枠を独占しないようにする。
+  //   住居を建てる → 定員が増える → 転入で埋まる → また 85% を超える、が毎日続くので、
+  //   人口に比例する 1日1軒の枠を住居が取り切ってしまう。実測 (村スタート・Day8):
+  //   学び舎の起業圧が 1.74 (発火閾値 0.125 の14倍) あるのに 0軒のまま、
+  //   飲食1軒・買い物1軒・娯楽0軒・学び舎0軒で「住宅しかない街」になっていた。
+  //   → 家なしが出ていない日は、住居の連投を1日休んで他のカテゴリに枠を回す。
+  //     家なしが1人でも居るなら従来どおり住居を最優先する (路頭に迷わせない)。
+  const homeless=agents.reduce((n,a)=>n+(a.home?0:1),0);
+  const homeHungry = pop >= hcap*HOME_PRESSURE && foundableTypes('home').length;
+  const homeStreak = (CITY._homeStreak||0);
+  if(homeHungry && (homeless>0 || homeStreak<HOME_STREAK_MAX)){
     if(foundCategory('home', day)){
-      console.log(`[City] 住居が不足 (人口${pop}/定員${hcap}) → 住むところを建てた`);
+      CITY._homeStreak = homeless>0 ? 0 : homeStreak+1;
+      console.log(`[City] 住居が不足 (人口${pop}/定員${hcap}` 
+        + (homeless?` 家なし${homeless}人`:'') + `) → 住むところを建てた`);
       return 1;
     }
+  }else if(homeHungry){
+    CITY._homeStreak = 0;          // 1日休んだので次の日はまた建てられる
+    console.log(`[City] 住居は足りていないが ${HOME_STREAK_MAX}日続けて建てたので、`
+      + `今日は他の用途に枠を回す (人口${pop}/定員${hcap})`);
   }
   if(workers >= wcap*WORK_PRESSURE && foundableTypes('work').length){
     if(foundCategory('work', day)){
@@ -4395,7 +4442,8 @@ function stepEra(){
   if((CITY.research||0) < eraNeedResearch()) return;
   if(eraGaps().length) return;
   // 発明のレシピを誰かが突き止めていること。stepQuest が4段構えで必ず解けるようにしている。
-  { const q=questOf(); if(q && !q.solved) return; }
+  // 業種が足りず探索を保留している間は待たない (待つと街が育つまで時代が止まる)。
+  { const q=questOf(); if(q && !q.solved && !q.paused) return; }
   if(n.minDays && gameDay()-(CITY.eraDay||0) < n.minDays) return;
   advanceEra(n);
 }
@@ -4567,6 +4615,49 @@ const TREE_HEIGHT = 1.0;
 const AGENT_SPRITE_W = 0.35, AGENT_SPRITE_H = 0.9;
 const AGENT_SPRITE_RGB = [0.95, 0.75, 0.35];
 const SPRITE_MIN_DIST = 0.25, SPRITE_MAX_DIST = 8.0;   // 重なりで画面が埋まるのを防ぐ
+// ダイクストラの優先度キュー (二分ヒープ)。
+//   旧実装は毎回 900 セルを線形走査していて、1回の planPath で最大 810k 回まわっていた。
+//   CPU プロファイル (住民1000人) では **planPath が JS 側で最大のホットスポット** で、
+//   描画を除く自前処理の半分近くを占めていた。
+//   **取り出し順は線形走査と完全に一致させる**: 距離が同じときは index の小さい方を先に。
+//   (旧実装は strict `<` で最初の最小値を採るので「最小 index」が先だった)
+//   経路が変われば住民の動きが変わるので、速くするだけで結果は1経路も変えない。
+const _pqNode=new Int32Array(GRID*GRID*4), _pqDist=new Float64Array(GRID*GRID*4);
+let _pqLen=0;
+function _pqClear(){ _pqLen=0; }
+function _pqLess(i,j){
+  const a=_pqDist[i], b=_pqDist[j];
+  return a<b || (a===b && _pqNode[i]<_pqNode[j]);
+}
+function _pqSwap(i,j){
+  const n=_pqNode[i]; _pqNode[i]=_pqNode[j]; _pqNode[j]=n;
+  const d=_pqDist[i]; _pqDist[i]=_pqDist[j]; _pqDist[j]=d;
+}
+function _pqPush(node, d){
+  if(_pqLen>=_pqNode.length) return false;      // 容量超過 (通常起きない)
+  let i=_pqLen++;
+  _pqNode[i]=node; _pqDist[i]=d;
+  while(i>0){ const p=(i-1)>>1; if(_pqLess(i,p)){ _pqSwap(i,p); i=p; } else break; }
+  return true;
+}
+function _pqPop(){
+  if(_pqLen===0) return -1;
+  const top=_pqNode[0];
+  _pqLen--;
+  if(_pqLen>0){
+    _pqNode[0]=_pqNode[_pqLen]; _pqDist[0]=_pqDist[_pqLen];
+    let i=0;
+    for(;;){
+      const l=i*2+1, r=l+1; let m=i;
+      if(l<_pqLen && _pqLess(l,m)) m=l;
+      if(r<_pqLen && _pqLess(r,m)) m=r;
+      if(m===i) break;
+      _pqSwap(i,m); i=m;
+    }
+  }
+  return top;
+}
+
 function planPath(sr, sc, gr, gc){
   const N=GRID*GRID, key=(r,c)=>r*GRID+c;
   // ゴールの建物セルだけは終点として許可する (玄関まで経路を引くため)。
@@ -4577,9 +4668,15 @@ function planPath(sr, sc, gr, gc){
   const sk=key(sr,sc), gk=key(gr,gc);
   dist[sk]=0;
   const D=[[-1,0],[1,0],[0,-1],[0,1]];
+  _pqClear(); _pqPush(sk, 0);
   for(;;){
-    let u=-1, best=Infinity;
-    for(let i=0;i<N;i++) if(!done[i] && dist[i]<best){ best=dist[i]; u=i; }   // GRID=30 なので線形走査で十分
+    let u=-1;
+    // 取り出し済み / 距離が更新されて古くなったエントリは読み飛ばす (遅延削除)
+    for(;;){
+      const t=_pqPop();
+      if(t<0) break;
+      if(!done[t]){ u=t; break; }
+    }
     if(u<0 || u===gk) break;
     done[u]=1;
     const r=(u/GRID)|0, c=u%GRID;
@@ -4592,7 +4689,7 @@ function planPath(sr, sc, gr, gc){
       // 大きすぎると空き地を使わず遠回り、小さすぎると道路を無視する。
       const nd=dist[u]+(MAP[nr][nc]===ROAD?COST_ROAD
                        :(WORLD.solidBuildings?COST_OFFROAD:COST_BLDG));
-      if(nd<dist[k]){ dist[k]=nd; prev[k]=u; }
+      if(nd<dist[k]){ dist[k]=nd; prev[k]=u; _pqPush(k, nd); }
     }
   }
   if(dist[gk]===Infinity) return null;   // 到達不能 (木に囲まれた建物など)
