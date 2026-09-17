@@ -889,7 +889,11 @@ const BLDG_TYPES = [
   { label:'🗼 タワー',    name:'tower',       footprint:1, height:3.3, category:'work',    persona:'AE', fallbackColor:0x6070b0, textureFile:'./textures/v4/tower.jpg' },
   // ── 2x2 ──
   { label:'🛒 スーパー',   name:'supermarket', footprint:2, height:1.1, category:'shop',    persona:'CB', fallbackColor:0x40a060, textureFile:'./textures/v4/supermarket.jpg' },
-  { label:'⛩ 神社仏閣',   name:'temple',      footprint:2, height:1.1, category:'tour',    persona:'EA', fallbackColor:0xc04040, textureFile:'./textures/v4/temple.jpg' },
+  // ⛩ は 1x1。**並び順は絶対に変えない** (index が動くと配備済み meta の
+  // persona_reward_params が参照する建物 index とズレる)。footprint だけ 2→1。
+  // 娯楽(FUN)に 1x1 が1つも無いと 10x10 の村では娯楽が原理的に建てられず、
+  // 実測で Day17 まで娯楽0軒・退屈が解消されないままだった。
+  { label:'⛩ 神社',      name:'temple',      footprint:1, height:1.1, category:'tour',    persona:'EA', fallbackColor:0xc04040, textureFile:'./textures/v4/temple.jpg' },
   { label:'🏫 学校',      name:'school',      footprint:2, height:1.4, category:'learn',   persona:'C',  fallbackColor:0xe0b040, textureFile:'./textures/v4/school.jpg' },
   { label:'🚉 駅',        name:'station',     footprint:2, height:1.4, category:'transit', persona:'CA', fallbackColor:0x7080a0, textureFile:'./textures/v4/station.jpg' },
   { label:'📚 図書館',    name:'library',     footprint:2, height:1.4, category:'learn',   persona:'BE', fallbackColor:0x8060a0, textureFile:'./textures/v4/library.jpg' },
@@ -898,6 +902,12 @@ const BLDG_TYPES = [
   { label:'🖼 博物館',    name:'museum',      footprint:2, height:1.7, category:'tour',    persona:'E',  fallbackColor:0xa09060, textureFile:'./textures/v4/museum.jpg' },
   { label:'🏟 競技場',    name:'stadium',     footprint:2, height:2.1, category:'leisure', persona:'C',  fallbackColor:0x60a080, textureFile:'./textures/v4/stadium.jpg' },
   { label:'🏬 複合ビル',  name:'mall',        footprint:2, height:2.6, category:'shop',    persona:'CD', fallbackColor:0x5878a0, textureFile:'./textures/v4/mall.jpg' },
+  // ── 後から足した業種 (1x1) ──
+  // **必ず末尾に足すこと。** 既存の index 0〜24 が動くと、配備済みの ONNX の
+  // goal one-hot (meta.goal_classes) と対応がズレる。末尾なら知らないタイプは
+  // z=-1 (誘導なし・目的地だけ有効) に落ちるので、再学習しなくても動く。
+  { label:'🎤 カラオケ',   name:'karaoke',     footprint:1, height:1.4, category:'leisure', persona:'C',  fallbackColor:0xd04888, textureFile:'./textures/v4/karaoke.jpg' },
+  { label:'🕹 ゲームセンター', name:'arcade',  footprint:1, height:1.4, category:'leisure', persona:'CA', fallbackColor:0x40308c, textureFile:'./textures/v4/arcade.jpg' },
 ];
 // footprint 別インデックス (型割当で使用)
 const FP1_IDX = BLDG_TYPES.map((b,i)=>b.footprint===1?i:-1).filter(i=>i>=0);
@@ -1865,7 +1875,10 @@ const SLEEP_RECOVER = 0.55;        // 自宅に着いたときの疲労回復量
 // これを超えると「その欲求で目的地を選ぶ」。小さいほど住民が用事で動きやすくなる。
 const NEED_HI       = envNum('NEED_HI', 0.62);
 const SUPPLY_RATE   = 1/(16*60);   // 日用品の消費 (買い物欲)
-const BORED_RATE    = 1/(11*60);   // 退屈の蓄積 (人と会う/娯楽で解消)
+const BORED_RATE    = 1/(11*60);   // 退屈の蓄積 (娯楽で解消)
+// 人と一緒にいるときの退屈の溜まりやすさ (1=一人と同じ / 0=まったく溜まらない)。
+// 0 にすると密集した街で娯楽の需要が永久に立たなくなるので、必ず正の値にすること。
+const BORED_TOGETHER= Math.max(0, envNum('BORED_TOGETHER', 0.3));
 const SICK_PROB     = 1/(60*90);   // 1秒あたりの発症確率 (平均90分に1回)
 const SICK_HEAL     = 1/(4*60);    // 病院/薬局での回復速度
 const BUY_RECOVER   = 0.85;        // 店に着いたときの補充量
@@ -1879,7 +1892,9 @@ const HOME_IDX = ['house','apartment'].map(IDX_OF).filter(v=>v!=null);
 const WORK_IDX = ['office','tower','bank','post','cityhall'].map(IDX_OF).filter(v=>v!=null);
 const CARE_IDX = ['hospital','pharmacy'].map(IDX_OF).filter(v=>v!=null);        // 病気
 const BUY_IDX  = ['conbini','supermarket','shop','mall'].map(IDX_OF).filter(v=>v!=null); // 買い物
-const FUN_IDX  = ['stadium','temple','museum','library'].map(IDX_OF).filter(v=>v!=null);  // 退屈しのぎ
+// 退屈しのぎ。**1x1 を先に並べる**: pickTypeFor は軒数が最少の型から選ぶので順序は
+// 効かないが、どれが小さい街でも建つかを読み手に示す意図で 1x1 を前に置く。
+const FUN_IDX  = ['temple','karaoke','arcade','stadium','museum','library'].map(IDX_OF).filter(v=>v!=null);
 // 学び舎。ここに住民が居た時間が研究点になり、時代 (ERA) を進める。
 // 学校は今までどの欲求カテゴリにも入っておらず、建っても誰も使わない建物だった。
 const LEARN_IDX = ['school','library'].map(IDX_OF).filter(v=>v!=null);
@@ -2072,13 +2087,13 @@ const ERA_FALLBACK = [
     next:{ invention:'THE COMPUTER', inventionJa:'計算機', research:30, minDays:3,
            requires:{ pop:10 } } },
   { id:'pc', en:'PC ERA', ja:'パソコンの時代', tag:'everyone commutes to an office',
-    buildings:['apartment','supermarket','station','stadium','museum'], retire:[],
+    buildings:['apartment','supermarket','station','stadium','museum','arcade','karaoke'], retire:[],
     flow:{ nightStart:22, nightEnd:6, workFrom:9, workTo:18, homeShop:0.05, remoteWork:0,
            funBias:1.0, learnRate:1.0, speed:1.05, board:'place', persona:{as:'D', mix:0.35} },
     next:{ invention:'THE WIRELESS NETWORK', inventionJa:'無線ネットワーク', research:115, minDays:4,
            requires:{ pop:18, buildings:{ school:1 } } } },
   { id:'smartphone', en:'SMARTPHONE', ja:'スマホの時代', tag:'people go out less, and stay up late',
-    buildings:['mall','hotel','tower'], retire:['post','bank'],
+    buildings:['mall','hotel','tower'], retire:['post','bank','arcade'],
     flow:{ nightStart:23, nightEnd:7, workFrom:9, workTo:18, homeShop:0.45, remoteWork:0.15,
            funBias:1.3, learnRate:1.2, speed:1.1, board:'anywhere', persona:{as:'D', mix:0.5} },
     next:{ invention:'THE MODEL', inventionJa:'モデル', research:160, minDays:5,
@@ -2583,6 +2598,7 @@ const BLDG_EN = {
   office:'Office', tower:'Tower', supermarket:'Supermarket', temple:'Shrine',
   school:'School', station:'Station', library:'Library', hospital:'Hospital',
   cityhall:'City Hall', museum:'Museum', stadium:'Stadium', mall:'Mall',
+  karaoke:'Karaoke', arcade:'Arcade',
 };
 const enOf = t => BLDG_EN[BLDG_TYPES[t].name] || BLDG_TYPES[t].name;
 const CAT_EN = { eat:'food', shop:'shops', fun:'leisure', care:'healthcare',
@@ -3184,8 +3200,15 @@ function stepNeeds(dtSec){
         if(QUEST_ON && Math.random()<GOSSIP_P*3*dtSec) questGossip(a, o);
         break;
       } }
-    // 退屈の溜まる速さは時代で変わる (娯楽が増えるほど「出かけたくなる」)
-    a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?(F.funBias||1):-1.5)));
+    // 退屈の溜まる速さは時代で変わる (娯楽が増えるほど「出かけたくなる」)。
+    //   人といると **溜まりにくくなる** が、減りはしない。
+    //   以前は一緒にいると -1.5倍 で減っていたが、密集した街では住民は
+    //   ほぼ常に誰かの3セル以内に居る (屋内で同じ建物に居る人も数える) ため、
+    //   退屈が一度も 0.62 に届かず **娯楽の需要が永久に立たなかった**。
+    //   実測: 村スタート Day8 で娯楽0軒・bored 由来の用事は1件も観測されず。
+    //   「一人だと退屈が溜まりやすい」という性質は BORED_TOGETHER で残す。
+    a.bored = Math.min(1, Math.max(0,
+      (a.bored||0) + BORED_RATE*dtSec*(F.funBias||1)*(alone?1:BORED_TOGETHER)));
     // 学びたさ。学び舎で解消し、その時間が街の研究点になる。
     a.curious = Math.min(1, (a.curious||0) + CURIOUS_RATE*dtSec*(F.learnRate||1));
     // 実験: 学びたさが溜まったら「確かめたい組み合わせ」を1つ決めて出かける。
@@ -4355,7 +4378,7 @@ function onArrive(a, dest){
              `${a.name} is the first customer of the new ${enOf(st.typeIdx)}`);
     }
   }
-  const bit=1<<st.typeIdx;                       // typeIdx < 25 なのでビット演算で足りる
+  const bit=1<<st.typeIdx;   // typeIdx < 31 なら安全 (JS のビット演算は32bit符号付き)
   if(!((a.seenMask||0)&bit)){
     a.seenMask=(a.seenMask||0)|bit;
     if(st.state==='open' && Date.now()-_lastFirstNews>FIRST_NEWS_COOLDOWN_MS){
