@@ -115,6 +115,10 @@ const params   = new URLSearchParams(location.search);
 const IS_DEBUG = params.get('debug') === '1';
 const IS_ADMIN = params.get('admin') === '1';
 if(IS_DEBUG) document.getElementById('dbg').style.display  = 'block';
+// 右上の接続バッジ (STREAMING 等) はブラウザだけに出る古い表示なので、debug 時だけ出す
+if(!IS_DEBUG) document.getElementById('status-badge').style.display = 'none';
+// 画面下のカメラ/住民名バッジも同じくブラウザだけの古い表示なので出さない
+document.getElementById('cam-badge').style.display = 'none';
 if(IS_ADMIN) document.getElementById('ctrl').style.display = 'flex';
 
 // ── debug log ──
@@ -298,6 +302,11 @@ function showThought(personaId, displayName) {
   const box  = document.getElementById('thought-box');
   const nameEl = document.getElementById('thought-persona');
   const textEl = document.getElementById('thought-text');
+
+  // 手前に出る住民の吹き出しはブラウザだけに出る古い仕組みなので出さない
+  // (配信映像には出ない)。戻すときはこの return を外す。
+  box.style.display = 'none';
+  return;
 
   if (!personaId || displayName === 'overview' || !PERSONA_THOUGHTS[personaId]) {
     box.style.display = 'none';

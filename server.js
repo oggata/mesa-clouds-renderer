@@ -2494,10 +2494,11 @@ function hudDayLines(){
   return [`DAY ${gameDay()+1}  ${hh}:${mm}`,
           CITY ? `POP ${agents.length}  ${levelSpec().en}  ${weatherNow().en}` : '', ...(era!=null?[era]:[])];
 }
-// 日付板の中身の指紋。変わったときだけ作り直す (研究の板も含む)。
+// 日付板の中身の指紋。変わったときだけ作り直す。
+//   研究の中身は右下のカード (techCardRows) に移したので、ここは 3 行だけ。
 function hudDaySig(){
   const [a,b,c]=hudDayLines();
-  return a+'|'+b+'|'+(c||'')+'|'+(TECH_ON ? JSON.stringify(techBoardRows()) : '');
+  return a+'|'+b+'|'+(c||'');
 }
 // 板の幅に収まるよう末尾を「…」で落とす。全角=1em / 半角=0.55em で見積もる。
 function hudFit(text, px, fs){
@@ -2516,13 +2517,38 @@ async function refreshHudDay(){
   if(sig===hudDayText || !hudScene) return;
   hudDayText=sig;
   const [l1,l2,l3]=hudDayLines();
-  const W=HUD_DAY_W, pad=_hs(12), inner=W-pad*2;
-  const rows=TECH_ON ? techBoardRows() : [];
-  const RH=_hs(18), fs=_hs(12), fsS=_hs(11);
-  const top=HUD_DAY_H + (rows.length ? _hs(4) : 0);
-  const H=top + rows.length*RH + (rows.length ? _hs(6) : 0);
+  const W=HUD_DAY_W, pad=_hs(12), inner=W-pad*2, H=HUD_DAY_H;
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`
+    +`<rect width="${W}" height="${H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.58"/>`
+    +`<text x="${pad}" y="${_hs(24)}" font-size="${_hs(17)}" font-weight="bold" fill="#00d2a0"`
+    +` font-family="${HUD_FACE}">${_esc(_hud(l1))}</text>`
+    +`<text x="${pad}" y="${_hs(43)}" font-size="${_hs(13)}" fill="#9fd8c8"`
+    +` font-family="${HUD_FACE}">${_esc(_hud(l2))}</text>`
+    +(l3!=null ? `<text x="${pad}" y="${_hs(62)}" font-size="${_hs(13)}" font-weight="bold" fill="#f5c542"`
+      +` font-family="${HUD_FACE}">${_esc(hudFit(l3, inner, _hs(13)))}</text>` : '')
+    +`</svg>`);
+  if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
+  hudDay=hudPlane(W, H, tex);
+  hudDay.position.set(-WIDTH/2+W/2+12, HEIGHT/2-H/2-10, 1);
+  hudScene.add(hudDay);
+}
+
+// 升目の見た目。q=まだ分からない欄 / known=分かった欄 / new=いちばん新しい結果 / mat=見つけた素材
+const CELL_STYLE = {
+  head:  {color:'#9fd8c8'},
+  q:     {stroke:'#f5c542', dash:true, color:'#f5c542'},
+  known: {fill:'#3a3314', stroke:'#f5c542', color:'#f5c542', bold:true},
+  post:  {fill:'#1f2e2c', color:'#dfeee9'},
+  new:   {fill:'#1f2e2c', stroke:'#00d2a0', color:'#ffffff', bold:true},
+  mat:   {fill:'#0f3a40', color:'#9ff6ff'},
+  matq:  {stroke:'#5d7672', dash:true, color:'#7f9690'},
+};
+// 板に「行」を並べて描く (右下の研究カードが使う)。行の種類は techCardRows を参照。
+//   W … 板の幅 / top … 1 行目の上端 / RH … 1 行の高さ
+function hudRowsSvg(rows, W, top, RH){
+  const pad=_hs(12), inner=W-pad*2, fs=_hs(12), fsS=_hs(11);
   let body='';
-  if(rows.length) body+=`<rect x="${pad}" y="${HUD_DAY_H-_hs(2)}" width="${inner}" height="1" fill="#9fd8c8" fill-opacity="0.25"/>`;
   rows.forEach((r,i)=>{
     const y=top+i*RH, base=y+RH*0.72;
     if(r.t==='steps'){
@@ -2555,25 +2581,41 @@ async function refreshHudDay(){
       body+=`<rect x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="${bh/2}" fill="#1b2a2a"/>`;
       body+=`<rect x="${x0}" y="${by}" width="${Math.max(bh, bw*Math.max(0,Math.min(1,r.frac)))}" height="${bh}" rx="${bh/2}" fill="${r.color}"/>`;
       body+=`<text x="${W-pad}" y="${base}" font-size="${fsS}" text-anchor="end" fill="#dfeee9" font-family="${HUD_FACE_T}">${_esc(_hud(r.note))}</text>`;
+    }else if(r.t==='cells'){
+      // 升目の 1 行。答えの 4 マス / 試した組み合わせ / 素材の一覧に使う。
+      //   tail があれば右端に置く (当たりの ●○ / 「答え」)。
+      const n=r.cells.length, gap=_hs(3), tw=r.tail!=null ? _hs(46) : 0;
+      const cw=(inner-tw-gap*(n-1)-(tw?gap:0))/n, ch=RH-_hs(3);
+      r.cells.forEach((c,j)=>{
+        const x=pad+j*(cw+gap), st=CELL_STYLE[c.st]||CELL_STYLE.post;
+        if(st.fill || st.stroke)
+          body+=`<rect x="${x}" y="${y+_hs(1.5)}" width="${cw}" height="${ch}" rx="${_hs(3)}" fill="${st.fill||'none'}"`
+               +(st.stroke?` stroke="${st.stroke}" stroke-width="${_hs(1.2)}"${st.dash?` stroke-dasharray="${_hs(3)} ${_hs(2)}"`:''}`:'')+`/>`;
+        body+=`<text x="${x+cw/2}" y="${base}" font-size="${fsS}" text-anchor="middle" fill="${st.color}"${st.bold?' font-weight="bold"':''}`
+             +` font-family="${HUD_FACE_T}">${_esc(hudFit(c.text, cw-_hs(2), fsS))}</text>`;
+      });
+      if(r.hits!=null){
+        // 当たりの数は丸を描く (●○ の字はフォントによって小さく潰れて読めなかった)
+        const rad=_hs(4), st=_hs(11), cy=y+RH/2;
+        for(let k=0;k<4;k++){
+          const cx=W-pad-rad-(3-k)*st;
+          body+= k<r.hits ? `<circle cx="${cx}" cy="${cy}" r="${rad}" fill="${r.tailColor||'#dfeee9'}"/>`
+                          : `<circle cx="${cx}" cy="${cy}" r="${rad-_hs(0.6)}" fill="none" stroke="#5d7672" stroke-width="${_hs(1.2)}"/>`;
+        }
+      }else if(r.tail)
+        body+=`<text x="${W-pad}" y="${base}" font-size="${fsS}" text-anchor="end" fill="${r.tailColor||'#dfeee9'}"`
+             +` font-family="${HUD_FACE_T}">${_esc(_hud(r.tail))}</text>`;
     }else{
       const f=r.small?fsS:fs;
-      body+=`<text x="${pad}" y="${base}" font-size="${f}" fill="${r.color||'#dfeee9'}" font-family="${HUD_FACE_T}">${_esc(hudFit(r.text, inner, f))}</text>`;
+      // right … 右端に寄せる短い札 (カードの見出しの「新しい結果」など)
+      const rw=r.right ? _tw(_hud(r.right))*f*0.5+_hs(8) : 0;
+      if(r.right) body+=`<text x="${W-pad}" y="${base}" font-size="${fsS}" text-anchor="end" fill="${r.rightColor||'#f5c542'}"`
+                       +` font-weight="bold" font-family="${HUD_FACE_T}">${_esc(_hud(r.right))}</text>`;
+      body+=`<text x="${pad}" y="${base}" font-size="${f}" fill="${r.color||'#dfeee9'}"${r.bold?' font-weight="bold"':''}`
+           +` font-family="${HUD_FACE_T}">${_esc(hudFit(r.text, inner-rw, f))}</text>`;
     }
   });
-  const {tex}=await svgTexture(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`
-    +`<rect width="${W}" height="${H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="${rows.length?0.62:0.58}"/>`
-    +`<text x="${pad}" y="${_hs(24)}" font-size="${_hs(17)}" font-weight="bold" fill="#00d2a0"`
-    +` font-family="${HUD_FACE}">${_esc(_hud(l1))}</text>`
-    +`<text x="${pad}" y="${_hs(43)}" font-size="${_hs(13)}" fill="#9fd8c8"`
-    +` font-family="${HUD_FACE}">${_esc(_hud(l2))}</text>`
-    +(l3!=null ? `<text x="${pad}" y="${_hs(62)}" font-size="${_hs(13)}" font-weight="bold" fill="#f5c542"`
-      +` font-family="${HUD_FACE}">${_esc(hudFit(l3, inner, _hs(13)))}</text>` : '')
-    +body+`</svg>`);
-  if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
-  hudDay=hudPlane(W, H, tex);
-  hudDay.position.set(-WIDTH/2+W/2+12, HEIGHT/2-H/2-10, 1);
-  hudScene.add(hudDay);
+  return body;
 }
 
 async function refreshHudTicker(){
@@ -2815,11 +2857,11 @@ let hudBanner=null, hudBannerT0=0, hudBannerUntil=0, hudBannerBusy=false;
 const BANNER_FS    = _hs(envNum('HUD_BANNER_FONT', 15));      // 以前は 21
 const BANNER_PAD   = _hs(16);
 const BANNER_LINES = Math.max(1, Math.min(4, envNum('HUD_BANNER_LINES', 3)));
-// ★ 研究の板 (左上) が縦に伸びたので、中央に出すと板の右端に重なった。時代があるときは
-//   **板の右側の空いた帯の中央**に出す (右上のカメラ表示より下の高さなので、そちらとは重ならない)。
-const BANNER_LEFT  = TECH_ON ? 12+HUD_DAY_W+12 : 20;
+// 以前は研究の板で左上が縦に伸びていたので、板の右側へずらしていた。研究の中身を
+// 右下のカードへ移して左上は 3 行に戻ったので、また中央に出す (板の下端より低い高さ)。
+const BANNER_LEFT  = 20;
 const BANNER_MAXW  = Math.min(WIDTH-BANNER_LEFT-20, Math.round(WIDTH*0.72));
-const BANNER_CX    = TECH_ON ? (BANNER_LEFT + (WIDTH-12))/2 - WIDTH/2 : 0;
+const BANNER_CX    = 0;
 // 日本語は単語の切れ目が無いので、**表示幅**で割る (全角=2 / 半角=1)。
 //   句読点や閉じ括弧が行頭に来ないよう、その1文字だけは前の行にぶら下げる。
 function wrapByWidth(text, cols){
@@ -2891,6 +2933,95 @@ function updateBanner(){
   hudBanner.material.opacity=Math.max(0, Math.min(1, Math.min((now-hudBannerT0)/300, left/600)));
 }
 
+// ── 研究カード (画面右下) ──────────────────────────────────────────────────
+//   左上に研究の中身まで積むと街が隠れるので、**進捗があったときだけ** 右下に出す。
+//   進捗 = 実験の結果 / 素材の発見 / ひらめき / 発明 / 研究の開始 / 行き詰まり / 時代の交代。
+//   TECH_CARD_SEC 秒 (実時間) で消える。0 なら出しっぱなし。チャットの !tech でも出る。
+//   ★ 表示の長さは配信を見る人の時間なので Date.now() でよい (街の時計ではない)。
+const TECH_CARD_ON  = TECH_ON && process.env.TECH_PANEL !== '0';
+const TECH_CARD_SEC = Math.max(0, envNum('TECH_CARD_SEC', 20));
+const TECH_CARD_W   = _hs(330);
+let hudTech=null, techCardBusy=false, techCardAt=0, techCardSig='', techCardPrev=null,
+    techCardWhy='', techCardT0=0, techCardUntil=0;
+
+// 進捗の指紋。どの欄が変わったかで「なぜ出たか」を決める。
+function techCardKey(){
+  if(!CITY || !CITY.tech) return null;
+  const T=CITY.tech, R=T.round;
+  return { era:T.era, k:R?R.k:-1, step:R?(R.step||0):-1, solved:R&&R.solvedDay!=null?1:0,
+           hints:R?Object.keys(R.hints).length:0, found:R?R.deposits.filter(d=>d.found).length:0,
+           posts:R?R.posts.length:0, stall:R?R.stall:0, prereq:R&&techPrereqOk()?1:0 };
+}
+function techCardReason(a, b){
+  const J=JA_HUD;
+  if(a.era!==b.era)            return J?'新しい時代':'new era';
+  if(a.k!==b.k)                return J?'研究開始':'research begins';
+  if(b.step>a.step || b.solved>a.solved) return J?'発明!':'invented!';
+  if(b.hints>a.hints)          return J?'ひらめき':'a hunch';
+  if(b.found>a.found)          return J?'素材を発見':'item found';
+  if(b.posts>a.posts)          return J?'新しい結果':'new result';
+  if(b.stall>a.stall)          return J?'行き詰まり':'stalled';
+  if(b.prereq>a.prereq)        return J?'研究所ができた':'lab ready';
+  return null;                 // 減っただけ (段が変わって掲示板がまっさらになった等) は出さない
+}
+function showTechCard(why){
+  if(!TECH_CARD_ON || !hudScene) return false;
+  const now=Date.now();
+  if(!(now<techCardUntil)) techCardT0=now;          // 出ていないときだけフェードインし直す
+  techCardUntil=now+TECH_CARD_SEC*1000;
+  techCardWhy=why||'';
+  techCardSig='';                                    // 見出しの札が変わるので描き直す
+  return true;
+}
+async function refreshTechCard(rows){
+  const W=TECH_CARD_W, RH=_hs(18), top=_hs(6);
+  const H=top + rows.length*RH + _hs(8);
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`
+    +`<rect width="${W}" height="${H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.72"/>`
+    +`<rect x="${W-_hs(3)}" y="0" width="${_hs(3)}" height="${H}" fill="#f5c542"/>`
+    +hudRowsSvg(rows, W, top, RH)+`</svg>`);
+  const op=hudTech ? hudTech.material.opacity : 0;
+  if(hudTech){ hudScene.remove(hudTech); hudTech.material.map.dispose(); hudTech.material.dispose(); hudTech.geometry.dispose(); }
+  hudTech=hudPlane(W, H, tex);
+  hudTech.material.opacity=op;
+  // 右下。ティッカーの帯の上 (左下の会話ログと同じ高さの基準)
+  hudTech.position.set(WIDTH/2-W/2-12, -HEIGHT/2+HUD_TICKER_H+6+H/2+10, 1);
+  hudScene.add(hudTech);
+}
+function updateTechCard(now){
+  if(!TECH_CARD_ON) return;
+  if(!techCardBusy && now-techCardAt>=1000){
+    techCardAt=now;
+    const key=techCardKey();
+    if(key){
+      if(techCardPrev && JSON.stringify(key)!==JSON.stringify(techCardPrev)){
+        const why=techCardReason(techCardPrev, key);
+        if(why) showTechCard(why);
+      }
+      techCardPrev=key;
+    }
+    const vis = TECH_CARD_SEC<=0 || now<techCardUntil;
+    if(vis){
+      const rows=techCardRows(techCardWhy);
+      const sig=JSON.stringify(rows);
+      if(rows.length && sig!==techCardSig){
+        techCardSig=sig; techCardBusy=true;
+        refreshTechCard(rows).catch(e=>console.warn('[HUD]',e.message)).finally(()=>{techCardBusy=false;});
+      }
+    }
+  }
+  if(!hudTech) return;
+  if(TECH_CARD_SEC<=0){ hudTech.material.opacity=1; return; }
+  const left=techCardUntil-now;
+  if(left<=0){
+    hudScene.remove(hudTech); hudTech.material.map.dispose(); hudTech.material.dispose(); hudTech.geometry.dispose();
+    hudTech=null; techCardSig=''; return;
+  }
+  // 0.3 秒でフェードイン / 0.6 秒でフェードアウト (バナーと同じ)
+  hudTech.material.opacity=Math.max(0, Math.min(1, (now-techCardT0)/300, left/600));
+}
+
 // 毎フレーム呼ばれる。テクスチャの作り直しは「文字が変わったとき」だけで、
 // スクロールは板を動かすだけ (sharp を毎フレーム回さない)。
 function updateHud(dt){
@@ -2905,6 +3036,7 @@ function updateHud(dt){
       refreshHudDay().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudDayBusy=false;});
     }
   }
+  updateTechCard(now);
   // いま何を映しているか (最短1秒に1回だけ作り直す)
   if(!hudCamBusy && now-hudCamAt>1000){
     hudCamBusy=true; hudCamAt=now;
@@ -13126,88 +13258,136 @@ function syncTechProps(){
   TechInst.drone.count=d; TechInst.drone.instanceMatrix.needsUpdate=true;
 }
 
-// ── HUD: 研究の板 (左上の日付板の下にまとめて描く) ──────────────────────────
-//   ★ 以前は右上に別の板として出していたが、左上の「時代・年号」と離れていて
-//     読みにくかった。**「いまどの時代で、次に何が起きれば進むのか」を 1 か所で**読めるように、
-//     日付板の下に続けて描く。文字を詰め込まず、段の進み・素材・絞り込みは図で見せる。
-//   TECH_PANEL=0 で研究の部分だけ消せる (日付板の 3 行目の時代と年号は残る)。
-const TECH_PANEL_ON = TECH_ON && process.env.TECH_PANEL !== '0';
-// 仮説の短い書き方。特性は名前の横に出すので、ここでは 場所×素材×時間帯 だけ。
+// ── HUD: 研究カード (画面右下) の中身 ─────────────────────────────────────────
+//   ★ 以前は左上の日付板の下に積んでいたが、行が増えるほど街が隠れ、しかも
+//     「答えは 4 つの欄の組み合わせで、●は合っている欄の数」という骨格が読めなかった。
+//     右下のカードに移し、**答えの 4 マスと、同じ列に揃えた直近の結果**を並べる
+//     (視聴者が一緒に推理できるように)。時代の道具 (伝わり方・推理) も数字で見せる。
+//   出し入れは updateTechCard が決める。TECH_PANEL=0 でカードごと消せる。
+// 仮説の短い書き方。特性は「○○の人に」と別に言うので、ここでは 場所×素材×時間帯 だけ。
 function techShortLabel(k, h, ja){
   const D=TECH.RESEARCH[k], d=TECH.dec(h);
   return ja ? `${TECH.PLACES[d[1]].ja}×${D.materials[d[0]].ja}×${TECH.TIMES[d[3]].ja}`
             : `${D.materials[d[0]].id}/${TECH.PLACES[d[1]].id}/${TECH.TIMES[d[3]].id}`;
 }
-// 板に描く中身。文字列の配列ではなく「行の種類」を返し、描き方は refreshHudDay が決める。
-//   {t:'steps', items:[{label, st:'done'|'now'|'todo'}]}   段の進み (チップ)
-//   {t:'dots',  label, n, of, note}                         素材
-//   {t:'bar',   label, frac, note, color}                   絞り込み / 普及
-//   {t:'text',  text, color, small}
-function techBoardRows(){
-  if(!TECH_PANEL_ON || !CITY || !CITY.tech) return [];
+// 升目に入れる短い名前 (slot: 0=素材 1=場所 2=特性 3=時間帯)
+const TECH_SLOT_HEAD  = [['素材','item'], ['場所','place'], ['人','who'], ['時間','time']];
+const TECH_PLACE_CELL = {home:['自宅','home'], learn:['学び舎','school'], work:['仕事場','work'],
+                         eat:['飲食店','diner'], shop:['商店','shop']};
+function techCellLabel(k, slot, v){
+  const J=JA_HUD, D=TECH.RESEARCH[k];
+  if(slot===0) return J ? D.materials[v].ja : D.materials[v].id;
+  if(slot===1){ const s=TECH_PLACE_CELL[TECH.PLACES[v].id]; return s ? s[J?0:1] : TECH.PLACES[v].id; }
+  if(slot===2) return J ? techTraitJa(k, v) : techTraitEn(k, v);
+  return J ? TECH.TIMES[v].ja : TECH.TIMES[v].id;
+}
+// 住民が平均して掲示板の結果の何割を知っているか (アナログは口コミなので歯抜けになる)
+function techKnowFrac(){
+  const R=CITY.tech.round;
+  if(!R || !R.posts.length) return null;
+  if(TECH_BOARD && CITY.tech.era>=2) return 1;
+  let s=0, n=0;
+  for(const a of agents){
+    if(a.def && a.def.age!=null && a.def.age<7) continue;   // 研究に加われない幼児は数えない
+    s+=techKnown(a).length/R.posts.length; n++;
+  }
+  return n ? s/n : 0;
+}
+// 答えの 4 マス。ひらめきで明かされた欄と、AI 時代なら論理で 1 つに決まった欄だけ埋まる。
+function techAnswerCells(R){
+  const known=[null,null,null,null];
+  for(const k in R.hints) known[+k]=R.hints[k];
+  if(TECH.ERA_INFER[CITY.tech.era]==='logic'){
+    const S=techPublicS();
+    if(S.length) for(let s=0;s<4;s++){
+      if(known[s]!=null) continue;
+      const v=TECH.dec(S[0])[s];
+      if(S.every(h=>TECH.dec(h)[s]===v)) known[s]=v;
+    }
+  }
+  return known.map((v,s)=>v==null ? {text:'?', st:'q'} : {text:techCellLabel(R.k, s, v), st:'known'});
+}
+// カードの中身。文字列ではなく「行の種類」を返し、描き方は hudRowsSvg が決める。
+//   {t:'text',  text, color, small, bold, right, rightColor}  right = 右端の札
+//   {t:'steps', items:[{label, st:'done'|'now'|'todo'}]}       段の進み (チップ)
+//   {t:'cells', cells:[{text, st}], tail, tailColor, hits}     升目 (st は CELL_STYLE。hits = 右端に丸を 4 つ)
+//   {t:'bar',   label, frac, note, color}                      伝わり方 / 絞り込み / 普及
+function techCardRows(why){
+  if(!TECH_CARD_ON || !CITY || !CITY.tech) return [];
   const T=CITY.tech, R=T.round, J=JA_HUD;
   const rows=[];
+  const title = (text) => rows.push({t:'text', text, bold:true, color:'#f5c542', right:why||'', rightColor:'#00d2a0'});
   if(!R){
     if(T.era===TECH.ERAS.length-1 && !TECH_LOOP){
-      rows.push({t:'text', text: J?'最後の時代を満喫中':'Enjoying the final era', color:'#dfeee9'});
+      title(J?'最後の時代を満喫中':'Enjoying the final era');
       return rows;
     }
     const D=TECH.RESEARCH[T.era];
     const left=Math.max(0, T.eraDay+TECH_QUIET_D-gameDay());
+    title(J?`次の研究: ${D.ja}への道`:_ascii(`Next: ${D.en}`));
     rows.push({t:'steps', items:D.steps.map(x=>({label:J?x.ja:x.en, st:'todo'}))});
     rows.push({t:'text', text: J?`研究開始まで あと${left}日`:`research starts in ${left} days`, color:'#dfeee9'});
     rows.push({t:'text', text: J?'始まると街に素材が光ります':'materials will glow around town', color:'#8aa39b', small:true});
     return rows;
   }
-  const D=TECH.RESEARCH[R.k], nS=techSteps(R).length, si=R.step||0;
-  const solved=R.solvedDay!=null;
+  const D=TECH.RESEARCH[R.k], si=R.step||0, solved=R.solvedDay!=null;
+  title(J?`研究: ${D.ja}への道`:_ascii(`R&D: ${D.en}`));
   rows.push({t:'steps', items:D.steps.map((x,i)=>({label:J?x.ja:x.en,
     st: solved||i<si ? 'done' : i===si ? 'now' : 'todo'}))});
   if(solved){
     const minDay=T.eraDay+TECH_MIN_D;
     const frac=Math.min(1,(gameDay()-R.solvedDay)/Math.max(1,minDay-R.solvedDay));
     rows.push({t:'bar', label:J?'普及':'spread', frac, note:`${Math.round(frac*100)}%`, color:'#f5c542'});
-    rows.push({t:'text', text: J?`${R.solvedBy||'偶然の発見'}が「${D.ja}」を発明`:`${D.en} by ${R.solvedBy||'luck'}`, color:'#8aa39b', small:true});
+    rows.push({t:'text', text: J?`${R.solvedBy||'偶然の発見'}が「${D.ja}」を発明`:_ascii(`${D.en} by ${R.solvedBy||'luck'}`), color:'#8aa39b', small:true});
     return rows;
   }
+  // 答えの 4 マスと、同じ列に揃えた直近の結果 (新しいものが上)
+  rows.push({t:'cells', cells:TECH_SLOT_HEAD.map(h=>({text:h[J?0:1], st:'head'})), tail:''});
+  rows.push({t:'cells', cells:techAnswerCells(R), tail:J?'答え':'answer', tailColor:'#f5c542'});
+  const recent=R.posts.slice(-3).reverse();
+  recent.forEach((p,i)=>{
+    const d=TECH.dec(p.h);
+    rows.push({t:'cells', cells:d.map((v,s)=>({text:techCellLabel(R.k, s, v), st:i===0?'new':'post'})),
+               tail:'', hits:p.hits, tailColor:p.hits>=3?'#00d2a0':'#dfeee9'});
+  });
+  rows.push({t:'text', small:true, color:'#8aa39b',
+    text: recent.length ? (J?'右の丸＝合っている欄の数 (どの欄かは分からない)':'hits = how many columns match')
+                        : (J?'まだ実験していない — ●4つで発明':'no tests yet - 4 hits invents it')});
+  // 素材: 湧く順に並べる。後ろの段の正解ほど後から湧く。
   const found=R.deposits.filter(d=>d.found).length;
-  rows.push({t:'dots', label:J?'素材':'items', n:found, of:TECH.NM,
-    note: found ? '' : (J?'光る場所を探そう':'look for the glow')});
-  // 「残り何通り」は論理的に絞れる AI 時代だけが知っている数。それより前は試した数と伝わり方を出す
-  //   (時代で住民の道具が違うことを、画面でも見せる)。
-  const tried=(R.tried||0)+R.posts.length;
-  if(TECH.ERA_INFER[T.era]==='logic'){
+  rows.push({t:'text', small:true, color:'#9fd8c8',
+    text: (J?`素材 ${found}/${TECH.NM}`:`items ${found}/${TECH.NM}`)
+        + (found<TECH.NM ? (J?' · 光る場所の近くを通ると見つかる':' - found by walking past the glow') : '')});
+  const mats=R.deposits.map(dp=>dp.found ? {text:J?D.materials[dp.m].ja:D.materials[dp.m].id, st:'mat'} : {text:'?', st:'matq'});
+  rows.push({t:'cells', cells:mats.slice(0,3)});
+  rows.push({t:'cells', cells:mats.slice(3,6)});
+  // 時代の道具: 伝わり方 (知っている割合) と 推理 (勘 / 論理)
+  const kf=techKnowFrac(), era=T.era;
+  const how=[J?'口コミ':'gossip', J?'掲示板':'board', J?'どこでも':'anywhere', J?'どこでも':'anywhere'][era];
+  rows.push({t:'bar', label:J?'伝わる':'shared', frac:kf==null?0:kf,
+    note: kf==null ? how : `${how} ${Math.round(kf*100)}%`, color: kf!=null && kf<0.5 ? '#ff9f43' : '#00d2a0'});
+  if(TECH.ERA_INFER[era]==='logic'){
     const S=techPublicS().length;
-    const frac=1-Math.log(Math.max(1,S))/Math.log(TECH.NHYP);
-    rows.push({t:'bar', label:J?'絞込':'narrow', frac,
+    rows.push({t:'bar', label:J?'絞込':'narrow', frac:1-Math.log(Math.max(1,S))/Math.log(TECH.NHYP),
       note: J?`残り${S}通り`:`${S} left`, color: R.stall ? '#ff9f43' : '#00d2a0'});
   }else{
-    const how=[J?'すれ違った人にだけ伝わる':'word of mouth only', J?'図書館などで読んで持ち帰る':'read it at the library',
-               J?'どこでも読める':'readable anywhere'][T.era];
-    rows.push({t:'text', text: J?`試した${tried}通り · ${how}`:_ascii(`${tried} tried - ${how}`),
-      color: R.stall ? '#ff9f43' : '#9fd8c8', small:true});
-  }
-  // いちばん新しい結果
-  const last=R.posts[R.posts.length-1];
-  if(last){
-    const tr=techTraitJa(R.k, TECH.dec(last.h)[2]);
-    // 当たりの印を先頭に置く (名前が長いと末尾が「…」で切れて、いちばん大事な印が見えなかった)
-    rows.push({t:'text', text: J ? `${TECH.hitsMark(last.hits,true)} ${last.by}(${tr}) ${techShortLabel(R.k,last.h,true)}`
-                                 : _ascii(`${last.by}: ${last.hits}/4`), color:'#dfeee9', hits:last.hits});
+    rows.push({t:'text', small:true, color:'#9fd8c8',
+      text: J?`推理  勘 (似た組み合わせを試す) · 試した${R.posts.length}/${TECH.NHYP}通り`
+             :`guess by hunch - tried ${R.posts.length}/${TECH.NHYP}`});
   }
   // いま起きていること / 次に何をすればよいか (1 行だけ)
+  const last=R.posts[R.posts.length-1];
   const testing=agents.filter(a=>a.research);
   const hintKeys=Object.keys(R.hints);
   let tip=null, tipColor='#8aa39b';
   if(!techPrereqOk()){ tip=J?`${D.prereq.ja}ができるのを待っている`:`waiting for ${D.prereq.en}`; tipColor='#ff9f43'; }
   else if(testing.length) tip=J?`実験中: ${testing.map(a=>a.name).join('、')}`:_ascii(`testing: ${testing.map(a=>a.name).join(', ')}`);
-  else if(R.stall>=2 && hintKeys.length){ const k2=hintKeys[hintKeys.length-1], v=R.hints[k2];
-    const val=k2==='0'?D.materials[v].ja:k2==='1'?TECH.PLACES[v].ja:k2==='2'?TECH.TRAITS[D.traits[v]].ja:TECH.TIMES[v].ja;
-    tip=J?`ひらめき: 正解は「${val}」を含むらしい`:'a hunch narrowed it down'; tipColor='#f5c542'; }
+  else if(R.stall>=2 && hintKeys.length){ const k2=hintKeys[hintKeys.length-1];
+    tip=J?`ひらめき: ${TECH_SLOT_HEAD[+k2][0]}は「${techCellLabel(R.k, +k2, R.hints[k2])}」らしい`:'a hunch narrowed it down'; tipColor='#f5c542'; }
   else if(R.stall>=1){ tip=J?'行き詰まり → みんなで手分けして実験中':'stalled - everyone pitches in'; tipColor='#ff9f43'; }
   else if(last && last.req) tip=J?`次は「${techTraitJa(R.k,last.req.t)}」の人に ${techShortLabel(R.k,last.req.h,true)}`
                                  :_ascii(`next: a ${techTraitEn(R.k,last.req.t)} should try`);
-  else if(R.posts.length<2) tip=J?'素材で実験 → ●が4つ揃えば発明':'test combos - 4 hits invents it';
+  else if(last) tip=J?`最新: ${last.by}`:_ascii(`latest: ${last.by}`);
   if(tip) rows.push({t:'text', text:tip, color:tipColor, small:true});
   // 前の時代の記録 (課題は同じ。住民がどれだけ速くなったか)
   const recs=(T.records||[]).slice(-3);
@@ -15084,7 +15264,7 @@ function handleChatCommand(text, author){
   }
   if(TECH_ON && /^!?(?:tech|era|研究|時代)$/i.test(raw)){
     const t=techStatusText();
-    showBanner(t, 8);
+    if(!showTechCard(JA_HUD?'いまの研究':'status')) showBanner(t, 8);
     return {ok:true, msg:'tech status', reply:t.slice(0,300)};
   }
 
