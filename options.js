@@ -126,7 +126,9 @@ register({
   text: 'go home to sleep for the night',
   precond: (a, C) => {
     const fa = a.fatigue || 0;
-    if (C.hour < 6 || C.hour >= 22 || fa > C.thr.sleepHi) return true;
+    // 寝る時刻は時代で変わる (アナログは早寝、スマホ以降は夜更かし)。C.sleepFrom が無ければ従来どおり 22-6 時。
+    const from = C.sleepFrom != null ? C.sleepFrom : 22, wake = C.wakeAt != null ? C.wakeAt : 6;
+    if (C.hour < wake || C.hour >= from || fa > C.thr.sleepHi) return true;
     // REST が切られているときだけ、日中の疲労もここが受け持つ (元 needOf の三項)。
     return !C.restOn && fa > C.thr.needHi;
   },
@@ -165,14 +167,18 @@ register({
   id: 'work', need: 'work', tier: TIER.duty,
   ja: '仕事・学校へ行く', en: 'go to work or school', icon: '💼',
   text: 'go to the workplace or school for the day',
+  // 勤務時間は時代で形が変わる。C.workShift(a) は住民ごとの始業のずれ (アナログは人によって
+  // バラバラ = 通勤が分散、PC 時代はずれ 0 = 9 時に集中して通勤ピークが鋭い)。無ければ 0。
   precond: (a, C) => C.isStudent(a)
     ? (!C.weekend && C.hour >= C.school.from && C.hour < C.school.to)
-    : (!C.weekend && C.hour >= C.work.from && C.hour < C.work.to),
+    : (() => { const sh = C.workShift ? C.workShift(a) : 0;
+               return !C.weekend && C.hour >= C.work.from + sh && C.hour < C.work.to + sh; })(),
   target: () => spec('workplace'),
   stay: (a, C) => {
     // 配達員は「街の中」が職場。倉庫に留めると荷物が一つも届かない。
     if (C.isCourier(a) && C.onDeliveryDuty(a)) return false;
-    const w = a.school || a.work;
+    // 在宅勤務の日は自宅が職場 (a.teleToday は時代が PC 以降のときだけ立つ)
+    const w = a.school || (a.teleToday && a.home) || a.work;
     return !!(w && C.indoorsAt(a, w[0], w[1]));
   },
 });
@@ -233,6 +239,47 @@ const EXTRA = [
     persona: (a, C) => C.trait(a, 'gourmet') * PERSONA_MAX,
   },
 ];
+
+// ═══ 時代の行動 (server.js が TECH=1 のときだけ登録する) ═══════════════════
+// 時代が「いま何をするか」の選択肢そのものを変える。**登録しなければ既存と完全に同じ**
+// (tools/hlp-equiv.js は登録しない状態で検証する)。
+//   errand       … アナログ/PC: 郵便局・銀行へ用事を済ませに行く (その日に用事がある人だけ)
+//   order-online … スマホ/AI: 買い物に出ず、家で通販を頼んで受け取る (配達の動きが増える)
+//   home-evening … スマホ/AI: 用事の無い夜は家でスマホ・動画 (夜更かしでも外に出ない)
+const ERA_OPTS = [
+  {
+    id: 'errand', need: 'errand', tier: TIER.errand + 5,
+    ja: '郵便局・銀行へ用事', en: 'run an errand', icon: '📮',
+    text: 'go to the post office or the bank to send a letter or pay a bill',
+    precond: (a, C) => C.era != null && C.era <= 1 && !!a.errandDue && !C.weekend
+      // 勤めている人は仕事の後に寄る (勤務の段のほうが上なので、昼間は選ばれない)。19 時半まで開いている
+      && C.hour >= 9 && C.hour < 19.5 && !!(C.IDX.civic && C.IDX.civic.length),
+    target: (a, C) => spec('cat', { cat: C.IDX.civic, pref: 0, topK: 2 }),
+    stay: (a, C, t) => t != null && C.IDX.civic.includes(t),
+  },
+  {
+    // スマホ/AI: 用事が無い夜は、家でスマホや動画で過ごす (外をぶらつかない)。idle のすぐ上。
+    id: 'home-evening', need: null, tier: TIER.idle + 5,
+    ja: '家でスマホ', en: 'stay in with a phone', icon: '📱',
+    text: 'spend the evening at home on a phone or watching videos',
+    precond: (a, C) => C.era != null && C.era >= 2 && !!a.home && C.hour >= 18
+      && !!(C.homeEvening && C.homeEvening(a)),
+    target: () => spec('home'),
+    stay: (a, C) => C.indoorsAt(a, a.home[0], a.home[1]),
+  },
+  {
+    id: 'order-online', need: 'order', tier: TIER.errand + 10,
+    ja: '通販で注文する', en: 'order online', icon: '📱',
+    text: 'order daily supplies online from home instead of going to a shop',
+    precond: (a, C) => C.era != null && C.era >= 2 && !!a.home && (a.supply || 0) > C.thr.needHi
+      && !!(C.ordersOnline && C.ordersOnline(a)),
+    target: () => spec('home'),
+    stay: (a, C) => C.indoorsAt(a, a.home[0], a.home[1]),
+  },
+];
+function registerEraOptions() {
+  for (const e of ERA_OPTS) if (!byId[e.id]) register(e);
+}
 
 /** EXTRA を登録する (HLP_EXTRA=1 のときだけ server.js から呼ぶ)。 */
 function registerExtras() {
@@ -295,8 +342,15 @@ function registerFromMeta(meta, X) {
       //   ① 夜 (22時〜6時) と限界の疲労 (>0.93) では sleep だけ
       //   ② 行き先のカテゴリ / 建物タイプが街に無い行動は候補に出さない
       precond: (a, C) => {
-        const forceSleep = (C.hour >= 22 || C.hour < 6) || (a.fatigue || 0) > 0.93;
+        // 時代つきのメタ (era_dim) は、寝る時刻が時代で変わる env で学習している (セル E2)
+        const eraOn = !!meta.era_dim && C.era != null;
+        const from = eraOn ? C.sleepFrom : 22, wake = eraOn ? C.wakeAt : 6;
+        const forceSleep = (C.hour >= from || C.hour < wake) || (a.fatigue || 0) > 0.93;
         if (forceSleep) return m.id === 'sleep';
+        // 時代の行動は、その時代にだけ出す (学習時 mask の逐語訳)
+        if (m.eras) { if (!eraOn || C.era < m.eras[0] || C.era > m.eras[1]) return false; }
+        if (m.id === 'errand' && !a.errandDue) return false;
+        if (m.id === 'telework') return !!(a.home && a.work && !a.owns);
         if (m.cat === '-') return true;
         if (ttypeIdx != null) return X.hasType(ttypeIdx);
         if (m.cat === 'home') return !!a.home || X.hasCat('home');
@@ -305,6 +359,7 @@ function registerFromMeta(meta, X) {
         return !!(catList && catList.length && X.hasCat(m.cat));
       },
       target: (a, C) => {
+        if (m.id === 'telework') return spec('home');   // 仕事だが行き先は自宅
         if (m.cat === '-')     return spec('stay');
         if (m.cat === 'home')  return spec('home');
         if (m.cat === 'work')  return spec('workplace');
@@ -316,6 +371,7 @@ function registerFromMeta(meta, X) {
       },
       // 屋内に留まるかは既存の need ごとの規則をそのまま使う (UI と回復判定の互換)
       stay: (a, C, t) => {
+        if (m.id === 'telework' || m.id === 'order-online') return !!(a.home && C.indoorsAt(a, a.home[0], a.home[1]));
         switch (m.need) {
           case 'sleep': return a.home ? C.indoorsAt(a, a.home[0], a.home[1])
                                       : (t != null && C.IDX.home.includes(t));
@@ -337,6 +393,6 @@ function registerFromMeta(meta, X) {
 }
 
 module.exports = {
-  ACTS, byId, register, registerExtras, registerFromMeta, resetTo, spec,
+  ACTS, byId, register, registerExtras, registerEraOptions, registerFromMeta, resetTo, spec, ERA_OPTS,
   TIER, PERSONA_MAX, PERCEPTS, EXTRA,
 };

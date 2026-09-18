@@ -29,6 +29,8 @@ for (let i = 0; i < N; i++) {
     hour: Math.random() * 24, raining: Math.random() < 0.2, indoors,
     atHome: indoors && Math.random() < 0.5,
     mates: Math.random() < 0.4 ? 1 + ((Math.random() * 2) | 0) : 0,
+    // 時代 (tech.js)。半分は「時代の無い街」、残りはアナログ〜AI をまんべんなく
+    era: Math.random() < 0.5 ? undefined : (Math.random() * 4) | 0,
   });
   if (!A) { none++; continue; }
   count[A.id] = (count[A.id] || 0) + 1;

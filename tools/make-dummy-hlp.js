@@ -49,7 +49,9 @@ const node = (op, ins, outs, attrs) => cat(
 const attrInts = (name, ints) => lenf(5, cat(strf(1, name), ...ints.map(i => varf(8, i)), varf(20, 7)));
 
 const OUT   = arg('out', 'data');
-const SDIM  = +arg('state', 46);
+// --era で「時代つき」(ノートブック セル E2) の形にする: 観測 +5 次元、時代の行動 3 つ
+const ERA   = process.argv.includes('--era');
+const SDIM  = +arg('state', 46) + (ERA ? 5 : 0);
 const EDIM  = +arg('emb', 64);
 
 // A: (SDIM, EDIM) の適当な行列。**種を固定する** (毎回同じダミーになるように)
@@ -105,6 +107,8 @@ const OPTS = [
  ['idle',null,'-',null,25,0],               ['explore',null,'other',null,60,0],
  ['food-crawl',null,'food',null,35,7],      ['socialize',null,'fun',null,50,4],
  ['found-shop',null,'other',null,240,120],  ['pickpocket',null,'-',null,20,-40],
+ ...(ERA ? [['errand','errand','work','post',30,2,[0,1]], ['order-online','order','home',null,10,12,[2,3]],
+            ['telework','work','home',null,300,-60,[2,3]]] : []),
 ];
 const emb = (i) => { let s2 = (i * 7919 + 13) >>> 0;
   const r = () => { s2 = (s2 * 1664525 + 1013904223) >>> 0; return s2 / 4294967296 - 0.5; };
@@ -119,11 +123,14 @@ const meta = {
     { name:'clock', dim:4 }, { name:'memory', dim:8 }, { name:'alone', dim:1 },
     { name:'has_percept', dim:1 }, { name:'near', dim:7 }, { name:'has', dim:7 },
     { name:'percept', dim:4 },
+    ...(ERA ? [{ name:'era', dim:5, keys:['analog','pc','mobile','ai','errand_due'] }] : []),
   ],
+  ...(ERA ? { era_dim: 5 } : {}),
   traits: ['curiosity','gourmet','sociability','diligence','thrift','enterprise','honesty','homebody'],
   categories: ['food','buy','fun','care','home','work','other'],
-  options: OPTS.map(([id, need, cat_, ttype, dwell, cost], i) => ({
-    id, need, cat: cat_, ttype, dwell_min: dwell, cost, text: id.replace(/-/g, ' '), emb: emb(i) })),
+  options: OPTS.map(([id, need, cat_, ttype, dwell, cost, eras], i) => ({
+    id, need, cat: cat_, ttype, dwell_min: dwell, cost, text: id.replace(/-/g, ' '), emb: emb(i),
+    ...(eras ? { eras } : {}) })),
   train: { updates: 0, note: 'dummy' },
   validation: { persona_differentiation: ['dummy モデルなので未検証'],
                 unknown_action: ['dummy モデルなので未検証'] },

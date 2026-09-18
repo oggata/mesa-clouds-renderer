@@ -326,6 +326,11 @@ const WALK = require('./walk.js');
 // お金・仕事・追い詰められ度・犯罪。犯罪だけ足すと飾りになるので、
 // 「失業 → 無一文 → 犯行 → 店の売上減 → さらに失業」の環ごと持たせる。
 const ECO = require('./economy.js');
+// 時代 (アナログ→PC→スマホ→AI) と研究開発。ヒット&ブローと掲示板、研究の方策。
+const TECH = require('./tech.js');
+// 行動のベクトル化: 欲求ベクトル × 場所が与えるベクトル の照合で「いま何をするか」を決める
+const VEC = require('./vec.js');
+const TECH_ON = process.env.TECH !== '0' && process.env.CITY_EVOLVE !== '0';
 const { OTHER, ROAD, BUILDING, TREE } = MW;
 // 道路のクラス分け・オートタイルのマスク・アトラスの UV。
 // **MAP には触らない。** クラスは MAP と別の配列で持つ (MAP のセル種別は
@@ -2404,7 +2409,7 @@ const HUD_ON        = process.env.HUD !== '0';
 //   下の HUD_* / TALK_LOG_* の既定値は **倍率をかける前**の値。
 const HUD_SCALE     = Math.max(0.4, Math.min(2, parseFloat(process.env.HUD_SCALE) || 0.8));
 const _hs           = v => Math.max(1, Math.round(v*HUD_SCALE));   // 大きさ (px)
-const HUD_DAY_W     = _hs(250), HUD_DAY_H = _hs(54);
+const HUD_DAY_W     = _hs(TECH_ON ? 300 : 250), HUD_DAY_H = _hs(TECH_ON ? 72 : 54);   // 研究の板を足すと高さは行数ぶん伸びる
 const HUD_TICKER_H  = _hs(30);
 // 文字が小さくなるとティッカーは同じ px/秒でも「速く」読めてしまうので、速さも一緒に縮める
 const HUD_SPEED     = envNum('HUD_SPEED', 90) * HUD_SCALE;   // ティッカーの流れる速さ (px/秒)
@@ -2477,26 +2482,97 @@ async function initHud(){
 function hudDayLines(){
   const h=gameHour();
   const hh=String(Math.floor(h)).padStart(2,'0'), mm=String(Math.floor(h%1*60)).padStart(2,'0');
+  // 3 行目: 時代と年号と研究の進み具合 (時代の軸は大きさの軸とは別に上がる)
+  const era = (TECH_ON && CITY && CITY.tech) ? (()=>{
+    const E=TECH.ERAS[CITY.tech.era], R=CITY.tech.round;
+    const pct=R ? `  研究 ${Math.round(techProgress()*100)}%` : '';
+    return JA_HUD ? `${E.ja}  ${techYear()}年${pct}`
+                  : `${E.en.toUpperCase()} ${techYear()}${R?`  R&D ${Math.round(techProgress()*100)}%`:''}`;
+  })() : null;
   if(JA_HUD) return [`${gameDay()+1}日目  ${hh}:${mm}`,
-          CITY ? `人口 ${agents.length}  ${levelSpec().name}  ${weatherNow().ja}` : ''];
+          CITY ? `人口 ${agents.length}  ${levelSpec().name}  ${weatherNow().ja}` : '', ...(era!=null?[era]:[])];
   return [`DAY ${gameDay()+1}  ${hh}:${mm}`,
-          CITY ? `POP ${agents.length}  ${levelSpec().en}  ${weatherNow().en}` : ''];
+          CITY ? `POP ${agents.length}  ${levelSpec().en}  ${weatherNow().en}` : '', ...(era!=null?[era]:[])];
+}
+// 日付板の中身の指紋。変わったときだけ作り直す (研究の板も含む)。
+function hudDaySig(){
+  const [a,b,c]=hudDayLines();
+  return a+'|'+b+'|'+(c||'')+'|'+(TECH_ON ? JSON.stringify(techBoardRows()) : '');
+}
+// 板の幅に収まるよう末尾を「…」で落とす。全角=1em / 半角=0.55em で見積もる。
+function hudFit(text, px, fs){
+  const t=_hud(String(text));
+  const maxEm=px/fs;
+  let em=0, out='';
+  for(const ch of t){
+    const w = ch.codePointAt(0)>0x2E80 ? 1 : 0.56;
+    if(em+w > maxEm-0.8){ return out+'…'; }
+    em+=w; out+=ch;
+  }
+  return out;
 }
 async function refreshHudDay(){
-  const [l1,l2]=hudDayLines();
-  const txt=l1+'|'+l2;
-  if(txt===hudDayText || !hudScene) return;
-  hudDayText=txt;
+  const sig=hudDaySig();
+  if(sig===hudDayText || !hudScene) return;
+  hudDayText=sig;
+  const [l1,l2,l3]=hudDayLines();
+  const W=HUD_DAY_W, pad=_hs(12), inner=W-pad*2;
+  const rows=TECH_ON ? techBoardRows() : [];
+  const RH=_hs(18), fs=_hs(12), fsS=_hs(11);
+  const top=HUD_DAY_H + (rows.length ? _hs(4) : 0);
+  const H=top + rows.length*RH + (rows.length ? _hs(6) : 0);
+  let body='';
+  if(rows.length) body+=`<rect x="${pad}" y="${HUD_DAY_H-_hs(2)}" width="${inner}" height="1" fill="#9fd8c8" fill-opacity="0.25"/>`;
+  rows.forEach((r,i)=>{
+    const y=top+i*RH, base=y+RH*0.72;
+    if(r.t==='steps'){
+      // 3 つのチップを矢印でつなぐ。済=緑の塗り / いま=金の枠 / まだ=灰
+      const gap=_hs(10), cw=(inner-gap*(r.items.length-1))/r.items.length, ch=RH-_hs(4);
+      r.items.forEach((it,j)=>{
+        const x=pad+j*(cw+gap);
+        const fill = it.st==='done' ? '#00d2a0' : it.st==='now' ? '#3a2f08' : '#1b2a2a';
+        const stroke = it.st==='now' ? '#f5c542' : 'none';
+        const col = it.st==='done' ? '#04201a' : it.st==='now' ? '#f5c542' : '#7f9690';
+        body+=`<rect x="${x}" y="${y+_hs(2)}" width="${cw}" height="${ch}" rx="${_hs(4)}" fill="${fill}" stroke="${stroke}" stroke-width="${_hs(1.5)}"/>`;
+        body+=`<text x="${x+cw/2}" y="${base}" font-size="${fsS}" text-anchor="middle" fill="${col}"${it.st!=='todo'?' font-weight="bold"':''}`
+             +` font-family="${HUD_FACE_T}">${_esc(hudFit(it.label, cw-_hs(6), fsS))}</text>`;
+        if(j<r.items.length-1) body+=`<text x="${x+cw+gap/2}" y="${base}" font-size="${fsS}" text-anchor="middle" fill="#7f9690" font-family="${HUD_FACE_T}">›</text>`;
+      });
+    }else if(r.t==='dots'){
+      body+=`<text x="${pad}" y="${base}" font-size="${fsS}" fill="#9fd8c8" font-family="${HUD_FACE_T}">${_esc(_hud(r.label))}</text>`;
+      const x0=pad+_hs(42), sz=_hs(8), step=_hs(16);
+      for(let k=0;k<r.of;k++){
+        const cx=x0+k*step+sz/2, cy=y+RH/2;
+        body+= k<r.n ? `<rect x="${cx-sz/2}" y="${cy-sz/2}" width="${sz}" height="${sz}" transform="rotate(45 ${cx} ${cy})" fill="#9ff6ff"/>`
+                     : `<rect x="${cx-sz/2}" y="${cy-sz/2}" width="${sz}" height="${sz}" transform="rotate(45 ${cx} ${cy})" fill="none" stroke="#5d7672" stroke-width="${_hs(1.2)}"/>`;
+      }
+      const tx=x0+r.of*step+_hs(4);
+      body+=`<text x="${tx}" y="${base}" font-size="${fsS}" fill="#dfeee9" font-family="${HUD_FACE_T}">${r.n}/${r.of}`
+           +(r.note?` <tspan fill="#8aa39b">${_esc(hudFit(r.note, W-pad-tx-_hs(20), fsS))}</tspan>`:'')+`</text>`;
+    }else if(r.t==='bar'){
+      body+=`<text x="${pad}" y="${base}" font-size="${fsS}" fill="#9fd8c8" font-family="${HUD_FACE_T}">${_esc(_hud(r.label))}</text>`;
+      const x0=pad+_hs(40), bw=inner-_hs(40)-_hs(78), bh=_hs(8), by=y+RH/2-bh/2;
+      body+=`<rect x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="${bh/2}" fill="#1b2a2a"/>`;
+      body+=`<rect x="${x0}" y="${by}" width="${Math.max(bh, bw*Math.max(0,Math.min(1,r.frac)))}" height="${bh}" rx="${bh/2}" fill="${r.color}"/>`;
+      body+=`<text x="${W-pad}" y="${base}" font-size="${fsS}" text-anchor="end" fill="#dfeee9" font-family="${HUD_FACE_T}">${_esc(_hud(r.note))}</text>`;
+    }else{
+      const f=r.small?fsS:fs;
+      body+=`<text x="${pad}" y="${base}" font-size="${f}" fill="${r.color||'#dfeee9'}" font-family="${HUD_FACE_T}">${_esc(hudFit(r.text, inner, f))}</text>`;
+    }
+  });
   const {tex}=await svgTexture(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${HUD_DAY_W}" height="${HUD_DAY_H}">`
-    +`<rect width="${HUD_DAY_W}" height="${HUD_DAY_H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.58"/>`
-    +`<text x="${_hs(12)}" y="${_hs(24)}" font-size="${_hs(17)}" font-weight="bold" fill="#00d2a0"`
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`
+    +`<rect width="${W}" height="${H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="${rows.length?0.62:0.58}"/>`
+    +`<text x="${pad}" y="${_hs(24)}" font-size="${_hs(17)}" font-weight="bold" fill="#00d2a0"`
     +` font-family="${HUD_FACE}">${_esc(_hud(l1))}</text>`
-    +`<text x="${_hs(12)}" y="${_hs(43)}" font-size="${_hs(13)}" fill="#9fd8c8"`
-    +` font-family="${HUD_FACE}">${_esc(_hud(l2))}</text></svg>`);
+    +`<text x="${pad}" y="${_hs(43)}" font-size="${_hs(13)}" fill="#9fd8c8"`
+    +` font-family="${HUD_FACE}">${_esc(_hud(l2))}</text>`
+    +(l3!=null ? `<text x="${pad}" y="${_hs(62)}" font-size="${_hs(13)}" font-weight="bold" fill="#f5c542"`
+      +` font-family="${HUD_FACE}">${_esc(hudFit(l3, inner, _hs(13)))}</text>` : '')
+    +body+`</svg>`);
   if(hudDay){ hudScene.remove(hudDay); hudDay.material.map.dispose(); hudDay.material.dispose(); hudDay.geometry.dispose(); }
-  hudDay=hudPlane(HUD_DAY_W, HUD_DAY_H, tex);
-  hudDay.position.set(-WIDTH/2+HUD_DAY_W/2+12, HEIGHT/2-HUD_DAY_H/2-10, 1);
+  hudDay=hudPlane(W, H, tex);
+  hudDay.position.set(-WIDTH/2+W/2+12, HEIGHT/2-H/2-10, 1);
   hudScene.add(hudDay);
 }
 
@@ -2549,6 +2625,11 @@ function camStateShort(a){
     if(a.work && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1]) return 'at work';
     return t!=null ? `inside ${enOf(t)}` : 'indoors';
   }
+  if(a.research){
+    const ph=a.research.phase;
+    return ph==='test' ? 'running an experiment' : ph==='wait' ? 'waiting to experiment'
+         : ph==='toBoard' ? 'checking the notice board' : 'off to experiment';
+  }
   // ★ 配達中は「通勤中」ではない。needOf は勤務時間なので 'work' を返すが、
   //   配達員にとって**配達そのものが仕事**なので、字幕もそう出す
   //   (describeActivity は既にそうなっていたのに、ここだけ揃っていなかった)。
@@ -2560,7 +2641,7 @@ function camStateShort(a){
   }
   const dest=a.goalType!=null ? enOf(a.goalType) : null;
   const n=needOf(a);
-  const NEED_EN={eat:'hungry', sleep:'sleepy', work:'commuting', shop:'shopping',
+  const NEED_EN={errand:'running an errand', order:'ordering online', eat:'hungry', sleep:'sleepy', work:'commuting', shop:'shopping',
                  bored:'bored', sick:'unwell'};
   const st=NEED_EN[n]||'walking';
   return dest ? `${st} - ${dest}` : st;
@@ -2573,11 +2654,18 @@ function camStateShortJa(a){
   // 目的地が「誰かの店」なら固有名で出す (『カフェ』より『アイのカフェ』)
   const destName = () => { const d=a.navDest; const st=d?structAt(d[0],d[1]):null;
     return (st && st.owner) ? shopNameJa(st) : (a.goalType!=null ? jaOf(a.goalType) : null); };
+  // ベクトル版: 屋内でも屋外でも「いましている過ごし方」の名前を出す (研究・配達は下の専用表示)
+  if(VEC_ON && !a.deliv && !a.research) return vecLabel(a, true);
   if(MW.isIndoors(a)){
     const t=_typeAt(a.indoors);
-    if(a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1]) return '自宅';
+    if(a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1]) return (a.teleToday && needOf(a)==='work') ? '在宅勤務' : '自宅';
     if(a.work && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1]) return '職場';
     return t!=null ? `${jaOf(t)} の中` : '屋内';
+  }
+  if(a.research){
+    const ph=a.research.phase;
+    return ph==='test' ? '実験中' : ph==='wait' ? '実験の時間帯を待っている'
+         : ph==='toBoard' ? '研究の掲示板を見に行く' : '実験しに向かっている';
   }
   if(a.deliv){                       // 英語版と同じ理由 (配達中は通勤ではない)
     const D=a.deliv;
@@ -2586,7 +2674,7 @@ function camStateShortJa(a){
     return '配達中';
   }
   const dest=destName();
-  const NEED_JA={eat:'空腹', sleep:'眠い', work:'通勤中', shop:'買い物',
+  const NEED_JA={errand:'郵便局・銀行へ用事', order:'通販を頼みに帰る', eat:'空腹', sleep:'眠い', work:'通勤中', shop:'買い物',
                  bored:'退屈', sick:'具合が悪い'};
   const st=NEED_JA[needOf(a)]||'歩いている';
   return dest ? `${st} - ${dest}` : st;
@@ -2727,7 +2815,11 @@ let hudBanner=null, hudBannerT0=0, hudBannerUntil=0, hudBannerBusy=false;
 const BANNER_FS    = _hs(envNum('HUD_BANNER_FONT', 15));      // 以前は 21
 const BANNER_PAD   = _hs(16);
 const BANNER_LINES = Math.max(1, Math.min(4, envNum('HUD_BANNER_LINES', 3)));
-const BANNER_MAXW  = Math.min(WIDTH-40, Math.round(WIDTH*0.72));
+// ★ 研究の板 (左上) が縦に伸びたので、中央に出すと板の右端に重なった。時代があるときは
+//   **板の右側の空いた帯の中央**に出す (右上のカメラ表示より下の高さなので、そちらとは重ならない)。
+const BANNER_LEFT  = TECH_ON ? 12+HUD_DAY_W+12 : 20;
+const BANNER_MAXW  = Math.min(WIDTH-BANNER_LEFT-20, Math.round(WIDTH*0.72));
+const BANNER_CX    = TECH_ON ? (BANNER_LEFT + (WIDTH-12))/2 - WIDTH/2 : 0;
 // 日本語は単語の切れ目が無いので、**表示幅**で割る (全角=2 / 半角=1)。
 //   句読点や閉じ括弧が行頭に来ないよう、その1文字だけは前の行にぶら下げる。
 function wrapByWidth(text, cols){
@@ -2776,7 +2868,7 @@ async function setBanner(text, secs){
   if(hudBanner){ hudScene.remove(hudBanner); hudBanner.material.map.dispose(); hudBanner.material.dispose(); hudBanner.geometry.dispose(); }
   hudBanner=hudPlane(w, h, tex);
   hudBanner.material.opacity=0;
-  hudBanner.position.set(0, HEIGHT/2-h/2-74, 2);
+  hudBanner.position.set(BANNER_CX, HEIGHT/2-h/2-74, 2);
   hudScene.add(hudBanner);
   hudBannerT0=Date.now(); hudBannerUntil=hudBannerT0+secs*1000;
 }
@@ -2807,7 +2899,7 @@ function updateHud(dt){
   // 時計は最短1秒に1回だけ作り直す (SVG のラスタライズを毎フレーム回さない)
   const now=Date.now();
   if(!hudDayBusy && now-hudDayAt>900){
-    const want=hudDayLines().join('|');
+    const want=hudDaySig();
     if(want!==hudDayText){
       hudDayBusy=true; hudDayAt=now;
       refreshHudDay().catch(e=>console.warn('[HUD]',e.message)).finally(()=>{hudDayBusy=false;});
@@ -3985,7 +4077,7 @@ const CITY_SEED    = envNum('CITY_SEED', 42);
 const SIM_SEED = envNum('SIM_SEED', CITY_SEED);
 RNG.seed(SIM_SEED);
 // 純粋モジュールの既定乱数も差し替える。**ここを忘れると1本だけ非決定になる。**
-SOC.setRng(RNG.R); ECO.setRng(RNG.R); EV.setRng(RNG.R); PT.setRng(RNG.R); WIT.setRng(RNG.R);
+SOC.setRng(RNG.R); ECO.setRng(RNG.R); EV.setRng(RNG.R); PT.setRng(RNG.R); WIT.setRng(RNG.R); TECH.setRng(RNG.R);
 const CITY_FILE    = process.env.CITY_STATE_FILE || path.join(__dirname,'data','city_state.json');
 const CITY_SAVE_SEC= envNum('CITY_SAVE_SEC', 60);
 const DAY_ROLL_H   = envNum('DAY_ROLL_H', 5);       // 日付が変わる時刻 (朝5時)
@@ -4222,7 +4314,31 @@ const BLDG_EN = {
   cityhall:'City Hall', museum:'Museum', stadium:'Stadium', mall:'Mall',
   park:'Park', ground:'Sports Ground',
 };
-const enOf = t => BLDG_EN[BLDG_TYPES[t].name] || BLDG_TYPES[t].name;
+// 時代で呼び名が変わる建物。**型 (typeIdx) は変えない** — 方策の観測とテクスチャは
+// 型に紐づいているので、変えるのは名前だけ。null はその時代も元の名前のまま。
+//   [アナログ, パソコン, スマホ, AI] の順に [日本語, 英語]。
+const ERA_BLDG = {
+  shop:     [['レコード店','Record Shop'], ['パソコンショップ','PC Shop'], ['携帯ショップ','Phone Shop'], ['ガジェット店','Gadget Store']],
+  cafe:     [['喫茶店','Coffee House'], ['ネットカフェ','Internet Cafe'], null, ['ロボットカフェ','Robot Cafe']],
+  kiosk:    [null, null, ['キッチンカー','Food Truck'], ['自動屋台','Robo Stall']],
+  conbini:  [['よろず屋','General Store'], null, null, ['無人コンビニ','Cashierless Store']],
+  post:     [null, null, ['宅配センター','Parcel Center'], ['ドローン基地','Drone Hub']],
+  bank:     [null, null, ['ネット銀行','Online Bank'], ['フィンテック','Fintech Office']],
+  office:   [['事務所','Office'], null, ['IT企業','Tech Company'], ['AIラボ','AI Lab']],
+  tower:    [null, null, null, ['データセンター','Data Center']],
+  library:  [null, null, null, ['デジタル図書館','Digital Library']],
+  warehouse:[null, ['物流センター','Distribution Center'], null, ['自動倉庫','Robot Warehouse']],
+  mall:     [['百貨店','Department Store'], null, null, null],
+  museum:   [null, null, null, ['VR博物館','VR Museum']],
+};
+function eraBldg(t){
+  if(!TECH_ON || !CITY || !CITY.tech || !BLDG_TYPES[t]) return null;
+  const row=ERA_BLDG[BLDG_TYPES[t].name];
+  return row ? row[CITY.tech.era] : null;
+}
+const enOf = t => { const e=eraBldg(t); return e ? e[1] : (BLDG_EN[BLDG_TYPES[t].name] || BLDG_TYPES[t].name); };
+// 絵文字つきの表示名 (時代の呼び名を反映)
+const bldgLabel = t => { const e=eraBldg(t); return e ? BLDG_TYPES[t].label.replace(/\s.*$/,' ')+e[0] : BLDG_TYPES[t].label; };
 const CAT_EN = { eat:'food', shop:'shops', fun:'leisure', care:'healthcare',
                  home:'housing', work:'workplaces', civic:'public services',
                  learn:'schools' };
@@ -4907,7 +5023,7 @@ function arriveAtBuilding(a, dst){
   _arriveHold = true;
   try { onArrive(a, dst); } finally { _arriveHold = false; }
   // 配達員は玄関先に荷物を置くのが仕事。中に入ると本人も荷物も見えなくなる。
-  if(!WORLD.solidBuildings || !dst || a.deliv){ camArriveFlush(); return false; }
+  if(!WORLD.solidBuildings || !dst || a.deliv || a.research){ camArriveFlush(); return false; }
   if(enterOpenPlace(a, dst)){ camArriveFlush(); return true; }   // 広場: 屋外に留まる
   if(ARRIVE_POSE_MS<=0){                            // 一拍を切ったら従来どおり即入館
     onEnterBuilding(a, dst[0], dst[1]);
@@ -6780,6 +6896,7 @@ function agentSnap(a){
     hm:a.home||null, wk:a.work||null, sc:a.school||null, ind:a.indoors||null,
     md:a.mode||null, gt:a.goalType||null, gz:(a.goalZ==null?null:a.goalZ),
     op:(a.opt&&a.opt.id)||null,   // いまの Option (分岐どうしを同じ地点から始めるため)
+    vn:a.vn ? Object.fromEntries(Object.entries(a.vn).map(([k,v])=>[k,_r3(v)])) : undefined,   // 暮らしのチャンネルの状態 (vec)
   };
 }
 function applyAgentSnap(a, sn){
@@ -6800,6 +6917,7 @@ function applyAgentSnap(a, sn){
   // 余計な引き直しが走り、分岐どうしが同じ地点から始まらなくなる。
   a.lastOptId = sn.op || undefined;
   a.percepts=null; a.optSpec=null;
+  if(sn.vn) a.vn={...sn.vn};
   a.path=null; a.pathIdx=0; a.navDest=null;   // 経路は次の tick で引き直される
   a._snapped=true;
   return true;
@@ -6857,6 +6975,8 @@ function cityToJSON(){
     // 事件は稀にしか起きない。再起動で台帳が消えると、材料が貯まる前に毎回ゼロに戻る。
     witness: WITNESS_ON ? WIT.serialize(WIT_STATE) : undefined,
     dead:CITY.dead||[], bodies:CITY.bodies||[],
+    // 時代と研究。日付はゲーム日 (gameDay) なので、そのまま保存してよい
+    tech: TECH_ON ? CITY.tech : undefined,
   };
 }
 function saveCity(){
@@ -6970,7 +7090,10 @@ function freshCity(){
 //   それ以外は種から生成し直す (進化で書き換わった MAP を持ち越さない)。
 function resetCity(keepMap){
   if(!keepMap) MAP=makeMap(GRID, CITY_SEED);
+  const oldTech=CITY && CITY.tech, oldDay=CITY ? gameDay() : 0;
   CITY=freshCity();
+  // 技術は街を作り直しても受け継ぐ (前の街の住民が見つけたことは消えない)
+  if(TECH_ON) CITY.tech = oldTech ? techCarry(oldTech, oldDay, gameDay()) : techFresh(gameDay());
   cars=[]; _carGwDirty=true;
   _lastDay=null;
   for(const a of agents){ a.owns=null; a.seenMask=0; a.unmetBy=null; }
@@ -7013,6 +7136,7 @@ function initCity(){
       unrest:j.unrest||0,
       news:j.news||[], savedAgents:j.agents||{}, residents:j.residents||null, diag:freshDiag(),
       waiting:j.waiting||[], recs:j.recs||[],
+      tech:j.tech||null,
     };
     if(CITY.foot.length!==GRID*GRID) CITY.foot=new Int32Array(GRID*GRID);
     if(CITY.roadUse.length!==GRID*GRID) CITY.roadUse=new Int32Array(GRID*GRID);
@@ -7037,6 +7161,13 @@ function initCity(){
     console.log(`[City] フィールドを最低の広さまで拡張 ${before} → ${CITY.size} (木+${t})`);
   }
 
+  // 時代と研究。古い保存 (tech を持たない) からはアナログ時代で始まる
+  if(TECH_ON){
+    techEnsure();
+    const T=CITY.tech;
+    console.log(`[Tech] ${TECH.ERAS[T.era].ja} (第${T.cycle}周, ${T.eraDay+1}日目から)`
+      + (T.round ? ` 研究中: ${TECH.RESEARCH[T.round.k].ja} 実験${T.round.posts.length}回` : ''));
+  }
   if(j && j.witness && WITNESS_ON){
     const n=WIT.restore(WIT_STATE, j.witness);
     if(n) console.log(`[City] 目撃台帳 ${n}件を復元`);
@@ -7198,6 +7329,7 @@ function retargetOnNeedChange_legacy(){
 // 内部状態を進める (1秒ごと)。到着していれば回復させる。
 const _nearBuf=[];
 function stepNeeds(dtSec){
+  if(TECH_ON) _techAidMap=null;       // aid → 住民 の表は1秒ごとに作り直す (転出した人を引かないように)
   SOC.buildGrid(SOC_STATE, agents);   // 近接判定の下ごしらえ (SOCIAL=0 でも要る)
   const h=gameHour();
   const night = (h<6 || h>=22);
@@ -7224,6 +7356,14 @@ function stepNeeds(dtSec){
     if(HLP_ON) hlpScan(a, _nearBuf);
     if(!alone && CITY_EVOLVE && RNG.R()<GOSSIP_P*dtSec)
       gossip(a, _nearBuf[0]);      // すれ違いざまに「行きつけ」の話をする (低確率)
+    // スマホ以降は、**離れた友だち**にも口コミが届く。集積が起きるかどうかの実験の軸。
+    if(TECH_ON && SOCIAL_ON && techEra()>=2 && RNG.R()<GOSSIP_P*dtSec*TECH_REMOTE_GOSSIP){
+      const fr=Object.keys(a.rel||{}).filter(k=>a.rel[k].s>=SOC_STATE.cfg.relFriend);
+      if(fr.length){
+        const b=techAgentByAid(fr[Math.floor(RNG.R()*fr.length)]);
+        if(b && b!==a) gossip(a, b);
+      }
+    }
     a.bored = Math.min(1, Math.max(0, (a.bored||0) + BORED_RATE*dtSec*(alone?1:-1.5)));
     // 病気の発症は events.js へ移した。ここに書いてあったころは**何の説明も無く**
     // 体調が悪くなるので、視聴者には「急に病院へ歩き出した人」にしか見えなかった。
@@ -7231,42 +7371,53 @@ function stepNeeds(dtSec){
     // 出る。発症率 (平均90分・疲労で最大2倍) は据え置き — tools/event-report.js
     // が元の SICK_PROB と突き合わせて検算する。
 
-    // 屋内なら「その建物の中に居る」ので、自分のセルではなく屋内の建物で判定する。
     const r=Math.floor(a.x), c=Math.floor(a.y);
-    const t = MW.isIndoors(a) ? BUILDING_TYPES[a.indoors[0]+'_'+a.indoors[1]]
-                             : BUILDING_TYPES[r+'_'+c];
-    if(t!=null){
-      if(FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
-      if(BUY_IDX.includes(t))  a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec);
-      if(FUN_IDX.includes(t))  a.bored  = Math.max(0, a.bored  - FUN_RECOVER*dtSec);
-    }
-    // 病院/薬局は隣接でも受診とみなす (建物セル中心に完全に乗れず治らないのを防ぐ)
-    if((a.sick||0) > 0){
-      for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
-        const tt=BUILDING_TYPES[(r+dr)+'_'+(c+dc)];
-        if(tt!=null && CARE_IDX.includes(tt)){ a.sick = Math.max(0, a.sick - SICK_HEAL*dtSec); dr=dc=2; }
+    if(VEC_ON){
+      // 行動と同じベクトルで満たされる (vecStepNeeds)
+      vecStepNeeds(a, dtSec, alone);
+    }else{
+      // 屋内なら「その建物の中に居る」ので、自分のセルではなく屋内の建物で判定する。
+      const t = MW.isIndoors(a) ? BUILDING_TYPES[a.indoors[0]+'_'+a.indoors[1]]
+                               : BUILDING_TYPES[r+'_'+c];
+      // 通販: 家に居て「通販で注文する」を選んでいる間は、店に居るのと同じく日用品が満ちる
+      if(TECH_ON && a.opt && a.opt.id==='order-online' && a.home && MW.isIndoors(a)
+         && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1]){
+        techOnlineOrder(a);
+        a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec);
       }
+      if(t!=null){
+        if(FOOD_IDX.includes(t)) a.hunger = Math.max(0, a.hunger - EAT_RECOVER*dtSec);
+        if(BUY_IDX.includes(t))  a.supply = Math.max(0, a.supply - BUY_RECOVER*dtSec);
+        if(FUN_IDX.includes(t))  a.bored  = Math.max(0, a.bored  - FUN_RECOVER*dtSec);
+      }
+      // 病院/薬局は隣接でも受診とみなす (建物セル中心に完全に乗れず治らないのを防ぐ)
+      if((a.sick||0) > 0){
+        for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+          const tt=BUILDING_TYPES[(r+dr)+'_'+(c+dc)];
+          if(tt!=null && CARE_IDX.includes(tt)){ a.sick = Math.max(0, a.sick - SICK_HEAL*dtSec); dr=dc=2; }
+        }
+      }
+      // 休憩。飲食店 / 娯楽 / 屋根の無い場所 に居れば疲れが取れる。
+      //   ★ **REST_FLOOR までしか下がらない。** 仮眠は一晩の睡眠の代わりにならないので、
+      //     日中に休んでも夜はちゃんと帰る。ここを 0 にすると誰も家に帰らなくなる。
+      if(REST_ON && a.fatigue > REST_FLOOR){
+        const restHere = (t!=null && (FOOD_IDX.includes(t) || FUN_IDX.includes(t)))
+                      || isOpenCell(r, c);
+        if(restHere) a.fatigue = Math.max(REST_FLOOR, a.fatigue - REST_RECOVER*dtSec);
+      }
+      // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
+      //   ★ **屋内に居るときは a.indoors で判定する。** 屋内の住民の x,y は玄関の
+      //     ままなので、生の座標で見ると自宅に入っていても判定が外れる。上の
+      //     建物種別 t は a.indoors を見ているのに、ここだけ生の座標だった。
+      //     実測: 24人中9人が「自宅に屋内で居るのに回復せず、疲労1.00で飽和」し、
+      //     日中ずっと『眠い』のまま動かなかった。**これが主因。**
+      const hr = MW.isIndoors(a) ? a.indoors[0] : r;
+      const hc = MW.isIndoors(a) ? a.indoors[1] : c;
+      if(a.home && Math.abs(hr-a.home[0])<=1 && Math.abs(hc-a.home[1])<=1)
+        a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
+      else if(!a.home && t!=null && HOME_IDX.includes(t))
+        a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);   // 家なしは住居に居れば休める
     }
-    // 休憩。飲食店 / 娯楽 / 屋根の無い場所 に居れば疲れが取れる。
-    //   ★ **REST_FLOOR までしか下がらない。** 仮眠は一晩の睡眠の代わりにならないので、
-    //     日中に休んでも夜はちゃんと帰る。ここを 0 にすると誰も家に帰らなくなる。
-    if(REST_ON && a.fatigue > REST_FLOOR){
-      const restHere = (t!=null && (FOOD_IDX.includes(t) || FUN_IDX.includes(t)))
-                    || isOpenCell(r, c);
-      if(restHere) a.fatigue = Math.max(REST_FLOOR, a.fatigue - REST_RECOVER*dtSec);
-    }
-    // 自宅は「そのセル or 隣接」で休息とみなす (建物セル中心へ完全に乗らなくても帰宅扱い)
-    //   ★ **屋内に居るときは a.indoors で判定する。** 屋内の住民の x,y は玄関の
-    //     ままなので、生の座標で見ると自宅に入っていても判定が外れる。上の
-    //     建物種別 t は a.indoors を見ているのに、ここだけ生の座標だった。
-    //     実測: 24人中9人が「自宅に屋内で居るのに回復せず、疲労1.00で飽和」し、
-    //     日中ずっと『眠い』のまま動かなかった。**これが主因。**
-    const hr = MW.isIndoors(a) ? a.indoors[0] : r;
-    const hc = MW.isIndoors(a) ? a.indoors[1] : c;
-    if(a.home && Math.abs(hr-a.home[0])<=1 && Math.abs(hc-a.home[1])<=1)
-      a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);
-    else if(!a.home && t!=null && HOME_IDX.includes(t))
-      a.fatigue = Math.max(0, a.fatigue - SLEEP_RECOVER*dtSec);   // 家なしは住居に居れば休める
 
     // ── 需要 = 「不満 × 遠さ」の積分 ──────────────────────────────────────
     //   近くに店があるのに空腹なのは供給不足ではない。**遠いのに欲しい**時間だけを
@@ -7317,7 +7468,7 @@ const ptActive = a => !!(a.pastime && a.pastime.until > simNow());
 
 // いま暇か。**用事があるうちは遊ばせない** (needOf の優先順位を壊さないため)。
 function ptIdle(a){
-  if(a.jail>0 || a.deliv || a.talk) return false;
+  if(a.jail>0 || a.deliv || a.talk || a.research) return false;
   return needOf(a) === null;
 }
 
@@ -7386,7 +7537,7 @@ function stepPastime(dtSec){
     const fr=mates.filter(b=>SOC.relOf(a, b.aid) >= SOC_STATE.cfg.relFriend);
     if(fr.length) mates=fr;
 
-    const A=PT.pick({hour:h, raining, indoors, atHome, mates:mates.length});
+    const A=PT.pick({hour:h, raining, indoors, atHome, mates:mates.length, era:TECH_ON?techEra():undefined});
     if(!A) continue;
     startPastime(a, A, A.group>1 ? mates.slice(0, A.group-1) : []);
   }
@@ -7712,7 +7863,7 @@ function shouldLeaveBuilding_legacy(a){
     //     配達時間外 (DELIV_FROM/TO を狭めた場合) に「倉庫を出る→職場へ向かう→
     //     倉庫に入る→また出る」を延々繰り返す。
     if(isCourier(a) && onDeliveryDuty(a)) return true;
-    const w=a.school||a.work;
+    const w=a.school||(a.teleToday&&a.home)||a.work;
     return !(w && br===w[0] && bc===w[1]);
   }
   if(t==null) return true;
@@ -7755,6 +7906,8 @@ const PERCEPT_EVERY   = Math.max(1, envNum('PERCEPT_EVERY', 4));   // 何tickに
 const PERCEPT_SIGHT_R = Math.max(0, envNum('PERCEPT_SIGHT_R', 4)); // 「知らない店」を探す半径(セル)
 const PERCEPT_FRIEND  = envNum('PERCEPT_FRIEND', 0.35);            // これ以上の関係を「知り合い」とする
 if(HLP_ON && HLP_EXTRA) OPTS.registerExtras();
+// 時代の行動 (郵便局への用事 / 通販)。TECH=0 では登録しない = 既存の選択肢と同じ
+if(HLP_ON && TECH_ON && !process.env.HLP_NET && process.env.VEC==='0') OPTS.registerEraOptions();   // ベクトル版では時代は「自宅が与えるもの」で表す
 console.log(`[HLP] ${HLP_ON?'on':'off'} persona=${HLP_PERSONA?1:0} extra=${HLP_EXTRA?1:0} `
           + `temp=${HLP_TEMP} goal=${GOAL_RESOLVE} percept=${PERCEPT_MODE}`
           + (HLP_ON && !HLP_PERSONA && !HLP_EXTRA && PERCEPT_MODE==='off' ? '  (既存挙動と一致)' : '  ★既存挙動と異なる'));
@@ -7793,6 +7946,12 @@ function hlpCtx(){
   _hctx.IDX=_hIDX; _hctx.prefWeight=PREF_WEIGHT; _hctx.teachBonus=TEACH_BONUS;
   _hctx.personaOn=HLP_PERSONA; _hctx.temp=HLP_TEMP;
   _hctx.resolveMode=GOAL_RESOLVE; _hctx.perceptMode=PERCEPT_MODE;
+  // 時代 (TECH=0 では undefined のまま = options.js は従来の定数を使う)
+  if(TECH_ON && CITY && CITY.tech){
+    const e=CITY.tech.era;
+    _hctx.era=e; _hctx.sleepFrom=TECH_SLEEP_FROM[e]; _hctx.wakeAt=TECH_WAKE_AT[e];
+    _hctx.workShift=techWorkShift; _hctx.ordersOnline=techOrdersOnline; _hctx.homeEvening=techHomeEvening;
+  }
   // 学習方策があるならスコアはそちらが決める。まだ推論が回っていない住民には
   // null を返し、hlp.js が手書きの段で埋める (起動直後の1周だけ)。
   _hctx.netScore = hlpSession ? _netScore : null;
@@ -7805,7 +7964,8 @@ function _netScore(o, a){
 // カテゴリ表は起動後に確定するので、初回参照時に組み立てる。
 let _hIDX=null;
 function hlpAttach(){
-  _hIDX={ food:FOOD_IDX, home:HOME_IDX, care:CARE_IDX, buy:BUY_IDX, fun:FUN_IDX };
+  _hIDX={ food:FOOD_IDX, home:HOME_IDX, care:CARE_IDX, buy:BUY_IDX, fun:FUN_IDX,
+           civic:['post','bank'].map(IDX_OF).filter(v=>v!=null) };   // アナログ時代の用事 (tech)
   HLP.setRng(RNG.R); LLP.setRng(RNG.R);
   // 学習方策があるなら、行動の一覧も**メタから作り直す**。JS 側に書き写さない。
   if(hlpNetMeta && Array.isArray(hlpNetMeta.options)){
@@ -7832,13 +7992,17 @@ function hlpAttach(){
 //   ★ a.opt を読むのではなく毎回 choose() し直す。**そうしないと、決定と決定の
 //     あいだに閾値をまたいだ欲求が1tick遅れて見え、既存挙動と一致しなくなる。**
 //     候補8個の precond は数値比較だけなので、これで十分に安い。
-function needOf(a){ return HLP_ON ? HLP.choose(a, hlpCtx()).opt.need : needOf_legacy(a); }
+function needOf(a){
+  if(VEC_ON) return vecDecide(a).need;
+  return HLP_ON ? HLP.choose(a, hlpCtx()).opt.need : needOf_legacy(a);
+}
 
 // ── 行き先 ──────────────────────────────────────────────────────────────────
 // Option は targetSpec (「飲食カテゴリを好み込みで上位3軒から」) までしか
 // 決めず、どのセルかは llp.js が解決する。**ここを混ぜると「視覚で目的地を
 // 確かめる」が原理的に成立しなくなる** (座標を渡した時点で確認が儀式になる)。
 function pickLifeGoal(a, ex){
+  if(VEC_ON) return vecPickLifeGoal(a, ex);
   if(!HLP_ON) return pickLifeGoal_legacy(a, ex);
   const C=hlpCtx();
   const o=HLP.choose(a, C).opt;
@@ -7851,6 +8015,7 @@ function pickLifeGoal(a, ex){
 
 // ── 屋内に留まるか ──────────────────────────────────────────────────────────
 function shouldLeaveBuilding(a){
+  if(VEC_ON) return vecShouldLeave(a);
   if(!HLP_ON) return shouldLeaveBuilding_legacy(a);
   if(!MW.isIndoors(a)) return true;
   const [br,bc]=a.indoors;
@@ -7871,6 +8036,7 @@ function shouldLeaveBuilding(a){
 // **性格OFF・温度0・割り込みOFF のときこの2つは同値**なので Phase A では
 // 挙動が変わらない。
 function retargetOnNeedChange(){
+  if(VEC_ON) return vecRetarget();
   if(!HLP_ON) return retargetOnNeedChange_legacy();
   const C=hlpCtx();
   for(const a of agents){
@@ -7882,6 +8048,348 @@ function retargetOnNeedChange(){
     if(a.meet) continue;                                   // 待ち合わせ中は横取りしない
     if(a.mode==='wander' && !MW.isIndoors(a)) enterWander(a);
   }
+}
+
+// ═══ 行動のベクトル化 (vec.js) ═══════════════════════════════════════════════
+// **「いま何をするか」を if-else の段で選ぶのをやめる。** 住民の欲求ベクトルと、
+// 街の場所が与えるベクトルを照合して、いちばん合う場所 (と、そこでする過ごし方) を選ぶ。
+//   needOf / pickLifeGoal / shouldLeaveBuilding / retargetOnNeedChange の 4 つの入口を
+//   ここへ向ける。欲求の満たされ方 (stepNeeds) も同じベクトルで決める。
+//
+//   VEC=0 … 従来の段 (options.js + hlp.js) に戻す。**比較の基準として残してある**
+//           (TECH=0 と同じ扱い。tools/vec-report.js が両方を回して並べる)。
+//
+// ★ 書いてあるのは「世界」(場所が与えるもの・時刻・時代の自宅) と「欲求の曲線」だけ。
+//   在宅勤務・通販・郵便局の用事・夜更かしは、どこにも規則として書いていない。
+const VEC_ON     = process.env.VEC !== '0';
+const VEC_EVERY  = Math.max(1, envNum('VEC_EVERY', 7));      // 何 tick に 1 回、選び直しを計算するか (≒1 秒)
+const VEC_JITTER = envNum('VEC_JITTER', 0.08);               // 人と日による好みの揺らぎ (乱数は引かない)
+const VEC_FAM    = envNum('VEC_FAM', 0.25);                  // 行きつけの強さ (prefOf) の効き
+if(VEC_ON && process.env.HLP_NET==='1') console.warn('[Vec] ⚠ HLP_NET=1 だが、行動のベクトル化 (VEC=1) では hlp.onnx を使わない。学習した方策で選ぶなら VEC=0');
+if(VEC_ON) console.log(`[Vec] on チャンネル ${VEC.NC} (${VEC.CH.map(c=>c.ja).join('/')}) — 行動の一覧ではなくベクトルの照合で選ぶ`);
+
+// 住民ごとに固定の揺らぎ (0..1)。乱数を引かないので決定性を壊さない
+function _vecHash(s){
+  let h=2166136261;
+  for(let i=0;i<s.length;i++) h=Math.imul(h^s.charCodeAt(i),16777619);
+  return ((h>>>0)%10007)/10007;
+}
+
+// 暮らしのチャンネルの状態 (人と会う / 新しさ / 自然 / 体を動かす / 用事)
+function vecState(a){
+  if(!a.vn){
+    a.vn={};
+    for(const k of VEC.LIFE) a.vn[k]=0.15+0.35*_vecHash(a.aid+':'+k);
+  }
+  return a.vn;
+}
+
+// ── 場所のベクトル (公開の建物)。時刻 (30 分刻み)・時代・建物の状態でキャッシュ ──
+let _vecPlaceCache={key:'', list:[]};
+function vecPublicPlaces(){
+  const hb=Math.floor(gameHour()*2), era=techEra();
+  const key=cityStamp+':'+hb+':'+era;
+  if(_vecPlaceCache.key===key) return _vecPlaceCache.list;
+  const h=gameHour(), list=[];
+  for(const st of CITY?CITY.structs:[]){
+    if(st.state!=='open') continue;
+    const nm=BLDG_TYPES[st.typeIdx].name, P=VEC.PLACE[nm];
+    if(!P || P.public===false) continue;
+    const op=VEC.openness(P.open, h);
+    if(op<=0.01) continue;
+    const A=new Float32Array(VEC.NC);
+    for(let c=0;c<VEC.NC;c++) A[c]=P.a[c]*op;
+    list.push({key:st.r+'_'+st.c, kind:'place', typeName:nm, r:st.r, c:st.c, A, price:P.price||0, st});
+  }
+  _vecPlaceCache={key, list};
+  return list;
+}
+const vecTeleworkable = a => !!(a.work && a.home && !a.owns && !a.school && !isCourier(a) && !isCop(a));
+const WALK_A = VEC.vec({active:.35, novelty:.25, nature:.15, social:.1});
+
+// 住民 a にとっての候補 (公開の建物 + 自宅 + 職場/学校 + 街を歩く)
+function vecCandidates(a){
+  const era=techEra(), day=gameDay(), out=[];
+  const dist=(r,c)=>Math.hypot(r-a.x, c-a.y);
+  const jit=k=>(VEC_JITTER>0 ? (_vecHash(a.aid+':'+day+':'+k)-0.5)*2*VEC_JITTER : 0);
+  for(const p of vecPublicPlaces()){
+    out.push({key:p.key, kind:'place', typeName:p.typeName, r:p.r, c:p.c, A:p.A, price:p.price, st:p.st,
+      dist:dist(p.r,p.c), fam:VEC_FAM*prefOf(a, p.key), jit:jit(p.key)});
+  }
+  if(a.home){
+    out.push({key:'home', kind:'home', typeName:'home', r:a.home[0], c:a.home[1],
+      A:VEC.personal('home', era, {teleworkable:vecTeleworkable(a)}), dist:dist(a.home[0],a.home[1]), jit:jit('home')});
+  }else{
+    const h=nearestHome(a);
+    if(h) out.push({key:'shelter', kind:'shelter', typeName:'shelter', r:h[0], c:h[1],
+      A:VEC.personal('shelter', era, {}), dist:dist(h[0],h[1]), jit:0});
+  }
+  const w=a.school||a.work;
+  if(w) out.push({key:'work', kind:'work', typeName:a.school?'school':'work', student:!!a.school, r:w[0], c:w[1],
+    A:VEC.personal('work', era, {}), dist:dist(w[0],w[1]), jit:0});
+  out.push({key:'walk', kind:'walk', typeName:'walk', r:null, c:null, A:WALK_A, dist:4, jit:jit('walk')});
+  return out;
+}
+
+// 欲求ベクトルの材料
+const _vecDes=new Float32Array(VEC.NC);
+function vecDesire(a){
+  const tr=traitsOf(a), era=techEra();
+  // 始業のずれ (アナログは人によってバラバラ、PC は揃う) と、夜型/朝型の個人差
+  const spread=[1.5,0,1,1][era]||0;
+  const shift=spread ? Math.round((_vecHash(a.aid+':shift')*2-1)*spread*2)/2 : 0;
+  const nightOwl = TECH_ON && CITY && CITY.tech ? (techTraits(a).includes('night')?1.5:0) : 0;
+  const chrono=(_vecHash(a.aid+':chrono')-0.5)*1.2 + nightOwl;
+  const worker=!!a.work && !((a.def&&a.def.age!=null) && a.def.age<16);
+  return VEC.desire({
+    hunger:a.hunger||0, fatigue:a.fatigue||0, supply:a.supply||0, bored:a.bored||0, sick:a.sick||0,
+    vn:vecState(a), hour:gameHour(), weekend:isWeekend(), era,
+    worker, student:!!a.school, dutyShift:shift, chrono,
+    traits:{curiosity:tr[0], sociability:tr[2], diligence:tr[3], thrift:tr[4], homebody:tr[7]},
+  }, _vecDes);
+}
+const vecIsNight = () => VEC.circadian(gameHour(), VEC.ERA_SLEEP_MID[techEra()]) > 0.35;
+
+// 1 人ぶんの決定。VEC_EVERY tick に 1 回だけ計算し、その間は同じ決定を返す
+//   (needOf は 1 人 1 tick に何度も呼ばれるので、毎回照合すると重い)
+let _vecUnmetTalkAt=0;
+function vecDecide(a){
+  if(a._vec && (_simTicks - a._vecAt) < VEC_EVERY && a._vecAt<=_simTicks) return a._vec;
+  const d=vecDesire(a);
+  const cands=vecCandidates(a);
+  const tr=traitsOf(a);
+  const m=VEC.match(d, cands, {current:a.lastVecKey, fatigue:a.fatigue||0, thrift:tr[4]});
+  m.desire=Float32Array.from(d);
+  m.need=VEC.needOf(m, vecIsNight());
+  m.unmetCh=VEC.unmetChannel(d, cands);
+  a._vec=m; a._vecAt=_simTicks;
+  // 叶わなかった欲求を記録する (街の需要と起業の種)
+  if(CITY && !MW.isIndoors(a) && VEC.isUnmet(m)) vecNoteUnmet(a, m);
+  return m;
+}
+function vecKey(m){ return m && m.best ? m.best.key : 'none'; }
+function vecPlaceName(m, ja){
+  const b=m && m.best; if(!b) return ja?'どこか':'somewhere';
+  if(b.kind==='home') return ja?'自宅':'home';
+  if(b.kind==='shelter') return ja?'空いている家':'a shelter';
+  if(b.kind==='work') return b.student ? (ja?'学校':'school') : (ja?'職場':'work');
+  if(b.kind==='walk') return ja?'街':'town';
+  return ja ? shopNameJa(b.st) : shopNameEn(b.st);
+}
+function vecLabel(a, ja){
+  const m=a._vec || vecDecide(a);
+  if(!ja){
+    const [c1]=VEC.topChannels(m.contrib);
+    return `${c1>=0?VEC.CH[c1].id:'idle'} @ ${vecPlaceName(m,false)}`;
+  }
+  return VEC.label(m, vecPlaceName(m, true), vecIsNight(), true);
+}
+
+// ── 叶わなかった欲求 ──
+//   欲求は強いのに、街のどこでも満たしきれない。**捨てずに**、場所ごとの需要として溜める。
+//   日次処理 (vecDaily) が、溜まったベクトルに一番合う建物の型を選んで起業の需要に回す。
+function vecNoteUnmet(a, m){
+  if(!CITY.vecUnmet) CITY.vecUnmet={sum:new Array(VEC.NC).fill(0), cells:{}, n:0};
+  const U=CITY.vecUnmet, c0=m.unmetCh;
+  // 1 人 1 日 1 チャンネルにつき 1 回だけ数える (毎秒数えると、閉店後の「用事」だけで数万件になった)
+  const day=gameDay();
+  if(!a._vecUnmetSeen || a._vecUnmetSeen.day!==day) a._vecUnmetSeen={day, ch:0};
+  if(a._vecUnmetSeen.ch & (1<<c0)) return;
+  a._vecUnmetSeen.ch |= (1<<c0);
+  // 満たせなかった欲求の「形」を溜める (いちばん強いものを主に、他も少し)
+  for(let c=0;c<VEC.NC;c++){
+    if(['duty','rest'].includes(VEC.CH[c].id)) continue;
+    U.sum[c]+=(c===c0 ? 1 : 0.25)*m.desire[c];
+  }
+  const k=Math.floor(a.x)*GRID+Math.floor(a.y);
+  U.cells[k]=(U.cells[k]||0)+1; U.n++;
+  const now=simNow();
+  if(now-_vecUnmetTalkAt > 60000){
+    _vecUnmetTalkAt=now;
+    const ch=VEC.CH[c0];
+    pushTalkLine(a.name, JA_HUD ? `「${ch.ja}」を満たせる場所が近くに無いなあ` : `Nowhere nearby for ${ch.id}...`);
+  }
+}
+function vecDaily(day){
+  const U=CITY && CITY.vecUnmet;
+  if(!U || U.n<Math.max(8, agents.length*0.15)) { if(U){ U.sum=U.sum.map(v=>v*0.5); U.n=Math.floor(U.n*0.5); } return; }
+  const pub=Object.keys(VEC.PLACE).filter(nm=>VEC.PLACE[nm].public!==false && BLDG_NAME_TO_IDX[nm]!=null
+    && typeAllowed(BLDG_NAME_TO_IDX[nm]));
+  const typeName=VEC.bestTypeFor(U.sum, pub);
+  const t=typeName!=null ? BLDG_NAME_TO_IDX[typeName] : null;
+  const cat=t==null ? null : ['eat','shop','fun','care'].find(c=>(CAT_IDX[c]||[]).includes(t));
+  const top=U.sum.map((v,i)=>[v,i]).sort((x,y)=>y[0]-x[0]).slice(0,2).map(([,i])=>VEC.CH[i].ja);
+  if(cat && CITY.demand[cat]){
+    const tot=Object.values(U.cells).reduce((x,y)=>x+y,0)||1;
+    for(const k in U.cells) CITY.demand[cat][+k]+=U.cells[k]/tot*60;    // 叶わなかった場所を起業の立地に
+    CITY.unmet[cat]+=U.n*0.5;
+    news('wish', `💭 住民の叶わなかった「${top.join('×')}」が溜まっている — ${BLDG_TYPES[t].label} のような場所が求められている`,
+         `Residents keep wishing for ${top.join(' + ')} - the town wants something like a ${enOf(t)}`);
+  }
+  console.log('[VecUnmet] '+JSON.stringify({day, n:U.n, top, want:typeName, cat}));
+  U.sum=U.sum.map(v=>v*0.3); U.cells={}; U.n=0;
+}
+
+// ── その場所で欲求がどれだけ満たされるか ──
+//   **行動の選び方と同じベクトル**を使う。「飲食店に居れば空腹が減る」という分類ではなく、
+//   その場所の 満腹 の強さに比例して減る。
+function vecHereA(a){
+  const era=techEra();
+  if(MW.isIndoors(a)){
+    const [r,c]=a.indoors;
+    if(a.home && r===a.home[0] && c===a.home[1]) return {A:VEC.personal('home', era, {teleworkable:vecTeleworkable(a)}), kind:'home'};
+    const w=a.school||a.work;
+    if(w && r===w[0] && c===w[1]) return {A:VEC.personal('work', era, {}), kind:'work'};
+    const st=structAt(r,c); if(!st) return null;
+    const nm=BLDG_TYPES[st.typeIdx].name, P=VEC.PLACE[nm];
+    if(P && P.home && !a.home) return {A:VEC.personal('shelter', era, {}), kind:'shelter'};
+    if(!P || P.public===false) return null;
+    const op=VEC.openness(P.open, gameHour());
+    return {A:P.a.map(v=>v*op), kind:'place', st};
+  }
+  // 屋外: 広場で過ごしている / 隣の病院・薬局 / 歩いている
+  if(a.mode==='hold' && a.linger && a.navDest){
+    const st=structAt(a.navDest[0], a.navDest[1]);
+    const P=st && VEC.PLACE[BLDG_TYPES[st.typeIdx].name];
+    if(P) return {A:P.a, kind:'place', st};
+  }
+  return {A:WALK_A, kind:'walk'};
+}
+function vecStepNeeds(a, dtSec, alone){
+  const vn=vecState(a);
+  for(const k of VEC.LIFE) vn[k]=Math.min(1, vn[k]+VEC.LIFE_RATE[k]*dtSec);
+  if(!alone) vn.social=Math.max(0, vn.social - dtSec/2400);     // 人のそばに居るだけでも少しは満たされる
+  const H=vecHereA(a);
+  if(H){
+    // ★ **満たされるのは、その場所で「いましていること」のぶんだけ。**
+    //   最初は居るだけで全チャンネルが満たされていて、自宅で眠っている間に空腹まで
+    //   回復し、誰も朝食に出かけなかった (来店が旧ロジックの 1/3 に落ちた。実測)。
+    //   集中度 = 選んだ行動の中でそのチャンネルが効いた割合。選んだ場所に居ないとき
+    //   (通りすがり・寄り道) は、どのチャンネルも少しだけ (0.15)。
+    const m=a._vec, b=m&&m.best;
+    const here = b && ((H.kind==='home'&&b.kind==='home') || (H.kind==='work'&&b.kind==='work')
+      || (H.kind==='shelter'&&b.kind==='shelter') || (H.kind==='walk'&&b.kind==='walk')
+      || (H.st && b.r===H.st.r && b.c===H.st.c));
+    let top=0; if(here) for(let c=0;c<VEC.NC;c++) if(m.contrib[c]>top) top=m.contrib[c];
+    const E=new Float32Array(VEC.NC);
+    for(let c=0;c<VEC.NC;c++) E[c]= here && top>0 ? Math.max(0.15, Math.min(1, m.contrib[c]/top)) : 0.15;
+    const A=H.A.map((v,c)=>v*E[c]), I=VEC.IDX;
+    const food=A[I.food]*EAT_RECOVER*dtSec, sup=A[I.supply]*BUY_RECOVER*dtSec;
+    a.hunger=Math.max(0, a.hunger-food);
+    const before=a.supply;
+    a.supply=Math.max(0, a.supply-sup);
+    a.bored =Math.max(0, a.bored -A[I.fun]*FUN_RECOVER*dtSec);
+    if((a.sick||0)>0) a.sick=Math.max(0, a.sick-A[I.care]*SICK_HEAL*dtSec);
+    for(const k of VEC.LIFE) vn[k]=Math.max(0, vn[k]-A[I[k]]*VEC.LIFE_SAT[k]*dtSec);
+    // 休息: 自分の家 (と家なしの住居) は眠れる。それ以外は仮眠 (REST_FLOOR まで)
+    if(H.kind==='home' || H.kind==='shelter') a.fatigue=Math.max(0, a.fatigue-H.A[I.rest]*Math.max(E[I.rest],0.5)*SLEEP_RECOVER*dtSec);
+    else if(REST_ON && a.fatigue>REST_FLOOR && A[I.rest]>0)
+      a.fatigue=Math.max(REST_FLOOR, a.fatigue-A[I.rest]*REST_RECOVER*dtSec);
+    // 自宅で日用品が満ちた = 通販で頼んだ (スマホ以降の自宅だけが supply を持つ)
+    if(TECH_ON && H.kind==='home' && sup>0 && before>0.05) techOnlineOrder(a);
+  }
+  // 病院/薬局は隣接でも受診とみなす (従来と同じ救済。建物セルの中心に乗れないことがあるため)
+  if((a.sick||0)>0 && !MW.isIndoors(a)){
+    const r=Math.floor(a.x), c=Math.floor(a.y);
+    for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+      const tt=BUILDING_TYPES[(r+dr)+'_'+(c+dc)];
+      if(tt!=null && CARE_IDX.includes(tt)){ a.sick=Math.max(0, a.sick-SICK_HEAL*dtSec); dr=dc=2; }
+    }
+  }
+}
+
+// ── 4 つの入口 ──
+function vecPickLifeGoal(a, ex){
+  const m=vecDecide(a);
+  a.lastVecKey=vecKey(m);
+  if(!m.best || m.best.kind==='walk') return randB(ex);
+  return [m.best.r, m.best.c];
+}
+function vecShouldLeave(a){
+  if(!MW.isIndoors(a)) return true;
+  const [br,bc]=a.indoors;
+  const pl=(a.plot && a.plot.until>simNow()) ? a.plot.place
+         : (a.lured && a.lured.until>simNow()) ? a.lured.place : null;
+  if(pl && br===pl[0] && bc===pl[1]) return false;
+  if(ptActive(a) && PT.byId[a.pastime.id] && PT.byId[a.pastime.id].where==='home') return false;
+  // 配達員は街の中が職場
+  if(isCourier(a) && onDeliveryDuty(a)) return true;
+  const m=vecDecide(a), b=m.best;
+  if(!b || b.kind==='walk') return true;
+  return !(b.r===br && b.c===bc);       // いちばん合う場所がここなら留まる
+}
+function vecRetarget(){
+  for(const a of agents){
+    const m=vecDecide(a), k=vecKey(m);
+    if(k===a.lastVecKey) continue;
+    a.lastVecKey=k;
+    a.lastNeed=m.need||null;
+    if(a.meet) continue;
+    if(a.mode==='wander' && !MW.isIndoors(a)) enterWander(a);
+  }
+}
+
+// ── 新しさの計測 ──
+//   1 日に選ばれた「過ごし方の署名」(効いたチャンネル上位 2 つ + 場所の種類) を数える。
+//   行動の一覧だった頃は種類が Option の数 (8) を超えなかった。
+let _vecSig={};
+function vecTallyTick(){
+  for(const a of agents){
+    const m=a._vec; if(!m) continue;
+    const s=VEC.signature(m);
+    _vecSig[s]=(_vecSig[s]||0)+1;
+  }
+}
+// 暮らしの健全さの計測 (VEC=0 / 1 を比べるため。**状態は変えない** = 指紋に影響しない)
+let _life={n:0, hunger:0, fatigue:0, starving:0, exhausted:0, night:0, nightHome:0, work:0, workAt:0};
+let _vecDbgDay=-1;
+function lifeSampleTick(){
+  const h=gameHour(), we=isWeekend();
+  if(VEC_ON && process.env.VEC_DEBUG && ((h>=13 && h<13.02) || (h>=19 && h<19.02)) && (gameDay()*2+(h>=19?1:0))!==_vecDbgDay){
+    _vecDbgDay=gameDay()*2+(h>=19?1:0);
+    const kinds={}, dsum=new Array(VEC.NC).fill(0); let n=0;
+    for(const a of agents){ const m=a._vec; if(!m) continue; n++;
+      const k=m.best?m.best.kind:'none'; kinds[k]=(kinds[k]||0)+1;
+      for(let c=0;c<VEC.NC;c++) dsum[c]+=m.desire[c]; }
+    if(process.env.VEC_DEBUG==='labels'){
+      const seen=new Set();
+      for(const a of agents){ if(!a._vec) continue; const l=vecLabel(a,true); if(seen.has(l)) continue; seen.add(l);
+        if(seen.size<=14) console.log('[VecLabel]', gameHour().toFixed(1), a.name, '→', l); }
+    }
+    console.log('[VecDbg] day',gameDay(),'13時 行き先',JSON.stringify(kinds),'欲求平均',
+      VEC.CH.map((c,i)=>c.id+':'+(dsum[i]/Math.max(1,n)).toFixed(2)).join(' '), 'weekend',we);
+  }
+  for(const a of agents){
+    _life.n++; _life.hunger+=a.hunger||0; _life.fatigue+=a.fatigue||0;
+    if((a.hunger||0)>0.97) _life.starving++;
+    if((a.fatigue||0)>0.97) _life.exhausted++;
+    const inHome = a.home && MW.isIndoors(a) && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1];
+    if(h>=2 && h<4){ _life.night++; if(inHome) _life.nightHome++; }
+    if(!we && h>=10.5 && h<11.5 && a.work && !a.school && !a.owns){
+      _life.work++;
+      const atWork = MW.isIndoors(a) && a.indoors[0]===a.work[0] && a.indoors[1]===a.work[1];
+      if(atWork || inHome) _life.workAt++;      // 在宅勤務も「働いている」に数える
+    }
+  }
+}
+function lifeReportDaily(day){
+  const L=_life, n=Math.max(1,L.n);
+  console.log('[LifeJSON] '+JSON.stringify({day, vec:VEC_ON, pop:agents.length,
+    hunger:+(L.hunger/n).toFixed(2), fatigue:+(L.fatigue/n).toFixed(2),
+    starving:+(L.starving/n*100).toFixed(1), exhausted:+(L.exhausted/n*100).toFixed(1),
+    nightAtHome:L.night?+(L.nightHome/L.night*100).toFixed(0):null,
+    workersWorking:L.work?+(L.workAt/L.work*100).toFixed(0):null,
+    econ:Math.round(CITY?CITY.econ:0), shops:CITY?CITY.structs.filter(x=>x.state==='open').length:0,
+    opened:CITY?CITY.stats.shopsOpened:0, closed:CITY?CITY.stats.shopsClosed:0}));
+  _life={n:0, hunger:0, fatigue:0, starving:0, exhausted:0, night:0, nightHome:0, work:0, workAt:0};
+}
+function vecReportDaily(day){
+  const ent=Object.entries(_vecSig).sort((x,y)=>y[1]-x[1]);
+  const tot=ent.reduce((n,[,v])=>n+v,0)||1;
+  let H=0; for(const [,v] of ent){ const p=v/tot; H-=p*Math.log2(p); }
+  console.log('[VecJSON] '+JSON.stringify({day, kinds:ent.length, entropyBits:+H.toFixed(2),
+    top:ent.slice(0,8).map(([k,v])=>[k, +(v/tot*100).toFixed(1)])}));
+  _vecSig={};
 }
 
 // ── 割り込みの見回り (LLP → HLP) ────────────────────────────────────────────
@@ -8022,6 +8530,13 @@ function buildHlpState(a){
   // 学習側の歩行速度 (0.9 セル/分) で割って分に直す近似。
   S[i++]=Math.min(1, ((a.pathIdx||0)/0.9)/30);
   S[i++]=(a.sick||0)>0.5?1:0;
+  // 時代 (ノートブック セル E2)。**メタに era_dim があるときだけ**足す — 時代を知らない
+  // 既存の hlp.onnx はそのまま動く。並び: 時代 one-hot 4 + 今日の用事があるか 1
+  if(hlpNetMeta && hlpNetMeta.era_dim){
+    const e=techEra();
+    for(let k=0;k<4;k++) S[i++]=(k===e)?1:0;
+    S[i++]=a.errandDue?1:0;
+  }
   return S.subarray(0, i);
 }
 
@@ -8132,6 +8647,15 @@ function describeActivity(a){
   const atWork = a.work && Math.abs(r-a.work[0])<=1 && Math.abs(c-a.work[1])<=1;
   const h=gameHour();
 
+  // 研究中。実験の中身まで書く (住民一覧を見れば誰が何を試しているか分かる)
+  if(a.research && CITY && CITY.tech && CITY.tech.round){
+    const Q=a.research, lab=TECH.hypLabel(Q.k, Q.h, true);
+    if(Q.phase==='toBoard') return '📋 研究の掲示板を見に行っている';
+    if(Q.phase==='test')    return `🧪 実験している (${lab})`;
+    if(Q.phase==='wait')    return `⏳ 実験の時間帯を待っている (${lab})`;
+    return `🔬 実験しに向かっている (${lab})`;
+  }
+  if(a.teleToday && atHome && needOf(a)==='work') return '💻 在宅勤務している';
   // 配達中は業務がそのまま行動。生活の欲求より先に見せる
   // (勤務時間中の配達員は needOf が 'work' なので、下の判定だと全員「職場で働いている」になる)。
   if(a.deliv){
@@ -8144,6 +8668,7 @@ function describeActivity(a){
     }
     return '🚶 倉庫へ荷物を取りに戻っている';
   }
+  if(VEC_ON) return '🧭 '+vecLabel(a, true);        // ベクトルで選んだ過ごし方に、後から付けた名前
   if((a.sick||0)>0 && near(CARE_IDX)) return '🏥 病院・薬局で治療を受けている';
   if(t!=null && FOOD_IDX.includes(t)) return `${BLDG_TYPES[t].label} で食事をしている`;
   if(t!=null && BUY_IDX.includes(t))  return `${BLDG_TYPES[t].label} で買い物をしている`;
@@ -8192,6 +8717,7 @@ function pickLifeGoal_legacy(a, ex){
     const h2=nearestHome(a); if(h2) return h2;
   }
   if(n==='work'  && a.school) return [...a.school];   // 学生は学校へ
+  if(n==='work'  && a.teleToday && a.home) return [...a.home];   // 在宅勤務の日 (時代で割合が変わる)
   if(n==='work'  && a.work) return [...a.work];
   // 欲求 → 行き先カテゴリ。近い方から数軒のランダムで選ぶ (最寄り固定だと往復しやすい)
   const CAT={eat:FOOD_IDX, sick:CARE_IDX, shop:BUY_IDX, bored:FUN_IDX}[n];
@@ -8637,10 +9163,10 @@ const givenName = a => String(a && a.name || '').trim().split(/\s+/).pop() || ''
 //     最初は日本語の完成形 (st.name) だけを持たせたが、英語の見出しでそれを使うと
 //     「Zoraの牛丼屋's Beef Bowl Shop」になった。ニュースは ja/en の両方を要求する
 //     ので、片方の言語の完成形から他方を作ろうとしてはいけない。
-const jaLabelOf = t => BLDG_TYPES[t].label.replace(/^\S+\s*/,'');   // 絵文字を落とす
+const jaLabelOf = t => { const e=eraBldg(t); return e ? e[0] : BLDG_TYPES[t].label.replace(/^\S+\s*/,''); };   // 絵文字を落とす
 function shopNameJa(st){
   if(!st) return '';
-  return st.owner ? `${st.owner}の${jaLabelOf(st.typeIdx)}` : BLDG_TYPES[st.typeIdx].label;
+  return st.owner ? `${st.owner}の${jaLabelOf(st.typeIdx)}` : bldgLabel(st.typeIdx);
 }
 function shopNameEn(st){
   if(!st) return '';
@@ -9412,6 +9938,8 @@ const CHAT_HINTS_JA = [
   'チャットに:  !teach 名前 ラーメン  - 店をすすめる (行くかは本人しだい)',
   'チャットに:  !ask 名前  - その住民が何を覚えたか聞く',
   'チャットに:  !focus overview  - 街全体までカメラを引く',
+  ...(TECH_ON ? ['チャットに:  !idea 銅線 学び舎 夜  - 研究のアイデアを掲示板に貼る',
+                 'チャットに:  !tech  - いまの時代と研究の様子'] : []),
 ];
 const CHAT_HINTS_EN = [
   'TYPE IN CHAT:  test  - check your message reaches the town',
@@ -9422,6 +9950,8 @@ const CHAT_HINTS_EN = [
   'TYPE IN CHAT:  !teach <name> ramen  - recommend a shop (they decide for themselves)',
   'TYPE IN CHAT:  !ask <name>  - hear what that resident has learned',
   'TYPE IN CHAT:  !focus overview  - pull the camera back over the whole town',
+  ...(TECH_ON ? ['TYPE IN CHAT:  !idea copper school night  - pin a research idea to the board',
+                 'TYPE IN CHAT:  !tech  - what era is it, and how is research going'] : []),
 ];
 const CHAT_HINTS = JA_HUD ? CHAT_HINTS_JA : CHAT_HINTS_EN;
 // 自由質問は GEMINI_API_KEY があるときだけ案内する
@@ -10659,6 +11189,7 @@ function learnFromVisit(a, st, pathLen){
 // 口コミ: 近くに居る人と「行きつけ」を少しだけ共有する。
 //   stepNeeds の孤独判定 (既に近くの人を走査している) に相乗りする。
 function gossip(a, other){
+  if(TECH_ON) techShareRead(a, other);      // 掲示板の話も立ち話で伝わる (アナログ/PC 時代)
   const b=prefBest(other, null);
   if(!b || b.s<=0.2) return;
   const before=prefOf(a, b.key);
@@ -11039,7 +11570,24 @@ function pickDropTarget(a){
     if(agents.some(o=>o!==a && o.deliv && o.deliv.target===st)) continue;
     const d=Math.hypot(st.r-depot[0], st.c-depot[1]);
     const ago=Math.min((now-(st.deliveredAt||0))/1000, 3600);
-    const sc=ago - d*8 + RNG.R()*40;
+    // 通販を頼んだ家 (まだ届けていない) を優先する。TECH=0 では orderedAt が立たないので従来どおり
+    const ordered = st.orderedAt && st.orderedAt>(st.deliveredAt||0) ? 2000 : 0;
+    const sc=ago - d*8 + RNG.R()*40 + ordered;
+    if(sc>bestSc){ bestSc=sc; best=st; }
+  }
+  return best;
+}
+
+// 1 巡で複数運ぶとき、次の届け先 = **いま居る場所から近い**家 (倉庫からではなく)。
+function pickNextDrop(a){
+  const now=simNow();
+  let best=null, bestSc=-Infinity;
+  for(const st of openStructsOf(HOME_IDX)){
+    if(parcels.some(p=>p.hr===st.r && p.hc===st.c)) continue;
+    if(agents.some(o=>o!==a && o.deliv && o.deliv.target===st)) continue;
+    const d=Math.hypot(st.r-a.x, st.c-a.y);
+    const ago=Math.min((now-(st.deliveredAt||0))/1000, 3600);
+    const sc=ago*0.3 - d*12;
     if(sc>bestSc){ bestSc=sc; best=st; }
   }
   return best;
@@ -11110,6 +11658,11 @@ function stepDelivery(){
         }
         delivGo(a);
       }else if(D.phase==='drop'){
+        // パソコン時代以降は 1 巡で複数の荷物を運ぶ。倉庫へ戻らず、近い家へ続けて届ける。
+        if(TECH_ON && (D.left||0)>0){
+          const nx=pickNextDrop(a);
+          if(nx){ D.left--; D.target=nx; D.box=true; D.phase='toHome'; delivGo(a); continue; }
+        }
         D.phase='toDepot'; D.target=null;
         delivGo(a);
       }
@@ -11135,6 +11688,7 @@ function stepDelivery(){
       const st=pickDropTarget(a);
       if(!st){ D.since=now; D.retryAt=now+DELIV_RETRY_SEC*1000; continue; }
       D.target=st; D.box=true; D.phase='load'; D.waitUntil=now+DELIV_LOAD_SEC*1000;
+      D.left = TECH_ON ? (TECH_PARCELS[techEra()]||1)-1 : 0;   // この巡で追加で運ぶ荷物の数
     }else if(D.phase==='toHome'){
       // 玄関に着いた。荷物を置く。
       D.phase='drop'; D.waitUntil=now+DELIV_DROP_SEC*1000; D.box=false;
@@ -11177,7 +11731,9 @@ function staffWarehouses(){
   if(!DELIVERY_ON || WAREHOUSE_IDX==null || !CITY) return 0;
   let hired=0;
   for(const wh of openStructsOf([WAREHOUSE_IDX])){
-    const cap=Math.min(DELIV_CREW, ECON_ON ? workCapOf(wh) : WORK_CAP);
+    // スマホ時代以降は通販が増えるので、倉庫に配達員を多く置く (TECH=0 では従来どおり DELIV_CREW)
+    const crew=DELIV_CREW*(TECH_ON ? (TECH_CREW[techEra()]||1) : 1);
+    const cap=Math.min(crew, ECON_ON ? workCapOf(wh) : WORK_CAP);
     let need=cap - agents.filter(a=>a.work && a.work[0]===wh.r && a.work[1]===wh.c).length;
     if(need<=0) continue;
     // 店主 (自分の店がある) と学生は引き抜かない。生活の筋が壊れる。
@@ -11375,6 +11931,7 @@ function onArrive(a, dest){
   learnFromVisit(a, st, a.path?a.path.length:null);   // 行きつけを覚える
   if(st.state==='open'){
     st.visits++; st.visitsToday++;
+    if(a.errandDue && _hIDX && _hIDX.civic.includes(st.typeIdx)) a.errandDue=false;   // 用事が済んだ
     if(ECON_ON) settleVisit(a, st);      // 支払い / 払えないときの分岐
     // 経済活動 = 店/施設への来店の累計。これが溜まると発展段階が上がる
     if(CLOSABLE_CATS.some(c=>(CAT_IDX[c]||[]).includes(st.typeIdx))) CITY.econ++;
@@ -11418,6 +11975,8 @@ function dailyRollover(day){
   const gone=maybeDemolish(day) + relieveCongestion(day);
   // 1日に建てられる軒数は人口に比例させる。人が増えるほど街が速く育つ (複利)。
   const budget=Math.max(1, Math.min(6, 1+Math.floor(agents.length/FOUND_PER_POP)));
+  if(VEC_ON){ vecDaily(day); vecReportDaily(day); }
+  if(SIM_FAST) lifeReportDaily(day);   // 叶わなかった欲求を起業の需要へ / 過ごし方の種類を記録
   let opened=0;
   while(opened<budget && maybeFound(day)) opened++;
   const moved=growPopulation(day);              // 住居に空きがあれば人が引っ越してくる
@@ -11435,6 +11994,7 @@ function dailyRollover(day){
   maybeFoundWarehouse(day);                     // 通販の荷物をさばく倉庫 (配達員の職場)
   staffWarehouses();                            // 倉庫の欠員を補充する (辞めた/引っ越した配達員のぶん)
   const bankrupt=bankruptSweep(day);            // 採算の合わない建物を畳む (種類を問わない)
+  if(TECH_ON) techDaily(day);                   // 時代と研究 (研究の開始 / 素材 / 行き詰まりの解消 / 時代の交代)
   // 発展段階が上がったか (経済活動の累計で決まる)
   const lv=cityLevel();
   if(lv>(CITY.level||0)){
@@ -11497,6 +12057,1163 @@ function cityTick(){
   else if(d!==_lastDay){ _lastDay=d; dailyRollover(d); }
   finishConstruction();
   stepPopReset();                 // 人口が上限に達したら祝ってからリセット
+}
+
+// ═══ 時代と研究開発 ═══════════════════════════════════════════════════════════
+// 仕組みの本体 (ヒット&ブロー / 特徴量 / 方策) は tech.js。ここは街との配線:
+//   ・研究ラウンドの開始・素材の置き場所・前提の建物          techDaily
+//   ・住民が研究者になって実験しに行く状態機械                stepTech (配達員と同じ作り)
+//   ・行き詰まりの解消 (**必ずどこかで前へ進む**梯子)          techStall
+//   ・時代の効き目 (掲示板の読み方 / 口コミの届き方 / 配達 / 在宅勤務 / 娯楽 / 店の名前 / 屋上の小物)
+//
+// ── 配信のための約束 ──
+// 研究が止まって見える時間を作らない。止まる理由は全部で 5 つしかないので、
+// それぞれに打開策を用意してある (docs/tech-era-spec.md の §4)。
+//   ① 研究に要る建物が無い         → 街が建てる。建てられなければ仮設で代用 (免除)
+//   ② 正解の特性を持つ人が居ない    → 誰かが独学で身につける
+//   ③ 正解の場所が街に無い          → 街が建てる
+//   ④ 暇な人が居ない / 実験が進まない → 手分けを増やす (用事があっても手を挙げる)
+//                                     → ひらめき (正解の欄を 1 つ明かす) + 行商人 (素材を届ける)
+//   ⑤ それでも期限が来た            → 偶然の大発見 (強制的に次の時代へ)
+// 逆に早すぎる発明は「普及待ち」にして、時代の長さをおおむね揃える。
+
+const TECH_MODE        = process.env.TECH_MODE === 'policy' ? 'policy' : 'logic';
+// ── 難易度は全時代で一定 (PoW と同じ) ──
+//   課題 (480 通り × 3 段 × 素材 6 個) と、素材の湧き方・1 日の実験数・期限は**時代で変えない**。
+//   住民が速く解けば時代は速く進む。速さの差は「情報の伝わり方」と「推論の強さ」
+//   (tech.js の ERA_SHARE / ERA_INFER) からだけ生まれる。
+//   ★ 以前は時代の長さを揃えるために「普及待ち」で速さの差を吸収していたが、
+//     それでは時代ごとに住民が違う最適化をしても結果が同じに見えるのでやめた。
+//   日数はすべてゲーム日。TECH_DAY_SCALE でまとめて縮められる (検証用)。
+const TECH_DAY_SCALE   = Math.max(0.05, envNum('TECH_DAY_SCALE', 1));
+const _tdays = (k, d) => Math.max(0, Math.round(envNum(k, d)*TECH_DAY_SCALE));
+const TECH_QUIET_D     = _tdays('TECH_QUIET_DAYS', 2);    // 時代が変わってから研究が始まるまで (新しい時代を味わう間)
+const TECH_SPAWN_D     = Math.max(1, _tdays('TECH_SPAWN_DAYS', 10));   // 素材 6 個をこの期間に散らして湧かせる
+const TECH_MIN_D       = _tdays('TECH_MIN_DAYS', 0);      // これより早く発明しても時代はここまで変わらない (既定 0 = すぐ変わる)
+const TECH_STEP_D      = Math.max(2, _tdays('TECH_STEP_DAYS', 45));    // 1 段の安全の期限 (これを越えたら「試行錯誤の末に」)
+const TECH_MAX_D       = Math.max(3, _tdays('TECH_MAX_DAYS', 150));    // 時代の安全の期限 (偶然の大発見)
+const TECH_STALL_DAYS  = Math.max(1, _tdays('TECH_STALL_DAYS', 5));
+const TECH_EXP_PER_DAY = Math.max(1, envNum('TECH_EXP_PER_DAY', 2)/TECH_DAY_SCALE|0);
+const TECH_MAX_ACTIVE  = envNum('TECH_MAX_ACTIVE', 3);   // 同時に実験へ出ている人数の上限
+const TECH_TEST_SEC    = envNum('TECH_TEST_SEC', 8);     // 実験している実時間 (カメラが寄れる長さ)
+const TECH_MAX_WAIT_H  = envNum('TECH_MAX_WAIT_H', 2);   // 時間帯が来るまで待ってよいゲーム時間
+const TECH_CELL_SEC    = envNum('TECH_CELL_SEC', 1.5);   // 1 セル歩くのにかかる実時間の見積り
+const TECH_FIND_P      = envNum('TECH_FIND_P', 0.05);    // 素材の近くを通ったとき 1 秒あたりに気づく確率
+const TECH_FIND_R      = envNum('TECH_FIND_R', 1.6);     // 気づける距離 (セル)
+const TECH_REMOTE_GOSSIP = envNum('TECH_REMOTE_GOSSIP', 0.5);  // スマホ以降、離れた友人との口コミの強さ (近くの口コミに対する倍率)
+const TECH_LOOP        = process.env.TECH_LOOP !== '0';  // AI 時代を過ごしきったらアナログへ戻って 2 周目
+const TECH_BOARD       = process.env.TECH_BOARD !== '0'; // 0 = 掲示板を読まない (自分の結果だけ) — 比較実験用
+const TECH_START_ERA   = Math.max(0, Math.min(TECH.ERAS.length-1, envNum('TECH_START_ERA', 0)|0));
+// ── 時代ごとの人流 (ハイポリシーの選択肢と条件を変える。オフィスは取り壊さない) ──
+//   アナログ … 全部歩く。郵便局・銀行が現役 (用事)。早寝早起き。始業が人によってバラバラ
+//   PC      … 始業が 9 時に揃う = 通勤ピークが鋭い。用事は少し残る
+//   スマホ  … 買い物は通販 (家で受け取り、配達が増える)。夜更かし。在宅勤務が出てくる
+//   AI      … ほとんど在宅勤務。通勤が消え、オフィスは建ったまま空く
+const TECH_TELEWORK    = [0, 0, 0.25, 0.80];            // 在宅勤務の割合
+const TECH_SLEEP_FROM  = [21, 22, 23.5, 23];             // 寝る時刻
+const TECH_WAKE_AT     = [5.5, 6, 7, 7];                 // 起きる時刻
+const TECH_WORK_SPREAD = [1.5, 0, 1, 1];                 // 始業のずれ幅 (±時間)。0 = 全員同じ時刻
+const TECH_ERRAND      = [0.35, 0.15, 0, 0];             // その日に郵便局・銀行の用事がある人の割合
+const TECH_ONLINE      = [0, 0, 0.7, 0.9];               // 買い物を通販で済ませる人の割合 (人ごとに固定)
+const TECH_HOME_EVENING= [0, 0, 0.5, 0.6];               // 夜は家でスマホ・動画で過ごす人の割合 (夜更かしでも外に出ない)
+const TECH_PARCELS     = [1, 2, 3, 4];                   // 時代ごとに配達員が 1 巡で運べる荷物の数
+const TECH_CREW        = [1, 1, 2, 3];                   // 倉庫 1 軒あたりの配達員の人数の倍率 (通販が増えるぶん)
+const TECH_PLACE_IDX   = {
+  learn: [...SCHOOL_ALL, IDX_OF('school'), IDX_OF('library')].filter(v=>v!=null),
+  work: WORK_IDX, eat: FOOD_IDX, shop: BUY_IDX,
+};
+const techHourSec = () => DAY_MINUTES*60/24;             // ゲーム 1 時間 = 実時間の秒
+
+let TECH_W = null;                                       // 学習した方策 (TECH_MODE=policy)
+if(TECH_ON && TECH_MODE==='policy'){
+  const p=path.join(__dirname,'data','tech_policy.json');
+  try{
+    TECH_W=JSON.parse(fs.readFileSync(p,'utf8'));
+    if(TECH_W.inDim!==TECH.FEAT_DIM){
+      console.warn(`[Tech] tech_policy.json の特徴量 ${TECH_W.inDim} ≠ tech.js の ${TECH.FEAT_DIM} → ロジックで選ぶ`);
+      TECH_W=null;
+    }else if(!(TECH_W.validation && TECH_W.validation.passed)){
+      console.warn('[Tech] ⚠ tech_policy.json は検証に通っていない (二分木より遅い共有モードがある)。そのまま使う');
+    }
+  }catch(e){ console.warn('[Tech] data/tech_policy.json が読めない → ロジックで選ぶ (node tools/tech-train.js で作れる)'); }
+}
+if(TECH_ON) console.log(`[Tech] on mode=${TECH_W?'policy':'logic'} 難易度は全時代で一定`
+  + ` (研究開始 ${TECH_QUIET_D}日目 / 素材 ${TECH_SPAWN_D}日で湧く / 段の期限 ${TECH_STEP_D}日 / 時代の期限 ${TECH_MAX_D}日)`
+  + ` 行き詰まり判定 ${TECH_STALL_DAYS}日 実験 ${TECH_EXP_PER_DAY}回/日`
+  + `${TECH_BOARD?'':' ★掲示板なし'}`);
+
+// 指紋 (stateHash) に混ぜる研究の状態。**TECH=0 のときは呼ばない** (既存の指紋を変えない)
+function techMixHash(mix){
+  const T=CITY.tech;
+  mix(T.era); mix(T.cycle); mix(T.eraDay);
+  const R=T.round;
+  if(R){ mix(R.k); mix(R.step||0); mix(R.answer); mix(R.posts.length); mix(R.solvedDay==null?-1:R.solvedDay);
+         for(const p of R.posts){ mix(p.h); mix(p.hits); }
+         for(const d of R.deposits){ mix(d.found?1:0); mix(d.r); mix(d.c); } }
+  for(const a of agents) if(a.research){ mix(a.research.h); mix(a.research.phase.length); }
+}
+let _techLastStart = 0;          // 最後に誰かが実験へ出た時刻 (simNow)。保存しない
+let _techAidMap = null;          // aid → 住民 (離れた友人の口コミ用。1秒ごとに作り直す)
+let _techPubKey = '', _techPubS = null;
+
+// ── 状態 ────────────────────────────────────────────────────────────────────
+function techFresh(day){
+  return { v:1, era:TECH_START_ERA, cycle:1, eraDay:day, round:null, know:{}, records:[], gifted:{},
+           history:[{era:TECH_START_ERA, day, cycle:1}],
+           stats:{exps:0, finds:0, hints:0, forced:0, remedies:0, requests:0, ideas:0, gifts:0, builds:0},
+           ver:0 };
+}
+function techEnsure(){
+  if(!TECH_ON || !CITY) return;
+  if(!CITY.tech || CITY.tech.v!==1) CITY.tech=techFresh(gameDay());
+}
+// 街を作り直しても**技術は受け継ぐ** (前の街の住民が見つけたことは消えない)。
+//   日付は新しい街の暦に付け替える。素材の置き場所は地形ごと変わるので置き直す。
+function techCarry(old, oldDay, newDay){
+  if(!old) return techFresh(newDay);
+  const d=newDay-oldDay;
+  const T=JSON.parse(JSON.stringify(old));
+  T.eraDay+=d; T.know={};
+  const R=T.round;
+  if(R){
+    R.openDay+=d; R.lastProg+=d; R.expDay=newDay; R.expToday=0;
+    if(R.solvedDay!=null) R.solvedDay+=d;
+    R.prereq.since=newDay; R.prereq.building=false;
+    for(const dp of R.deposits){ dp.spawnDay=Math.max(newDay, dp.spawnDay+d); if(!dp.found){ dp.r=-1; dp.c=-1; } }
+  }
+  return T;
+}
+
+const techEra   = () => (TECH_ON && CITY && CITY.tech) ? CITY.tech.era : 0;
+const techEraOf = () => TECH.ERAS[techEra()];
+function techYear(){
+  if(!CITY || !CITY.tech) return TECH.ERAS[0].year;
+  const T=CITY.tech, e=TECH.ERAS[T.era];
+  const y1=T.era+1<TECH.ERAS.length ? TECH.ERAS[T.era+1].year : TECH.END_YEAR;
+  // 年号は「研究の進み具合」で進める (時代の長さが住民しだいで変わるので、日数では決められない)
+  const f=Math.max(0, Math.min(0.99, T.round ? techProgress() : 0));
+  return e.year + Math.floor((y1-e.year)*f);
+}
+function techTraits(a){ return TECH.traitsOf(a.def, CITY.tech.gifted[a.aid]); }
+function techTraitIdx(a, k){
+  const ids=TECH.RESEARCH[k].traits;
+  return techTraits(a).map(t=>ids.indexOf(t)).filter(i=>i>=0);
+}
+const techTraitJa = (k,t) => TECH.TRAITS[TECH.RESEARCH[k].traits[t]].ja;
+const techTraitEn = (k,t) => TECH.TRAITS[TECH.RESEARCH[k].traits[t]].en;
+const techLabel   = (k,h) => TECH.hypLabel(k, h, JA_HUD);
+const techAgentByAid = aid => {
+  if(!_techAidMap) _techAidMap=new Map(agents.map(x=>[x.aid,x]));
+  return _techAidMap.get(aid)||null;
+};
+
+// 掲示板の全部の結果と矛盾しない候補 (表示・ひらめき・依頼で使う)
+function techPublicS(){
+  const R=CITY.tech.round;
+  if(!R) return [];
+  const key=R.k+':'+R.posts.length+':'+Object.keys(R.hints).join(',');
+  if(key!==_techPubKey){ _techPubKey=key; _techPubS=TECH.consistent(R.posts, R.hints); }
+  return _techPubS;
+}
+function techProgress(){
+  const T=CITY&&CITY.tech, R=T&&T.round;
+  if(!R) return 0;
+  if(R.solvedDay!=null) return 1;
+  const found=R.deposits.filter(d=>d.found).length/TECH.NM;
+  const S=techPublicS().length||1;
+  const nS=techSteps(R).length;
+  const stepP=((R.step||0) + (1-Math.log(S)/Math.log(TECH.NHYP)))/nS;
+  return Math.max(0, Math.min(0.99, 0.25*found + 0.75*stepP));
+}
+
+// ── 掲示板をどれだけ読めているか (時代で読み方が変わる) ───────────────────
+//   アナログ … 掲示板のある建物の前を通ったとき / 立ち話で聞いたとき
+//   パソコン … 家に帰れば読める (パソコン通信)
+//   スマホ以降 … いつでも読める
+// 住民ごとに「どの結果を知っているか」(投稿の番号の集合)。スマホ以降は全員が全部知っている。
+//   ★ 以前は「掲示板を何件目まで読んだか」の 1 つの数で持っていたが、アナログ時代は
+//     **すれ違った人から聞いた結果だけ**を知っているので、途中が歯抜けになる。集合で持つ。
+function techKnowSet(a){
+  const T=CITY.tech;
+  if(!T.know) T.know={};
+  return T.know[a.aid] || (T.know[a.aid]=[]);
+}
+function techLearn(a, idxs){
+  const k=techKnowSet(a);
+  for(const i of idxs) if(!k.includes(i)) k.push(i);
+}
+function techReadCount(a){
+  const R=CITY.tech.round;
+  if(!R) return 0;
+  if(!TECH_BOARD) return R.posts.filter(p=>p.aid===a.aid).length;
+  if(CITY.tech.era>=2) return R.posts.length;
+  return techKnowSet(a).length;
+}
+function techKnown(a){
+  const R=CITY.tech.round;
+  if(TECH_BOARD && CITY.tech.era>=2) return R.posts;
+  const k=TECH_BOARD ? new Set(techKnowSet(a)) : null;
+  return R.posts.filter((p,i)=> p.aid===a.aid || (k && k.has(i)));
+}
+// PC 時代の掲示板: 図書館・市役所・学び舎・郵便局。**読みに行くコストがある** (中央集権)。
+let _techBoardCache={stamp:-1, site:null};
+function techBoardSite(){
+  if(_techBoardCache.stamp===cityStamp) return _techBoardCache.site;
+  let site=null;
+  for(const nm of ['library','cityhall','school','university','high','junior','elementary','post']){
+    const t=IDX_OF(nm); if(t==null) continue;
+    const st=CITY.structs.find(s=>s.state==='open' && s.typeIdx===t);
+    if(st){ site=[st.r, st.c]; break; }
+  }
+  _techBoardCache={stamp:cityStamp, site};
+  return site;
+}
+const techAllIdx = () => CITY.tech.round.posts.map((_,i)=>i);
+// PC 時代: 掲示板の建物の前を通れば全部読める
+function techReadTick(){
+  const T=CITY.tech, R=T.round;
+  if(!R || !TECH_BOARD || T.era!==1 || !R.posts.length) return;
+  const board=techBoardSite();
+  if(!board) return;
+  for(const a of agents){
+    if(techKnowSet(a).length>=R.posts.length) continue;
+    if(Math.abs(a.x-(board[0]+0.5))<=2.2 && Math.abs(a.y-(board[1]+0.5))<=2.2) techLearn(a, techAllIdx());
+  }
+}
+// 立ち話で、知っている結果を交換する (gossip から呼ぶ。乱数は使わない)。
+//   アナログ時代の**唯一の**伝わり方。PC 時代も、読んだ人から聞くことはできる。
+function techShareRead(a, b){
+  const T=CITY&&CITY.tech;
+  if(!T || !T.round || T.era>=2 || !b || !TECH_BOARD) return;
+  const u=[...new Set([...techKnowSet(a), ...techKnowSet(b)])];
+  if(u.length){ T.know[a.aid]=u.slice(); T.know[b.aid]=u; }
+}
+
+// ── 研究の場所 ──────────────────────────────────────────────────────────────
+function techSiteFor(a, p){
+  const id=TECH.PLACES[p].id;
+  if(id==='home') return a.home ? [a.home[0], a.home[1]] : null;
+  const list=buildingsOfTypes(TECH_PLACE_IDX[id]);
+  let best=null, bd=Infinity;
+  for(const b of list){
+    const d=Math.hypot(b[0]-a.x, b[1]-a.y);
+    if(d<bd){ bd=d; best=b; }
+  }
+  return best ? [best[0], best[1]] : null;
+}
+const techPlaceExists = p => TECH.PLACES[p].id==='home'
+  ? agents.some(a=>a.home) : buildingsOfTypes(TECH_PLACE_IDX[TECH.PLACES[p].id]).length>0;
+function techHasUniversity(){
+  const t=IDX_OF('university');
+  return t!=null && CITY.structs.some(s=>s.state==='open' && s.typeIdx===t);
+}
+function techHasPrereq(){
+  const R=CITY.tech.round;
+  const idx=TECH.RESEARCH[R.k].prereq.types.map(IDX_OF).filter(v=>v!=null);
+  return CITY.structs.some(s=>s.state==='open' && idx.includes(s.typeIdx));
+}
+const techPrereqOk = () => CITY.tech.round.prereq.waived || techHasPrereq();
+
+// ── 研究ラウンドを始める ────────────────────────────────────────────────────
+// 段 j の正解。素材は「湧く順番の 2j 番目か 2j+1 番目」— 1 段目は最初に湧く 2 個、
+// 2 段目は 3〜4 個目、3 段目は最後の 2 個。**新しい素材が見つかって初めて次の発明に届く**。
+//   ★ 以前は「前から 2+2j 個」のどれでもよく、3 段とも時代の前半に解けて残りが長い
+//     普及待ちになった (実測: 名目 64 日の時代で 3 段が 5〜15 日目に終わった)。
+function techPickAnswer(order, j){
+  const m=order[Math.min(order.length-1, 2*j + Math.floor(RNG.R()*2))];
+  const p=Math.floor(RNG.R()*TECH.NP), t=Math.floor(RNG.R()*TECH.NT), tm=Math.floor(RNG.R()*TECH.NH);
+  return TECH.enc(m, p, t, tm);
+}
+const techSteps  = R => TECH.RESEARCH[R.k].steps;
+const techStepOf = R => techSteps(R)[Math.min(R.step||0, techSteps(R).length-1)];
+const techIsLastStep = R => (R.step||0) >= techSteps(R).length-1;
+
+function techOpenRound(day){
+  const T=CITY.tech, k=T.era, D=TECH.RESEARCH[k];
+  const order=[0,1,2,3,4,5];
+  for(let i=order.length-1;i>0;i--){ const j=Math.floor(RNG.R()*(i+1)); [order[i],order[j]]=[order[j],order[i]]; }
+  const answer=techPickAnswer(order, 0);
+  // 素材は TECH_SPAWN_D 日に散らして湧かせる (全時代で同じ — 課題の一部)
+  const span=TECH_SPAWN_D;
+  T.round={ k, step:0, order, stepDays:[], answer, openDay:day, lastProg:day, stall:0, hints:{}, posts:[], ideas:[],
+    deposits: order.map((m,i)=>({m, spawnDay: day+Math.floor(span*i/order.length), r:-1, c:-1, found:false, by:null})),
+    solvedDay:null, solvedBy:null, forced:false, expDay:day, expToday:0,
+    prereq:{since:day, waived:false, building:false} };
+  T.know={}; T.ver++;
+  const S0=D.steps[0];
+  news('tech', `🔬 研究が始まった — 「${D.ja}」への道: ${D.steps.map(x=>x.ja).join(' → ')}。まずは「${S0.ja}」`,
+       `Research has begun - the road to ${D.en} starts with ${S0.en}`);
+  showBanner(JA_HUD ? `研究開始: まずは「${S0.ja}」 (${D.ja}まで3段)` : `Research begins: ${S0.en}`, 7);
+  console.log(`[Tech] 研究ラウンド開始 k=${k} 正解=${TECH.hypLabel(k, answer, true)} (${answer})`);
+}
+
+// 素材を置く: 道に面した空き地。ほかの素材から離す。
+function techPlaceDeposit(dp){
+  const lo=fieldLo(), hi=fieldHi(), R=CITY.tech.round;
+  const cand=[];
+  for(let r=lo;r<=hi;r++) for(let c=lo;c<=hi;c++){
+    if(MAP[r][c]!==OTHER) continue;
+    if(!MW.D4.some(([dr,dc])=>{ const nr=r+dr, nc=c+dc;
+      return nr>=0&&nr<GRID&&nc>=0&&nc<GRID&&MAP[nr][nc]===ROAD; })) continue;
+    if(R.deposits.some(o=>o!==dp && o.r>=0 && Math.abs(o.r-r)+Math.abs(o.c-c)<4)) continue;
+    cand.push([r,c]);
+  }
+  if(!cand.length) return false;
+  const [r,c]=cand[Math.floor(RNG.R()*cand.length)];
+  dp.r=r; dp.c=c; CITY.tech.ver++;
+  news('tech', `✨ 街のどこかで何かが光っている…`, `Something is glinting somewhere in town...`);
+  showCityEvent(r, c, JA_HUD ? '何かが光っている…' : 'Something is glinting here...', 6);
+  return true;
+}
+
+function techDiscover(dp, a, via){
+  const T=CITY.tech, R=T.round, day=gameDay();
+  const M=TECH.RESEARCH[R.k].materials[dp.m];
+  dp.found=true; dp.by=a ? a.name : via; R.lastProg=day; T.stats.finds++; T.ver++;
+  const n=R.deposits.filter(d=>d.found).length;
+  if(a){
+    news('tech', `🔎 ${a.name} が「${M.ja}」を見つけた (素材 ${n}/${TECH.NM})`,
+         `${a.name} found ${M.en} (materials ${n}/${TECH.NM})`);
+    pushTalkLine(a.name, JA_HUD ? `これは…「${M.ja}」だ! 何かに使えそう` : `Is this... ${M.en}? Could be useful.`);
+    CH.push(a, {day, icon:'🔎', mark:true, ja:`「${M.ja}」を発見した`, en:`discovered ${M.en}`});
+  }else{
+    news('tech', `🧳 ${via} が「${M.ja}」を届けてくれた (素材 ${n}/${TECH.NM})`,
+         `${via} brought ${M.en} to town (materials ${n}/${TECH.NM})`);
+  }
+  if(dp.r>=0) showCityEvent(dp.r, dp.c,
+    JA_HUD ? `発見! 「${M.ja}」 (素材 ${n}/${TECH.NM})` : `Found: ${M.en} (${n}/${TECH.NM})`, 7);
+  else showBanner(JA_HUD ? `素材「${M.ja}」が街に届いた` : `${M.en} arrived in town`, 6);
+}
+
+function techFind(){
+  const R=CITY.tech.round, rad=TECH_FIND_R + R.stall*0.8;
+  for(const dp of R.deposits){
+    if(dp.found || dp.r<0) continue;
+    for(const a of agents){
+      if(MW.isIndoors(a) || (a.jail||0)>0) continue;
+      if(Math.abs(a.x-(dp.r+0.5))>rad || Math.abs(a.y-(dp.c+0.5))>rad) continue;
+      const p=TECH_FIND_P*(techTraits(a).includes('explorer')?2:1)*(1+R.stall)
+             *(techHasUniversity()?1.5:1);
+      if(RNG.R()<p){ techDiscover(dp, a); break; }
+    }
+  }
+}
+
+// ── 研究者を出す ────────────────────────────────────────────────────────────
+function techExpPerDay(){
+  const R=CITY.tech.round;
+  return Math.ceil(TECH_EXP_PER_DAY*(techHasUniversity()?1.5:1)*(1+0.5*R.stall));
+}
+// relaxed = 行き詰まり中。用事 (仕事・買い物・退屈) があっても手を挙げる。
+function techEligible(a, relaxed){
+  if(a.research || a.deliv || a.meet || a.chase || (a.plot && a.plot.until>simNow()) || (a.jail||0)>0) return false;
+  if(MW.isIndoors(a) || a.mode==='hold' || a.rally) return false;
+  if((a.def && a.def.age!=null && a.def.age<7)) return false;
+  if(a.talk && a.talk.until>simNow()) return false;
+  const n=needOf(a);
+  if(!relaxed) return n===null && !ptActive(a);
+  return !['sick','sleep','eat','rest'].includes(n);
+}
+
+function techPlan(a, only){
+  const T=CITY.tech, R=T.round, k=R.k;
+  const myT=techTraitIdx(a, k);
+  if(!myT.length) return null;
+  const known=techKnown(a);
+  const infer=TECH.ERA_INFER[T.era];
+  const S=TECH.knowledgeSet(known, R.hints, infer);     // 推論の強さは時代で違う (AI だけ論理的に絞る)
+  const Sset=new Set(S);
+  const traitBad=!S.some(s=>myT.includes(TECH.dec(s)[2]));
+  const hour=gameHour(), cellH=TECH_CELL_SEC/techHourSec(), size=Math.max(8, fieldSize());
+  const knownH=new Set(known.map(p=>p.h));
+  // 「いま誰が何を試しているか」が見えるのはスマホ以降。それより前は同じ実験が街の中で重複する
+  const busy=new Set(T.era>=2 ? agents.filter(o=>o.research).map(o=>o.research.h) : []);
+  const req=new Set();
+  for(const p of known) if(p.req && myT.includes(p.req.t)) req.add(p.req.h);
+  const tried={m:new Float32Array(TECH.NM), p:new Float32Array(TECH.NP), t:new Float32Array(TECH.NT)};
+  for(const p of known){ const d=TECH.dec(p.h); tried.m[d[0]]++; tried.p[d[1]]++; tried.t[d[2]]++; }
+  const ideaOk = h => { const d=TECH.dec(h);
+    return R.ideas.some(i=>(i.m<0||i.m===d[0]) && (i.p<0||i.p===d[1]) && (i.tm<0||i.tm===d[3])); };
+  const sites=TECH.PLACES.map((_,p)=>techSiteFor(a,p));
+  const cands=[];
+  for(let m=0;m<TECH.NM;m++){
+    if(!R.deposits.some(d=>d.m===m && d.found)) continue;
+    for(let p=0;p<TECH.NP;p++){
+      const site=sites[p]; if(!site) continue;
+      const dist=Math.hypot(site[0]-a.x, site[1]-a.y), travelH=dist*cellH;
+      for(const t of myT) for(let tm=0;tm<TECH.NH;tm++){
+        const h=TECH.enc(m,p,t,tm);
+        if(knownH.has(h) || busy.has(h) || (only && !only.has(h))) continue;
+        const W=TECH.TIMES[tm], arrive=(hour+travelH)%24;
+        let wait=0;
+        if(!(arrive>=W.from && arrive<W.to-0.3)) wait=(W.from-arrive+24)%24;
+        if(wait>TECH_MAX_WAIT_H) continue;
+        cands.push({h, inS:Sset.has(h), cost:dist/size, wait:wait/24, requested:req.has(h),
+          viewer:ideaOk(h), triedM:tried.m[m]/6, triedP:tried.p[p]/6, triedT:tried.t[t]/6, site});
+      }
+    }
+  }
+  if(!cands.length) return null;
+  const kk={S, era:T.era, known:known.length, board:R.posts.length, traitBad, posts:known};
+  const c = TECH_W ? TECH.choosePolicy(cands, kk, TECH_W, TECH_W.temp||0.5, RNG.R)
+          : infer==='logic' ? TECH.chooseLogic(cands, kk, true, RNG.R)
+          : TECH.chooseFolk(cands, kk, RNG.R);
+  return c;
+}
+
+function techTryStart(){
+  const T=CITY.tech, R=T.round, now=simNow(), day=gameDay();
+  if(R.expDay!==day){ R.expDay=day; R.expToday=0; }
+  if(!techPrereqOk()) return;
+  const hour=gameHour();
+  if(hour<5.5 || hour>=21.2) return;
+  let active=0; for(const a of agents) if(a.research) active++;
+  if(active >= TECH_MAX_ACTIVE + (techHasUniversity()?1:0) + Math.min(2, R.stall)) return;
+  // ── 終盤 ── 候補が 3 通り以下に絞れて素材も揃っているなら、上限と間隔を外して
+  //   「その特性を持つ人」を優先して送り出す。答えが分かっているのに誰も試しに
+  //   行かないまま期限を迎える、を防ぐ (実測: 残り1通りで丸1日動かず偶然の発見に落ちた)。
+  const S=techPublicS();
+  // ★ 「残り 3 通り」は掲示板を全部つき合わせた**論理的な**答え。それを使えるのは AI 時代だけ。
+  //   AI 以前にも使うと、住民が知らないはずの答えへ街が人を送ることになる (難易度が時代で変わる)。
+  //   それより前の時代は、行き詰まりの梯子 (Lv2 以上) まで待つ。
+  const endgame = S.length<=3 && S.every(h=>R.deposits.some(d=>d.m===TECH.dec(h)[0] && d.found))
+    && (TECH.ERA_INFER[T.era]==='logic' || R.stall>=2);
+  const perDay=techExpPerDay();
+  if(!endgame && R.expToday>=perDay) return;
+  // 1 日の実験を昼間 16 時間に散らす (朝いちばんに全部出てしまわないように)
+  const spacing=(endgame ? 0.5 : 16/perDay*0.6)*techHourSec()*1000;
+  if(now-_techLastStart < spacing) return;
+  const needTraits=new Set(S.map(h=>TECH.dec(h)[2]));
+  const pool=agents.filter(a=>techEligible(a, R.stall>=1 || endgame)
+    && (endgame ? techTraitIdx(a, R.k).some(t=>needTraits.has(t)) : techTraitIdx(a, R.k).length));
+  if(!pool.length) return;
+  for(let tries=0; tries<(endgame?8:3) && pool.length; tries++){
+    const i=Math.floor(RNG.R()*pool.length);
+    const a=pool.splice(i,1)[0];
+    const c=techPlan(a, endgame ? new Set(S) : null);
+    if(!c) continue;
+    const readAll=techReadCount(a)>=R.posts.length;
+    const board=techBoardSite();
+    a.research={ k:R.k, h:c.h, site:c.site, requested:!!c.requested, viewer:!!c.viewer,
+      phase:(T.era===1 && TECH_BOARD && !readAll && board) ? 'toBoard' : 'toSite',
+      since:now, waitUntil:0, retryAt:0, fails:0 };
+    a.pastime=null;
+    R.expToday++; _techLastStart=now;
+    const lab=techLabel(R.k, c.h);
+    pushTalkLine(a.name, JA_HUD
+      ? (c.requested ? `頼まれていたやつを試そう: ${lab}` : c.viewer ? `視聴者さんのアイデアを試してみよう: ${lab}` : `よし、${lab} で試してみよう`)
+      : (c.requested ? `I'll try the one I was asked about: ${lab}` : `Let's try ${lab}.`));
+    if(a.research.phase==='toBoard') pushTalkLine(a.name, JA_HUD ? 'その前に掲示板を見ておこう' : 'Checking the notice board first.');
+    techGo(a);
+    return;
+  }
+}
+
+function techGo(a){
+  const Q=a.research;
+  const dst = Q.phase==='toBoard' ? techBoardSite() : Q.site;
+  if(!dst){ Q.phase='toSite'; }
+  const to = dst || Q.site;
+  if(to && delivWalkTo(a, to[0], to[1])){ Q.retryAt=0; return true; }
+  Q.fails++;
+  if(Q.fails>=3){ techEnd(a, 'unreachable'); return false; }
+  Q.retryAt=simNow()+4000;
+  return false;
+}
+
+function techEnd(a){
+  if(!a.research) return;
+  a.research=null;
+  a.rally=false;
+  if(a.mode==='hold') a.mode='wander';
+  a.atDoor=null;
+  if(!MW.isIndoors(a)) enterWander(a);
+}
+
+function techStepAgent(a){
+  const Q=a.research, T=CITY.tech, R=T.round, now=simNow();
+  if(!R || R.k!==Q.k || R.solvedDay!=null || (a.jail||0)>0 || MW.isIndoors(a)){ techEnd(a); return; }
+  if(Q.phase!=='test'){
+    const n=needOf(a);
+    const stop = R.stall>=1 ? ['sick','sleep'] : ['sick','sleep','eat','rest'];
+    if(stop.includes(n)){ techEnd(a); return; }
+  }
+  const stuckMs=Math.max(150, (TECH_MAX_WAIT_H+1)*techHourSec()+60)*1000;
+  if(now-Q.since > stuckMs){ techEnd(a); return; }
+  if(Q.waitUntil){
+    if(now<Q.waitUntil) return;
+    Q.waitUntil=0;
+    if(Q.phase==='test'){ techResult(a); return; }
+  }
+  if(Q.retryAt){ if(now>=Q.retryAt) techGo(a); return; }
+  if(a.mode!=='hold' && a.mode!=='navigate'){ techGo(a); return; }
+  if(a.mode!=='hold') return;
+  // ── 着いた ──
+  if(Q.phase==='toBoard'){
+    techLearn(a, techAllIdx());
+    // 読んだら、もう試された / 矛盾する仮説だったと分かることがある → 選び直す
+    const known=techKnown(a);
+    if(known.some(p=>p.h===Q.h)){
+      const c=techPlan(a);
+      if(!c){ techEnd(a); return; }
+      Q.h=c.h; Q.site=c.site;
+    }
+    pushTalkLine(a.name, JA_HUD ? `掲示板を読んだ。${R.posts.length}件の結果が貼ってある` : `Read the board: ${R.posts.length} results so far.`);
+    Q.phase='toSite'; Q.since=now;
+    techGo(a);
+    return;
+  }
+  const W=TECH.TIMES[TECH.dec(Q.h)[3]], hour=gameHour();
+  if(hour>=W.from && hour<W.to){
+    if(Q.phase!=='test'){
+      Q.phase='test'; Q.since=now; Q.waitUntil=now+TECH_TEST_SEC*1000;
+      a.th=Math.atan2(Q.site[1]+0.5-a.y, Q.site[0]+0.5-a.x);
+      const tr=techTraitJa(R.k, TECH.dec(Q.h)[2]);
+      showCityEvent(Math.floor(a.x), Math.floor(a.y),
+        JA_HUD ? `実験中: ${a.name}(${tr})  ${techLabel(R.k, Q.h)}`
+               : `Experiment: ${a.name} tries ${techLabel(R.k, Q.h)}`, TECH_TEST_SEC);
+    }
+    return;
+  }
+  const wait=(W.from-hour+24)%24;
+  if(wait>TECH_MAX_WAIT_H+0.5){ techEnd(a); return; }
+  if(Q.phase!=='wait'){
+    Q.phase='wait'; Q.since=now;
+    pushTalkLine(a.name, JA_HUD ? `${W.ja}になるまで待とう` : `I'll wait until ${W.en}.`);
+  }
+}
+
+function techResult(a){
+  const Q=a.research, T=CITY.tech, R=T.round, day=gameDay();
+  const hh=TECH.hits(Q.h, R.answer);
+  const d=TECH.dec(Q.h);
+  const before=techPublicS().length;
+  const post={day, hour:+gameHour().toFixed(1), aid:a.aid, by:a.name, h:Q.h, hits:hh, req:null};
+  R.posts.push(post);
+  T.stats.exps++; T.ver++;
+  const S=techPublicS();
+  if(S.length<before) R.lastProg=day;
+  CH.push(a, {day, icon:'🧪', mark:hh>=3,
+    ja:`${TECH.hypLabel(R.k, Q.h, true)} を試した (${hh}つ当たり)`,
+    en:`tested ${TECH.hypLabel(R.k, Q.h, false)} (${hh} hits)`});
+  if(hh===TECH.SLOTS){ techSolve(a, false); techEnd(a); return; }   // 本人も生活へ戻す (途中の段では round が続くので自動では外れない)
+  // 「僕はこの特性で確かめた、君はこの特性で」— 自分の特性では試せない、いちばん割れる仮説
+  const myT=techTraitIdx(a, R.k);
+  const usableM=R.deposits.reduce((o,dp)=>{ o[dp.m]=o[dp.m]||dp.found; return o; }, []);
+  const usableP=TECH.PLACES.map((_,p)=>techPlaceExists(p));
+  const rq=TECH.bestRequest(S, myT, usableM, usableP);
+  if(rq!=null){ post.req={t:TECH.dec(rq)[2], h:rq}; T.stats.requests++; }
+  const mark=TECH.hitsMark(hh, JA_HUD), markJa=TECH.hitsMark(hh, true);
+  const trJa=techTraitJa(R.k, d[2]);
+  news('tech', `🧪 ${a.name}(${trJa}) ${TECH.hypLabel(R.k, Q.h, true)} → ${markJa}  残り${S.length}通り`,
+       `${a.name} tested ${TECH.hypLabel(R.k, Q.h, false)}: ${hh}/4 right, ${S.length} options left`);
+  pushTalkLine(a.name, JA_HUD
+    ? `結果は ${mark} … ${hh>=3?'惜しい!':hh>=2?'手応えあり':hh===1?'うーん':'全部はずれ。これも手がかりだ'}`
+    : `Result ${mark}. ${hh>=3?'So close!':hh>=2?'Getting somewhere.':'Hmm.'}`);
+  if(post.req){
+    pushTalkLine(a.name, JA_HUD
+      ? `次は「${techTraitJa(R.k, post.req.t)}」の人に ${techLabel(R.k, rq)} を試してほしい`
+      : `Could a ${techTraitEn(R.k, post.req.t)} try ${techLabel(R.k, rq)}?`);
+  }
+  showBanner(JA_HUD ? `${a.name} の実験結果 ${mark}  (残り ${S.length} 通り)`
+                    : `${a.name}'s result: ${hh}/4  (${S.length} options left)`, 6);
+  techEnd(a);
+}
+
+// 途中の段の発明。掲示板をまっさらにして次の段へ。
+function techNextStep(a, forced){
+  const T=CITY.tech, R=T.round, day=gameDay(), D=TECH.RESEARCH[R.k];
+  const done=techStepOf(R), was=R.answer;
+  R.stepDays=(R.stepDays||[]).concat([day]);
+  R.step=(R.step||0)+1;
+  R.answer=techPickAnswer(R.order||[0,1,2,3,4,5], R.step);
+  R.tried=(R.tried||0)+R.posts.length;
+  R.posts=[]; R.hints={}; R.ideas=[]; T.know={};
+  R.lastProg=day; R.stall=0; R.prereq.since=day; T.ver++;
+  if(forced) T.stats.forced++;
+  const nx=techStepOf(R), left=techSteps(R).length-R.step;
+  if(a){
+    news('tech', `🔧 ${a.name} が「${done.ja}」を発明した! (${TECH.hypLabel(R.k, was, true)}) — 次は「${nx.ja}」、${D.ja}まであと${left}段`,
+         `${a.name} invented ${done.en}! Next: ${nx.en}`);
+    pushTalkLine(a.name, JA_HUD ? `やった、「${done.ja}」ができた! 次は「${nx.ja}」だ` : `Yes! ${done.en}! Next up: ${nx.en}.`);
+    CH.push(a, {day, icon:'🔧', mark:true, ja:`「${done.ja}」を発明した`, en:`invented ${done.en}`});
+  }else{
+    news('tech', `🔧 試行錯誤の末に「${done.ja}」ができた — 次は「${nx.ja}」`, `${done.en} came together at last - next: ${nx.en}`);
+  }
+  const at = a ? [Math.floor(a.x), Math.floor(a.y)] : techCenter();
+  showCityEvent(at[0], at[1], JA_HUD ? `発明! 「${done.ja}」 (${D.ja}まであと${left}段)` : `Invented: ${done.en}`, 8, null, {wide:!a});
+  for(const o of agents) if(o.research && o!==a) techEnd(o);
+  console.log(`[Tech] 段 ${R.step}/${techSteps(R).length} 次の正解=${TECH.hypLabel(R.k, R.answer, true)}`);
+}
+
+function techSolve(a, forced){
+  const T=CITY.tech, R=T.round, day=gameDay(), D=TECH.RESEARCH[R.k];
+  if(!forced && !techIsLastStep(R)){ techNextStep(a, false); return; }
+  if(forced==='step'){ techNextStep(null, true); return; }
+  R.solvedDay=day; R.solvedBy=a?a.name:null; R.forced=!!forced; R.lastProg=day; T.ver++;
+  if(forced) T.stats.forced++;
+  if(a){
+    news('tech', `💡 ${a.name} がついに「${D.ja}」を発明した! (${TECH.hypLabel(R.k, R.answer, true)})`,
+         `${a.name} invented ${D.en}!`);
+    pushTalkLine(a.name, JA_HUD ? `できた…! これが「${D.ja}」だ!` : `It works... this is ${D.en}!`);
+    CH.push(a, {day, icon:'💡', mark:true, ja:`「${D.ja}」を発明した`, en:`invented ${D.en}`});
+  }else{
+    news('tech', `💡 偶然の大発見で「${D.ja}」が生まれた (${TECH.hypLabel(R.k, R.answer, true)})`,
+         `A lucky accident gave the town ${D.en}`);
+  }
+  const at = a ? [Math.floor(a.x), Math.floor(a.y)] : techCenter();
+  showCityEvent(at[0], at[1], JA_HUD ? `発明! 「${D.ja}」` : `Invented: ${D.en}!`, 10, null, {wide:!a});
+  for(const o of agents) if(o.research && o!==a) techEnd(o);
+  if(day >= T.eraDay + TECH_MIN_D) techAdvance(day);
+  else news('tech', `📦 「${D.ja}」が街に広まるのを待っている (${T.eraDay+TECH_MIN_D-day}日ほど)`,
+            `${D.en} is spreading through town`);
+}
+
+// 普及待ちの 1 日。発明が街に広がっていく様子を、住民ひとりの出来事として出す。
+const TECH_ADOPT = [
+  { ja:'初めてパソコンを買った', en:'bought their first computer' },
+  { ja:'スマホに機種変更した', en:'switched to a smartphone' },
+  { ja:'AIアシスタントを使い始めた', en:'started using an AI assistant' },
+  { ja:'タイムマシンの試乗券を手に入れた', en:'got a ticket for a time-machine test ride' },
+];
+function techAdoptNews(day){
+  const T=CITY.tech, R=T.round;
+  const minDay=T.eraDay+TECH_MIN_D;
+  const pct=Math.round(100*Math.min(1,(day-R.solvedDay)/Math.max(1,minDay-R.solvedDay)));
+  const pool=agents.filter(a=>!a.school && a.home);
+  if(!pool.length) return;
+  const a=pool[Math.floor(RNG.R()*pool.length)], A=TECH_ADOPT[R.k];
+  news('tech', `📦 ${a.name} が${A.ja} (普及 ${pct}%)`, `${a.name} ${A.en} (${pct}% adoption)`);
+  CH.push(a, {day, icon:'📦', ja:A.ja, en:A.en});
+}
+
+function techCenter(){
+  let sr=0, sc=0, n=0;
+  for(const st of CITY.structs) if(st.state==='open'){ sr+=st.r; sc+=st.c; n++; }
+  return n ? [Math.round(sr/n), Math.round(sc/n)] : [Math.floor(GRID/2), Math.floor(GRID/2)];
+}
+
+const TECH_ERA_NEWS = [
+  null,
+  { ja:'💻 家でパソコンが使えるようになった — 掲示板は図書館で読める / 配達員は一度に2個運ぶ',
+    en:'Computers arrive at home - the board can be read at the library - couriers carry two parcels' },
+  { ja:'📱 家から通販や手続きができるようになった — 口コミは離れた友だちにも届く / 配達は一度に3個',
+    en:'Shopping and errands can now be done from home - word of mouth reaches distant friends' },
+  { ja:'🤖 家でもほとんどの仕事ができるようになった — AI が仮説を論理的に絞る / 配達は一度に4個',
+    en:'Most work can now be done from home - AI narrows down experiments' },
+];
+
+function techAdvance(day){
+  const T=CITY.tech;
+  const from=T.era;
+  // 時代ごとの記録 (課題は同じなので、住民の速さの比較になる)
+  if(T.round){
+    const R0=T.round;
+    (T.records=T.records||[]).push({era:from, cycle:T.cycle, days:day-R0.openDay,
+      tried:(R0.tried||0)+R0.posts.length, forced:!!R0.forced});
+    while(T.records.length>12) T.records.shift();
+    console.log(`[Tech] 記録 ${TECH.ERAS[from].ja}: 研究 ${day-R0.openDay}日 / 試した組み合わせ ${(R0.tried||0)+R0.posts.length}`);
+  }
+  const last=TECH.ERAS.length-1;
+  if(from===last){                              // タイムマシン → 文明の 2 周目
+    T.cycle++; T.era=0;
+  }else T.era=from+1;
+  T.eraDay=day; T.round=null; T.know={}; T.ver++;
+  T.history.push({era:T.era, day, cycle:T.cycle});
+  for(const a of agents) if(a.research) techEnd(a);
+  const E=TECH.ERAS[T.era], c=techCenter();
+  if(from===last) news('era', `🌀 タイムマシンで ${E.year}年へ! 文明の第${T.cycle}周が始まる`,
+       `Back to ${E.year} by time machine - round ${T.cycle} of civilisation begins`);
+  else news('era', `🎉 時代が変わった — ${E.ja} (${E.year}年) がやってきた`,
+       `A new era: the ${E.en} (${E.year})`);
+  if(TECH_ERA_NEWS[T.era] && from!==last) news('era', TECH_ERA_NEWS[T.era].ja, TECH_ERA_NEWS[T.era].en);
+  showCityEvent(c[0], c[1], from===last ? (JA_HUD ? `第${T.cycle}周 ${E.ja} (${E.year}年)` : `Round ${T.cycle}: ${E.en} (${E.year})`)
+    : (JA_HUD ? `${E.ja}の到来 (${E.year}年)` : `The ${E.en} begins (${E.year})`), 12, null, {wide:true});
+  _techPropsStamp=-1;
+  techTeleworkDaily();
+  console.log(`[Tech] 時代 ${from} → ${T.era} (Day ${day+1})`);
+}
+
+// ── 行き詰まりの解消 ────────────────────────────────────────────────────────
+function techGiftTrait(traitId, needHome){
+  const T=CITY.tech;
+  const pool=agents.filter(a=>(a.def&&a.def.age!=null ? a.def.age>=12 : true)
+    && (!needHome || a.home) && !techTraits(a).includes(traitId));
+  if(!pool.length) return null;
+  pool.sort((x,y)=>techTraits(x).length-techTraits(y).length);
+  const few=pool.filter(a=>techTraits(a).length===techTraits(pool[0]).length);
+  const a=few[Math.floor(RNG.R()*few.length)];
+  (T.gifted[a.aid]=T.gifted[a.aid]||[]).push(traitId);
+  T.stats.gifts++; T.stats.remedies++; T.ver++;
+  const tr=TECH.TRAITS[traitId];
+  news('tech', `📚 ${a.name} が独学で「${tr.ja}」の素養を身につけた`,
+       `${a.name} taught themselves to be a ${tr.en}`);
+  pushTalkLine(a.name, JA_HUD ? `最近「${tr.ja}」っぽいことが面白くなってきた` : `I've been getting into ${tr.en} things lately.`);
+  CH.push(a, {day:gameDay(), icon:'📚', mark:true, ja:`「${tr.ja}」の素養を身につけた`, en:`became a ${tr.en}`});
+  return a;
+}
+
+// 建物を 1 軒建てる (研究のため)。建てられる型が無ければ false。
+function techBuildOneOf(typeNames, why, day){
+  for(const nm of typeNames){
+    const t=IDX_OF(nm);
+    if(t==null || !typeAllowed(t)) continue;
+    const site=pickSite(day, BLDG_TYPES[t].footprint, ()=>RNG.R());
+    if(!site) continue;
+    const cat = TECH_PLACE_IDX.learn.includes(t) ? 'learn' : WORK_IDX.includes(t) ? 'work'
+              : FOOD_IDX.includes(t) ? 'eat' : BUY_IDX.includes(t) ? 'shop' : 'civic';
+    foundShop(cat, site, t, null, day);
+    CITY.tech.stats.builds++; CITY.tech.stats.remedies++;
+    news('tech', `🏗 ${why}ために ${BLDG_TYPES[t].label} が建てられた`,
+         `A ${enOf(t)} is going up for the research`);
+    return true;
+  }
+  return false;
+}
+const TECH_PLACE_BUILD = {
+  learn:['elementary','library','junior','school','high','university'],
+  work:['post','office','bank','warehouse'], eat:['kiosk','cafe','ramen','bento','gyudon'],
+  shop:['conbini','shop','supermarket'],
+};
+
+function techStall(day){
+  const T=CITY.tech, R=T.round;
+  if(!R || R.solvedDay!=null || day<R.openDay) return;
+  const D=TECH.RESEARCH[R.k];
+  const ans=TECH.dec(R.answer);
+
+  // ① 研究に要る建物
+  if(!techHasPrereq() && !R.prereq.waived){
+    const waited=day-R.prereq.since;
+    if(waited>=1 && !R.prereq.building)
+      R.prereq.building=techBuildOneOf(D.prereq.types, `「${D.ja}」の研究を始める`, day);
+    if(waited>=3 && !techHasPrereq()){
+      R.prereq.waived=true; T.stats.remedies++; T.ver++;
+      news('tech', `🔧 ${D.prereq.ja}が間に合わないので、仮設の研究所で研究を始めることにした`,
+           `No ${D.prereq.en} yet - research starts in a makeshift lab`);
+    }
+    return;                      // 研究が始められない間は他の梯子を回さない
+  }
+  R.prereq.since=day;
+
+  const idle=day-R.lastProg;
+  const lvl=Math.min(3, Math.floor(idle/TECH_STALL_DAYS));
+  if(lvl>R.stall){
+    T.stats.remedies++;
+    if(lvl===1) news('tech', `🤝 研究が行き詰まっている — 手の空いていない人も実験を手伝い始めた`,
+                     `Research has stalled - more residents pitch in`);
+  }
+  R.stall=lvl;
+  // ② 正解の特性を持つ人が居ない (候補が絞れてきたら行き詰まりを待たずに直す)
+  const needT=D.traits[ans[2]];
+  const needHome=TECH.PLACES[ans[1]].id==='home';
+  const qualified=agents.filter(a=>techTraits(a).includes(needT) && (!needHome || a.home)
+    && !(a.def && a.def.age!=null && a.def.age<7));
+  if((lvl>=1 || (TECH.ERA_INFER[T.era]==='logic' && techPublicS().length<=3)) && qualified.length<2) techGiftTrait(needT, needHome);
+  if(lvl<1) return;
+  // ③ 正解の場所が街に無い
+  if(!techPlaceExists(ans[1]) && TECH.PLACES[ans[1]].id!=='home')
+    techBuildOneOf(TECH_PLACE_BUILD[TECH.PLACES[ans[1]].id]||[], '研究の実験場所にする', day);
+  // 素材が置けずに湧いていないもの (空き地が無い) は、行商人が持ってくる
+  for(const dp of R.deposits) if(!dp.found && dp.r<0 && day>=dp.spawnDay+TECH_STALL_DAYS) techDiscover(dp, null, '行商人');
+
+  if(lvl<2) return;
+  // ④ ひらめき: 正解の欄を 1 つ明かす。まだいちばん割れていない欄から。
+  const S=techPublicS();
+  const free=[0,1,2,3].filter(s=>R.hints[s]==null);
+  if(free.length){
+    let best=free[0], bestN=-1;
+    for(const s of free){
+      const vals=new Set(S.map(h=>TECH.dec(h)[s]));
+      if(vals.size>bestN){ bestN=vals.size; best=s; }
+    }
+    R.hints[best]=ans[best];
+    T.stats.hints++; T.stats.remedies++; T.ver++;
+    const slotJa=['素材','場所','特性','時間帯'][best], slotEn=['material','place','trait','time'][best];
+    const valJa = best===0 ? D.materials[ans[0]].ja : best===1 ? TECH.PLACES[ans[1]].ja
+                : best===2 ? TECH.TRAITS[needT].ja : TECH.TIMES[ans[3]].ja;
+    const valEn = best===0 ? D.materials[ans[0]].en : best===1 ? TECH.PLACES[ans[1]].en
+                : best===2 ? TECH.TRAITS[needT].en : TECH.TIMES[ans[3]].en;
+    const sage=agents.find(a=>a.def && ['teacher','elder','doctor','librarian'].includes(a.def.poolId))
+            || agents[Math.floor(RNG.R()*Math.max(1,agents.length))];
+    const who=sage ? sage.name : (JA_HUD?'街の長老':'an old-timer');
+    news('tech', `💡 ${who} のひらめき: 正解の「${slotJa}」は『${valJa}』らしい (残り${techPublicS().length}通り)`,
+         `${who} has a hunch: the ${slotEn} is ${valEn}`);
+    showBanner(JA_HUD ? `ひらめき! ${slotJa}は「${valJa}」らしい` : `A hunch: the ${slotEn} is ${valEn}`, 8);
+    if(sage) pushTalkLine(sage.name, JA_HUD ? `もしかして、${slotJa}は「${valJa}」なんじゃないか?` : `Maybe the ${slotEn} is ${valEn}?`);
+    R.lastProg=day;              // 前へ進んだので梯子を下りる (また詰まれば次のひらめき)
+  }
+  // 正解の素材がまだ見つかっていなければ行商人が持ってくる
+  const am=R.deposits.find(dp=>dp.m===ans[0]);
+  if(am && !am.found) techDiscover(am, null, '行商人');
+}
+
+// ── 1 日ぶん ────────────────────────────────────────────────────────────────
+function techTeleworkDaily(){
+  const era=techEra(), rate=TECH_TELEWORK[era]||0, er=TECH_ERRAND[era]||0;
+  for(const a of agents){
+    if(VEC_ON){ a.teleToday=false; a.errandDue=false; continue; }   // ベクトル版では規則で決めない
+    a.teleToday = rate>0 && !!a.work && !!a.home && !a.owns && !a.school
+               && !isCourier(a) && !isCop(a) && RNG.R()<rate;
+    a.errandDue = er>0 && !a.school && RNG.R()<er;
+  }
+}
+// 住民ごとに固定の「ずれ」や「通販派か」。乱数を引かないよう aid のハッシュで決める
+function _techHash(a, salt){
+  let h=2166136261^salt;
+  for(const ch of String(a.aid)) h=Math.imul(h^ch.charCodeAt(0),16777619);
+  return ((h>>>0)%10000)/10000;
+}
+// 始業のずれ。**在宅勤務の日は起きたらそのまま家で始める** (9 時に家へ歩いて帰る「通勤」を作らない)。
+//   ★ 以前は在宅の人も 7 時に起きて外をぶらつき、9 時の始業で家に帰っていたので、
+//     AI 時代でも通勤の人流が減らなかった (実測: アナログ 140 → AI 143)。
+const techWorkShift = a => {
+  const e=techEra();
+  if(a.teleToday) return (TECH_WAKE_AT[e]||6) - 9;
+  const w=TECH_WORK_SPREAD[e]||0; return w ? Math.round((_techHash(a,7)*2-1)*w*2)/2 : 0;
+};
+const techHomeEvening = a => _techHash(a,29) < (TECH_HOME_EVENING[techEra()]||0);
+const techOrdersOnline = a => _techHash(a,13) < (TECH_ONLINE[techEra()]||0);
+// 通販の注文。**来店と同じく店の売上と来店数に数える** — 数えないと、スマホ時代に
+// 商店の来店が消えて閉店が連鎖する (人流は変わっても、街の経済は壊さない)。
+function techOnlineOrder(a){
+  if(!CITY || !a.home) return;
+  const day=gameDay();
+  if(a.orderDay===day) return;
+  a.orderDay=day;
+  let best=null, bd=Infinity;
+  for(const st of openStructsOf(BUY_IDX)){
+    const d=Math.hypot(st.r-a.home[0], st.c-a.home[1]);
+    if(d<bd){ bd=d; best=st; }
+  }
+  if(best){
+    best.visits++; best.visitsToday++;
+    if(ECON_ON){ ECO.initAgent(ECO_STATE, a); const kind=priceKindOf(best.typeIdx);
+      if(kind && ECO.pay(ECO_STATE, a, kind)){ const p=ECO.priceOf(ECO_STATE, kind);
+        best.revenue=(best.revenue||0)+p; best.sales=(best.sales||0)+p; best.salesToday=(best.salesToday||0)+p; } }
+    CITY.econ++;
+  }
+  const home=structAt(a.home[0], a.home[1]);
+  if(home) home.orderedAt=simNow();                 // 配達員はこの家を優先して回る
+  CITY.tech.stats.orders=(CITY.tech.stats.orders||0)+1;
+}
+
+function techDaily(day){
+  techEnsure();
+  const T=CITY.tech;
+  // 最後の時代で TECH_LOOP=0 なら、もう研究しない (AI 時代のまま)
+  if(T.era===TECH.ERAS.length-1 && !TECH_LOOP){
+    // 何もしない
+  }else{
+    const R=T.round;
+    if(!R && day>=T.eraDay+TECH_QUIET_D) techOpenRound(day);
+    const R2=T.round;
+    if(R2){
+      if(R2.solvedDay!=null){
+        if(day>=T.eraDay+TECH_MIN_D) techAdvance(day);
+        else techAdoptNews(day);                 // 普及待ちの間も、毎日小さな出来事を出す
+      }else{
+        techStall(day);
+        // 段ごとの期限。研究期間を段の数で割った位置までに解けなければ、その段は「試行錯誤の末に」できる
+        const R3=T.round, nS=techSteps(R3).length;
+        // 段の期限は「その段が始まってから」数える (全時代で同じ日数)
+        const stepStart=(R3.stepDays&&R3.stepDays.length) ? R3.stepDays[R3.stepDays.length-1] : R3.openDay;
+        const stepDue=stepStart+TECH_STEP_D;
+        if(day>=T.eraDay+TECH_MAX_D) techSolve(null, true);
+        else if(!techIsLastStep(R3) && day>=stepDue) techSolve(null, 'step');
+      }
+    }
+  }
+  techTeleworkDaily();
+  const R=T.round;
+  console.log('[TechJSON] '+JSON.stringify({day, era:T.era, cycle:T.cycle, eraDay:T.eraDay,
+    open:!!R, step:R?(R.step||0):null, solved:R?R.solvedDay:null, forced:R?R.forced:false,
+    found:R?R.deposits.filter(d=>d.found).length:0, posts:R?R.posts.length:0,
+    left:R?techPublicS().length:null, stall:R?R.stall:0, hints:R?Object.keys(R.hints).length:0,
+    prereq:R?(R.prereq.waived?'waived':techHasPrereq()?'ok':'missing'):null,
+    tele:agents.filter(a=>a.teleToday).length, stats:T.stats}));
+  const F=_techFlow, pop=Math.max(1,agents.length);
+  console.log('[TechFlow] '+JSON.stringify({day, era:T.era, pop:agents.length,
+    outdoorsPerCapita:+(F.out/pop).toFixed(0), commutePerCapita:+(F.commute/pop).toFixed(1),
+    teleworkPerCapita:+(F.tele/pop).toFixed(1), nightOutPerCapita:+(F.night/pop).toFixed(1),
+    delivered:CITY.stats.delivered||0, orders:T.stats.orders||0,
+    // 通勤の鋭さ: 屋外の通勤のうち、いちばん混む 1 時間に集まっている割合 (大きいほどピークが鋭い)
+    commuteTotalPerCapita:+(F.workOutByHour.reduce((x,y)=>x+y,0)/pop).toFixed(1),
+    commutePeakShare:+(Math.max(...F.workOutByHour)/Math.max(1,F.workOutByHour.reduce((x,y)=>x+y,0))).toFixed(2),
+    opt:Object.fromEntries(Object.entries(F.opt).map(([k,v])=>[k,+(v/pop).toFixed(0)]))}));
+  _techFlow={out:0, commute:0, tele:0, night:0, opt:{}, workOutByHour:new Array(24).fill(0)};
+}
+
+// 人流の計測 (時代でどう変わったかを数字で見る)。1 秒ごとに数え、日次で [TechFlow] に出して空にする。
+//   out … 屋外に居た人・秒 / commute … 朝 7〜10 時に通勤で屋外を歩いていた人・秒
+//   tele … 勤務時間に自宅で在宅勤務していた人・秒 / opt … 選んでいる行動の人・秒
+let _techFlow={out:0, commute:0, tele:0, night:0, opt:{}, workOutByHour:new Array(24).fill(0)};
+function techFlowTick(){
+  const h=gameHour();
+  for(const a of agents){
+    // ベクトル版には Option が無いので、決定の互換名 (need) と場所の種類で数える
+    const vb=VEC_ON && a._vec && a._vec.best;
+    const id=VEC_ON ? (a._vec ? (a._vec.need||'-')+'@'+(vb?vb.kind:'none') : null) : (a.opt&&a.opt.id);
+    if(id) _techFlow.opt[id]=(_techFlow.opt[id]||0)+1;
+    if(MW.isIndoors(a)){
+      const teleNow = VEC_ON ? !!(a._vec && a._vec.best && a._vec.best.kind==='home' && a._vec.need==='work') : a.teleToday;
+      if(teleNow && a.home && a.indoors[0]===a.home[0] && a.indoors[1]===a.home[1] && h>=9 && h<17) _techFlow.tele++;
+      continue;
+    }
+    _techFlow.out++;
+    if(h>=21 || h<5) _techFlow.night++;
+    // 通勤 = **職場へ向かっている**人。在宅勤務の人が朝食から自宅へ帰る道のりは通勤ではない
+    //   (need は work でも行き先が自宅。ここを分けないと AI 時代でも通勤が減らないように見えた)
+    const wantWork = VEC_ON ? !!(a._vec && a._vec.need==='work') : id==='work';
+    const toWork = wantWork && a.work && a.navDest && a.navDest[0]===a.work[0] && a.navDest[1]===a.work[1];
+    if(h>=7 && h<10 && toWork) _techFlow.commute++;
+    if(toWork) _techFlow.workOutByHour[Math.floor(h)]++;          // 職場へ向かって屋外に居る = 通勤の人流
+  }
+}
+function stepTech(){
+  if(!TECH_ON || !CITY || !CITY.tech) return;
+  techFlowTick();
+  _techAidMap=null;
+  // 研究の開始は日次処理を待たない (再起動の直後に最長 1 日「準備中」のまま、を避ける)
+  const T0=CITY.tech;
+  if(!T0.round && !(T0.era===TECH.ERAS.length-1 && !TECH_LOOP)
+     && gameDay()>=T0.eraDay+TECH_QUIET_D) techOpenRound(gameDay());
+  const R=CITY.tech.round;
+  if(R){
+    techReadTick();
+    if(R.solvedDay==null){
+      const day=gameDay();
+      for(const dp of R.deposits) if(!dp.found && dp.r<0 && day>=dp.spawnDay && (stepCount&31)===0) techPlaceDeposit(dp);
+      techFind(); techTryStart();
+    }
+  }
+  for(const a of agents) if(a.research) techStepAgent(a);
+}
+
+// ── 視聴者のアイデア (!idea 銅線 学び舎 夜) ─────────────────────────────────
+//   チャットは**データ**。語彙表に一致した語だけを拾い、それ以外は捨てる。
+let _techIdeaAt=0;
+function techViewerIdea(text, who){
+  if(!TECH_ON || !CITY || !CITY.tech) return {ok:false, msg:'tech off'};
+  const R=CITY.tech.round;
+  if(!R || R.solvedDay!=null) return {ok:false, msg:'no research',
+    reply: JA_HUD ? 'いまは研究の期間ではありません' : 'No research is running right now'};
+  const now=Date.now();
+  if(now-_techIdeaAt<20000) return {ok:false, msg:'idea cooldown'};
+  const D=TECH.RESEARCH[R.k], s=String(text||'').toLowerCase();
+  const hit=(list)=>list.findIndex(x=>[x.ja,x.en,x.id].filter(Boolean).some(w=>s.includes(String(w).toLowerCase())));
+  const idea={m:hit(D.materials), p:hit(TECH.PLACES), tm:hit(TECH.TIMES), by:who, day:gameDay()};
+  if(idea.m<0 && idea.p<0 && idea.tm<0) return {ok:false, msg:'no idea words',
+    reply: JA_HUD ? `素材・場所・時間帯の言葉が見つかりません (例: !idea ${D.materials[0].ja} 学び舎 夜)`
+                  : `Try e.g. !idea ${D.materials[0].id} school night`};
+  _techIdeaAt=now;
+  R.ideas.push(idea); while(R.ideas.length>5) R.ideas.shift();
+  CITY.tech.stats.ideas++; CITY.tech.ver++;
+  const parts=[idea.p>=0?TECH.PLACES[idea.p].ja:null, idea.m>=0?D.materials[idea.m].ja:null,
+               idea.tm>=0?TECH.TIMES[idea.tm].ja:null].filter(Boolean).join('×');
+  news('tech', `💬 視聴者 ${who} のアイデア: ${parts} を試してみては?`, `Viewer ${who} suggests trying ${parts}`);
+  showBanner(JA_HUD ? `${who} さんのアイデアが掲示板に貼られた: ${parts}` : `${who}'s idea is on the board`, 6);
+  return {ok:true, msg:`idea ${parts}`,
+    reply: JA_HUD ? `掲示板に貼りました: ${parts} (その特性の住民が試すかも)` : `Pinned to the board: ${parts}`};
+}
+function techStatusText(){
+  if(!TECH_ON || !CITY || !CITY.tech) return '';
+  const T=CITY.tech, E=TECH.ERAS[T.era], R=T.round;
+  if(!R) return JA_HUD ? `${E.ja} ${techYear()}年 — 次の研究の準備中` : `${E.en} ${techYear()} - preparing the next research`;
+  const D=TECH.RESEARCH[R.k];
+  if(R.solvedDay!=null) return JA_HUD ? `${E.ja} — 「${D.ja}」は発明済み。普及を待っている` : `${D.en} is invented and spreading`;
+  const found=R.deposits.filter(d=>d.found).map(d=>D.materials[d.m].ja);
+  return JA_HUD ? `${E.ja} ${techYear()}年 — 次は「${techStepOf(R).ja}」(${D.ja}への${(R.step||0)+1}/${techSteps(R).length}段) 素材${found.length}/6 (${found.join('・')||'なし'}) 残り${techPublicS().length}通り 実験${R.posts.length}回`
+                : `${E.en} ${techYear()} - chasing ${D.en}: ${found.length}/6 materials, ${techPublicS().length} options left`;
+}
+
+// ── 3D: 素材の光 / 屋上の小物 / ドローン ────────────────────────────────────
+//   どれも「画にだけ居る」。MAP も通行判定も観測 (レイキャスタ) も触らない。
+const TechInst = { gem:null, beam:null, rod:null, bar:null, dish:null, mast:null, lamp:null, solar:null, drone:null };
+let _techPropsStamp=-1, _techPropsEra=-1;
+const TECH_PROP_CAP=360;
+function initTechInstances(S){
+  if(!TECH_ON || !S) return;
+  const mk=(geo, mat, n, shadow)=>{
+    mat.userData.shared=true;
+    const m=new THREE.InstancedMesh(geo, mat, n);
+    m.count=0; m.frustumCulled=false;
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    if(shadow) markShadow(m, true, false);
+    S.add(m); return m;
+  };
+  const cyl=(r1,r2,h)=>{ const g=new THREE.CylinderGeometry(r1,r2,h,10); g.rotateX(Math.PI/2); return g; };
+  TechInst.gem  = mk(new THREE.OctahedronGeometry(CELL*0.2), new THREE.MeshLambertMaterial({color:0x9ff6ff, emissive:0x33c8e8}), 8, true);
+  TechInst.beam = mk(cyl(CELL*0.05, CELL*0.12, CELL*3.2),
+    new THREE.MeshBasicMaterial({color:0x9ff6ff, transparent:true, opacity:0.28, depthWrite:false}), 8, false);
+  TechInst.rod  = mk(new THREE.BoxGeometry(CELL*0.025, CELL*0.025, CELL*0.45), new THREE.MeshLambertMaterial({color:0x44474c}), TECH_PROP_CAP, true);
+  TechInst.bar  = mk(new THREE.BoxGeometry(CELL*0.34, CELL*0.02, CELL*0.02), new THREE.MeshLambertMaterial({color:0x44474c}), TECH_PROP_CAP, false);
+  TechInst.dish = mk(cyl(CELL*0.13, CELL*0.05, CELL*0.05), new THREE.MeshLambertMaterial({color:0xe8e8e2}), TECH_PROP_CAP, true);
+  TechInst.mast = mk(new THREE.BoxGeometry(CELL*0.05, CELL*0.05, CELL*0.9), new THREE.MeshLambertMaterial({color:0xb9bec4}), TECH_PROP_CAP, true);
+  TechInst.lamp = mk(new THREE.SphereGeometry(CELL*0.045, 8, 6), new THREE.MeshBasicMaterial({color:0xff3b30}), TECH_PROP_CAP, false);
+  TechInst.solar= mk(new THREE.BoxGeometry(CELL*0.42, CELL*0.3, CELL*0.02), new THREE.MeshLambertMaterial({color:0x1d3b6e, emissive:0x0a1a33}), TECH_PROP_CAP, false);
+  TechInst.drone= mk(new THREE.BoxGeometry(CELL*0.16, CELL*0.16, CELL*0.04), new THREE.MeshLambertMaterial({color:0x1c1e22, emissive:0x0a2a44}), 8, true);
+  _techPropsStamp=-1;
+}
+const _tpP=new THREE.Vector3(), _tpQ=new THREE.Quaternion(), _tpS=new THREE.Vector3(1,1,1), _tpM=new THREE.Matrix4();
+const _tpZ=new THREE.Vector3(0,0,1), _tpX=new THREE.Vector3(1,0,0), _tpE=new THREE.Euler();
+function _tpSet(mesh, i, x, y, z, rz, rx, s){
+  _tpE.set(rx||0, 0, rz||0, 'ZXY'); _tpQ.setFromEuler(_tpE);
+  _tpS.set(s||1, s||1, s||1);
+  _tpP.set(x, y, z); _tpM.compose(_tpP, _tpQ, _tpS);
+  mesh.setMatrixAt(i, _tpM);
+}
+// 屋上の小物は建物か時代が変わったときだけ並べ直す (毎フレームは素材とドローンだけ)
+function rebuildTechProps(){
+  const era=techEra();
+  const n={rod:0, bar:0, dish:0, mast:0, lamp:0, solar:0};
+  for(const key in occluders){
+    if(!key.endsWith('_b')) continue;
+    const o=occluders[key];
+    if(o.noFade) continue;                         // 屋根の無い場所
+    const [r,c]=key.split('_').map(Number);
+    const st=structAt(r,c);
+    if(!st || st.state!=='open') continue;
+    const top=(o.mesh.userData.hVis||0);
+    const hash=((r*73856093) ^ (c*19349663))>>>0;
+    const isHome=HOME_IDX.includes(st.typeIdx), tall=top>=CELL*1.6;
+    const ox=((hash&7)/7-0.5)*CELL*0.3, oy=(((hash>>3)&7)/7-0.5)*CELL*0.3;
+    const x=o.cx+ox, y=o.cy+oy;
+    if(era===0 && isHome && n.rod<TECH_PROP_CAP){          // テレビのアンテナ
+      _tpSet(TechInst.rod, n.rod++, x, y, top+CELL*0.22, 0);
+      _tpSet(TechInst.bar, n.bar++, x, y, top+CELL*0.36, (hash&3)*0.6);
+    }else if(era===1 && (isHome || (hash&3)===0) && n.dish<TECH_PROP_CAP){   // 衛星放送のパラボラ
+      _tpSet(TechInst.dish, n.dish++, x, y, top+CELL*0.1, (hash&7)*0.8, 0.9);
+    }else if(era===2 && tall && n.mast<TECH_PROP_CAP){      // 携帯の基地局
+      _tpSet(TechInst.mast, n.mast++, x, y, top+CELL*0.45, 0);
+      _tpSet(TechInst.lamp, n.lamp++, x, y, top+CELL*0.92, 0);
+    }else if(era===3 && (isHome || (hash&1)===0) && n.solar<TECH_PROP_CAP){  // 屋上の太陽光パネル
+      _tpSet(TechInst.solar, n.solar++, o.cx, o.cy, top+CELL*0.06, (hash&1)*Math.PI/2, 0.35);
+    }
+  }
+  for(const k in n){ TechInst[k].count=n[k]; TechInst[k].instanceMatrix.needsUpdate=true; }
+}
+function syncTechProps(){
+  if(!TECH_ON || !TechInst.gem || !CITY || !CITY.tech) return;
+  if(_techPropsStamp!==cityStamp || _techPropsEra!==techEra()){
+    _techPropsStamp=cityStamp; _techPropsEra=techEra();
+    rebuildTechProps();
+  }
+  const t=Date.now()/1000, R=CITY.tech.round;
+  // 素材の光。行き詰まるほど大きく光る (見つけてもらいやすく、視聴者にも分かる)
+  let g=0;
+  if(R && R.solvedDay==null){
+    const s=1+R.stall*0.35;
+    for(const dp of R.deposits){
+      if(dp.found || dp.r<0 || g>=8) continue;
+      const x=dp.c*CELL+CELL*0.5, y=dp.r*CELL+CELL*0.5;
+      _tpSet(TechInst.gem, g, x, y, CELL*(0.35+0.08*Math.sin(t*2+dp.m)), t*1.4+dp.m, 0, s);
+      _tpSet(TechInst.beam, g, x, y, CELL*1.6, 0, 0, s);
+      g++;
+    }
+  }
+  TechInst.gem.count=g; TechInst.beam.count=g;
+  TechInst.gem.instanceMatrix.needsUpdate=true; TechInst.beam.instanceMatrix.needsUpdate=true;
+  // AI 時代はドローンが街の上を飛ぶ
+  let d=0;
+  if(techEra()===3){
+    const cx=fieldCenterW(), cy=fieldCenterW(), rad=fieldSize()*CELL*0.32;
+    for(let i=0;i<6;i++){
+      const a=t*(0.12+i*0.02)+i*1.05, rr=rad*(0.5+0.12*i);
+      _tpSet(TechInst.drone, d++, cx+Math.cos(a)*rr, cy+Math.sin(a)*rr, CELL*(3.2+0.4*Math.sin(t+i)), a, 0);
+    }
+  }
+  TechInst.drone.count=d; TechInst.drone.instanceMatrix.needsUpdate=true;
+}
+
+// ── HUD: 研究の板 (左上の日付板の下にまとめて描く) ──────────────────────────
+//   ★ 以前は右上に別の板として出していたが、左上の「時代・年号」と離れていて
+//     読みにくかった。**「いまどの時代で、次に何が起きれば進むのか」を 1 か所で**読めるように、
+//     日付板の下に続けて描く。文字を詰め込まず、段の進み・素材・絞り込みは図で見せる。
+//   TECH_PANEL=0 で研究の部分だけ消せる (日付板の 3 行目の時代と年号は残る)。
+const TECH_PANEL_ON = TECH_ON && process.env.TECH_PANEL !== '0';
+// 仮説の短い書き方。特性は名前の横に出すので、ここでは 場所×素材×時間帯 だけ。
+function techShortLabel(k, h, ja){
+  const D=TECH.RESEARCH[k], d=TECH.dec(h);
+  return ja ? `${TECH.PLACES[d[1]].ja}×${D.materials[d[0]].ja}×${TECH.TIMES[d[3]].ja}`
+            : `${D.materials[d[0]].id}/${TECH.PLACES[d[1]].id}/${TECH.TIMES[d[3]].id}`;
+}
+// 板に描く中身。文字列の配列ではなく「行の種類」を返し、描き方は refreshHudDay が決める。
+//   {t:'steps', items:[{label, st:'done'|'now'|'todo'}]}   段の進み (チップ)
+//   {t:'dots',  label, n, of, note}                         素材
+//   {t:'bar',   label, frac, note, color}                   絞り込み / 普及
+//   {t:'text',  text, color, small}
+function techBoardRows(){
+  if(!TECH_PANEL_ON || !CITY || !CITY.tech) return [];
+  const T=CITY.tech, R=T.round, J=JA_HUD;
+  const rows=[];
+  if(!R){
+    if(T.era===TECH.ERAS.length-1 && !TECH_LOOP){
+      rows.push({t:'text', text: J?'最後の時代を満喫中':'Enjoying the final era', color:'#dfeee9'});
+      return rows;
+    }
+    const D=TECH.RESEARCH[T.era];
+    const left=Math.max(0, T.eraDay+TECH_QUIET_D-gameDay());
+    rows.push({t:'steps', items:D.steps.map(x=>({label:J?x.ja:x.en, st:'todo'}))});
+    rows.push({t:'text', text: J?`研究開始まで あと${left}日`:`research starts in ${left} days`, color:'#dfeee9'});
+    rows.push({t:'text', text: J?'始まると街に素材が光ります':'materials will glow around town', color:'#8aa39b', small:true});
+    return rows;
+  }
+  const D=TECH.RESEARCH[R.k], nS=techSteps(R).length, si=R.step||0;
+  const solved=R.solvedDay!=null;
+  rows.push({t:'steps', items:D.steps.map((x,i)=>({label:J?x.ja:x.en,
+    st: solved||i<si ? 'done' : i===si ? 'now' : 'todo'}))});
+  if(solved){
+    const minDay=T.eraDay+TECH_MIN_D;
+    const frac=Math.min(1,(gameDay()-R.solvedDay)/Math.max(1,minDay-R.solvedDay));
+    rows.push({t:'bar', label:J?'普及':'spread', frac, note:`${Math.round(frac*100)}%`, color:'#f5c542'});
+    rows.push({t:'text', text: J?`${R.solvedBy||'偶然の発見'}が「${D.ja}」を発明`:`${D.en} by ${R.solvedBy||'luck'}`, color:'#8aa39b', small:true});
+    return rows;
+  }
+  const found=R.deposits.filter(d=>d.found).length;
+  rows.push({t:'dots', label:J?'素材':'items', n:found, of:TECH.NM,
+    note: found ? '' : (J?'光る場所を探そう':'look for the glow')});
+  // 「残り何通り」は論理的に絞れる AI 時代だけが知っている数。それより前は試した数と伝わり方を出す
+  //   (時代で住民の道具が違うことを、画面でも見せる)。
+  const tried=(R.tried||0)+R.posts.length;
+  if(TECH.ERA_INFER[T.era]==='logic'){
+    const S=techPublicS().length;
+    const frac=1-Math.log(Math.max(1,S))/Math.log(TECH.NHYP);
+    rows.push({t:'bar', label:J?'絞込':'narrow', frac,
+      note: J?`残り${S}通り`:`${S} left`, color: R.stall ? '#ff9f43' : '#00d2a0'});
+  }else{
+    const how=[J?'すれ違った人にだけ伝わる':'word of mouth only', J?'図書館などで読んで持ち帰る':'read it at the library',
+               J?'どこでも読める':'readable anywhere'][T.era];
+    rows.push({t:'text', text: J?`試した${tried}通り · ${how}`:_ascii(`${tried} tried - ${how}`),
+      color: R.stall ? '#ff9f43' : '#9fd8c8', small:true});
+  }
+  // いちばん新しい結果
+  const last=R.posts[R.posts.length-1];
+  if(last){
+    const tr=techTraitJa(R.k, TECH.dec(last.h)[2]);
+    // 当たりの印を先頭に置く (名前が長いと末尾が「…」で切れて、いちばん大事な印が見えなかった)
+    rows.push({t:'text', text: J ? `${TECH.hitsMark(last.hits,true)} ${last.by}(${tr}) ${techShortLabel(R.k,last.h,true)}`
+                                 : _ascii(`${last.by}: ${last.hits}/4`), color:'#dfeee9', hits:last.hits});
+  }
+  // いま起きていること / 次に何をすればよいか (1 行だけ)
+  const testing=agents.filter(a=>a.research);
+  const hintKeys=Object.keys(R.hints);
+  let tip=null, tipColor='#8aa39b';
+  if(!techPrereqOk()){ tip=J?`${D.prereq.ja}ができるのを待っている`:`waiting for ${D.prereq.en}`; tipColor='#ff9f43'; }
+  else if(testing.length) tip=J?`実験中: ${testing.map(a=>a.name).join('、')}`:_ascii(`testing: ${testing.map(a=>a.name).join(', ')}`);
+  else if(R.stall>=2 && hintKeys.length){ const k2=hintKeys[hintKeys.length-1], v=R.hints[k2];
+    const val=k2==='0'?D.materials[v].ja:k2==='1'?TECH.PLACES[v].ja:k2==='2'?TECH.TRAITS[D.traits[v]].ja:TECH.TIMES[v].ja;
+    tip=J?`ひらめき: 正解は「${val}」を含むらしい`:'a hunch narrowed it down'; tipColor='#f5c542'; }
+  else if(R.stall>=1){ tip=J?'行き詰まり → みんなで手分けして実験中':'stalled - everyone pitches in'; tipColor='#ff9f43'; }
+  else if(last && last.req) tip=J?`次は「${techTraitJa(R.k,last.req.t)}」の人に ${techShortLabel(R.k,last.req.h,true)}`
+                                 :_ascii(`next: a ${techTraitEn(R.k,last.req.t)} should try`);
+  else if(R.posts.length<2) tip=J?'素材で実験 → ●が4つ揃えば発明':'test combos - 4 hits invents it';
+  if(tip) rows.push({t:'text', text:tip, color:tipColor, small:true});
+  // 前の時代の記録 (課題は同じ。住民がどれだけ速くなったか)
+  const recs=(T.records||[]).slice(-3);
+  if(recs.length) rows.push({t:'text', color:'#8aa39b', small:true,
+    text: (J?'記録 ':'rec ') + recs.map(r=>J?`${TECH.ERAS[r.era].short}${r.days}日/${r.tried}通り`:_ascii(`${TECH.ERAS[r.era].id} ${r.days}d/${r.tried}`)).join('  ')});
+  return rows;
 }
 
 // ═══ 行動モード A/B ══════════════════════════════════════════════════════════
@@ -12612,6 +14329,7 @@ function doCityReset(newMap){
     initAgentInstances(scene);
     initCarInstances(scene);
     initParcelInstances(scene);
+    initTechInstances(scene);
     initAgents(scene);
   }
   saveCity();
@@ -13354,6 +15072,20 @@ function handleChatCommand(text, author){
     return {ok:true, msg:`story ${a.name}`,
       reply: ls.length ? `${a.name}: ${ls.join(' / ')}`.slice(0,340)
                        : (JA_HUD?`${a.name} はまだ来歴がありません`:`${a.name} has no story yet`)};
+  }
+
+  // 研究: 視聴者のアイデアを掲示板に貼る / いまの研究の様子を聞く
+  const mi=raw.match(/^!?(?:idea|アイデア|案)\s+(.{1,60})$/i);
+  if(mi && TECH_ON){
+    const r=techViewerIdea(mi[1], who);
+    chatLog.push({t:now, by:who, text:_hud(raw).slice(0,60), target:'(idea)'});
+    while(chatLog.length>30) chatLog.shift();
+    return r;
+  }
+  if(TECH_ON && /^!?(?:tech|era|研究|時代)$/i.test(raw)){
+    const t=techStatusText();
+    showBanner(t, 8);
+    return {ok:true, msg:'tech status', reply:t.slice(0,300)};
   }
 
   // 住民を応援する
@@ -15137,18 +16869,35 @@ function pickCameraTarget() {
 const CAM_MARK = process.env.CAM_MARK !== '0';
 // 住民の体の半径は約 0.04 ワールド単位。輪はその 3〜4 倍で「足元の輪」に見える。
 // CELL*0.22 (=0.44) にしたら体の 10 倍あって道を覆い、輪のほうが主役になった。
-const CAM_MARK_R = envNum('CAM_MARK_R', CELL*0.075);
+// ★ 配信では**見えていなかった**。加算合成・細い輪・明滅 (不透明度 0.40〜0.65) の組み合わせは、
+//   /shot の生の画では見えても、明るい石畳の上では地面とほぼ同じ明るさになり、
+//   YouTube のエンコードで潰れる。暗い縁取り + 不透明な明るい輪にする。影の有無とは無関係
+//   (SHADOWS=0 でも /shot には出ていた)。
+//   ★ 深度は**見る**。一度 depthTest:false にしたら、人物の後ろ側の輪の線まで体の手前に
+//     描かれて、足元に置いた輪に見えなかった。住民の体は不透明で深度を書くので、
+//     深度を見れば「体の奥の弧は隠れ、手前の弧は見える」になる。縁石 (CURB_H) に
+//     埋もれないよう、高さは縁石の天端より少し上に置く。
+const CAM_MARK_R = envNum('CAM_MARK_R', CELL*0.1);
 let _camMark = null;
 function stepCamMark(S, a, show){
   if(!CAM_MARK || !S) return;
+  // ★ 街を作り直すと scene ごと新しくなる (doCityReset → buildScene)。輪は最初の 1 回しか
+  //   作らないので、古い scene に付いたまま新しい scene には居なくなり、**最初の街のリセット
+  //   以降ずっと表示されなかった** (起動直後の手元では見えて、長く回した配信でだけ消える)。
+  if(_camMark && _camMark.parent!==S) _camMark=null;
   if(!_camMark){
     // 内径/外径のリング。Z 上向きの平面に最初から寝ているので回転は要らない。
-    const g=new THREE.RingGeometry(CAM_MARK_R*0.72, CAM_MARK_R, 28);
-    _camMark=new THREE.Mesh(g, new THREE.MeshBasicMaterial({
-      color:0x00e0b0, transparent:true, opacity:0.7, depthWrite:false,
-      blending:THREE.AdditiveBlending, fog:false, side:THREE.DoubleSide }));
-    _camMark.renderOrder=2;
-    _camMark.frustumCulled=false;
+    const mat=(color, opacity)=>new THREE.MeshBasicMaterial({
+      color, transparent:true, opacity, depthWrite:false, depthTest:true,
+      polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2,
+      fog:false, side:THREE.DoubleSide, toneMapped:false });
+    _camMark=new THREE.Group();
+    const edge=new THREE.Mesh(new THREE.RingGeometry(CAM_MARK_R*0.58, CAM_MARK_R*1.12, 32), mat(0x02140f, 0.55));
+    const ring=new THREE.Mesh(new THREE.RingGeometry(CAM_MARK_R*0.70, CAM_MARK_R, 32), mat(0x00ffc0, 0.95));
+    edge.renderOrder=5; ring.renderOrder=6;
+    edge.frustumCulled=false; ring.frustumCulled=false;
+    _camMark.add(edge); _camMark.add(ring);
+    _camMark.userData.ring=ring;
     S.add(_camMark);
   }
   // 屋内の人は描いていない (m.visible=false)。輪だけ残すと、誰も居ない建物の
@@ -15159,10 +16908,12 @@ function stepCamMark(S, a, show){
   // 描画位置 (補間後) に合わせる。実座標だと輪だけ先に動いて足元からずれる。
   const x = m ? m.position.x : a.y*CELL+CELL*.5;
   const y = m ? m.position.y : a.x*CELL+CELL*.5;
-  _camMark.position.set(x, y, 0.035);
-  // ゆっくり明滅させて、地面の模様と見分けやすくする
+  _camMark.position.set(x, y, CURB_H+0.012);
+  // ゆっくり脈打たせて、地面の模様と見分けやすくする (消えるほどは薄くしない)
   const t=Date.now()/1000;
-  _camMark.material.opacity = 0.40 + 0.25*(0.5+0.5*Math.sin(t*2.2));
+  _camMark.userData.ring.material.opacity = 0.80 + 0.20*(0.5+0.5*Math.sin(t*2.2));
+  const k=1 + 0.08*Math.sin(t*2.2);
+  _camMark.scale.set(k, k, 1);
 }
 
 // 追跡中の人が**どの建物へ向かっているか**を地面に示す。
@@ -15220,6 +16971,7 @@ function setFrameGeo(mesh, w, h){
 
 function stepDestMark(S, a, show){
   if(!DEST_MARK || !S) return;
+  if(_destMark && _destMark.parent!==S){ _destMark=null; _destCage=null; _destPin=null; }   // 上の輪と同じ理由
   if(!_destMark){
     // 建物の足元を囲む枠。1セルより少し大きく取って輪郭が建物に隠れないようにする。
     const g=new THREE.RingGeometry(CELL*0.52, CELL*0.62, 4);
@@ -15304,6 +17056,8 @@ function updateTrackingCamera(cam) {
     _camLookAt.set(tx, ty, 0);
     camSwitchTimer = Date.now();     // イベント明けに即切り替わらないように
     camFPV = false;
+    // 住民を追っていないので足元の輪と行き先の枠は消す (前の人の場所に取り残さない)
+    stepCamMark(scene, null, false); stepDestMark(scene, null, false);
     return;
   }
   if (!held) pickCameraTarget();
@@ -16159,6 +17913,45 @@ tick(); setInterval(tick, ${ms});
     return;
   }
 
+  // ── /tech : 時代と研究 ──
+  //   /tech            いまの時代・研究の掲示板・研究者 (正解は出さない)
+  //   /tech?answer=1   正解も出す (CHAT_TOKEN を設定しているときは token も要る)
+  if(urlPath==='/tech'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!TECH_ON || !CITY || !CITY.tech){ res.writeHead(200); res.end(JSON.stringify({ok:false, enabled:TECH_ON})); return; }
+    const T=CITY.tech, R=T.round, D=R?TECH.RESEARCH[R.k]:null;
+    const showAns = q.get('answer')==='1' && (!CHAT_TOKEN || q.get('token')===CHAT_TOKEN);
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, mode:TECH_W?'policy':'logic', board:TECH_BOARD,
+      era:{index:T.era, ...TECH.ERAS[T.era], year:techYear(), cycle:T.cycle, sinceDay:T.eraDay+1,
+           days:gameDay()-T.eraDay, share:TECH.ERA_SHARE[T.era], infer:TECH.ERA_INFER[T.era]},
+      pacing:{quiet:TECH_QUIET_D, spawn:TECH_SPAWN_D, min:TECH_MIN_D, step:TECH_STEP_D,
+              max:TECH_MAX_D, stallDays:TECH_STALL_DAYS, expPerDay:TECH_EXP_PER_DAY},
+      records:(T.records||[]).map(r=>({era:TECH.ERAS[r.era].ja, cycle:r.cycle, days:r.days, tried:r.tried, forced:r.forced})),
+      status:techStatusText(), progress:+techProgress().toFixed(3),
+      research: R ? {
+        target:D.ja, targetEn:D.en, step:(R.step||0)+1, steps:D.steps.map(x=>x.ja), stepNow:techStepOf(R).ja,
+        stepDays:(R.stepDays||[]).map(d=>d+1), openDay:R.openDay+1, solvedDay:R.solvedDay==null?null:R.solvedDay+1,
+        solvedBy:R.solvedBy, forced:R.forced, stall:R.stall, expToday:R.expToday, perDay:techExpPerDay(),
+        prereq:{need:D.prereq.ja, ok:techHasPrereq(), waived:R.prereq.waived},
+        materials:R.deposits.map(d=>({name:D.materials[d.m].ja, found:d.found, by:d.by,
+          placed:d.r>=0, cell:d.r>=0?[d.r,d.c]:null, spawnDay:d.spawnDay+1})),
+        hints:Object.fromEntries(Object.entries(R.hints).map(([k,v])=>[['material','place','trait','time'][k], v])),
+        optionsLeft:techPublicS().length,
+        posts:R.posts.map(p=>({day:p.day+1, hour:p.hour, by:p.by, test:TECH.hypLabel(R.k,p.h,true), hits:p.hits,
+          request:p.req?{trait:techTraitJa(R.k,p.req.t), test:TECH.hypLabel(R.k,p.req.h,true)}:null})),
+        ideas:R.ideas,
+        answer: showAns ? TECH.hypLabel(R.k, R.answer, true) : undefined,
+      } : null,
+      researchers:agents.filter(a=>a.research).map(a=>({name:a.name, phase:a.research.phase,
+        test:TECH.hypLabel(a.research.k, a.research.h, true), traits:techTraits(a).map(t=>TECH.TRAITS[t].ja)})),
+      telework:agents.filter(a=>a.teleToday).length,
+      history:T.history.map(h=>({era:TECH.ERAS[h.era].ja, day:h.day+1, cycle:h.cycle})),
+      stats:T.stats}));
+    return;
+  }
+
   // ── /city : 街の蓄積 (経過日数 / 道 / 開業・閉店 / 需要 / ニュース) ──
   //   /city            いまの街の状態
   //   /city?reset=1    蓄積を捨てて街を作り直す (マップはそのまま)
@@ -16265,6 +18058,7 @@ tick(); setInterval(tick, ${ms});
         limits:{maxDensity:BUILD_MAX_DENS, minWalkability:WALK_MIN},
         buildingPaused: fieldDensity()>=BUILD_MAX_DENS || walkability()<WALK_MIN,
         expandAt:{density:EXPAND_DENSITY, freeLots:EXPAND_FREE}},
+      tech: (TECH_ON && CITY.tech) ? {era:TECH.ERAS[CITY.tech.era].ja, year:techYear(), status:techStatusText()} : undefined,
       level:{index:cityLevel(), name:levelSpec().name, econ:Math.round(CITY.econ),
         maxHeight:levelSpec().maxH, fp2:levelSpec().fp2,
         next:CITY_LEVELS[cityLevel()+1]?{name:CITY_LEVELS[cityLevel()+1].name,
@@ -16764,6 +18558,9 @@ const PT_POSE = {
   reading:'sit', origami:'sit', doodle:'sit', daydream:'sit', sunbath:'sit',
   stargaze:'sit', clouds:'sit', cards:'sit', shogi:'sit', fortune:'sit',
   rainsound:'sit', tea:'sit', diary:'sit', letter:'sit', mending:'sit',
+  records:'sit', tvwatch:'sit', pccomm:'sit', netsurf:'sit',
+  // 時代の娯楽
+  phone:'phone', selfie:'phone', aichat:'phone', vrgame:'dance',
   // 立ち話の類
   chat:'talk', gossip:'talk', memories:'talk', consult:'talk',
   shiritori:'talk', janken:'talk',
@@ -16787,6 +18584,9 @@ function poseOf(a){
   if((a.sick||0) > 0.55) return P.sick;
   // ② 荷物を担いでいる配達員
   if(a.deliv) return P.carry;
+  // ②' 実験している / 時間帯を待っている。スマホ以降は携帯で記録を取る
+  if(a.research && (a.research.phase==='test' || a.research.phase==='wait'))
+    return (a.research.phase==='test' && techEra()>=2) ? P.phone : a.research.phase==='test' ? P.crouch : P.look;
   // ③ 待ち合わせ: 連絡した直後は携帯、待っている間は見回す
   if(a.meet){
     const held = a.mode==='hold';
@@ -16822,7 +18622,7 @@ const STUCK_MOVE = envNum('STUCK_MOVE', 0.08);            // 「動いた」と�
 function stepUnstickWatch(){
   for(const a of agents){
     // 止まっているのが自然な状態は見張らない
-    if(MW.isIndoors(a) || a.mode==='hold' || a.rally || a.deliv || ptActive(a) || a.meet){
+    if(MW.isIndoors(a) || a.mode==='hold' || a.rally || a.deliv || a.research || ptActive(a) || a.meet){
       a._sx=a.x; a._sy=a.y; a._stuck=0; continue;
     }
     const dx=a.x-(a._sx==null?a.x:a._sx), dy=a.y-(a._sy==null?a.y:a._sy);
@@ -16858,7 +18658,9 @@ function stepUnstickWatch(){
 // **両方から同じものを呼ぶ**ので、早送りで挙動がズレない。
 function stepOneSecond(){
   stepSocial(1); stepNeeds(1); stepOutings(1); stepPastime(1); stepEvents(1);
-  stepPolice(); stepDelivery(); retargetOnNeedChange();
+  stepPolice(); stepDelivery(); stepTech(); retargetOnNeedChange();
+  if(VEC_ON) vecTallyTick();
+  if(SIM_FAST) lifeSampleTick();
   stepMeetups();               // 待ち合わせの合流/時間切れ
   stepUnstickWatch();          // 屋外で止まっている人を歩かせる
   stepDisguise(1);         // 手配されている人は顔を隠す
@@ -16917,6 +18719,7 @@ function stateParts(){
   }
   if(CITY){
     P.city.mixf(CITY.econ); P.city.mix(CITY.level);
+    if(TECH_ON && CITY.tech) techMixHash(v=>P.city.mix(v));
     for(const k of Object.keys(CITY.stats).sort()) P.city.mix(CITY.stats[k]|0);
     for(const st of CITY.structs){ P.city.mix(st.r*997+st.c); P.city.mix(st.typeIdx); P.city.str(st.state); }
   }
@@ -16957,6 +18760,7 @@ function stateHash(){
   }
   if(CITY){
     mixf(CITY.econ); mix(CITY.level); mix(CITY.structs.length);
+    if(TECH_ON && CITY.tech) techMixHash(mix);
     for(const k of Object.keys(CITY.stats).sort()) mix(CITY.stats[k]|0);
     for(const st of CITY.structs){ mix(st.r*997+st.c); mix(st.typeIdx);
       for(let i=0;i<st.state.length;i++) mix(st.state.charCodeAt(i)); }
@@ -17291,6 +19095,7 @@ async function renderLoop(){
     const _tS=PERF_LOG?Date.now():0;
     syncAgentInstances();
     syncParcels();                // 担いでいる荷物 / 玄関先に置かれた荷物
+    if(TECH_ON) syncTechProps();  // 素材の光 / 屋上の小物 (時代) / ドローン
     if(PERF_LOG){ _perf.agents+=Date.now()-_tS; }
     const _t1=PERF_LOG?Date.now():0;
     updateOcclusionFade();
@@ -17472,6 +19277,7 @@ function startLoops(){
   initAgentInstances(scene);
   initCarInstances(scene);
   initParcelInstances(scene);
+  initTechInstances(scene);
   initAgents(scene);
 
   httpServer.listen(PORT, ()=>{

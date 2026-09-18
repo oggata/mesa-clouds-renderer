@@ -77,6 +77,7 @@ function resolveMap(a, spec, ex, C) {
     }
     case 'workplace': {
       if (a.school) return [a.school[0], a.school[1]];   // 学生は学校が先
+      if (a.teleToday && a.home) return [a.home[0], a.home[1]];   // 在宅勤務の日 (server.js の techTeleworkDaily)
       if (a.work) return [a.work[0], a.work[1]];
       break;                                   // → random
     }

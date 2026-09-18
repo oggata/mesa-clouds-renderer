@@ -75,10 +75,10 @@ const ACTS = [
   { id:'plants',    ja:'植木の世話', jaIng:'植木の世話をしている',      en:'tending the plants', icon:'🪴', where:'home', group:1, secs:[20,45], bored:0.28,
     ja_l:['ちょっと元気がないな','新しい芽が出てる'],
     en_l:['It looks a bit droopy.','There is a new shoot.'] },
-  { id:'radio',     ja:'ラジオを聴く', jaIng:'ラジオを聴いている',    en:'listening to radio', icon:'📻', where:'home', group:1, secs:[30,70], bored:0.30,
+  { id:'radio',     ja:'ラジオを聴く', jaIng:'ラジオを聴いている',    en:'listening to radio', icon:'📻', where:'home', group:1, secs:[30,70], bored:0.30, era:[0,1],
     ja_l:['この時間の放送が好きなんだ','また同じ曲だ'],
     en_l:['I like this time slot.','They played this one already.'] },
-  { id:'letter',    ja:'手紙を書く', jaIng:'手紙を書いている',      en:'writing a letter',   icon:'✉️', where:'home', group:1, secs:[30,65], bored:0.30,
+  { id:'letter',    ja:'手紙を書く', jaIng:'手紙を書いている',      en:'writing a letter',   icon:'✉️', where:'home', group:1, secs:[30,65], bored:0.30, era:[0,1],
     ja_l:['書き出しが決まらない','だいぶ長くなってしまった'],
     en_l:["I can't decide how to start.",'This got rather long.'] },
   { id:'diary',     ja:'日記をつける', jaIng:'日記をつけている',    en:'writing in a diary', icon:'📔', where:'home', group:1, secs:[20,45], bored:0.25,
@@ -145,6 +145,33 @@ const ACTS = [
   { id:'gossip2',   ja:'噂話', jaIng:'噂話をしている',           en:'trading gossip',     icon:'🤫', where:'any',  group:2, secs:[20,45], bored:0.30, social:0.45,
     ja_l:['ここだけの話なんだけど','誰にも言わないでね'],
     en_l:['Just between us.',"Don't tell anyone."] },
+
+  // ── 時代の娯楽 (tech.js の時代があるときだけ。techOnly は時代が無い街では出さない) ──
+  //   era:[from,to] … アナログ=0 / パソコン=1 / スマホ=2 / AI=3
+  { id:'records',   ja:'レコードを聴く', jaIng:'レコードを聴いている', en:'playing records', icon:'💿', where:'home', group:1, secs:[30,70], bored:0.32, era:[0,0], techOnly:true,
+    ja_l:['針を落とす瞬間がいい','B面のほうが好きなんだ'],
+    en_l:['I love the moment the needle drops.','I prefer the B-side.'] },
+  { id:'tvwatch',   ja:'テレビを見る', jaIng:'テレビを見ている',     en:'watching TV',       icon:'📺', where:'home', group:1, secs:[30,70], bored:0.35, era:[0,2], techOnly:true,
+    ja_l:['この時間のドラマ、見逃せない','チャンネル争いに勝った'],
+    en_l:["Can't miss this drama.",'I won the remote.'] },
+  { id:'pccomm',    ja:'パソコン通信', jaIng:'パソコン通信をしている', en:'dialing into a BBS', icon:'💻', where:'home', group:1, secs:[35,80], bored:0.45, era:[1,1], techOnly:true,
+    ja_l:['ピーガガガ… つながった','電話代がこわい','掲示板に新しい書き込みがある'],
+    en_l:['Beep-beep-screech... connected.','The phone bill is going to hurt.','New posts on the board!'] },
+  { id:'netsurf',   ja:'ネットサーフィン', jaIng:'ネットサーフィンをしている', en:'surfing the web', icon:'🌐', where:'indoor', group:1, secs:[30,75], bored:0.40, era:[1,3], techOnly:true,
+    ja_l:['リンクをたどってたら朝だった','このサイト、面白い'],
+    en_l:['One link led to another...','This site is great.'] },
+  { id:'phone',     ja:'スマホを眺める', jaIng:'スマホを眺めている', en:'scrolling on a phone', icon:'📱', where:'any', group:1, secs:[15,40], bored:0.25, era:[2,3], techOnly:true,
+    ja_l:['通知がたまってる','あの店、評価が高いらしい','つい見ちゃう'],
+    en_l:['So many notifications.','That shop has great reviews.',"Can't stop scrolling."] },
+  { id:'selfie',    ja:'自撮り', jaIng:'一緒に自撮りしている', en:'taking a selfie', icon:'🤳', where:'out', group:2, secs:[12,28], bored:0.30, social:0.4, era:[2,3], techOnly:true,
+    ja_l:['もう一枚!','いい感じに撮れた'],
+    en_l:['One more!','That came out nice.'] },
+  { id:'aichat',    ja:'AIと雑談', jaIng:'AIと雑談している', en:'chatting with an AI', icon:'🤖', where:'any', group:1, secs:[25,60], bored:0.42, era:[3,3], techOnly:true,
+    ja_l:['AIに今日の献立を相談した','話が合うんだよな、このAI'],
+    en_l:['Asked the AI what to cook tonight.','This AI actually gets me.'] },
+  { id:'vrgame',    ja:'VRゲーム', jaIng:'VRゲームをしている', en:'playing VR games', icon:'🕶', where:'home', group:1, secs:[35,90], bored:0.58, era:[3,3], techOnly:true,
+    ja_l:['壁にぶつかった','現実に戻りたくない'],
+    en_l:['I walked into the wall.',"I don't want to come back to reality."] },
 ];
 
 const byId = {};
@@ -152,13 +179,16 @@ for (const a of ACTS) byId[a.id] = a;
 
 /**
  * いま a が始められる娯楽の一覧。
- *   ctx = { hour, raining, indoors, atHome, mates }
+ *   ctx = { hour, raining, indoors, atHome, mates, era }
  *     mates … 近くに居て、同じく暇な住民の数 (自分を含まない)
  */
 function candidates(ctx) {
   const night = ctx.hour < 6 || ctx.hour >= 20;
   const out = [];
   for (const A of ACTS) {
+    // 時代。ctx.era が無い (時代の無い街) なら時代の娯楽は出さず、既存の娯楽は全部出す。
+    if (ctx.era == null) { if (A.techOnly) continue; }
+    else if (A.era && (ctx.era < A.era[0] || ctx.era > A.era[1])) continue;
     if (A.where === 'home'   && !ctx.atHome) continue;
     if (A.where === 'indoor' && !ctx.indoors) continue;   // 家でなくてよいが屋根の下
     if (A.where === 'out'    && ctx.indoors) continue;
