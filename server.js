@@ -314,6 +314,10 @@ const SOC = require('./social.js');
 const PT  = require('./pastime.js');   // 暇な時間の娯楽 (建物も小物も増やさない)
 const EV  = require('./events.js');    // 良いこと・悪いこと (病気の発症もここに一本化)
 const CH  = require('./chronicle.js'); // 住民ごとの来歴 (!story で読める)
+const DR  = require('./dreamer.js');   // 夜の振り返り: 経験の結果から性格を少しずつ動かす
+// ★ 既定 OFF。DREAM=1 のときだけ経験を積み、毎晩性格のずれを更新する。
+//   性格は VEC の欲求 (traitsOf) に効くので、配信の住民の過ごし方が変わる。
+const DREAM_ON = process.env.DREAM === '1';
 const RNG = require('./rng.js');       // 種の決まった乱数 (シミュレーションだけが使う)
 const WIT = require('./witness.js');   // 目撃台帳 (犯行を「誰がどこまで見たか」)
 const AL  = require('./alibi.js');     // アリバイ台帳 (その時間、誰がどこに居たか)
@@ -7072,7 +7076,8 @@ function cityToJSON(){
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
                   b:a.viewer?a.by:undefined, c:a.cheers||undefined,
                   p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
-                  t:a.taught||undefined, r:rel, e:eco};
+                  t:a.taught||undefined, r:rel, e:eco,
+                  dx:DREAM_ON?DR.serialize(a):undefined};
     }
   }
   return {
@@ -7743,6 +7748,10 @@ function chainEvent(a, E, near){
   if(honest && P.backGood){
     applyEventFx(a, P.backGood);
     CH.push(a, {day, icon:P.backGood.icon, ja:P.backGood.ja, en:P.backGood.en});
+    // ★ 振り返りに渡すのは**返ってきた側 (a) だけ**。届けた/黙っていたは b が
+    //   自分の正直さで選んだことなので、b の証拠にすると性格が自分を強める輪になる。
+    if(DREAM_ON) DR.note(a, {kind:'event', id:P.from==='wallet_lost'?'wallet_back':'helped_back',
+                             day, label:`${P.backGood.icon} ${P.backGood.ja}`});
   }
   // 連鎖は**必ず**見出しに出す。二人の名前が並ぶ行はこの街でいちばん物語になる。
   //   ただし quiet の連鎖 (もめ事) だけは別。数が多いので流すと開店/閉店を押し出すし、
@@ -7955,6 +7964,7 @@ function stepEvents(dtSec){
     applyEventFx(a, E);
     _evStat[E.id]=(_evStat[E.id]||0)+1;
     CH.push(a, {day:gameDay(), icon:E.icon, ja:E.ja, en:E.en});
+    if(DREAM_ON) DR.note(a, {kind:'event', id:E.id, day:gameDay(), label:`${E.icon} ${E.ja}`});
     // ★ 相手を巻き込む出来事なら、近くの誰かに「その続き」を起こす。
     //   一つの出来事から二人分の話が生まれるので、住民どうしが交わる。
     const mate = chainEvent(a, E, _evBuf);
@@ -8613,6 +8623,10 @@ function traitsOf(a){
   t[5]=Math.max(0,Math.min(1, d.enterprise!=null?d.enterprise:mix('enterprise',0.3)));
   t[6]=Math.max(0,Math.min(1, d.honesty!=null?d.honesty:mix('honesty',0.7)));
   t[7]=mix('homebody',  0.3+0.45*old);                    // 出不精
+  // 夜の振り返り (dreamer.js) で育ったずれを足す。土台 (上の値) は変えない。
+  //   ずれが動いた晩は dreamDaily が a._traits を捨てるので、ここで組み直される。
+  const dr=DREAM_ON ? DR.driftOf(a) : null;
+  if(dr) for(let k=0;k<8;k++) t[k]=Math.max(0, Math.min(1, t[k]+dr[k]));
   a._traits=t;
   return t;
 }
@@ -11182,6 +11196,10 @@ function onFriend(a, b){
   // 「誰と友達になったか」は本人の一生の話なので落とさない。
   CH.push(a, {day, icon:'🤝', mark:true, ja:`${b.name} と友達になった`, en:`became friends with ${b.name}`});
   CH.push(b, {day, icon:'🤝', mark:true, ja:`${a.name} と友達になった`, en:`became friends with ${a.name}`});
+  if(DREAM_ON){   // had = この友達より前にいた友達の数 (何人目か)
+    DR.note(a, {kind:'friend', day, had:SOC.degreeOf(a)-1, label:`🤝 ${b.name}`});
+    DR.note(b, {kind:'friend', day, had:SOC.degreeOf(b)-1, label:`🤝 ${a.name}`});
+  }
   if(day!==_friendNewsDay){ _friendNewsDay=day; _friendNewsN=0; }
   const viewer = a.viewer || b.viewer;
   if(!viewer && _friendNewsN>=FRIEND_NEWS_PER_DAY) return;
@@ -11230,6 +11248,7 @@ function stepDebts(day){
         paid++;
         CH.push(lender, {day, icon:'🧾', ja:`${borrower.name} が ${Math.round(amt)} 返してくれた`,
                          en:`${borrower.name} paid back ${Math.round(amt)}`});
+        if(DREAM_ON) DR.note(lender, {kind:'repaid', day, label:`🧾 ${borrower.name}`});
         continue;
       }
       // 返ってこない日が積み上がる
@@ -11251,6 +11270,10 @@ function onFeud(a, b){
   const day=gameDay();
   CH.push(a, {day, icon:'💢', mark:true, ja:`${b.name} と険悪になった`, en:`fell out with ${b.name}`});
   CH.push(b, {day, icon:'💢', mark:true, ja:`${a.name} と険悪になった`, en:`fell out with ${a.name}`});
+  if(DREAM_ON){
+    DR.note(a, {kind:'feud', day, label:`💢 ${b.name}`});
+    DR.note(b, {kind:'feud', day, label:`💢 ${a.name}`});
+  }
   if(day!==_feudNewsDay){ _feudNewsDay=day; _feudNewsN=0; }
   if(!(a.viewer||b.viewer) && _feudNewsN>=FEUD_NEWS_PER_DAY) return;
   _feudNewsN++;
@@ -11312,6 +11335,12 @@ function learnFromVisit(a, st, pathLen){
   // その点は人口が変われば動く (上の集積の説明を参照)。
   const agglo=aggloBonus(st.r, st.c);
   const reward=Math.max(0, Math.min(1, 1 - dist/PREF_FAR)) + agglo - crowd;
+  // 振り返りの材料: 採点 (近さ・集積・混雑) を渡す。期待 (本人のいつもの外出) との比較は dreamer.js 側。
+  if(DREAM_ON){
+    const pe=a.pref && a.pref[key], first=!(pe && pe.n>0);
+    DR.note(a, {kind:'visit', day:gameDay(), first, food:FOOD_IDX.includes(st.typeIdx),
+      reward, label:`${BLDG_TYPES[st.typeIdx].label}${first?' (初)':''} ${reward.toFixed(2)}`});
+  }
   const e=prefBump(a, key, reward);
   e.n=(e.n||0)+1;
   // 勧められて来たのなら、その結果を記録する (定着したかの判定に使う)
@@ -12087,6 +12116,27 @@ function onArrive(a, dest){
 }
 
 // ── 日次のまとめ ───────────────────────────────────────────────────────────
+// ── 夜の振り返り (dreamer.js) ───────────────────────────────────────────────
+// 1日に溜まった「経験の結果」を住民ごとにまとめ、性格のずれを少し動かす。
+// 動いた人は traitsOf のキャッシュを捨てる (翌日の欲求から効く)。
+function dreamDaily(day){
+  let changed=0, contra=0, noted=0;
+  const moved={};
+  for(const a of agents){
+    const r=DR.dream(a, day);
+    if(r.changed.length){ changed++; a._traits=null; }
+    contra+=r.contra.length;
+    for(const c of r.changed) moved[c.axis]=(moved[c.axis]||0)+c.delta;
+    for(const n of r.notes){
+      CH.push(a, {day, icon:'🌙', ja:n.ja, en:n.en});
+      noted++;
+    }
+  }
+  const mv=Object.entries(moved).map(([k,v])=>`${k}${v>=0?'+':''}${v.toFixed(2)}`).join(' ');
+  console.log(`[Dream] Day${day+1} 性格が動いた ${changed}/${agents.length}人 矛盾${contra}件 来歴${noted}行`
+            + (mv?` | 合計 ${mv}`:''));
+}
+
 function dailyRollover(day){
   if(!CITY || !CITY_EVOLVE) return;
   const t0=Date.now();
@@ -12099,6 +12149,7 @@ function dailyRollover(day){
   rolloverVisits();                       // 先に EMA を更新してから閉店判定する
   if(SOCIAL_ON) SOC.dailyDecay(SOC_STATE, agents);   // 会わない相手との関係は薄れる
   stepDebts(day);                                   // 返済と取り立て (借金が恨みに育つ)
+  if(DREAM_ON) dreamDaily(day);                     // 夜の振り返り (返済・もめ事まで入れてから)
   const roads=promoteFootpaths(day);
   const roadsBack=decayRoads(day);        // 使われなくなった道は空き地へ戻す
   reclassRoads();                         // よく使われる道は太く、使われない道は路地へ
@@ -14004,6 +14055,7 @@ function initAgents(S){
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
       if(sv.r && SOCIAL_ON){ SOC.restoreAgent(a, sv.r); rels++; }
       if(sv.e && ECON_ON) ECO.restoreAgent(a, sv.e);
+      if(sv.dx && DREAM_ON){ DR.restore(a, sv.dx); a._traits=null; }
       if(sv.sn && applyAgentSnap(a, sv.sn)) snapped++;
     }
     if(snapped) console.log(`[City] ${snapped}人の居場所と体調を復元 (分岐はここから始まる)`);
@@ -15388,6 +15440,7 @@ function viewerCheer(query, who){
   _lastCheerAt=now;
   a.cheers=(a.cheers||0)+1;
   a.bored=Math.max(0, (a.bored||0)-CHEER_RELIEF);
+  if(DREAM_ON) DR.note(a, {kind:'cheer', day:gameDay(), had:a.cheers-1, label:`📣 ${_ascii(who||'viewer').slice(0,16)}`});
   lifeNews.push({day:gameDay(), shape:'cheer',
     en:`${a.name} was cheered by ${who} (${a.cheers} total)`,
     ja:`${a.name} が ${who} に応援された (通算${a.cheers})`});
@@ -17797,6 +17850,37 @@ tick(); setInterval(tick, ${ms});
       res.writeHead(502);
       res.end(JSON.stringify({ok:false, error:GEM.lastError}));
     }
+    return;
+  }
+
+  // 夜の振り返り: 性格のずれと、その根拠になった経験
+  //   /dream            … 街全体 (よく動いた人の上位)
+  //   /dream?who=<名前>  … 1人ぶん (ずれ・持ち越し中の経験の数・最近の気づきと根拠)
+  if(urlPath==='/dream'){
+    const q=new URL(req.url,'http://x').searchParams;
+    res.setHeader('Content-Type','application/json');
+    if(!DREAM_ON){
+      res.writeHead(200); res.end(JSON.stringify({ok:false, enabled:false, hint:'DREAM=1 で有効'}));
+      return;
+    }
+    const who=q.get('who');
+    if(who){
+      const hit=findAgentByQuery(who);
+      const a=hit && hit.idx>=0 ? agents[hit.idx] : null;
+      if(!a){ res.writeHead(404); res.end(JSON.stringify({ok:false,error:`no match: ${who}`})); return; }
+      const tr=traitsOf(a), traits={};
+      DR.AXES.forEach((k,i)=>{ traits[k]=+tr[i].toFixed(3); });
+      res.writeHead(200);
+      res.end(JSON.stringify({ok:true, name:a.name, aid:a.aid, traits, ...DR.describe(a)}));
+      return;
+    }
+    const top=agents.map(a=>{
+      const d=DR.describe(a), mag=Object.values(d.drift).reduce((s,v)=>s+Math.abs(v),0);
+      return {name:a.name, aid:a.aid, drift:d.drift, pending:d.pending, mag:+mag.toFixed(3)};
+    }).sort((x,y)=>y.mag-x.mag);
+    res.writeHead(200);
+    res.end(JSON.stringify({ok:true, day:gameDay()+1, residents:agents.length,
+      evolved:top.filter(x=>x.mag>0).length, cfg:DR.C, top:top.slice(0, +q.get('n')||10)}));
     return;
   }
 
