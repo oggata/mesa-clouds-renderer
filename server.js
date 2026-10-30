@@ -330,6 +330,9 @@ const ECO = require('./src/economy.js');
 const TECH = require('./src/tech.js');
 // 行動のベクトル化: 欲求ベクトル × 場所が与えるベクトル の照合で「いま何をするか」を決める
 const VEC = require('./src/vec.js');
+// 見た目の好み (MobileCLIP-S0 の空間)。行ったことの無い店にも「見た目が好み」で効く。
+// 埋め込みは tools/clip/embed.mjs が事前に作った data/clip_emb.json を読むだけで、推論はしない。
+const TASTE = require('./src/taste.js');
 const TECH_ON = process.env.TECH !== '0' && process.env.CITY_EVOLVE !== '0';
 const { OTHER, ROAD, BUILDING, TREE } = MW;
 // 道路のクラス分け・オートタイルのマスク・アトラスの UV。
@@ -7072,7 +7075,7 @@ function cityToJSON(){
                   n:a.viewer?a.name:undefined, v:a.viewer?1:undefined,
                   b:a.viewer?a.by:undefined, c:a.cheers||undefined,
                   p:top.length?Object.fromEntries(top.map(([k,v])=>[k,[+v.s.toFixed(2), v.n||0]])):undefined,
-                  t:a.taught||undefined, r:rel, e:eco};
+                  t:a.taught||undefined, r:rel, e:eco, ts:TASTE.serialize(a)};
     }
   }
   return {
@@ -8197,6 +8200,21 @@ const VEC_ON     = process.env.VEC !== '0';
 const VEC_EVERY  = Math.max(1, envNum('VEC_EVERY', 7));      // 何 tick に 1 回、選び直しを計算するか (≒1 秒)
 const VEC_JITTER = envNum('VEC_JITTER', 0.08);               // 人と日による好みの揺らぎ (乱数は引かない)
 const VEC_FAM    = envNum('VEC_FAM', 0.25);                  // 行きつけの強さ (prefOf) の効き
+// 見た目の好み。z 値 1 あたりの上乗せで、0.05 なら z=+2 の店が 3 セルぶん近く感じる程度。
+// TASTE_W=0 にすると**測るだけ** (好みは育つが選択には効かせない) なので、同じ種で比べられる。
+const TASTE_W    = envNum('TASTE_W', 0.05);
+const TASTE_STATE = (()=>{
+  if(process.env.TASTE==='0') return null;
+  const f=path.join(__dirname,'data','clip_emb.json');
+  if(!fs.existsSync(f)){ console.log('[Taste] data/clip_emb.json 無し → 見た目の好みは使わない (tools/clip/embed.mjs で作る)'); return null; }
+  // z 値は「住民が実際に選び合う場所」の間でとる (vecPublicPlaces と同じ絞り方)
+  const among=Object.keys(VEC.PLACE).filter(k=>VEC.PLACE[k].public!==false);
+  const S=TASTE.createState(JSON.parse(fs.readFileSync(f,'utf8')), BLDG_TYPES.map(b=>b.name), among,
+    {learn:envNum('TASTE_LEARN', 0.15), decay:envNum('TASTE_DECAY', 0.98)});
+  console.log(`[Taste] on ${S.model} w=${TASTE_W} — 見た目の好みを行き先選びに足す${TASTE_W?'':' (w=0: 測るだけ)'}`);
+  return S;
+})();
+const tasteZ = (a, t) => TASTE_STATE ? TASTE.scores(TASTE_STATE, a)[t] : 0;
 if(VEC_ON && process.env.HLP_NET==='1') console.warn('[Vec] ⚠ HLP_NET=1 だが、行動のベクトル化 (VEC=1) では hlp.onnx を使わない。学習した方策で選ぶなら VEC=0');
 if(VEC_ON) console.log(`[Vec] on チャンネル ${VEC.NC} (${VEC.CH.map(c=>c.ja).join('/')}) — 行動の一覧ではなくベクトルの照合で選ぶ`);
 
@@ -8246,7 +8264,7 @@ function vecCandidates(a){
   const jit=k=>(VEC_JITTER>0 ? (_vecHash(a.aid+':'+day+':'+k)-0.5)*2*VEC_JITTER : 0);
   for(const p of vecPublicPlaces()){
     out.push({key:p.key, kind:'place', typeName:p.typeName, r:p.r, c:p.c, A:p.A, price:p.price, st:p.st,
-      dist:dist(p.r,p.c), fam:VEC_FAM*prefOf(a, p.key), jit:jit(p.key)});
+      dist:dist(p.r,p.c), fam:VEC_FAM*prefOf(a, p.key) + TASTE_W*tasteZ(a, p.st.typeIdx), jit:jit(p.key)});
   }
   if(a.home){
     out.push({key:'home', kind:'home', typeName:'home', r:a.home[0], c:a.home[1],
@@ -8514,6 +8532,15 @@ function lifeReportDaily(day){
     econ:Math.round(CITY?CITY.econ:0), shops:CITY?CITY.structs.filter(x=>x.state==='open').length:0,
     opened:CITY?CITY.stats.shopsOpened:0, closed:CITY?CITY.stats.shopsClosed:0}));
   _life={n:0, hunger:0, fatigue:0, starving:0, exhausted:0, night:0, nightHome:0, work:0, workAt:0};
+}
+// 来店した店の種類が、その人の見た目の好み (z) でどれくらい上だったか。
+// TASTE_W=0 と比べて上がっていれば、好みが行き先を動かしている。
+let _taste={n:0, z:0};
+function tasteReportDaily(day){
+  if(!TASTE_STATE) return;
+  console.log('[TasteJSON] '+JSON.stringify({day, w:TASTE_W, visits:_taste.n,
+    meanZ:_taste.n?+(_taste.z/_taste.n).toFixed(3):null}));
+  _taste={n:0, z:0};
 }
 function vecReportDaily(day){
   const ent=Object.entries(_vecSig).sort((x,y)=>y[1]-x[1]);
@@ -11314,6 +11341,11 @@ function learnFromVisit(a, st, pathLen){
   const reward=Math.max(0, Math.min(1, 1 - dist/PREF_FAR)) + agglo - crowd;
   const e=prefBump(a, key, reward);
   e.n=(e.n||0)+1;
+  // 見た目の好みも同じ採点で動かす。z は**学習する前**の値を数える (選んだ時点の好み)。
+  if(TASTE_STATE){
+    _taste.n++; _taste.z+=tasteZ(a, st.typeIdx);
+    TASTE.learn(TASTE_STATE, a, st.typeIdx, reward);
+  }
   // 勧められて来たのなら、その結果を記録する (定着したかの判定に使う)
   if(a.taught && a.taught.key===key) a.taught.tried=true;
 }
@@ -12108,7 +12140,7 @@ function dailyRollover(day){
   // 1日に建てられる軒数は人口に比例させる。人が増えるほど街が速く育つ (複利)。
   const budget=Math.max(1, Math.min(6, 1+Math.floor(agents.length/FOUND_PER_POP)));
   if(VEC_ON){ vecDaily(day); vecReportDaily(day); }
-  if(SIM_FAST) lifeReportDaily(day);   // 叶わなかった欲求を起業の需要へ / 過ごし方の種類を記録
+  if(SIM_FAST){ lifeReportDaily(day); tasteReportDaily(day); }   // 叶わなかった欲求を起業の需要へ / 過ごし方の種類を記録
   let opened=0;
   while(opened<budget && maybeFound(day)) opened++;
   const moved=growPopulation(day);              // 住居に空きがあれば人が引っ越してくる
@@ -12153,6 +12185,7 @@ function dailyRollover(day){
       a.pref[k].s*=PREF_DECAY;
       if(Math.abs(a.pref[k].s)<0.02 && a.pref[k].n<2) delete a.pref[k];
     }
+    if(TASTE_STATE) TASTE.decay(TASTE_STATE, a);   // 経験で付いた見た目の好みも人柄へ戻っていく
     // 勧められた店が「行きつけ」になったか
     if(a.taught && a.taught.tried && !a.taught.judged && day-a.taught.day>=TEACH_DAYS){
       a.taught.judged=true;
@@ -14000,6 +14033,7 @@ function initAgents(S){
       a.cheers=sv.c||0;
       if(sv.p){ a.pref={}; for(const k in sv.p) a.pref[k]={s:sv.p[k][0], n:sv.p[k][1]}; }
       if(sv.t) a.taught=sv.t;
+      if(sv.ts) TASTE.restore(a, sv.ts);   // 見た目の好み (経験で付いた重みだけ。人柄の分は作り直せる)
       if(sv.v && sv.n){ a.viewer=true; a.name=sv.n; a.by=sv.b||null; viewers++; }   // 視聴者住民を戻す
       if(sv.o && structAt(sv.o[0],sv.o[1])){ a.owns=[...sv.o]; restored++; }
       if(sv.r && SOCIAL_ON){ SOC.restoreAgent(a, sv.r); rels++; }
@@ -18495,6 +18529,8 @@ tick(); setInterval(tick, ${ms});
           age:a.def.age!=null?a.def.age:null,
           gender:a.def.gender||null,
           personaDesc:(JA_HUD&&a.def.descJa)||a.def.desc||'',
+          // 見た目の好み (上位3種)。人柄の文から始まり、行った店の採点で育つ
+          taste: TASTE_STATE ? TASTE.top(TASTE_STATE, a, 3).like.map(x=>x.name) : null,
           need, needEmoji:NEED_EMOJI[need]||null, needLabel:need?(NEED_LABEL_JA[need]||need):'元気',
           activity: describeActivity(a),
           pos:[+a.x.toFixed(1),+a.y.toFixed(1)]
