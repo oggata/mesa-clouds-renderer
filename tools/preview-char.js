@@ -14,8 +14,8 @@
 const path=require('path');
 const THREE=require('three');
 const gl=require('gl');
-const SK=require('../skeleton.js');
-const CHARMESH=require('../charmesh.js');
+const SK=require('../src/skeleton.js');
+const CHARMESH=require('../src/charmesh.js');
 
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?a.split('=')[1]:null; };
 const STYLE=(arg('style')||'human')==='skeleton'?'skeleton':'human';

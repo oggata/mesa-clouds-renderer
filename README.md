@@ -431,7 +431,7 @@ build_pro_onnx_by_persona.ipynb   ★学習＋ONNX生成（DINOv2 / 複数ペル
 data/                ONNX モデル（dinov2_vits14 / persona_multi + meta）
 textures/            建物のファサード写真（3D描画の壁 & 観測レイキャスタ用）
 glb/                 3Dモデル（tree.glb / building.glb）
-glb.js               GLB(glTF 2.0) から静的ジオメトリだけ読む最小のローダ（自前）
+src/glb.js           GLB(glTF 2.0) から静的ジオメトリだけ読む最小のローダ（自前）
 tools/make-building-glb.js   building.glb を生成する（寸法・パーツ構成はここ）
 docs/images/         README 用の図
 NPC_INFERENCE.md     推論パイプラインの詳細メモ

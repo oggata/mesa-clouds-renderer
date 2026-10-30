@@ -3,7 +3,7 @@
 // scale-report.js — 街の寸法をメートルで一覧する。
 //   node tools/scale-report.js [--cell=2.0] [--char=0.3333]
 // 数字を足したり変えたりしたあと、人間 (1.70m) から見て妥当かを一目で見るため。
-const SC=require('../scale.js');
+const SC=require('../src/scale.js');
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?parseFloat(a.split('=')[1]):null; };
 const CELL=arg('cell')||2.0, CHAR=arg('char')||SC.DEFAULT_CHAR_SCALE;
 const S=SC.make(CELL, CHAR, process.env);
@@ -18,7 +18,7 @@ if(png){
 // 数字だけだと「揃っているか」は判断しづらいので、同じ縮尺で横に並べる。
 // 人物は skeleton.js の骨格をそのまま描く (絵と実装がズレないように)。
 function drawLineup(S, CELL, out){
-  const PNG=require('./png.js'), SK=require('../skeleton.js'), fs=require('fs');
+  const PNG=require('./png.js'), SK=require('../src/skeleton.js'), fs=require('fs');
   const SK_HUMAN_M=S.HUMAN_M;                    // 基準の身長 (scale.js)
   const W=1120, H=560, GY=H-70;                // GY = 地面の線
   const TOPM=14;                               // 画面に収める高さ (m)

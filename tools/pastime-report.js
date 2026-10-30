@@ -8,7 +8,7 @@
 // 絞り込まれるので、条件を書き間違えると**一度も選ばれない項目**ができる。
 // 街を眺めていても気づけないので、選択ロジックだけをここで回して確かめる。
 
-const PT = require('../pastime.js');
+const PT = require('../src/pastime.js');
 const arg = (k, d) => { const a = process.argv.find(v => v.startsWith('--' + k + '=')); return a ? parseFloat(a.split('=')[1]) : d; };
 const N = arg('n', 200000);
 

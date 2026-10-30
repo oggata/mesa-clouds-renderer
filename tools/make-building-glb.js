@@ -60,7 +60,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ── 寸法 (ワールド単位) ──────────────────────────────────────────────────────
-const SCALE  = require('../scale.js');
+const SCALE  = require('../src/scale.js');
 const CELL   = 2.0;
 // 寸法は scale.js から引く (メートルで書いてある)。焼く側と使う側で別々に
 // 数字を持つと、片方だけ直したときに建物の背だけが変わって気付きにくい。

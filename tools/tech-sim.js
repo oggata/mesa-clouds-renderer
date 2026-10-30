@@ -13,7 +13,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const T = require('../tech.js');
+const T = require('../src/tech.js');
 
 const arg = (k, d) => { const a = process.argv.find(v => v.startsWith('--' + k + '=')); return a ? a.split('=')[1] : d; };
 const N = +arg('n', 300), NA = +arg('agents', 6), CONC = +arg('concurrent', 3);

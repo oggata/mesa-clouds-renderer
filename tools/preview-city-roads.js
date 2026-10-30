@@ -16,8 +16,8 @@
 // 道が隣のセルと繋がらないので、出力を一目見れば分かる。
 
 const fs=require('fs'), path=require('path');
-const MW=require('../world.js');
-const RD=require('../roads.js');
+const MW=require('../src/world.js');
+const RD=require('../src/roads.js');
 const PNG=require('./png.js');
 
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?a.split('=')[1]:null; };

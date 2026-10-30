@@ -28,7 +28,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const T = require('../tech.js');
+const T = require('../src/tech.js');
 
 const arg = (k, d) => { const a = process.argv.find(v => v.startsWith('--' + k + '=')); return a ? a.split('=')[1] : d; };
 const EPISODES = +arg('episodes', 3000), H = +arg('hidden', 16);

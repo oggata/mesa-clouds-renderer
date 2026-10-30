@@ -13,9 +13,9 @@
 // 街の中身は使わず、事件・目撃・アリバイ・動機を**同じ確率構造で**でっち上げる。
 // 本物の街で測るには /mystery を叩く (こちらは仕掛けの当たりを取るための机上検算)。
 
-const WIT = require('../witness.js');
-const AL  = require('../alibi.js');
-const MYS = require('../mystery.js');
+const WIT = require('../src/witness.js');
+const AL  = require('../src/alibi.js');
+const MYS = require('../src/mystery.js');
 const POOL= require('../persona_pool.json').personas;
 
 const arg=(k,d)=>{const a=process.argv.find(v=>v.startsWith('--'+k+'='));return a?parseFloat(a.split('=')[1]):d;};

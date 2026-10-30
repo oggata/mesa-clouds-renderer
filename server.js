@@ -285,7 +285,7 @@ const MAX_TRAIL=parseInt(process.env.MAX_TRAIL)||10;
 // 相当なのか分からなくなっていた (実測すると車 4.64m・木 6.95m・街灯の支柱が
 // 実物の約2倍という具合に、個別には妥当でも並べると揃っていなかった)。
 //   node tools/scale-report.js  で一覧できる。
-const SCALE = require('./scale.js');
+const SCALE = require('./src/scale.js');
 // ★ CHAR_SCALE が SCALE.DEFAULT_CHAR_SCALE を引くので、require はこの上に置くこと。
 // 人型の大きさ。**これが街全体の縮尺の基準**でもある (scale.js を参照)。
 //   住民の身長を 1.70m と決めることで「1ワールド単位 = 何m」が決まり、車・街灯・
@@ -308,28 +308,28 @@ const TRAIL_SCALE=parseFloat(process.env.TRAIL_SCALE)|| 1/9;   // 軌跡マー�
 // マップ生成・通行判定・マップ補修・屋内状態は world.js が持つ。Python 側
 // (mesa_env) と同じ実装で、js/map_conformance.cjs が一致を検証する。
 // 変数名は MW (mesa world)。W は既存の const W=GRID*CELL と衝突する。
-const MW = require('./world.js');
+const MW = require('./src/world.js');
 // 住民どうしの関係と立ち話。街の物理/経済と混ざると読めなくなるので別ファイル。
-const SOC = require('./social.js');
-const PT  = require('./pastime.js');   // 暇な時間の娯楽 (建物も小物も増やさない)
-const EV  = require('./events.js');    // 良いこと・悪いこと (病気の発症もここに一本化)
-const CH  = require('./chronicle.js'); // 住民ごとの来歴 (!story で読める)
-const RNG = require('./rng.js');       // 種の決まった乱数 (シミュレーションだけが使う)
-const WIT = require('./witness.js');   // 目撃台帳 (犯行を「誰がどこまで見たか」)
-const AL  = require('./alibi.js');     // アリバイ台帳 (その時間、誰がどこに居たか)
-const MYS = require('./mystery.js');   // 事件を「謎として解ける形か」で採点する
+const SOC = require('./src/social.js');
+const PT  = require('./src/pastime.js');   // 暇な時間の娯楽 (建物も小物も増やさない)
+const EV  = require('./src/events.js');    // 良いこと・悪いこと (病気の発症もここに一本化)
+const CH  = require('./src/chronicle.js'); // 住民ごとの来歴 (!story で読める)
+const RNG = require('./src/rng.js');       // 種の決まった乱数 (シミュレーションだけが使う)
+const WIT = require('./src/witness.js');   // 目撃台帳 (犯行を「誰がどこまで見たか」)
+const AL  = require('./src/alibi.js');     // アリバイ台帳 (その時間、誰がどこに居たか)
+const MYS = require('./src/mystery.js');   // 事件を「謎として解ける形か」で採点する
 // GLB (glTF) から静的なジオメトリだけ読む最小の読み取り。
 // three の GLTFLoader は ESM で CommonJS から require できないため自前で持つ。
-const GLB = require('./glb.js');
+const GLB = require('./src/glb.js');
 // 歩き方 (人をよける / 車を待つ / 曲がりながら歩く)。経路のたどり方とは別。
-const WALK = require('./walk.js');
+const WALK = require('./src/walk.js');
 // お金・仕事・追い詰められ度・犯罪。犯罪だけ足すと飾りになるので、
 // 「失業 → 無一文 → 犯行 → 店の売上減 → さらに失業」の環ごと持たせる。
-const ECO = require('./economy.js');
+const ECO = require('./src/economy.js');
 // 時代 (アナログ→PC→スマホ→AI) と研究開発。ヒット&ブローと掲示板、研究の方策。
-const TECH = require('./tech.js');
+const TECH = require('./src/tech.js');
 // 行動のベクトル化: 欲求ベクトル × 場所が与えるベクトル の照合で「いま何をするか」を決める
-const VEC = require('./vec.js');
+const VEC = require('./src/vec.js');
 const TECH_ON = process.env.TECH !== '0' && process.env.CITY_EVOLVE !== '0';
 const { OTHER, ROAD, BUILDING, TREE } = MW;
 // 道路のクラス分け・オートタイルのマスク・アトラスの UV。
@@ -337,16 +337,16 @@ const { OTHER, ROAD, BUILDING, TREE } = MW;
 // 学習済み方策の観測そのものなので、値を増やすと方策が壊れる)。
 // 枠割りとマスクのビット順の唯一の定義でもあり、tools/make-road-atlas.js が
 // 焼くときも同じものを引いている。
-const RD = require('./roads.js');
+const RD = require('./src/roads.js');
 // 住民の骨格 (関節・骨・色) と歩行ポーズ。world.js / roads.js と同じ理由で切り出す:
 // 同じ式を server.js の頂点シェーダと tools/preview-walk.js の両方が使う。
 // three が要る server.js はテスト環境で動かせないので、ポーズの式がここに無いと
 // 「歩き方が正しいか」を実機に載せる前に確かめる手段が無くなる。
-const SK = require('./skeleton.js');
-const CHARMESH = require('./charmesh.js');   // 型紙 → three のジオメトリ (プレビューと共用)
+const SK = require('./src/skeleton.js');
+const CHARMESH = require('./src/charmesh.js');   // 型紙 → three のジオメトリ (プレビューと共用)
 // 車の出入口・経路・走行。住民 (ONNX 推論・欲求・屋内状態) とは別系統にする。
 // three にも server.js にも依存しない計算なので単体で検証できる。
-const TR = require('./traffic.js');
+const TR = require('./src/traffic.js');
 // ── 階層方策 (HLP / LLP) ────────────────────────────────────────────────────
 // 「いま何をするか」(options.js/hlp.js) と「行き先の仕様をどのセルに落とすか」
 // (llp.js) を server.js の外へ出す。**ウェイポイント→前進/左/右 の変換だけは
@@ -354,9 +354,9 @@ const TR = require('./traffic.js');
 // 2箇所に増やすより既にある1箇所を使うほうが安全だから。
 //   仕様: docs/hierarchical-policy-spec.md
 //   検証: node tools/hlp-equiv.js  (既存 needOf/pickLifeGoal と総当たりで一致)
-const OPTS = require('./options.js');
-const HLP  = require('./hlp.js');
-const LLP  = require('./llp.js');
+const OPTS = require('./src/options.js');
+const HLP  = require('./src/hlp.js');
+const LLP  = require('./src/llp.js');
 // フィールド外。makeMap は 0〜3 しか返さないので、実行時にだけ現れる4つ目の種別。
 //   街は GRID×GRID の一部 (CITY.size 四方) だけを使い、外側は VOID にして
 //   「まだ世界が無い」状態にする。通行不可・描画なし・レイを止める。
