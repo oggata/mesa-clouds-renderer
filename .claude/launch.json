@@ -4,8 +4,23 @@
     {
       "name": "mesa-server",
       "runtimeExecutable": "node",
-      "runtimeArgs": ["server.js"],
+      "runtimeArgs": [
+        "server.js"
+      ],
       "port": 8080
+    },
+    {
+      "name": "mesa-exp-8090",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "PORT=8090",
+        "CITY_STATE_FILE=/private/tmp/claude-501/-Users-oggata--claude-spares-spare-D9ruzB/eb0794f7-02cf-4679-b5fe-cba101852176/scratchpad/city_copy2.json",
+        "DAY_MINUTES=6",
+        "TECH_EXP_PER_DAY=16",
+        "node",
+        "server.js"
+      ],
+      "port": 8090
     }
   ]
 }

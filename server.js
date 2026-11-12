@@ -178,7 +178,8 @@ const CAM_MIN_HOLD_MS  = parseInt(process.env.CAM_MIN_HOLD_MS)  || 18000;
 const CAM_INDOOR_HOLD_MS = parseInt(process.env.CAM_INDOOR_HOLD_MS) || 5000;
 // FPV_CHANCE: ターゲット切替時に、そのキャラの一人称視点(目線)ショットになる確率 (0..1, 既定0.25)。
 //             A/B どちらでも「たまに挟む」形で入る。0 で無効。 例: FPV_CHANCE=0.3 node server.js
-const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); return isNaN(v)?0.25:Math.max(0,Math.min(1,v)); })();
+//const FPV_CHANCE       = (()=>{ const v=parseFloat(process.env.FPV_CHANCE); return isNaN(v)?0.25:Math.max(0,Math.min(1,v)); })();
+const FPV_CHANCE = 0;
 // FPV_EYE: 一人称カメラの目の高さの倍率。1.0 = 住民の実際の目線。 例: FPV_EYE=1.3 node server.js
 const FPV_EYE          = (()=>{ const v=parseFloat(process.env.FPV_EYE); return isNaN(v)?1.0:Math.max(0.3,Math.min(4.0,v)); })();
 // CAM_DIST: 追跡カメラのプレイヤーまでの距離倍率 (1.0=従来)。小さいほど寄る。 例: CAM_DIST=0.5 node server.js
@@ -347,6 +348,7 @@ const RD = require('./src/roads.js');
 // 「歩き方が正しいか」を実機に載せる前に確かめる手段が無くなる。
 const SK = require('./src/skeleton.js');
 const CHARMESH = require('./src/charmesh.js');   // 型紙 → three のジオメトリ (プレビューと共用)
+const CARMESH = require('./src/carmesh.js');     // 車の型紙 (tools/preview-car.js と共用)
 // 車の出入口・経路・走行。住民 (ONNX 推論・欲求・屋内状態) とは別系統にする。
 // three にも server.js にも依存しない計算なので単体で検証できる。
 const TR = require('./src/traffic.js');
@@ -2109,7 +2111,8 @@ function updateOcclusionFade(){
 // NIGHT_DEPTH: 夜の深さ (0=以前の明るい夜 / 1=既定 / 1.5 まで)。空と環境光の
 // **夜側だけ**を落とす。街灯・窓・店明かり・前照灯はそのままなので、相対的に
 // 明かりが際立つ。暗いところは今より見えなくなる (それが狙い)。
-const NIGHT_DEPTH = Math.max(0, Math.min(1.5, envNum('NIGHT_DEPTH', 1.0)));
+//const NIGHT_DEPTH = Math.max(0, Math.min(1.5, envNum('NIGHT_DEPTH', 1.0)));
+const NIGHT_DEPTH = 0.3;
 const _cDay=new THREE.Color(0xeaf2f7);
 // 夜空。以前は 0x0b1a33 で、街灯が点いていない場所もはっきり見えていた。
 const _cNight=new THREE.Color().setHex(0x0b1a33).multiplyScalar(1-0.55*NIGHT_DEPTH);
@@ -3025,6 +3028,344 @@ function updateTechCard(now){
   hudTech.material.opacity=Math.max(0, Math.min(1, (now-techCardT0)/300, left/600));
 }
 
+// ── ミニマップ (画面右下) ──────────────────────────────────────────────────
+//   追跡カメラは本人の周りしか映さないので、「どこから来て、どこへ向かっているのか」
+//   が画だけでは読めない。街の縮図に
+//     ・足跡 (直近 MINIMAP_TRAIL 点。古いほど薄い)
+//     ・これから歩く経路 (a.path の残り。点線)
+//     ・行き先の建物 (琥珀=向かっている / 緑=着いた。3D の行き先の枠と同じ色)
+//     ・いまの位置
+//   を重ねて出す。追跡中だけ出し、俯瞰と街のできごとの間は消す。
+//   街全体だと広すぎて一人の動きが点にしか見えないので、**本人を真ん中に半径
+//   MINIMAP_RADIUS セルだけ**映す (窓は本人と一緒に動く)。行き先が窓の外なら縁に矢印。
+//   向きは**俯瞰カメラと同じ** (列=右 / 行=上)。
+//   MINIMAP=0 で消える。MINIMAP_SIZE で一辺 (倍率をかける前の px)。
+const MINIMAP_ON    = process.env.MINIMAP !== '0';
+const MINIMAP_SIZE  = _hs(envNum('MINIMAP_SIZE', 115));
+const MINIMAP_TRAIL = Math.max(20, Math.min(2000, envNum('MINIMAP_TRAIL', 300)));
+const MINIMAP_RADIUS= Math.max(3, Math.min(60, envNum('MINIMAP_RADIUS', 10)));   // 映す半径 (セル)
+const MM_CAP_H      = _hs(30);                                 // 下の 2 行 (行き先の名前 / 残りマス数)
+const MM_W = MINIMAP_SIZE, MM_H = MINIMAP_SIZE + MM_CAP_H;
+const MM_CELL_COL   = { [OTHER]:'#16211f', [ROAD]:'#56625f', [BUILDING]:'#6e5d48', [TREE]:'#1d4429' };
+let hudMini=null, mmBusy=false, mmAt=0, mmSig='';
+
+// 足跡を記録する (stepAll から毎 tick)。セル 0.35 ぶん動いたら 1 点。
+//   全員ぶん記録しておくので、カメラが切り替わった瞬間からその人の来た道が出る。
+//   3 セル以上の跳び (湧き直し / 復元) は線をつながない (null で区切る)。
+function mmRecord(){
+  if(!MINIMAP_ON || !hudScene) return;
+  for(const a of agents){
+    if(!a || MW.isIndoors(a)) continue;
+    const t=a.mmTrail || (a.mmTrail=[]);
+    const L=t.length ? t[t.length-1] : null;
+    if(L){
+      const d=Math.hypot(a.x-L[0], a.y-L[1]);
+      if(d<0.35) continue;
+      if(d>3) t.push(null);
+    }
+    t.push([Math.round(a.x*20)/20, Math.round(a.y*20)/20]);
+    if(t.length>MINIMAP_TRAIL) t.splice(0, t.length-MINIMAP_TRAIL);
+  }
+}
+
+// 行き先: 3D の行き先の枠 (stepDestMark) と同じ決め方。
+function mmDest(a){
+  if(!a) return null;
+  const inside=MW.isIndoors(a);
+  const d = inside ? a.indoors : (a.atDoor ? [a.atDoor.r, a.atDoor.c] : a.navDest);
+  return d ? {r:d[0], c:d[1], there: inside || !!a.atDoor} : null;
+}
+
+// 本人のまわりの街 (背景)。同じ種類のセルを横に連結して矩形の数を減らす。
+//   窓は本人と一緒に動くので、毎回作り直す (半径 10 なら 22x22 セル程度で軽い)。
+//   街の外 (GRID の外) は塗らない (板の地の色のまま)。
+function mmBackground(v){
+  let out='';
+  const f=x=>x.toFixed(2);
+  const r0=Math.max(0, Math.floor(v.x0)), r1=Math.min(GRID-1, Math.ceil(v.x1));
+  const c0=Math.max(0, Math.floor(v.y0)), c1=Math.min(GRID-1, Math.ceil(v.y1));
+  for(let r=r0;r<=r1;r++){
+    const y=v.py(r+1);
+    let c=c0;
+    while(c<=c1){
+      const t=MAP[r][c]; let e=c+1;
+      while(e<=c1 && MAP[r][e]===t) e++;
+      const col=MM_CELL_COL[t];
+      if(col) out+=`<rect x="${f(v.px(c))}" y="${f(y)}" width="${f((e-c)*v.s+0.3)}" height="${f(v.s+0.3)}" fill="${col}"/>`;
+      c=e;
+    }
+  }
+  return out;
+}
+
+function mmTarget(){
+  if(!MINIMAP_ON || camEventCur || camTargetIdx===0) return null;
+  return agents[camTargetIdx-1] || null;
+}
+
+async function refreshMinimap(a){
+  const pad=_hs(5), M=MM_W-pad*2, R=MINIMAP_RADIUS;
+  const inside=MW.isIndoors(a);
+  // 窓の中心 = 本人 (屋内なら入っている建物)。半径 R セルぶんだけ映す。
+  const cx = inside ? a.indoors[0]+0.5 : a.x, cy = inside ? a.indoors[1]+0.5 : a.y;
+  const s=M/(2*R);
+  // (行, 列) の連続座標 → 板の px。列=右 / 行=上 (俯瞰カメラと同じ向き)。
+  const v={ s, x0:cx-R, x1:cx+R, y0:cy-R, y1:cy+R,
+            px: y => pad+(y-(cy-R))*s,       // 列 → 横
+            py: x => pad+((cx+R)-x)*s };     // 行 → 縦
+  const P=(x,y)=>[v.px(y).toFixed(1), v.py(x).toFixed(1)];
+  const C=(r,c)=>P(r+0.5, c+0.5);
+  const hex=(a.def && a.def.hex) || '#00d2a0';
+  let body=mmBackground(v);
+
+  // 足跡: 4 区間に分けて、古いほど薄く
+  const tr=a.mmTrail || [];
+  const strokeW=Math.max(1.2, _hs(2));
+  const segs=4, per=Math.ceil(tr.length/segs) || 1;
+  for(let k=0;k<segs;k++){
+    const part=tr.slice(Math.max(0,k*per-1), (k+1)*per);
+    const op=(0.25 + 0.75*(k+1)/segs).toFixed(2);
+    let d='', pen=false;
+    for(const p of part){
+      if(!p){ pen=false; continue; }
+      const [x,y]=P(p[0],p[1]);
+      d+=(pen?'L':'M')+x+' '+y; pen=true;
+    }
+    if(d) body+=`<path d="${d}" fill="none" stroke="${hex}" stroke-opacity="${op}" stroke-width="${strokeW}" stroke-linejoin="round" stroke-linecap="round"/>`;
+  }
+
+  // 行き先の建物 (敷地ぶんの枠)
+  const dst=mmDest(a);
+  const gcol = dst && dst.there ? '#30e070' : '#ffb020';
+  if(dst){
+    const st=structAt(dst.r, dst.c);
+    const r0=st?st.r:dst.r, c0=st?st.c:dst.c, fp=st?st.fp:1;
+    const x=v.px(c0), y=v.py(r0+fp), w=fp*s;
+    const m=_hs(2);
+    body+=`<rect x="${(x-m).toFixed(1)}" y="${(y-m).toFixed(1)}" width="${(w+m*2).toFixed(1)}" height="${(w+m*2).toFixed(1)}"`
+         +` fill="${gcol}" fill-opacity="0.35" stroke="${gcol}" stroke-width="${_hs(2)}"/>`;
+  }
+
+  // これから歩く経路 (点線)。いまの位置 → 経路の残り → 行き先
+  if(dst && !dst.there && !inside){
+    const pts=[P(a.x, a.y)];
+    if(Array.isArray(a.path)) for(let i=Math.max(0,a.pathIdx|0);i<a.path.length;i++) pts.push(C(a.path[i][0], a.path[i][1]));
+    pts.push(C(dst.r, dst.c));
+    const d=pts.map((p,i)=>(i?'L':'M')+p[0]+' '+p[1]).join('');
+    body+=`<path d="${d}" fill="none" stroke="#ffb020" stroke-opacity="0.85" stroke-width="${Math.max(1,_hs(1.8))}"`
+         +` stroke-dasharray="${_hs(4)} ${_hs(3)}" stroke-linejoin="round"/>`;
+  }
+
+  // いまの位置 (常に窓の真ん中)
+  const here=[(pad+M/2).toFixed(1), (pad+M/2).toFixed(1)];
+  body+=`<circle cx="${here[0]}" cy="${here[1]}" r="${_hs(4)}" fill="${hex}" stroke="#ffffff" stroke-width="${_hs(1.6)}"/>`;
+
+  // 行き先が窓の外なら、縁にその方向を指す矢印を出す (経路の点線は窓で切れるので)
+  let edge='';
+  if(dst){
+    const gx=v.px(dst.c+0.5), gy=v.py(dst.r+0.5), mid=pad+M/2;
+    if(gx<pad || gx>pad+M || gy<pad || gy>pad+M){
+      const dx=gx-mid, dy=gy-mid, half=M/2-_hs(7);
+      const t=Math.min(Math.abs(dx)>1e-6 ? half/Math.abs(dx) : Infinity, Math.abs(dy)>1e-6 ? half/Math.abs(dy) : Infinity);
+      const ex=mid+dx*t, ey=mid+dy*t, L=Math.hypot(dx,dy)||1, ux=dx/L, uy=dy/L, k=_hs(6);
+      const pt=(x,y)=>x.toFixed(1)+','+y.toFixed(1);
+      edge=`<polygon points="${pt(ex+ux*k, ey+uy*k)} ${pt(ex-ux*k*0.6-uy*k*0.75, ey-uy*k*0.6+ux*k*0.75)} ${pt(ex-ux*k*0.6+uy*k*0.75, ey-uy*k*0.6-ux*k*0.75)}"`
+          +` fill="${gcol}" stroke="#050b10" stroke-width="${_hs(1)}"/>`;
+    }
+  }
+
+  // 下の一行: 行き先の名前と残りのセル数
+  let cap;
+  const t = dst ? BUILDING_TYPES[dst.r+'_'+dst.c] : null;
+  // 自宅 / 職場に向かっているときは建物の種類ではなくそう書く (「住宅」だと誰の家か分からない)
+  const isAt=(p)=>p && p[0]===dst.r && p[1]===dst.c;
+  const nm = !dst ? '' : isAt(a.home) ? (JA_HUD?'自宅':'home') : isAt(a.work) ? (JA_HUD?'職場':'work')
+           : t!=null ? (JA_HUD ? BLDG_TYPES[t].label : enOf(t)) : '';
+  // 板が狭いので 2 行に分ける: 1 行目=行き先の名前 / 2 行目=残りマス数 (着いた等)
+  let cap2='';
+  if(!dst)            cap = JA_HUD ? '行き先なし' : 'no goal';
+  else if(dst.there){ cap = nm || (JA_HUD?'目的地':'destination'); cap2 = JA_HUD ? '着いた' : 'arrived'; }
+  else {
+    const left = Array.isArray(a.path) ? Math.max(0, a.path.length-(a.pathIdx|0)) : Math.round(Math.hypot(a.x-dst.r, a.y-dst.c));
+    cap = (JA_HUD?'→ ':'to ')+(nm||'?'); cap2 = JA_HUD ? `あと${left}マス` : `${left} cells`;
+  }
+
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${MM_W}" height="${MM_H}">`
+    +`<defs><clipPath id="mmclip"><rect x="${pad}" y="${pad}" width="${M}" height="${M}" rx="${_hs(4)}"/></clipPath></defs>`
+    +`<rect width="${MM_W}" height="${MM_H}" rx="${_hs(6)}" fill="#050b10" fill-opacity="0.72"/>`
+    +`<g clip-path="url(#mmclip)">${body}</g>`
+    +edge
+    +`<rect x="${pad}" y="${MM_W-pad+_hs(3)}" width="${_hs(8)}" height="${_hs(8)}" fill="${gcol}"/>`
+    +`<text x="${pad+_hs(13)}" y="${MM_W-pad+_hs(11)}" font-size="${_hs(11)}" fill="#dfeee9"`
+    +` font-family="${HUD_FACE_T}">${_esc(hudFit(cap, MM_W-pad*2-_hs(14), _hs(11)))}</text>`
+    +(cap2 ? `<text x="${pad+_hs(13)}" y="${MM_W-pad+_hs(24)}" font-size="${_hs(10)}" fill="#9fd8c8"`
+            +` font-family="${HUD_FACE_T}">${_esc(hudFit(cap2, MM_W-pad*2-_hs(14), _hs(10)))}</text>` : '')
+    +`<rect x="${MM_W-_hs(3)}" y="0" width="${_hs(3)}" height="${MM_H}" fill="${hex}"/>`
+    +`</svg>`);
+  if(hudMini){ hudScene.remove(hudMini); hudMini.material.map.dispose(); hudMini.material.dispose(); hudMini.geometry.dispose(); }
+  hudMini=hudPlane(MM_W, MM_H, tex);
+  // 右下。ティッカーの帯の上 (研究カードはこの上に積む → updateHud)
+  hudMini.position.set(WIDTH/2-MM_W/2-12, -HEIGHT/2+HUD_TICKER_H+6+MM_H/2+10, 1);
+  hudScene.add(hudMini);
+}
+
+function updateMinimap(now){
+  if(!MINIMAP_ON) return;
+  const a=mmTarget();
+  if(!a){
+    if(hudMini){ hudScene.remove(hudMini); hudMini.material.map.dispose(); hudMini.material.dispose(); hudMini.geometry.dispose(); hudMini=null; }
+    mmSig=''; return;
+  }
+  if(mmBusy || now-mmAt<300) return;   // 窓が本人と一緒に動くので、全体図より少し頻繁に
+  const tr=a.mmTrail||[], L=tr[tr.length-1], d=mmDest(a);
+  const sig=[a.aid, tr.length, L&&L.join(','), d&&[d.r,d.c,d.there].join(','), a.pathIdx, MW.isIndoors(a)?1:0].join('|');
+  if(sig===mmSig && hudMini) return;
+  mmSig=sig; mmBusy=true; mmAt=now;
+  refreshMinimap(a).catch(e=>console.warn('[HUD]',e.message)).finally(()=>{mmBusy=false;});
+}
+
+// ── 実験の場面 (画面下の中央) ──────────────────────────────────────────────
+//   研究は右下のカードに 1 行増えるだけで、画のどこで何が起きているのか分からなかった。
+//   実験が始まるとカメラが研究者に寄る (showCityEvent) ので、その間だけ
+//     ・何を試しているか (素材 / 場所 / 人 / 時間 の 4 枠)
+//     ・結果までの秒読み
+//     ・結果のランプ (合っている数だけ 1 つずつ点く。どの枠かは出さない = ヒット&ブロー)
+//   を出す。カメラがその実験を映していないときは出さない (画と関係ない札になるので)。
+//   EXP_SCENE=0 で消える。
+const EXP_SCENE_ON  = TECH_ON && process.env.EXP_SCENE !== '0';
+const EXP_REVEAL_MS = 650;                       // ランプを 1 つ点ける間隔 (実時間)
+const EXP_HOLD_SEC  = 5;                         // 全部点いてから映しておく秒数
+const EXP_W = _hs(380), EXP_H = _hs(116);
+const expScenes = new Map();                     // aid → 場面
+let hudExp=null, expBusy=false, expSig='';
+
+// 実験の開始 (techStepAgent から)。カメラは結果発表まで映し続ける長さを取る。
+function expSceneStart(a, R, h){
+  if(!EXP_SCENE_ON) return null;
+  const [m,p,t,tm]=TECH.dec(h);
+  const D=TECH.RESEARCH[R.k], S=techStepOf(R);
+  const L = o => JA_HUD ? o.ja : o.en;
+  const sc={ aid:a.aid, name:a.name, trait:L(TECH.TRAITS[D.traits[t]]),
+    slots:[ [JA_HUD?'素材':'item',  L(D.materials[m])], [JA_HUD?'場所':'place', L(TECH.PLACES[p])],
+            [JA_HUD?'人':'who',     L(TECH.TRAITS[D.traits[t]])], [JA_HUD?'時間':'time', L(TECH.TIMES[tm])] ],
+    goal:L(S), t0:Date.now(), dueAt:Date.now()+TECH_TEST_SEC*1000,
+    hits:null, left:null, tries:null, revealAt:0 };
+  expScenes.set(a.aid, sc);
+  console.log(`[ExpScene] start ${a.name} q=${camEvents.length} cur=${camEventCur?(camEventCur.tag?'exp':'other'):'none'}`);   // TMP_EXP
+  return sc;
+}
+// 結果 (techResult から)。カメラがもう別のところへ行っていたら、発表の場面を足す。
+function expSceneResult(a, hits, left, tries){
+  const sc=expScenes.get(a.aid);
+  if(!sc) return false;
+  sc.hits=hits; sc.left=left; sc.tries=tries;
+  const onAir = camEventCur && camEventCur.tag===sc;
+  const queued = camEvents.some(e=>e.tag===sc);
+  if(onAir){
+    // 映している最中なら、ランプを全部点け終わるまで延ばす
+    const need=Date.now() + hits*EXP_REVEAL_MS + 900 + EXP_HOLD_SEC*1000;
+    if(camEventCur.until<need) camEventCur.until=need;
+    return true;     // バナーは場面の札が兼ねるので出さない
+  }
+  if(!queued){
+    showCityEvent(Math.floor(a.x), Math.floor(a.y), null, hits*EXP_REVEAL_MS/1000 + 1 + EXP_HOLD_SEC, null, {tag:sc});
+  }
+  return true;
+}
+// 結果を出さずに終わった (生活に戻った等)。映している最中なら札だけ畳む。
+function expSceneAbort(aid){
+  const sc=expScenes.get(aid);
+  if(sc && sc.hits==null) expScenes.delete(aid);
+}
+
+function expCaption(sc, lit, done){
+  const J=JA_HUD;
+  if(sc.hits==null){
+    const s=Math.ceil((sc.dueAt-Date.now())/1000);
+    return [J?(s>0?`結果まで あと${s}秒`:'まもなく結果…'):(s>0?`result in ${s}s`:'any moment now...'), '#9fd8c8'];
+  }
+  if(!done) return [J?'結果は…':'and the result is...', '#9fd8c8'];
+  const h=sc.hits;
+  const say = J ? (h===4?'全部合った! 発明!':h===3?'3つ合っている! 惜しい':h===2?'2つ合っている。手応えあり':h===1?'1つだけ合っている':'全部はずれ。これも手がかり')
+                : (h===4?'All four! Invented!':h===3?'3 right - so close!':h===2?'2 right - getting warmer':h===1?'only 1 right':'none right - still a clue');
+  return [say, h>=3?'#00d2a0':h===0?'#ff8a8a':'#f5c542'];
+}
+
+async function refreshExpScene(sc, lit, done){
+  const W=EXP_W, H=EXP_H, pad=_hs(12), J=JA_HUD;
+  const fs=_hs(12), fsS=_hs(10);
+  let body='';
+  // 1 行目: 誰が / 何のために
+  const head=J?`実験  ${sc.name} (${sc.trait})`:`EXPERIMENT  ${sc.name} (${sc.trait})`;
+  const goal=J?`「${sc.goal}」を作りたい`:`trying to make ${sc.goal}`;
+  body+=`<text x="${pad}" y="${_hs(19)}" font-size="${_hs(13)}" font-weight="bold" fill="#f5c542" font-family="${HUD_FACE_T}">${_esc(hudFit(head, W*0.56, _hs(13)))}</text>`;
+  body+=`<text x="${W-pad}" y="${_hs(19)}" font-size="${fsS}" text-anchor="end" fill="#9fd8c8" font-family="${HUD_FACE_T}">${_esc(hudFit(goal, W*0.42, fsS))}</text>`;
+  // 2 行目: 4 枠
+  const gap=_hs(6), bw=(W-pad*2-gap*3)/4, by=_hs(28), bh=_hs(32);
+  sc.slots.forEach(([lab,val],i)=>{
+    const x=pad+i*(bw+gap);
+    body+=`<rect x="${x.toFixed(1)}" y="${by}" width="${bw.toFixed(1)}" height="${bh}" rx="${_hs(4)}" fill="#1f2e2c" stroke="#5d7672" stroke-width="1"/>`;
+    body+=`<text x="${(x+bw/2).toFixed(1)}" y="${by+_hs(11)}" font-size="${_hs(9)}" text-anchor="middle" fill="#7f9690" font-family="${HUD_FACE_T}">${_esc(_hud(lab))}</text>`;
+    body+=`<text x="${(x+bw/2).toFixed(1)}" y="${by+_hs(26)}" font-size="${fs}" text-anchor="middle" fill="#ffffff" font-weight="bold" font-family="${HUD_FACE_T}">${_esc(hudFit(val, bw-_hs(6), fs))}</text>`;
+  });
+  // 3 行目: ランプ (合っている数)。どの枠が合っているかは出さない
+  const ly=_hs(80), lr=_hs(8);
+  body+=`<text x="${pad}" y="${ly+_hs(4)}" font-size="${fsS}" fill="#9fd8c8" font-family="${HUD_FACE_T}">${_esc(_hud(J?'合っている数':'how many right'))}</text>`;
+  const lx0=pad+_hs(J?84:96);
+  for(let i=0;i<4;i++){
+    const cx=lx0+i*(lr*2+_hs(6)), on=i<lit;
+    if(sc.hits==null){
+      body+=`<circle cx="${cx}" cy="${ly}" r="${lr}" fill="#16211f" stroke="#5d7672" stroke-width="1.2"/>`
+           +`<text x="${cx}" y="${ly+_hs(4)}" font-size="${_hs(10)}" text-anchor="middle" fill="#5d7672" font-family="${HUD_FACE_T}">?</text>`;
+    }else{
+      body+= on ? `<circle cx="${cx}" cy="${ly}" r="${lr}" fill="#00d2a0" stroke="#bfffe9" stroke-width="1.2"/>`
+                : `<circle cx="${cx}" cy="${ly}" r="${lr}" fill="#16211f" stroke="${done?'#7a4a4a':'#5d7672'}" stroke-width="1.2"/>`;
+    }
+  }
+  const [cap,col]=expCaption(sc, lit, done);
+  const cx0=lx0+4*(lr*2+_hs(6))+_hs(4);
+  body+=`<text x="${cx0}" y="${ly+_hs(4)}" font-size="${fs}" font-weight="bold" fill="${col}" font-family="${HUD_FACE_T}">${_esc(hudFit(cap, W-pad-cx0, fs))}</text>`;
+  // 4 行目: 決まりごと / 進み具合
+  const foot = (done && sc.left!=null)
+    ? (J?`どの枠が合っているかは分からない · ${sc.tries}回目の実験 · 残り${sc.left}通り`
+        :`which ones are right stays hidden - test #${sc.tries}, ${sc.left} options left`)
+    : (J?'4枠のうち いくつ合っているかだけが分かる':'only the number of right picks is revealed');
+  body+=`<text x="${pad}" y="${H-_hs(9)}" font-size="${fsS}" fill="#7f9690" font-family="${HUD_FACE_T}">${_esc(hudFit(foot, W-pad*2, fsS))}</text>`;
+  const {tex}=await svgTexture(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`
+    +`<rect width="${W}" height="${H}" rx="${_hs(7)}" fill="#050b10" fill-opacity="0.80"/>`
+    +`<rect x="0" y="0" width="${W}" height="${_hs(3)}" fill="#f5c542"/>`
+    +body+`</svg>`);
+  if(hudExp){ hudScene.remove(hudExp); hudExp.material.map.dispose(); hudExp.material.dispose(); hudExp.geometry.dispose(); }
+  hudExp=hudPlane(W, H, tex);
+  // 画面下の中央。ティッカーの帯の上
+  hudExp.position.set(0, -HEIGHT/2+HUD_TICKER_H+6+H/2+10, 1);
+  hudScene.add(hudExp);
+}
+
+function updateExpScene(now){
+  if(!EXP_SCENE_ON) return;
+  const sc = camEventCur && camEventCur.tag && expScenes.has(camEventCur.tag.aid) ? camEventCur.tag : null;
+  // 映し終わった場面は捨てる (結果が出ていて、もうカメラに乗っていないもの)
+  for(const [aid,s] of expScenes){
+    if(s!==sc && s.hits!=null && s.revealAt && !camEvents.some(e=>e.tag===s)) expScenes.delete(aid);
+    else if(now-s.t0>180000) expScenes.delete(aid);              // 何かで取り残された場面
+  }
+  if(!sc){
+    if(hudExp){ hudScene.remove(hudExp); hudExp.material.map.dispose(); hudExp.material.dispose(); hudExp.geometry.dispose(); hudExp=null; }
+    expSig=''; return;
+  }
+  if(!sc._seen){ sc._seen=1; console.log(`[ExpScene] on air ${sc.name}`); }   // TMP_EXP
+  if(sc.hits!=null && !sc.revealAt) sc.revealAt=now;                // 発表はカメラに乗ってから
+  const lit = sc.revealAt ? Math.min(sc.hits, Math.floor((now-sc.revealAt)/EXP_REVEAL_MS)) : 0;
+  const done = !!sc.revealAt && now-sc.revealAt >= sc.hits*EXP_REVEAL_MS + 700;
+  const sig=[sc.aid, sc.t0, lit, done?1:0, sc.hits==null?Math.ceil((sc.dueAt-now)/1000):'r'].join('|');
+  if(sig===expSig || expBusy) return;
+  expSig=sig; expBusy=true;
+  refreshExpScene(sc, lit, done).catch(e=>console.warn('[HUD]',e.message)).finally(()=>{expBusy=false;});
+}
+
 // 毎フレーム呼ばれる。テクスチャの作り直しは「文字が変わったとき」だけで、
 // スクロールは板を動かすだけ (sharp を毎フレーム回さない)。
 function updateHud(dt){
@@ -3040,6 +3381,13 @@ function updateHud(dt){
     }
   }
   updateTechCard(now);
+  updateMinimap(now);
+  updateExpScene(now);
+  // 研究カードは右下でミニマップと重なるので、ミニマップが出ている間はその上に積む
+  if(hudTech){
+    const h=hudTech.geometry.parameters.height;
+    hudTech.position.y = -HEIGHT/2+HUD_TICKER_H+6+h/2+10 + (hudMini ? MM_H+8 : 0);
+  }
   // いま何を映しているか (最短1秒に1回だけ作り直す)
   if(!hudCamBusy && now-hudCamAt>1000){
     hudCamBusy=true; hudCamAt=now;
@@ -3216,15 +3564,36 @@ const glslPick = (fn, hexes) =>
 
 // 上衣 = instanceColor (ペルソナ色) / 下衣 = aWear.rgb / 肌と髪 = aWear.w が指す候補。
 // aWear.w には肌と髪の 2 つの番号を tone = 肌*4 + 髪 で詰めてある。
+// 小物 (帽子 / リュック / 靴) の色は aLook.yzw が指す候補 (skeleton.js の *_COLS)。
 const WEAR_COLOR_GLSL = `
   vColor = color;
   if(aPart > 0.5){
+    float _si = floor(aWear.w * 0.25 + 0.001);
     if(aPart < 1.5)      vColor = instanceColor;          // 上衣 (袖も)
     else if(aPart < 2.5) vColor = aWear.rgb;              // 下衣
-    else {
-      float _si = floor(aWear.w * 0.25);
-      vColor = (aPart < 3.5) ? mesaSkin(_si) : mesaHair(aWear.w - _si*4.0);
-    }
+    else if(aPart < 3.5) vColor = mesaSkin(_si);          // 肌
+    else if(aPart < 4.5 || aPart > 8.5) vColor = mesaHair(aWear.w - _si*4.0);   // 髪 (短髪 / 長い髪 / お団子)
+    else if(aPart < 6.5) vColor = mesaHat(aLook.y);       // 帽子
+    else if(aPart < 7.5) vColor = mesaBag(aLook.z);       // リュック
+    else                 vColor = mesaShoe(aLook.w);      // 靴
+  }
+`;
+// 付けていない小物を 1 点に潰す。**charmesh.partVisible と同じ規則**。
+//   aLook.x = 帽子 + 3*リュック + 6*髪型 (skeleton.js の lookStyle)。
+//   面積 0 の三角形はラスタライズされないので、消すのと同じになる。
+const LOOK_HIDE_GLSL = `
+  if(aPart > 3.5 && aPart != 8.0){
+    float _st=aLook.x+0.5;
+    float _hair=floor(_st/6.0), _rest=_st-_hair*6.0;
+    float _bag=floor(_rest/3.0), _hat=floor(_rest-_bag*3.0);
+    bool _hide =
+         (aPart == 5.0  && _hat != 1.0)
+      || (aPart == 6.0  && _hat != 2.0)
+      || (aPart == 7.0  && _bag != 1.0)
+      || (aPart == 9.0  && _hair != 1.0)
+      || (aPart == 10.0 && _hair != 2.0)
+      || (aPart == 4.0  && _hair == 3.0);
+    if(_hide) transformed = vec3(0.0, 0.0, ${(-CELL*.26+CELL*0.66*0.53).toFixed(5)});
   }
 `;
 
@@ -3233,8 +3602,9 @@ function addWalkShader(mat){
   mat.onBeforeCompile = (sh)=>{
     sh.vertexShader =
       'attribute vec4 aWalk;\nattribute float aBone;\n'
-    + 'attribute float aPart;\nattribute vec4 aWear;\n'
+    + 'attribute float aPart;\nattribute vec4 aWear;\nattribute vec4 aLook;\n'
     + glslPick('mesaSkin', SK.SKIN_TONES) + glslPick('mesaHair', SK.HAIR_TONES)
+    + glslPick('mesaHat', SK.HAT_COLS) + glslPick('mesaBag', SK.BAG_COLS) + glslPick('mesaShoe', SK.SHOE_COLS)
     + 'vec3 mesaRotX(vec3 p, float pz, float a){\n'
     + '  float s=sin(a), c=cos(a); float y=p.y, z=p.z-pz;\n'
     + '  return vec3(p.x, y*c - z*s, pz + y*s + z*c);\n}\n'
@@ -3281,6 +3651,7 @@ function addWalkShader(mat){
         // しぐさの首振りと沈み込み。**腰から上だけ**回す (足は床に残す)。
         if(_yaw != 0.0 && transformed.z > ${_f(SKZ('pelvis'))}) transformed = mesaRotZ(transformed, _yaw);
         transformed.z += _dz;
+        ${LOOK_HIDE_GLSL}
       }`);
     // three 既定の色経路 (頂点カラー × instanceColor) は使わず、部位で選ぶ。
     sh.vertexShader = sh.vertexShader.replace('#include <color_vertex>',
@@ -3304,7 +3675,6 @@ const CAR_SPEED = envNum('CAR_SPEED', 3.4);         // ワールド単位/秒 (�
 // 1車線 2.55m の生活道路なので、大型セダン (以前の 4.64m) だと車線から
 // はみ出さんばかりに見えていた。
 const CAR_L=DIM.CAR.len, CAR_W=DIM.CAR.wid;
-const CAR_BODY_Z=DIM.CAR.bodyZ, CAR_CAB_Z=DIM.CAR.cabZ, CAR_WHEEL_R=DIM.CAR.wheelR;
 const CAR_COLORS=[0xd8d8d4,0x2f3a4a,0xa83a32,0x2e6ea8,0x3f7a4a,0xd8a838,0x8a8f96,0x1f2227];
 const CAR_CAP = CAR_MAX + 4;
 // ── 前照灯 ──────────────────────────────────────────────────────────────────
@@ -3361,50 +3731,14 @@ let _carUse=null;
 const CarInst={ body:null, trim:null, alpha:null };
 
 // 車のジオメトリ。前方は +X (traffic.js の car.th と同じ向き)。
+// 形 (軽のトールワゴン: 傾いたフロントガラス、タイヤハウス、窓、バンパー) は
+// src/carmesh.js が持つ。tools/preview-car.js で同じ型紙を大きく描いて確かめられる。
+//   ・灯火は街灯と同じ考え方で、**本物のライトは使わない**。Lambert はライト数ぶん
+//     シェーダが重くなるので、光る灯具 (emissive を夜だけ上げる) と路面に落ちる光
+//     (加算合成の板) の 2 枚で見せる。どちらも InstancedMesh なので何台でも各 1 ドローコール。
 function buildCarGeos(){
   if(CarInst.geoBody) return;
-  const box=(lx,ly,z0,z1,dx)=>{
-    const g=new THREE.BoxGeometry(lx,ly,z1-z0);
-    g.translate(dx||0, 0, (z0+z1)/2);
-    return g;
-  };
-  const body=[
-    {geo:box(CAR_L, CAR_W, CAR_BODY_Z[0], CAR_BODY_Z[1]), color:new THREE.Color(0xffffff)},
-    {geo:box(CAR_L*0.52, CAR_W*0.86, CAR_CAB_Z[0], CAR_CAB_Z[1], -CAR_L*0.06),
-     color:new THREE.Color(0xffffff)},
-  ];
-  const trim=[];
-  // 車輪。前方 +X なので前後は ±X、左右は ±Y。
-  for(const sx of [1,-1]) for(const sy of [1,-1]){
-    const w=new THREE.CylinderGeometry(CAR_WHEEL_R, CAR_WHEEL_R, DIM.CAR.wheelW, 7);
-    w.translate(sx*CAR_L*0.32, sy*(CAR_W*0.5+0.005), CAR_WHEEL_R);
-    trim.push({geo:w, color:new THREE.Color(0x1a1c1f)});
-  }
-  // 窓 (フロントとリア)。夜に光らせたくなったらここを emissive にする。
-  for(const sx of [1,-1]){
-    const g=new THREE.BoxGeometry(0.02, CAR_W*0.72, (CAR_CAB_Z[1]-CAR_CAB_Z[0])*0.72);
-    g.translate(sx*CAR_L*0.20, 0, (CAR_CAB_Z[0]+CAR_CAB_Z[1])/2);
-    trim.push({geo:g, color:new THREE.Color(0x9fd8e8)});
-  }
-  // ── 灯火 (前照灯 / 尾灯) ──
-  // 街灯と同じ考え方で、**本物のライトは使わない**。Lambert はライト数ぶんシェーダが
-  // 重くなるので、車が数十台も走ると llvmpipe では破綻する。代わりに
-  //   ・光る灯具 (emissive を夜だけ上げる)
-  //   ・路面に落ちる光 (加算合成の板)
-  // の2枚で見せる。どちらも InstancedMesh なので **何台走っても各1ドローコール**。
-  const lamp=[];
-  const lw=CAR_W*0.17, lh=(CAR_BODY_Z[1]-CAR_BODY_Z[0])*0.30;
-  const lz=CAR_BODY_Z[0]+(CAR_BODY_Z[1]-CAR_BODY_Z[0])*0.52;
-  for(const sy of [1,-1]){                       // 前照灯 (白) … 前方 +X
-    const g=new THREE.BoxGeometry(0.02, lw*2, lh*2);
-    g.translate(CAR_L*0.49, sy*CAR_W*0.30, lz);
-    lamp.push({geo:g, color:new THREE.Color(0xfff2d2)});
-  }
-  for(const sy of [1,-1]){                       // 尾灯 (赤) … 後方 -X
-    const g=new THREE.BoxGeometry(0.02, lw*1.6, lh*1.4);
-    g.translate(-CAR_L*0.49, sy*CAR_W*0.30, lz);
-    lamp.push({geo:g, color:new THREE.Color(0xd83a24)});
-  }
+  const {body, trim, lamp}=CARMESH.build(THREE, DIM.CAR);
   CarInst.geoBody=mergeGeos(body);
   CarInst.geoTrim=mergeGeos(trim);
   CarInst.geoLamp=mergeGeos(lamp);
@@ -3807,9 +4141,12 @@ function initAgentInstances(S){
   // aWalk=(位相, 振幅, しぐさ番号, しぐさ時間)。しぐさの分で 2→4 成分に増やした。
   const walk=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*4), 4);
   const wear=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*4), 4);
-  walk.setUsage(THREE.DynamicDrawUsage); wear.setUsage(THREE.DynamicDrawUsage);
+  // aLook=(小物の組み合わせ, 帽子の色, リュックの色, 靴の色)
+  const look=new THREE.InstancedBufferAttribute(new Float32Array(AGENT_CAP*4), 4);
+  walk.setUsage(THREE.DynamicDrawUsage); wear.setUsage(THREE.DynamicDrawUsage); look.setUsage(THREE.DynamicDrawUsage);
   _agentGeo.setAttribute('aWalk', walk);
   _agentGeo.setAttribute('aWear', wear);
+  _agentGeo.setAttribute('aLook', look);
 
   // vertexColors を有効にして three に `color` と `vColor` を用意させる。
   // 実際にどの色を vColor へ入れるかは WEAR_COLOR_GLSL が部位ごとに決める。
@@ -3818,6 +4155,12 @@ function initAgentInstances(S){
   addWalkShader(mat);
 
   const mesh=new THREE.InstancedMesh(_agentGeo, mat, AGENT_CAP);
+  // 影も同じシェーダで描く。既定の深度マテリアルだと、影だけ棒立ちのまま
+  //   **全員が帽子もリュックも長い髪も付けた形**になる (小物を潰すのは頂点シェーダなので)。
+  const depth=new THREE.MeshDepthMaterial({depthPacking:THREE.RGBADepthPacking});
+  depth.userData.shared=true;
+  addWalkShader(depth);
+  mesh.customDepthMaterial=depth;
   // instanceColor は **ここで明示的に用意する**。setColorAt 任せだと、住民が
   // 1 人も居ない状態で最初のフレームを描いたときに USE_INSTANCING_COLOR が
   // 立たず、instanceColor を参照するシェーダがコンパイルに失敗する。
@@ -3830,12 +4173,16 @@ function initAgentInstances(S){
   markShadow(mesh, true, false);
   S.add(mesh);
 
-  AgentInst.mesh=mesh; AgentInst.walk=walk; AgentInst.wear=wear;
+  AgentInst.mesh=mesh; AgentInst.walk=walk; AgentInst.wear=wear; AgentInst.look=look;
   _slotColor.fill(-1); _slotWear.fill(-1);   // シーンを作り直したら詰め直す
 }
 
 // 住民ごとの服装。上衣はペルソナ色 (instanceColor) なので、ここで決めるのは
-// 下衣の色と、肌・髪の番号。**aid から作った固定値**なので毎回同じ人が同じ服になる。
+// 下衣の色と、肌・髪の番号、小物 (帽子 / リュック / 髪型 / 靴の色) と背の高さ。
+// **aid から作った固定値**なので毎回同じ人が同じ服になる。
+//   小物は年齢と性別で出やすさを変える (子どもはリュック、お年寄りは帽子、など)。
+//   背の高さは年齢で大きく変え (幼児 0.62 〜 大人 1.0)、大人には ±6% の個人差を足す。
+const LOOK_ON = process.env.CHAR_LOOK !== '0';
 function agentWear(a){
   if(a._wear) return a._wear;
   let h=2166136261;                                  // FNV-1a
@@ -3843,9 +4190,40 @@ function agentWear(a){
   h>>>=0;
   const pants=SK.PANTS[h % SK.PANTS.length];
   const skin =(h>>>7)  % SK.SKIN_TONES.length;
-  const hair =(h>>>13) % SK.HAIR_TONES.length;
+  let   hair =(h>>>13) % SK.HAIR_TONES.length;
+  // 小物用に別の乱数列 (服の色と相関させない)
+  let h2=Math.imul(h ^ 0x9e3779b9, 0x85ebca6b)>>>0;
+  const R=()=>{ h2=Math.imul(h2 ^ (h2>>>15), 0x2c1b3c6d)>>>0; h2^=h2>>>12; return (h2>>>0)/4294967296; };
+  const def=a.def||{}, age=Number.isFinite(def.age) ? def.age : 32, f=def.gender==='f';
+  const L=SK.LOOK;
+  let hat=L.HAT_NONE, bag=0, hs=L.HAIR_SHORT, height=1;
+  if(LOOK_ON){
+    const kid=age<13, teen=age>=13&&age<20, old=age>=65;
+    const pCap   = kid?0.35 : teen?0.25 : old?0.22 : 0.14;
+    const pKnit  = kid?0.10 : teen?0.12 : old?0.20 : 0.08;
+    const pBag   = kid?0.65 : teen?0.50 : old?0.05 : 0.20;
+    const r=R();
+    hat = r<pCap ? L.HAT_CAP : r<pCap+pKnit ? L.HAT_BEANIE : L.HAT_NONE;
+    bag = R()<pBag ? 1 : 0;
+    const rh=R();
+    if(f) hs = rh<0.45 ? L.HAIR_LONG : rh<0.70 ? L.HAIR_BUN : L.HAIR_SHORT;
+    else  hs = (old && rh<0.35) ? L.HAIR_BALD : rh<0.06 ? L.HAIR_LONG : L.HAIR_SHORT;
+    if(old && R()<0.55) hair=SK.HAIR_TONES.length-1;   // お年寄りは白髪が多い
+    // 背の高さ (身長比)。子どもは年齢でほぼ決まる。大人は性別で少しずらして個人差を足す
+    const base = age<4 ? 0.58 : age<7 ? 0.66 : age<10 ? 0.74 : age<13 ? 0.82 : age<16 ? 0.92
+               : old ? 0.96 : 1.0;
+    const sex  = age>=13 ? (f ? 0.965 : 1.03) : 1;
+    height = +(base*sex*(1 + (R()*2-1)*0.06)).toFixed(3);
+  }
+  const look={ hat, bag, hair:hs, style:SK.lookStyle(hat,bag,hs),
+               hatC:Math.floor(R()*SK.HAT_COLS.length), bagC:Math.floor(R()*SK.BAG_COLS.length),
+               shoeC:Math.floor(R()*SK.SHOE_COLS.length) };
+  const lookKey = look.style + 24*(look.hatC + 8*(look.bagC + 8*look.shoeC));
   // 肌と髪は 1 つの float に詰める (インスタンス属性を増やさないため)
-  return a._wear={ pants, tone: skin*4+hair, key: pants*16 + skin*4 + hair };
+  return a._wear={ pants, tone: skin*4+hair, look, height,
+                   // 横幅は背の伸びほどは変えない (子どもが棒にならないよう半分だけ)
+                   width: +(1-(1-height)*0.5).toFixed(3),
+                   key: (pants*16 + skin*4 + hair) + 128*lookKey };
 }
 
 const _acol=new THREE.Color();
@@ -3895,6 +4273,8 @@ function syncAgentInstances(){
     if(_slotWear[k]!==we.key){
       _acol.set(we.pants);
       wr[k*4]=_acol.r; wr[k*4+1]=_acol.g; wr[k*4+2]=_acol.b; wr[k*4+3]=we.tone;
+      const lk=AgentInst.look.array, L=we.look;
+      lk[k*4]=L.style; lk[k*4+1]=L.hatC; lk[k*4+2]=L.bagC; lk[k*4+3]=L.shoeC;
       _slotWear[k]=we.key; wearDirty=true;
     }
     w[k*4]=o.userData.ph||0;   w[k*4+1]=o.userData.amp||0;
@@ -3904,7 +4284,7 @@ function syncAgentInstances(){
   M.count=k;
   M.instanceMatrix.needsUpdate=true;
   if(colDirty && M.instanceColor) M.instanceColor.needsUpdate=true;
-  if(wearDirty) AgentInst.wear.needsUpdate=true;
+  if(wearDirty){ AgentInst.wear.needsUpdate=true; AgentInst.look.needsUpdate=true; }
   AgentInst.walk.needsUpdate=true;
   _drawnAgents=k;
 }
@@ -6983,7 +7363,8 @@ let camEventCur = null;
 // opts.wide = true で引きの画 (街全体を見せたいとき。発展段階が上がった瞬間など)。
 function showCityEvent(r, c, banner, secs, anim, opts){
   if(anim) prepStructAnim(anim.st, anim.kind);
-  camEvents.push({r, c, banner, secs:secs||EVENT_CAM_SEC, anim, wide:!!(opts&&opts.wide)});
+  // opts.tag … 誰の何の場面か (実験の札が「いまカメラに乗っているか」を見るのに使う)
+  camEvents.push({r, c, banner, secs:secs||EVENT_CAM_SEC, anim, wide:!!(opts&&opts.wide), tag:(opts&&opts.tag)||null});
   while(camEvents.length>4){
     // 溢れたぶんは映せないが、アニメだけは走らせる (地面の下に沈めたまま放置しない)
     const drop=camEvents.shift();
@@ -7489,6 +7870,7 @@ function stepNeeds(dtSec){
     // 歩きながらの気づきを HLP へ上げる (PERCEPT=off の既定では何も走らない)。
     // **新しい走査は足さない** — いま埋めたばかりの _nearBuf を渡すだけ。
     if(HLP_ON) hlpScan(a, _nearBuf);
+    if(TASTE_STATE && TASTE_GLANCE_R>0) tasteGlance(a);
     if(!alone && CITY_EVOLVE && RNG.R()<GOSSIP_P*dtSec)
       gossip(a, _nearBuf[0]);      // すれ違いざまに「行きつけ」の話をする (低確率)
     // スマホ以降は、**離れた友だち**にも口コミが届く。集積が起きるかどうかの実験の軸。
@@ -8215,6 +8597,15 @@ const TASTE_STATE = (()=>{
   return S;
 })();
 const tasteZ = (a, t) => TASTE_STATE ? TASTE.scores(TASTE_STATE, a)[t] : 0;
+// 見かけた知らない店が好みなら、寄ってみたくなる (tasteGlance)。
+// 見回しは計算済みの z と見通し (losClear) だけで、画像の推論はしない。
+// ★ 行き先を**直接は書き換えない**。vec の候補に上乗せするだけなので、空腹や眠気が
+//   強ければそちらが勝つ。「寝る時間なのに新しい店に吸い込まれる」を防ぐため。
+const TASTE_GLANCE_R  = Math.max(0, envNum('TASTE_GLANCE_R', 4));   // 何セル先まで目に入るか (0 で見回さない)
+const TASTE_GLANCE_Z  = envNum('TASTE_GLANCE_Z', 1.0);              // この z 以上の店だけが気になる
+const TASTE_CURIOUS   = envNum('TASTE_CURIOUS', 0.2);               // 気になった店への上乗せ (≒6セルぶん近く感じる)
+const TASTE_CURIOUS_H = envNum('TASTE_CURIOUS_H', 3);               // 気になっている時間 (街の中の時間)
+const isCurious = (a, key) => !!(a.curious && a.curious.key===key && a.curious.until>simNow());
 if(VEC_ON && process.env.HLP_NET==='1') console.warn('[Vec] ⚠ HLP_NET=1 だが、行動のベクトル化 (VEC=1) では hlp.onnx を使わない。学習した方策で選ぶなら VEC=0');
 if(VEC_ON) console.log(`[Vec] on チャンネル ${VEC.NC} (${VEC.CH.map(c=>c.ja).join('/')}) — 行動の一覧ではなくベクトルの照合で選ぶ`);
 
@@ -8264,7 +8655,8 @@ function vecCandidates(a){
   const jit=k=>(VEC_JITTER>0 ? (_vecHash(a.aid+':'+day+':'+k)-0.5)*2*VEC_JITTER : 0);
   for(const p of vecPublicPlaces()){
     out.push({key:p.key, kind:'place', typeName:p.typeName, r:p.r, c:p.c, A:p.A, price:p.price, st:p.st,
-      dist:dist(p.r,p.c), fam:VEC_FAM*prefOf(a, p.key) + TASTE_W*tasteZ(a, p.st.typeIdx), jit:jit(p.key)});
+      dist:dist(p.r,p.c), jit:jit(p.key),
+      fam:VEC_FAM*prefOf(a, p.key) + TASTE_W*tasteZ(a, p.st.typeIdx) + (isCurious(a, p.key)?TASTE_CURIOUS:0)});
   }
   if(a.home){
     out.push({key:'home', kind:'home', typeName:'home', r:a.home[0], c:a.home[1],
@@ -8535,12 +8927,34 @@ function lifeReportDaily(day){
 }
 // 来店した店の種類が、その人の見た目の好み (z) でどれくらい上だったか。
 // TASTE_W=0 と比べて上がっていれば、好みが行き先を動かしている。
-let _taste={n:0, z:0};
+// glances … 知らない好みの店が目に入って気になった回数 / lured … 実際に寄った回数
+let _taste={n:0, z:0, glances:0, lured:0};
 function tasteReportDaily(day){
   if(!TASTE_STATE) return;
   console.log('[TasteJSON] '+JSON.stringify({day, w:TASTE_W, visits:_taste.n,
-    meanZ:_taste.n?+(_taste.z/_taste.n).toFixed(3):null}));
-  _taste={n:0, z:0};
+    meanZ:_taste.n?+(_taste.z/_taste.n).toFixed(3):null, glances:_taste.glances, lured:_taste.lured}));
+  _taste={n:0, z:0, glances:0, lured:0};
+}
+
+// 歩きながら見回す (stepNeeds から 1 秒に 1 回)。半径 R の建物セルを舐めるだけなので
+// 100 人でも 1 秒あたり 8000 回の表引き程度。見通しは候補が見つかったときだけ引く。
+function tasteGlance(a){
+  if(MW.isIndoors(a) || (a.curious && a.curious.until>simNow())) return;
+  const r0=Math.floor(a.x), c0=Math.floor(a.y), R=TASTE_GLANCE_R;
+  let best=null, bz=TASTE_GLANCE_Z;
+  for(let dr=-R; dr<=R; dr++) for(let dc=-R; dc<=R; dc++){
+    const st=structAt(r0+dr, c0+dc);
+    if(!st || st.state!=='open' || !CHOOSABLE(st.typeIdx)) continue;
+    // 知っている店 (行ったことがある / 口コミで聞いた) は「見かけた」にならない
+    if(a.pref && a.pref[prefKey(st)]) continue;
+    const z=tasteZ(a, st.typeIdx);
+    if(z<bz || !losClear(a.x, a.y, st.r+0.5, st.c+0.5)) continue;
+    best=st; bz=z;
+  }
+  if(!best) return;
+  a.curious={key:prefKey(best), z:+bz.toFixed(2),
+             until:simNow() + TASTE_CURIOUS_H*(DAY_MINUTES*60/24)*1000};
+  _taste.glances++;
 }
 function vecReportDaily(day){
   const ent=Object.entries(_vecSig).sort((x,y)=>y[1]-x[1]);
@@ -11345,6 +11759,18 @@ function learnFromVisit(a, st, pathLen){
   if(TASTE_STATE){
     _taste.n++; _taste.z+=tasteZ(a, st.typeIdx);
     TASTE.learn(TASTE_STATE, a, st.typeIdx, reward);
+    if(isCurious(a, key)){
+      _taste.lured++;
+      a.curious=null;
+      CH.push(a, {day:gameDay(), icon:'👀',
+        ja:`見かけた${shopNameJa(st)}が気になって入ってみた`, en:`went into ${shopNameEn(st)} on a whim`});
+      // 開店したばかりの店だけニュースに出す (どこにでも出すと流れが埋まる)。1軒1日1回まで。
+      if(st.founded && gameDay()-(st.born||0)<=NEWSHOP_DAYS && st._lureDay!==gameDay()){
+        st._lureDay=gameDay();
+        news('taste', `👀 ${a.name} が開店したばかりの ${shopNameJa(st)} に吸い寄せられた`,
+             `${a.name} was drawn into the brand-new ${shopNameEn(st)}`);
+      }
+    }
   }
   // 勧められて来たのなら、その結果を記録する (定着したかの判定に使う)
   if(a.taught && a.taught.key===key) a.taught.tried=true;
@@ -12688,6 +13114,7 @@ function techGo(a){
 
 function techEnd(a){
   if(!a.research) return;
+  expSceneAbort(a.aid);       // 結果を出さずに終わった実験の札は畳む
   a.research=null;
   a.rally=false;
   if(a.mode==='hold') a.mode='wander';
@@ -12734,9 +13161,15 @@ function techStepAgent(a){
       Q.phase='test'; Q.since=now; Q.waitUntil=now+TECH_TEST_SEC*1000;
       a.th=Math.atan2(Q.site[1]+0.5-a.y, Q.site[0]+0.5-a.x);
       const tr=techTraitJa(R.k, TECH.dec(Q.h)[2]);
+      // 画面下の札 (expScene) が出せるときは、何を試すかは札に任せてバナーは出さない。
+      //   カメラは結果発表まで映したいので、結果が少し遅れても切れないよう余裕を持たせる
+      //   (着いたら expSceneResult がランプを点け終わるまで延ばす)。
+      const sc=expSceneStart(a, R, Q.h);
       showCityEvent(Math.floor(a.x), Math.floor(a.y),
-        JA_HUD ? `実験中: ${a.name}(${tr})  ${techLabel(R.k, Q.h)}`
-               : `Experiment: ${a.name} tries ${techLabel(R.k, Q.h)}`, TECH_TEST_SEC);
+        sc ? null
+           : (JA_HUD ? `実験中: ${a.name}(${tr})  ${techLabel(R.k, Q.h)}`
+                     : `Experiment: ${a.name} tries ${techLabel(R.k, Q.h)}`),
+        TECH_TEST_SEC + (sc ? 3 : 0), null, sc ? {tag:sc} : undefined);
     }
     return;
   }
@@ -12761,6 +13194,7 @@ function techResult(a){
   CH.push(a, {day, icon:'🧪', mark:hh>=3,
     ja:`${TECH.hypLabel(R.k, Q.h, true)} を試した (${hh}つ当たり)`,
     en:`tested ${TECH.hypLabel(R.k, Q.h, false)} (${hh} hits)`});
+  const onScene=expSceneResult(a, hh, S.length, R.posts.length);   // 画面下の札でランプを点ける
   if(hh===TECH.SLOTS){ techSolve(a, false); techEnd(a); return; }   // 本人も生活へ戻す (途中の段では round が続くので自動では外れない)
   // 「僕はこの特性で確かめた、君はこの特性で」— 自分の特性では試せない、いちばん割れる仮説
   const myT=techTraitIdx(a, R.k);
@@ -12780,8 +13214,8 @@ function techResult(a){
       ? `次は「${techTraitJa(R.k, post.req.t)}」の人に ${techLabel(R.k, rq)} を試してほしい`
       : `Could a ${techTraitEn(R.k, post.req.t)} try ${techLabel(R.k, rq)}?`);
   }
-  showBanner(JA_HUD ? `${a.name} の実験結果 ${mark}  (残り ${S.length} 通り)`
-                    : `${a.name}'s result: ${hh}/4  (${S.length} options left)`, 6);
+  if(!onScene) showBanner(JA_HUD ? `${a.name} の実験結果 ${mark}  (残り ${S.length} 通り)`
+                                  : `${a.name}'s result: ${hh}/4  (${S.length} options left)`, 6);
   techEnd(a);
 }
 
@@ -13789,8 +14223,13 @@ function stepNavigate(a){
   // pursuit は「にんじん」へ直進しようとするので、間に壁がある先読み点を狙うと
   // 角で引っかかって経路から外れる。見通せる範囲まで手前に寄せる。
   // 学習方策のときは観測(compass)を学習時と変えないため切り詰めない。
+  //   ★ **いまの経路点 (pathIdx) まで戻してよい。** 以前は pathIdx+1 で止めていたので、
+  //     角を曲がる直前 (いま (28,22) で、経路が (28,21)→(27,21) と折れる) には
+  //     斜め向こうの (27,21) を狙い続け、その直線は角の通れないセルを横切る。
+  //     人よけで向きが反対側に振れると「通れる向きが無い」で足が止まり、
+  //     引き直しても同じ経路なので抜けられなかった (2 日で 60 人中 50 人以上が数時間止まった)。
   if(MOVE_MODE==='pursuit' || !hasUsablePolicy(a)){
-    while(ti > a.pathIdx+1 && !lineOfSight(a.x, a.y, a.path[ti][0]+0.5, a.path[ti][1]+0.5)) ti--;
+    while(ti > a.pathIdx && !lineOfSight(a.x, a.y, a.path[ti][0]+0.5, a.path[ti][1]+0.5)) ti--;
   }
   const [tr,tc]=a.path[ti];
   a.gx=tr+0.5; a.gy=tc+0.5;
@@ -14345,6 +14784,7 @@ function unstickAction(a, move, rot){
 async function stepAll(){
   if(paused || !scene) return;   // ★ scene null ガード
   stepCount++;
+  mmRecord();                    // 右下ミニマップの足跡
   // 歩行は 150ms ごと、生活・社交の更新は 1秒ごと。以前は後者でしか
   // 空間ハッシュを作り直していなかったため、歩いてセルをまたいだ人が最大1秒
   // 古いバケツに残り、直前の人を検出できないことがあった。O(N) の再配置だけで
@@ -14944,8 +15384,8 @@ const CAM_SHAKE = envNum('CAM_SHAKE', 0.004);
 //   ・建物の陰に入ったら、建物の無い側へ回り込む
 // 次のターゲットを探す範囲 (セル)。この中に居る人へ渡すときはカメラを切らない。
 const CAM_NEXT_R     = envNum('CAM_NEXT_R', 6);
-const CAM_ORBIT_DIST = envNum('CAM_ORBIT_DIST', 3.0);   // 被写体までの水平距離 (ワールド単位)
-const CAM_ORBIT_HIGH = envNum('CAM_ORBIT_HIGH', 2.05);  // 通常の高さ (見下ろし 34 度)
+const CAM_ORBIT_DIST = envNum('CAM_ORBIT_DIST', 5.2);   // 被写体までの水平距離 (ワールド単位)
+const CAM_ORBIT_HIGH = envNum('CAM_ORBIT_HIGH', 2.45);  // 通常の高さ (見下ろし 34 度)
 // どの方位からも見えないときに逃げる高さ。建物のいちばん高いもの (6.6) より上。
 const CAM_ORBIT_LIFT = envNum('CAM_ORBIT_LIFT', 7.4);
 const CAM_ORBIT_SLEW = envNum('CAM_ORBIT_SLEW', 0.55);  // 方位の最大回転速度 (rad/秒)
@@ -15508,15 +15948,22 @@ function viewerAsk(targetQ){
     ? (a.taught.tried ? ` - ${a.taught.by} told them about that ${enOf(tSt.typeIdx)}`
                       : ` - has not yet tried the ${enOf(tSt.typeIdx)} ${a.taught.by} suggested`)
     : '';
-  const en=top.length
+  // 見た目の好み (行ったことの無い店も含む種類の好み)。行きつけ (個々の店) とは別に言う。
+  const tz=TASTE_STATE ? TASTE.top(TASTE_STATE, a, 2).like.filter(x=>x.z>=0.5).map(x=>BLDG_TYPES.findIndex(b=>b.name===x.name)) : [];
+  const cSt=(a.curious && a.curious.until>simNow()) ? cellStruct[a.curious.key] : null;
+  const tasteEn=(tz.length ? ` - into ${tz.map(enOf).join(' / ')} places` : '')
+              + (cSt ? ` - curious about that new-to-them ${enOf(cSt.typeIdx)}` : '');
+  const tasteJa=(tz.length ? ` / 好み: ${tz.map(jaLabelOf).join('・')}系` : '')
+              + (cSt ? ` / 気になっている店: ${shopNameJa(cSt)}` : '');
+  const en=(top.length
     ? `${a.name} likes ${top.join(' / ')}`
       + (worst && worst.s<0 ? ` - avoids that ${enOf(worst.st.typeIdx)}` : '') + tip
-    : `${a.name} has no favourite place yet` + tip;
+    : `${a.name} has no favourite place yet` + tip) + tasteEn;
   // ★ 「◯◯は何してる?」に**今していること**で答える。行きつけの店だけ返しても
   //   聞かれたことに答えていない (以前は英語の一文しか出しておらず、日本語表示でも
   //   英語のバナーが出ていた)。
-  const fav=list.slice(0,2).map(x=>`${BLDG_TYPES[x.st.typeIdx].label}(${x.n}回)`).join(' / ');
-  const ja=`${a.name} は ${describeActivity(a)}`+(fav?` / 行きつけ: ${fav}`:'');
+  const fav=visited.slice(0,2).map(x=>`${BLDG_TYPES[x.st.typeIdx].label}(${x.n}回)`).join(' / ');
+  const ja=`${a.name} は ${describeActivity(a)}`+(fav?` / 行きつけ: ${fav}`:'')+tasteJa;
   lifeNews.push({day:gameDay(), shape:'ask', en, ja});
   while(lifeNews.length>12) lifeNews.shift();
   hudNewsDirty=true;
@@ -17579,14 +18026,23 @@ tick(); setInterval(tick, ${ms});
     res.setHeader('Content-Type','application/json');
     if(!q.has('persona')){
       res.writeHead(200);
-      res.end(JSON.stringify({types:BLDG_TYPES.map((b,i)=>({index:i,name:b.name})),
+      res.end(JSON.stringify({tick:stepCount, types:BLDG_TYPES.map((b,i)=>({index:i,name:b.name})),
         agents:agents.map(a=>{
           const m=personaMeta[a.def.id]||{};
           return {aid:a.aid, persona:a.def.id, name:a.def.name, mode:a.mode,
             goalType:a.goalType, goalName:a.goalType!=null?BLDG_TYPES[a.goalType].name:null,
             zApplied:!!a.goalZ, pathLen:a.path?a.path.length:0, pathIdx:a.pathIdx,
             pos:[+a.x.toFixed(2), +a.y.toFixed(2)], goal:[+a.gx.toFixed(2), +a.gy.toFixed(2)],
-            stall:a.stall, trips:a.trips, viols:a.viols, goalDim:m.goalDim||0};
+            stall:a.stall, trips:a.trips, viols:a.viols, goalDim:m.goalDim||0,
+            // 立ち往生の調査用: 行き先 / 玄関待ち / 屋内 / 家 / 欲求
+            navDest:a.navDest||null, atDoor:a.atDoor?[a.atDoor.r,a.atDoor.c]:null,
+            indoors:a.indoors||null, home:a.home||null, need:needOf(a), walkWhy:a.walkWhy||null,
+            th:+a.th.toFixed(2), walkMul:a.walkMul, cell:MAP[Math.floor(a.x)]?.[Math.floor(a.y)],
+            talking:!!(a.talk && a.talk.until>simNow()), pastime:ptActive(a)?(a.pastime.kind||a.pastime.id||true):null,
+            linger:a.linger?Math.round((a.linger-simNow())/1000):null, steps:a.steps,
+            around:(()=>{ const r0=Math.floor(a.x), c0=Math.floor(a.y), out=[];
+              for(let r=r0+3;r>=r0-3;r--){ let l=''; for(let c=c0-3;c<=c0+3;c++){ const v=MAP[r]?.[c]; l+= v==null?'?':'.=#T '[v]; } out.push(l); }
+              return out; })()};
         })}));
       return;
     }
@@ -18406,6 +18862,8 @@ tick(); setInterval(tick, ${ms});
   // いま描いている画をそのまま PNG で返す。**見た目の確認用。**
   //   配信を見なくても、しぐさや街の様子を1枚で確かめられる。
   //   ?scale=2 で拡大。POSE_FORCE=n と併せると各しぐさを確認できる。
+  if(urlPath==='/expdbg'){   // TMP_EXP
+    res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify({hud:!!hudExp, pos:hudExp?[hudExp.position.x,hudExp.position.y,hudExp.position.z]:null, vis:hudExp?hudExp.visible:null, cur:camEventCur?(camEventCur.tag?camEventCur.tag.name:'other'):null, scenes:expScenes.size, busy:expBusy, sig:expSig, W:WIDTH, H:HEIGHT})); return; }   // TMP_EXP
   if(urlPath==='/shot'){
     const sq=new URL(req.url,'http://x').searchParams;
     const sc=Math.max(1,Math.min(3,parseInt(sq.get('scale'))||1));
@@ -19239,7 +19697,9 @@ async function renderLoop(){
         m.position.x=tx; m.position.y=ty;
         if(PERF_LOG) _perf.wallFix++;         // 何回めり込みを直したか (効いているかの確認)
       }
-      m.position.z=CELL*.26*CHAR_SCALE;   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
+      // 背の高さは人ごと (agentWear)。足元の持ち上げも同じ倍率で掛けないと、背の低い人が宙に浮く。
+      { const we=agentWear(a); m.scale.set(CHAR_SCALE*we.width, CHAR_SCALE*we.width, CHAR_SCALE*we.height);
+        m.position.z=CELL*.26*CHAR_SCALE*we.height; }   // 足元を地面に接地させる (足元ローカルz=-CELL*.26 をスケール分だけ持ち上げ)
       // 体は **実際に進んでいる向き** へ向ける。
       //
       // ── ① 骨格の正面は +Y であって +X ではない ──
