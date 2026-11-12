@@ -14,7 +14,7 @@
 // 算術式を JS へ機械的に置き換えて、skeleton.js の limbAngles と数値で比べる。
 
 const fs=require('fs'), path=require('path');
-const SK=require('../skeleton.js');
+const SK=require('../src/skeleton.js');
 
 const src=fs.readFileSync(path.join(__dirname,'..','server.js'),'utf8');
 const m=src.match(/const WALK_ANGLES_GLSL = `([\s\S]*?)`;/);

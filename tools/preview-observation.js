@@ -12,7 +12,7 @@
 // roads.js を呼んでいるので、そこがズレることはない。
 
 const fs=require('fs'), path=require('path');
-const MW=require('../world.js'), RD=require('../roads.js'), TR=require('../traffic.js');
+const MW=require('../src/world.js'), RD=require('../src/roads.js'), TR=require('../src/traffic.js');
 const PNG=require('./png.js');
 
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?a.split('=')[1]:null; };

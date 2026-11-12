@@ -174,6 +174,16 @@ function step(cfg, a, ctx){
       //   よけは「余裕があるときの上乗せ」であって、通行を妨げてはいけない。
       if(ctx.passable(a.x, a.y, gb, move)) bestTh=gb;
       else {
+        // 経路方向のまわりを**一周ぶん**探す。want の ±searchSteps だけだと、
+        //   人よけで want が反対側へ振れているとき、通れる向き (角を曲がる側) が
+        //   窓の外に出て「全方位ふさがり」と誤判定し、その場で回り続けた。
+        const full=Math.ceil(Math.PI/Math.max(rot,1e-3));
+        for(let k=1;k<=full && bestTh===null;k++) for(const sgn of [-1,1]){
+          const th2=gb+sgn*k*rot;
+          if(ctx.passable(a.x, a.y, th2, move)){ bestTh=th2; break; }
+        }
+      }
+      if(bestTh===null){
         // 本当に全方位ふさがり。決定論で回頭 (毎tick揺れないように)
         return {th:a.th + ((a.aid.charCodeAt(0)&1)?-rot:rot), speed:0, why:'blocked',
                 wait:false, ttc:1, crowdL:0, crowdR:0};
@@ -196,7 +206,14 @@ function step(cfg, a, ctx){
   //    一気に向けると、その場で回ってから歩く従来の動きに戻ってしまう。
   const dth=wrap(want-a.th);
   const step=Math.min(Math.abs(dth), rot*cfg.turnRate)*Math.sign(dth);
-  const th=a.th+step;
+  let th=a.th+step;
+  //    ★ ただし**少し曲げた向きがまだ壁なら、その場で want へ向き直る。**
+  //      歩く本体は th の向きへ一歩出るので、th が壁を向いている間は一歩も進めない。
+  //      真後ろへ振り向くのに 1tick 数度ずつだと 50tick 以上壁を押し続け、その間に
+  //      「足踏み」と判定されて経路の引き直し → 行き先の変更が起き、want が変わって
+  //      振り向きが終わらなかった (壁際で数時間立ち尽くす人が出た)。
+  //      人も壁に向かって歩きながら曲がりはしない。止まって振り向く。
+  if(!ctx.passable(a.x, a.y, th, move)) th=want;   // 減速は元の曲がり量 (dth) で掛かる
 
   // 7) 速度。前が詰まっているほど、大きく曲がるほど緩める。
   //    ★ ここは**街の速さそのもの**を決める。常時わずかに減速するだけでも、

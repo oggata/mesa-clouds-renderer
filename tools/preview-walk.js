@@ -12,7 +12,7 @@
 // 添付された姿勢推定オーバーレイと同じ並べ方 (横に 1 周期ぶん) で出す。
 
 const fs=require('fs'), path=require('path');
-const SK=require('../skeleton.js');
+const SK=require('../src/skeleton.js');
 const PNG=require('./png.js');
 
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?a.split('=')[1]:null; };

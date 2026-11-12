@@ -3,6 +3,7 @@
 // preview-char.js — 住民のキャラクターを大きく描いて形と色を確かめる。
 //
 //   node tools/preview-char.js [out.png] [--style=human|skeleton] [--size=520] [--wear=3]
+//   node tools/preview-char.js out.png --lineup   … 小物と背の高さの違う 8 人を斜めから並べる
 //
 // 配信画面では住民は 40px ほどにしかならないので、あれで形の良し悪しは分からない。
 // ここでは 1 体を画面いっぱいに、正面・横・斜めの 3 方向から描く。
@@ -14,18 +15,20 @@
 const path=require('path');
 const THREE=require('three');
 const gl=require('gl');
-const SK=require('../skeleton.js');
-const CHARMESH=require('../charmesh.js');
+const SK=require('../src/skeleton.js');
+const CHARMESH=require('../src/charmesh.js');
 
 const arg=k=>{ const a=process.argv.find(v=>v.startsWith('--'+k+'=')); return a?a.split('=')[1]:null; };
 const STYLE=(arg('style')||'human')==='skeleton'?'skeleton':'human';
 const SIZE=parseInt(arg('size'))||520;
-const WEAR_N=parseInt(arg('wear'))||3;            // 並べる服装の数
+const LINEUP=process.argv.includes('--lineup');   // 小物と背の高さを見比べる並び
+const WEAR_N=LINEUP ? 8 : (parseInt(arg('wear'))||3);   // 並べる服装の数
 const out=process.argv.slice(2).find(a=>!a.startsWith('--'))
        || path.join(__dirname,'..','docs','images','char_preview.png');
 
 const H=1.32, BASE=-0.52;                          // 身長と足元 (server.js と同じ比率)
-const VIEWS=[['front',0],['side',Math.PI/2],['iso',Math.PI*0.25]];
+// 並びのときは斜め前と斜め後ろの 2 方向 (帽子のつばと、リュック・髪が見える向き)
+const VIEWS=LINEUP ? [['iso',Math.PI*0.20],['back',Math.PI*1.15]] : [['front',0],['side',Math.PI/2],['iso',Math.PI*0.25]];
 const W=SIZE*VIEWS.length*WEAR_N, HT=SIZE;
 
 const glCtx=gl(W,HT,{preserveDrawingBuffer:true});
@@ -45,11 +48,24 @@ const sun=new THREE.DirectionalLight(0xfff4e0,2.35); sun.position.set(2,-3,4); s
 
 // 服装は server.js の agentWear と同じ考え方 (aid のハッシュ) で振る。
 // ここは見た目の確認なので、単純に候補を順に使う。
+// 小物の組み合わせ (server.js の agentWear が引くもの)。並びでは全種類が 1 回は出るようにする。
+const L=SK.LOOK;
+const LOOKS=[
+  {hat:L.HAT_CAP,    bag:1, hair:L.HAIR_SHORT, hatC:1, bagC:2, shoeC:1, height:0.74},   // 小学生
+  {hat:L.HAT_NONE,   bag:1, hair:L.HAIR_LONG,  hatC:0, bagC:6, shoeC:1, height:0.95},   // 高校生
+  {hat:L.HAT_BEANIE, bag:0, hair:L.HAIR_SHORT, hatC:3, bagC:0, shoeC:2, height:1.05},
+  {hat:L.HAT_NONE,   bag:0, hair:L.HAIR_BUN,   hatC:0, bagC:0, shoeC:4, height:0.97},
+  {hat:L.HAT_NONE,   bag:0, hair:L.HAIR_BALD,  hatC:0, bagC:0, shoeC:5, height:0.95},   // お年寄り
+  {hat:L.HAT_CAP,    bag:0, hair:L.HAIR_SHORT, hatC:0, bagC:0, shoeC:3, height:1.06},
+  {hat:L.HAT_NONE,   bag:1, hair:L.HAIR_SHORT, hatC:0, bagC:4, shoeC:7, height:1.00},
+  {hat:L.HAT_BEANIE, bag:0, hair:L.HAIR_LONG,  hatC:4, bagC:0, shoeC:0, height:0.60},   // 幼児
+];
 const wears=[];
 for(let i=0;i<WEAR_N;i++) wears.push({
   pants: SK.PANTS[i % SK.PANTS.length],
   tone : (i % SK.SKIN_TONES.length)*4 + (i % SK.HAIR_TONES.length),
   top  : [0xff3355,0x00ccff,0x33ff88,0xffee00,0xff7700][i % 5],
+  look : LINEUP ? LOOKS[i % LOOKS.length] : {hat:0, bag:0, hair:0, hatC:0, bagC:0, shoeC:0, height:1},
 });
 
 let col=0;
@@ -58,11 +74,15 @@ for(const w of wears){
   for(const [,yaw] of VIEWS){
     const g=new THREE.Group();
     for(const it of parts){
+      if(!CHARMESH.partVisible(it.part, w.look)) continue;   // 付けていない小物
       const c=CHARMESH.partColor(it.part, w, w.top);
       const m=new THREE.MeshLambertMaterial({color: c!=null ? c : it.color.getHex()});
       g.add(new THREE.Mesh(it.geo, m));
     }
     g.rotation.z=yaw;
+    // 背の高さ。足元 (BASE) を床に残したまま縦に伸び縮みさせる (server.js と同じ: 横は半分だけ)
+    const hs=w.look.height||1, ws=1-(1-hs)*0.5;
+    g.scale.set(ws, ws, hs); g.position.z=BASE*(1-hs);
     g.userData.col=col++;
     scene.add(g);
   }

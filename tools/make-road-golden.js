@@ -14,7 +14,7 @@
 // 出力は学習ノートブックのセルが読み、Python 側の実装と 1 件ずつ照合する。
 
 const fs=require('fs'), path=require('path');
-const MW=require('../world.js'), RD=require('../roads.js'), TR=require('../traffic.js');
+const MW=require('../src/world.js'), RD=require('../src/roads.js'), TR=require('../src/traffic.js');
 const PNG=require('./png.js');
 
 const out=process.argv[2] || path.join(__dirname,'..','data','road_golden.json');

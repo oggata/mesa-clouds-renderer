@@ -135,7 +135,7 @@ console.log(`  縁石の輪郭          : ${curbNote || `${curbLines}本 / 判�
 // あわせて、縦の面が**車道の側**を向いていることも見る (輪郭の法線は車道→歩道
 // なので、縦の面の法線はその逆でなければならない)。
 if(!curbNote){
-  const RD2=require('../roads.js');
+  const RD2=require('../src/roads.js');
   const J2=JSON.parse(fs.readFileSync(curbFile,'utf8'));
   const P={zRoad:0, zTop:0.06, zWalk:0.014, chamfer:0.06};
   let tris=0, windBad=0, faceBad=0, soft=0, worstDot=1;
@@ -179,7 +179,7 @@ if(!curbNote){
 // **アトラスの絵とズレていると、見た目と挙動が食い違う**。
 // タイルの中を格子状に走査して、式の答えと PNG のピクセルを突き合わせる。
 {
-  const RD2=require('../roads.js');
+  const RD2=require('../src/roads.js');
   const V={OTHER:0, ROAD:1, BUILDING:2, TREE:3};
   const N=40;                                   // タイルあたり N x N 点
   let gkN=0, gkBad=0;

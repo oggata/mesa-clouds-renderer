@@ -102,12 +102,31 @@ function partList(THREE, style, H, base) {
  * ここで同じ答えを得られる。
  */
 function partColor(part, wear, top) {
-  if (part === SK.PART.TOP) return top;
-  if (part === SK.PART.BOTTOM) return wear.pants;
+  const P = SK.PART, L = wear.look || {};
+  if (part === P.TOP) return top;
+  if (part === P.BOTTOM) return wear.pants;
   const si = Math.floor(wear.tone / 4);
-  if (part === SK.PART.SKIN) return SK.SKIN_TONES[si];
-  if (part === SK.PART.HAIR) return SK.HAIR_TONES[wear.tone - si * 4];
+  if (part === P.SKIN) return SK.SKIN_TONES[si];
+  if (part === P.HAIR || part === P.HAIR_LONG || part === P.HAIR_BUN) return SK.HAIR_TONES[wear.tone - si * 4];
+  if (part === P.CAP || part === P.BEANIE) return SK.HAT_COLS[L.hatC || 0];
+  if (part === P.BAG) return SK.BAG_COLS[L.bagC || 0];
+  if (part === P.SHOE) return SK.SHOE_COLS[L.shoeC || 0];
   return null;                                   // BAKED = 型紙の色をそのまま
 }
 
-module.exports = { partGeo, partList, humanParts, skeletonParts, partColor };
+/**
+ * その人がこの部位を付けているか。**頂点シェーダ (LOOK_HIDE_GLSL) と同じ規則**。
+ *   look = {hat, bag, hair} (skeleton.js の LOOK)。look が無ければ小物なし・短髪。
+ */
+function partVisible(part, look) {
+  const P = SK.PART, L = look || {}, hat = L.hat || 0, bag = L.bag || 0, hair = L.hair || 0;
+  if (part === P.CAP) return hat === SK.LOOK.HAT_CAP;
+  if (part === P.BEANIE) return hat === SK.LOOK.HAT_BEANIE;
+  if (part === P.BAG) return bag === 1;
+  if (part === P.HAIR_LONG) return hair === SK.LOOK.HAIR_LONG;
+  if (part === P.HAIR_BUN) return hair === SK.LOOK.HAIR_BUN;
+  if (part === P.HAIR) return hair !== SK.LOOK.HAIR_BALD;
+  return true;
+}
+
+module.exports = { partGeo, partList, humanParts, skeletonParts, partColor, partVisible };

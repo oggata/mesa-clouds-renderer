@@ -9,7 +9,7 @@
 // events.js へ移すときにここがズレると、病院の需要が変わって街の育ち方まで
 // 変わってしまう。重みから逆算した発症間隔をここで突き合わせる。
 
-const EV = require('../events.js');
+const EV = require('../src/events.js');
 const arg = (k, d) => { const a = process.argv.find(v => v.startsWith('--' + k + '=')); return a ? parseFloat(a.split('=')[1]) : d; };
 const MEAN = arg('mean', 25);      // イベントが起きる平均間隔 (分/人)
 const N    = arg('n', 400000);

@@ -1,0 +1,10 @@
+{
+  "name": "mesa-clip-embed",
+  "private": true,
+  "description": "MobileCLIP-S0 で建物と住民の埋め込みを事前計算する (server 本体の依存には入れない)",
+  "type": "module",
+  "dependencies": {
+    "@huggingface/transformers": "3.8.1",
+    "sharp": "0.34.5"
+  }
+}

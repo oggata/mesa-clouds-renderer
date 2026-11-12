@@ -2,7 +2,7 @@
 //
 // **配置先では world.js にリネームして使う。** mesa-env の js/ は ESM
 // (ブラウザ向け) なので .cjs にしてあるが、server.js は CommonJS なので
-// mesa-clouds-renderer には world.js として置き、require('./world.js') する。
+// mesa-clouds-renderer には world.js として置き、require('./src/world.js') する。
 //
 // server.js から切り出した共有ロジック。Python 側 (mesa_env/world.py, maps.py) と
 // 同じ結果を返すことが golden vector で検証される。

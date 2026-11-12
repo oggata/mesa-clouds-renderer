@@ -96,7 +96,16 @@ const JOINTS = [
 //   BOTTOM … 下衣。住民ごとの色 = aWear.rgb (PANTS から抽選)
 //   SKIN   … 肌。aWear.w が指す SKIN_TONES
 //   HAIR   … 髪。aWear.w が指す HAIR_TONES
-const PART = { BAKED:0, TOP:1, BOTTOM:2, SKIN:3, HAIR:4 };
+// 5 以降は**住民ごとに出したり消したりする小物**。ジオメトリは全員が全部持っていて、
+// シェーダが aLook を見て、付けていない人の分を 1 点に潰す (InstancedMesh のまま)。
+//   CAP      … つば付きの帽子        BEANIE … ニット帽 (てっぺんに玉)
+//   BAG      … リュック              SHOE   … 靴 (色は SHOE_COLS から)
+//   HAIR_LONG … 背中に流れる長い髪   HAIR_BUN … 後ろのお団子
+const PART = { BAKED:0, TOP:1, BOTTOM:2, SKIN:3, HAIR:4,
+               CAP:5, BEANIE:6, BAG:7, SHOE:8, HAIR_LONG:9, HAIR_BUN:10 };
+// 小物の組み合わせ。style = hat + 3*bag + 6*hair (シェーダもこの式でほどく)。
+const LOOK = { HAT_NONE:0, HAT_CAP:1, HAT_BEANIE:2, HAIR_SHORT:0, HAIR_LONG:1, HAIR_BUN:2, HAIR_BALD:3 };
+const lookStyle = (hat, bag, hair) => hat + 3*bag + 6*hair;
 
 const SKIN_TONES = [0xecc39c, 0xd8a87e, 0xb8834f, 0x82502f];
 const HAIR_TONES = [0x2a2320, 0x4a352a, 0x6b4a30, 0x8f8579];   // 黒 / 焦茶 / 茶 / 白髪
@@ -104,6 +113,10 @@ const HAIR_TONES = [0x2a2320, 0x4a352a, 0x6b4a30, 0x8f8579];   // 黒 / 焦茶 /
 // (原色) なので、下まで派手にすると 1000 人が万華鏡になる。
 const PANTS = [0x2b3242, 0x39404a, 0x23262b, 0x4a5468, 0x6b6152, 0x3d4a3f];
 const SHOE_COL = 0x1e2026;
+// 帽子 / リュック / 靴の色。**8 色まで** (シェーダの if 連鎖と aLook の詰め方がこの数を前提にしている)。
+const HAT_COLS  = [0x2b3a67, 0xc0392b, 0xe8e2d0, 0x2e7d4f, 0xf2b134, 0x1d1f24, 0x7a4a8c, 0x5a7d9a];
+const BAG_COLS  = [0x1d1f24, 0x2b3a67, 0xb03a2e, 0x4f6b3a, 0xd9a441, 0x6d4c3d, 0x3a8fb7, 0x8e8e8e];
+const SHOE_COLS = [0x1e2026, 0xeeeeea, 0x6b4a30, 0x2b3a67, 0xc0392b, 0x8a8f96, 0x2e7d4f, 0xe8b04a];
 
 // 体のパーツ。単位は骨格と同じ「身長 H の比」。
 //   cone … 上下に伸びるテーパー付き円柱 (a→b, 半径 r1→r2)。sy で前後を潰す
@@ -134,6 +147,29 @@ function bodyParts() {
              sx:1.0, sy:0.96, sz:1.02, theta:Math.PI*0.40, seg:[8,4],
              part:PART.HAIR, bone:BONE.TORSO });
 
+  // ── 付けたり外したりする小物 (住民ごとに aLook で選ぶ) ──
+  //   どれも TORSO に付けるので、前傾・首振りと一緒に動く。
+  const hz=J.head.z;
+  // つば付きの帽子: 髪より一回り大きい殻 + 前に張り出したつば
+  out.push({ type:'cap', p:{x:0,y:-0.004,z:hz+0.014}, r:HEAD_R*1.13,
+             sx:1.0, sy:1.0, sz:0.95, theta:Math.PI*0.44, seg:[8,4], part:PART.CAP, bone:BONE.TORSO });
+  out.push({ type:'box', p:{x:0, y:0.078, z:hz+0.030}, w:0.118, d:0.070, h:0.010,
+             part:PART.CAP, bone:BONE.TORSO });
+  // ニット帽: 頭に深くかぶる殻 + てっぺんの玉
+  out.push({ type:'cap', p:{x:0,y:-0.004,z:hz+0.006}, r:HEAD_R*1.14,
+             sx:1.0, sy:1.0, sz:1.12, theta:Math.PI*0.46, seg:[8,4], part:PART.BEANIE, bone:BONE.TORSO });
+  ball({x:0,y:-0.004,z:hz+0.092}, 0.026, PART.BEANIE, BONE.TORSO, {seg:[6,4]});
+  // リュック: 背中 (-y) に箱 + 上のふた
+  out.push({ type:'box', p:{x:0, y:-0.092, z:0.700}, w:0.150, d:0.070, h:0.210,
+             part:PART.BAG, bone:BONE.TORSO });
+  out.push({ type:'box', p:{x:0, y:-0.086, z:0.812}, w:0.140, d:0.074, h:0.030,
+             part:PART.BAG, bone:BONE.TORSO });
+  // 長い髪: 後頭部から肩の下まで流れる板。髪の色で塗る
+  cone({x:0,y:-0.040,z:hz+0.020}, {x:0,y:-0.052,z:0.775}, 0.074, 0.070,
+       PART.HAIR_LONG, BONE.TORSO, {sy:0.48, seg:8});
+  // お団子: 後頭部の高いところに玉
+  ball({x:0,y:-0.068,z:hz+0.040}, 0.036, PART.HAIR_BUN, BONE.TORSO, {seg:[6,5]});
+
   for (const s of [1, -1]) {
     const id = k => BONE[(s > 0 ? 'L' : 'R') + k];
     const X = v => v * s;
@@ -144,7 +180,7 @@ function bodyParts() {
          PART.BOTTOM, id('SHIN'), {sy:0.94, seg:7});
     // 靴。足首から下、つま先 (J.foot.y) の方向へ伸ばす。脛と一緒に動く。
     out.push({ type:'box', p:{x:X(J.ankle.x), y:0.026, z:0.029},
-               w:0.074, d:0.124, h:0.058, part:PART.BAKED, col:SHOE_COL, bone:id('SHIN') });
+               w:0.074, d:0.124, h:0.058, part:PART.SHOE, col:SHOE_COL, bone:id('SHIN') });
     // 腕。袖 (上腕) は上衣の色、前腕から先は肌。
     cone({x:X(J.shoulder.x),y:0,z:0.828}, {x:X(J.elbow.x),y:0,z:0.620}, 0.042, 0.034,
          PART.TOP, id('UARM'), {seg:6});
@@ -293,4 +329,5 @@ function jointSpheres() {
 
 module.exports = { POSE, POSE_DEF, J, BONE, COL, BONES, JOINTS, WALK, HEAD_R, BONE_R, JOINT_R,
                    PART, SKIN_TONES, HAIR_TONES, PANTS, SHOE_COL, bodyParts,
+                   LOOK, lookStyle, HAT_COLS, BAG_COLS, SHOE_COLS,
                    limbAngles, rotX, poseVertex, boneSegments, jointSpheres };

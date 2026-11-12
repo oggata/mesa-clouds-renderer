@@ -12,9 +12,9 @@
 //      謎として易しすぎ、街の全員が残る事件は手がかりゼロ。3〜8人が良い幅で、
 //      その幅に入る事件が全体の何割あるかが「ミステリーの素材の歩留まり」になる。
 
-const SOC = require('../social.js');
-const WIT = require('../witness.js');
-const EV  = require('../events.js');
+const SOC = require('../src/social.js');
+const WIT = require('../src/witness.js');
+const EV  = require('../src/events.js');
 
 const arg=(k,d)=>{const a=process.argv.find(v=>v.startsWith('--'+k+'='));return a?parseFloat(a.split('=')[1]):d;};
 const POP=arg('pop',300), N=arg('n',4000), DENSITY=arg('density',0.05);
